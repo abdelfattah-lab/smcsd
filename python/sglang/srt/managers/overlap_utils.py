@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.smc_info import SMCDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _is_cuda = is_cuda()
@@ -124,6 +125,19 @@ class FutureMap:
                 device=self.device,
             )
 
+    def _lazy_init_smc_buf(self, draft_input: "SMCDraftInput"):
+        self.buf_initialized = True
+        self.last_token_ids_buf = torch.empty(
+            (self.future_buffer_len, *draft_input.last_token_ids[0].shape),
+            dtype=draft_input.last_token_ids.dtype,
+            device=self.device,
+        )
+        self.new_seq_lens_buf = torch.empty(
+            (self.future_buffer_len, *draft_input.new_seq_lens[0].shape),
+            dtype=draft_input.new_seq_lens.dtype,
+            device=self.device,
+        )
+
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
@@ -136,6 +150,14 @@ class FutureMap:
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
+        elif self.spec_algo.is_smc():
+            draft_input = model_worker_batch.spec_info
+            if draft_input is None:
+                return
+            indices = draft_input.future_indices.indices
+            indices.record_stream(torch.get_device_module(self.device).current_stream())
+            draft_input.last_token_ids = self.last_token_ids_buf[indices]
+            draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
@@ -170,6 +192,9 @@ class FutureMap:
         if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
+        elif self.spec_algo.is_smc():
+            draft_input = batch_result.next_draft_input
+            self.store_to_map_for_new_smc_batch(future_indices, draft_input)
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
             self.store_to_map_for_new_batch(future_indices, draft_input)
@@ -191,3 +216,14 @@ class FutureMap:
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
+
+    def store_to_map_for_new_smc_batch(self, future_indices: FutureIndices, draft_input):
+        intv = future_indices.interval
+        if self.is_empty_slice(intv):
+            return
+
+        if not self.buf_initialized:
+            self._lazy_init_smc_buf(draft_input)
+
+        self.last_token_ids_buf[intv] = draft_input.last_token_ids
+        self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
