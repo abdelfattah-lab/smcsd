@@ -68,8 +68,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override profiler stack capture. Defaults to the runtime setting.",
     )
-    parser.add_argument("--smc-n-particles", type=int, default=4)
-    parser.add_argument("--smc-gamma", type=int, default=3)
+    parser.add_argument("--smc-n-particles", type=int, default=8)
+    parser.add_argument("--smc-gamma", type=int, default=8)
     parser.add_argument(
         "--prompt",
         action="append",
@@ -179,7 +179,6 @@ def main() -> None:
         smc_n_particles=args.smc_n_particles,
         smc_gamma=args.smc_gamma,
         page_size=1,
-        attention_backend="triton",
         mem_fraction_static=0.40,
         trust_remote_code=True,
         log_level="info",

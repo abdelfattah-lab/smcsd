@@ -35,7 +35,6 @@ def main():
         smc_n_particles=4,
         smc_gamma=3,
         page_size=1,
-        attention_backend="triton",
         cuda_graph_max_bs=4,
         mem_fraction_static=0.45,
         trust_remote_code=True,

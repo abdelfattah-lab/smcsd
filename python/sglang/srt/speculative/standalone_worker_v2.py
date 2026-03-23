@@ -158,6 +158,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
             return
 
         self.cuda_graph_runner = None
+        # SMC does not have an EAGLE-style recurring draft_extend stage.
         self.cuda_graph_runner_for_draft_extend = None
 
         if self.server_args.disable_cuda_graph:

@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Sequence
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -527,6 +528,63 @@ class SMCScoreInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self):
         return self.draft_token_num, self.draft_token_num
+
+    def generate_attn_arg_prefill(
+        self,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        req_to_token: torch.Tensor,
+    ):
+        device = req_pool_indices.device
+        batch_size = len(req_pool_indices)
+        qo_indptr = torch.arange(
+            0,
+            (1 + batch_size) * self.draft_token_num,
+            step=self.draft_token_num,
+            dtype=torch.int32,
+            device=device,
+        )
+        cum_kv_seq_len = torch.zeros(
+            (batch_size + 1,), dtype=torch.int32, device=device
+        )
+
+        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum + self.draft_token_num * batch_size,
+            dtype=torch.int32,
+            device=device,
+        )
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            cum_kv_seq_len,
+            None,
+            kv_indices,
+            req_to_token.size(1),
+        )
+
+        mask_numel = (
+            paged_kernel_lens_sum * self.draft_token_num
+            + (self.draft_token_num**2) * batch_size
+        )
+        if self.custom_mask.numel() < mask_numel:
+            self.custom_mask = torch.cat(
+                [
+                    self.custom_mask,
+                    torch.full(
+                        (mask_numel - self.custom_mask.numel(),),
+                        True,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                ],
+                dim=0,
+            )
+        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def prepare_for_v2_verify(
         self,

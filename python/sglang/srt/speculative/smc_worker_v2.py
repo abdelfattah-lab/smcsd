@@ -166,7 +166,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
                     continue
 
             try:
-                self._ensure_draft_prefix_materialized(parent_req)
+                self._ensure_draft_prefix_filled(parent_req)
                 any_cuda_graph |= self._run_parent_step(parent_req)
             except Exception as exc:
                 logger.exception("SMC parent step failed for request %s", parent_req.rid)
@@ -251,7 +251,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
             verify_done=verify_done,
         )
 
-    def _ensure_draft_prefix_materialized(self, parent_req: Req) -> None:
+    def _ensure_draft_prefix_filled(self, parent_req: Req) -> None:
         state = parent_req.smc_state
         if state is None or state.draft_prefix_materialized:
             return
@@ -269,7 +269,9 @@ class SMCWorkerV2(StandaloneWorkerV2):
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self._run_existing_prefix_extend_batch(
+                self._run_draft_prefix_fill_batch(
+                    # This is a one-time draft-prefix KV fill, not an EAGLE-style
+                    # recurring draft-extend stage with accepted bonus tokens.
                     reqs,
                     committed_seq_lens,
                     worker=self.draft_worker.draft_worker,
@@ -277,7 +279,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
 
         state.draft_prefix_materialized = True
 
-    def _run_existing_prefix_extend_batch(
+    def _run_draft_prefix_fill_batch(
         self,
         reqs: Sequence[Req],
         committed_seq_lens: Sequence[int],
@@ -309,7 +311,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
             committed_output_len = committed_seq_len - prompt_len
             if committed_output_len < 0 or committed_output_len > len(req.output_ids):
                 raise AssertionError(
-                    "SMC draft prefix materialization received inconsistent lengths: "
+                    "SMC draft prefix fill received inconsistent lengths: "
                     f"rid={req.rid}, prompt_len={prompt_len}, "
                     f"committed_seq_len={committed_seq_len}, "
                     f"output_len={len(req.output_ids)}"
@@ -318,7 +320,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
             fill_ids = req.origin_input_ids + req.output_ids[:committed_output_len]
             if len(fill_ids) != committed_seq_len:
                 raise AssertionError(
-                    "SMC draft prefix materialization built an unexpected fill length: "
+                    "SMC draft prefix fill built an unexpected fill length: "
                     f"rid={req.rid}, expected={committed_seq_len}, actual={len(fill_ids)}"
                 )
 
