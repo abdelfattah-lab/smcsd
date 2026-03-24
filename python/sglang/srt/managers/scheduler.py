@@ -158,6 +158,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -1899,6 +1900,203 @@ class Scheduler(
             return False
         return True
 
+    def _apply_smc_waiting_queue_policy(self):
+        if self.smc_manager is None or not self.waiting_queue:
+            return
+
+        waiting_index = {id(req): i for i, req in enumerate(self.waiting_queue)}
+        handled_req_ids = set()
+        lagged_entries: List[Req] = []
+        regular_entries: List[Req] = []
+
+        for req in self.waiting_queue:
+            if id(req) in handled_req_ids:
+                continue
+
+            group = self.smc_manager.get_group_for_req(req)
+            if group is None:
+                regular_entries.append(req)
+                handled_req_ids.add(id(req))
+                continue
+
+            members = [
+                member
+                for member in self.smc_manager.get_active_particle_reqs(group.group_id)
+                if id(member) in waiting_index
+            ]
+            if not members:
+                regular_entries.append(req)
+                handled_req_ids.add(id(req))
+                continue
+
+            members.sort(key=lambda member: waiting_index[id(member)])
+            handled_req_ids.update(id(member) for member in members)
+            target = (
+                lagged_entries
+                if self.smc_manager.get_group_lag(group.group_id) > 0
+                else regular_entries
+            )
+            target.extend(members)
+
+        self.waiting_queue[:] = lagged_entries + regular_entries
+
+    def _get_waiting_smc_group_reqs(self, req: Req) -> List[Req]:
+        if self.smc_manager is None or req.smc_group_id is None:
+            return []
+        if not self.smc_manager.all_active_members_present(
+            req.smc_group_id,
+            self.waiting_queue,
+        ):
+            return []
+        waiting_index = {
+            id(waiting_req): i for i, waiting_req in enumerate(self.waiting_queue)
+        }
+        members = self.smc_manager.get_active_particle_reqs(req.smc_group_id)
+        members.sort(key=lambda member: waiting_index[id(member)])
+        return members
+
+    def _prepare_req_for_prefill(self, req: Req, running_loras: Optional[set]) -> bool:
+        if self.enable_lora and running_loras is not None and req.lora_id not in running_loras:
+            if self.enable_lora_overlap_loading:
+                res = self.lora_overlap_loader.try_overlap_load_lora(
+                    req.lora_id, running_loras
+                )
+                if not res:
+                    return False
+            else:
+                new_lora_set = {req.lora_id} | running_loras
+                if not self.tp_worker.model_runner.lora_manager.validate_lora_batch(
+                    new_lora_set
+                ):
+                    return False
+
+        if self.enable_hicache_storage:
+            prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+            if not prefetch_done:
+                return False
+            req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+
+        req.init_next_round_input(self.tree_cache)
+        return True
+
+    def _snapshot_prefill_adder_state(self, adder: PrefillAdder) -> Dict[str, Any]:
+        return {
+            "rem_input_tokens": adder.rem_input_tokens,
+            "rem_chunk_tokens": adder.rem_chunk_tokens,
+            "rem_total_token_offset": adder.rem_total_token_offset,
+            "cur_rem_token_offset": adder.cur_rem_token_offset,
+            "req_states": list(adder.req_states) if adder.req_states is not None else None,
+            "can_run_list": list(adder.can_run_list),
+            "preempt_list": list(adder.preempt_list),
+            "new_chunked_req": adder.new_chunked_req,
+            "log_hit_tokens": adder.log_hit_tokens,
+            "log_input_tokens": adder.log_input_tokens,
+            "rem_dllm_tokens": getattr(adder, "rem_dllm_tokens", None),
+        }
+
+    def _restore_prefill_adder_state(
+        self, adder: PrefillAdder, snapshot: Dict[str, Any]
+    ) -> None:
+        adder.rem_input_tokens = snapshot["rem_input_tokens"]
+        adder.rem_chunk_tokens = snapshot["rem_chunk_tokens"]
+        adder.rem_total_token_offset = snapshot["rem_total_token_offset"]
+        adder.cur_rem_token_offset = snapshot["cur_rem_token_offset"]
+        adder.req_states = (
+            list(snapshot["req_states"]) if snapshot["req_states"] is not None else None
+        )
+        adder.can_run_list = list(snapshot["can_run_list"])
+        adder.preempt_list = list(snapshot["preempt_list"])
+        adder.new_chunked_req = snapshot["new_chunked_req"]
+        adder.log_hit_tokens = snapshot["log_hit_tokens"]
+        adder.log_input_tokens = snapshot["log_input_tokens"]
+        if hasattr(adder, "rem_dllm_tokens"):
+            adder.rem_dllm_tokens = snapshot["rem_dllm_tokens"]
+
+    def _snapshot_req_prefill_state(self, req: Req) -> Dict[str, Any]:
+        return {
+            "prefix_indices": (
+                req.prefix_indices.clone()
+                if isinstance(req.prefix_indices, torch.Tensor)
+                else req.prefix_indices
+            ),
+            "last_node": req.last_node,
+            "last_host_node": req.last_host_node,
+            "host_hit_length": req.host_hit_length,
+            "cache_protected_len": req.cache_protected_len,
+            "fill_ids": list(req.fill_ids),
+            "extend_input_len": req.extend_input_len,
+            "swa_uuid_for_lock": req.swa_uuid_for_lock,
+        }
+
+    def _restore_req_prefill_state(self, req: Req, snapshot: Dict[str, Any]) -> None:
+        req.prefix_indices = snapshot["prefix_indices"]
+        req.last_node = snapshot["last_node"]
+        req.last_host_node = snapshot["last_host_node"]
+        req.host_hit_length = snapshot["host_hit_length"]
+        req.cache_protected_len = snapshot["cache_protected_len"]
+        req.fill_ids = list(snapshot["fill_ids"])
+        req.set_extend_input_len(snapshot["extend_input_len"])
+        req.swa_uuid_for_lock = snapshot["swa_uuid_for_lock"]
+
+    def _release_prefill_lock_ref(self, req: Req) -> None:
+        if req.swa_uuid_for_lock is not None:
+            self.tree_cache.dec_lock_ref(
+                req.last_node,
+                DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+            )
+        else:
+            self.tree_cache.dec_lock_ref(req.last_node)
+
+    def _try_add_smc_group(
+        self,
+        group_reqs: List[Req],
+        adder: PrefillAdder,
+        running_loras: Optional[set],
+    ) -> Optional[AddReqResult]:
+        adder_snapshot = self._snapshot_prefill_adder_state(adder)
+        lora_snapshot = set(running_loras) if running_loras is not None else None
+        req_snapshots: List[tuple[Req, Dict[str, Any]]] = []
+        added_reqs: List[Req] = []
+
+        def rollback() -> None:
+            for added_req in reversed(added_reqs):
+                self._release_prefill_lock_ref(added_req)
+            for added_req, snapshot in req_snapshots:
+                self._restore_req_prefill_state(added_req, snapshot)
+            self._restore_prefill_adder_state(adder, adder_snapshot)
+            if running_loras is not None and lora_snapshot is not None:
+                running_loras.clear()
+                running_loras.update(lora_snapshot)
+
+        last_result = AddReqResult.CONTINUE
+        for i, group_req in enumerate(group_reqs):
+            req_snapshots.append((group_req, self._snapshot_req_prefill_state(group_req)))
+            if not self._prepare_req_for_prefill(group_req, running_loras):
+                rollback()
+                return None
+
+            can_run_len_before = len(adder.can_run_list)
+            result = adder.add_one_req(
+                group_req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
+            added = len(adder.can_run_list) > can_run_len_before
+            if not added:
+                rollback()
+                return None
+
+            added_reqs.append(group_req)
+            if self.enable_lora and running_loras is not None:
+                running_loras.add(group_req.lora_id)
+
+            last_result = result
+            if result != AddReqResult.CONTINUE and i != len(group_reqs) - 1:
+                rollback()
+                return None
+
+        return last_result
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -2221,6 +2419,7 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        self._apply_smc_waiting_queue_policy()
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -2258,27 +2457,13 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        running_loras = None
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
+        processed_smc_groups = set()
         for req in self.waiting_queue:
-            if self.enable_lora and req.lora_id not in running_loras:
-                if self.enable_lora_overlap_loading:
-                    # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
-                    # as opposed to loading them in one batch
-                    res = self.lora_overlap_loader.try_overlap_load_lora(
-                        req.lora_id, running_loras
-                    )
-                    if not res:
-                        continue
-                else:
-                    new_lora_set = {req.lora_id} | running_loras
-                    if not self.tp_worker.model_runner.lora_manager.validate_lora_batch(
-                        new_lora_set
-                    ):
-                        continue
-
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
@@ -2291,29 +2476,41 @@ class Scheduler(
             if self.running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                    or not adder.preempt_to_schedule(
+                        self._get_waiting_smc_group_reqs(req)
+                        if (
+                            self.smc_manager is not None
+                            and req.smc_group_id is not None
+                        )
+                        else req,
+                        self.server_args,
+                        self.smc_manager,
+                    )
                 ):
                     break
 
-            if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
+            if self.smc_manager is not None and req.smc_group_id is not None:
+                if req.smc_group_id in processed_smc_groups:
                     continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
+                processed_smc_groups.add(req.smc_group_id)
+
+                group_reqs = self._get_waiting_smc_group_reqs(req)
+                if not group_reqs:
+                    continue
+                res = self._try_add_smc_group(group_reqs, adder, running_loras)
+                if res is None:
+                    continue
+            else:
+                if not self._prepare_req_for_prefill(req, running_loras):
+                    continue
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
                 )
 
-            req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=(self.chunked_req is not None),
-                truncation_align_size=self.truncation_align_size,
-            )
-
-            if self.enable_lora:
-                running_loras.add(req.lora_id)
+                if self.enable_lora:
+                    running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:

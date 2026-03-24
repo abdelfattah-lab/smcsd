@@ -1914,6 +1914,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        retract_indices = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -1926,11 +1927,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-            # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            retract_indices.append(idx)
+
+        retracted_group_ids = {
+            req.smc_group_id for req in retracted_reqs if req.smc_group_id is not None
+        }
+        if retracted_group_ids:
+            extra_indices = [
+                idx
+                for idx in sorted_indices
+                if self.reqs[idx].smc_group_id in retracted_group_ids
+            ]
+            if extra_indices:
+                extra_index_set = set(extra_indices)
+                sorted_indices = [
+                    idx for idx in sorted_indices if idx not in extra_index_set
+                ]
+                retract_indices.extend(extra_indices)
+                retracted_reqs.extend(self.reqs[idx] for idx in extra_indices)
 
         reqs_to_abort: List[Req] = []
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+        if sorted_indices and len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
             # Even the last remaining request cannot fit in memory.
@@ -1943,10 +1960,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            retract_indices.append(last_idx)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
+
+        remaining_req_count = len(sorted_indices)
+        for idx in sorted(set(retract_indices), reverse=True):
+            self.release_req(idx, remaining_req_count, server_args)
 
         self.filter_batch(keep_indices=sorted_indices)
 

@@ -89,11 +89,6 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
-        if self.smc_logprob_diffs is not None:
-            self.smc_logprob_diffs = self.smc_logprob_diffs.to(
-                "cpu", non_blocking=True
-            )
-
         if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()
 

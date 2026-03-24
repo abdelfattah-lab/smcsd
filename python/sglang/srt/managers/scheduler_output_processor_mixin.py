@@ -484,6 +484,8 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
         smc_logprob_diffs = None
+        smc_step_reqs: List[Req] = []
+        smc_step_rows: List[int] = []
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
@@ -493,9 +495,13 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_smc():
                 assert result.smc_logprob_diffs is not None
                 if torch.is_tensor(result.smc_logprob_diffs):
-                    smc_logprob_diffs = result.smc_logprob_diffs.tolist()
+                    smc_logprob_diffs = result.smc_logprob_diffs
                 else:
-                    smc_logprob_diffs = list(result.smc_logprob_diffs)
+                    smc_logprob_diffs = torch.as_tensor(
+                        result.smc_logprob_diffs,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
 
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
@@ -559,12 +565,8 @@ class SchedulerOutputProcessorMixin:
                     raise RuntimeError(
                         "SMC decode result is missing batched smc_logprob_diffs."
                     )
-                finalized_req = self.smc_manager.on_particle_step(
-                    req,
-                    float(smc_logprob_diffs[i]),
-                )
-                if finalized_req is not None:
-                    smc_finalized_reqs.append(finalized_req)
+                smc_step_reqs.append(req)
+                smc_step_rows.append(i)
 
             if (
                 self.server_args.disaggregation_decode_enable_offload_kvcache
@@ -661,6 +663,24 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+
+        if (
+            batch.spec_algorithm.is_smc()
+            and self.smc_manager is not None
+            and smc_step_reqs
+        ):
+            assert smc_logprob_diffs is not None
+            row_indices = torch.tensor(
+                smc_step_rows,
+                dtype=torch.int64,
+                device=smc_logprob_diffs.device,
+            )
+            smc_finalized_reqs.extend(
+                self.smc_manager.on_particle_step_batch(
+                    smc_step_reqs,
+                    smc_logprob_diffs.index_select(0, row_indices),
+                )
+            )
 
         self.stream_output(batch.reqs, batch.return_logprob)
         if smc_finalized_reqs:

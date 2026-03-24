@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.speculative.smc_manager import SMCFinishedParticleSnapshot, SMCGroupState, SMCManager
 from sglang.srt.speculative.smc_info import SMCDraftInput, SMCScoreInput
 from sglang.srt.speculative.smc_info import (
     SMCParticleState,
@@ -58,6 +59,53 @@ class TestSMCWeightHelpers(TestCase):
 
     def test_multinomial_resample_with_degenerate_weight(self):
         self.assertEqual(multinomial_resample([1.0, 0.0, 0.0]), [0, 0, 0])
+
+
+class TestSMCManagerHelpers(TestCase):
+    def test_group_queries_use_active_particles_only(self):
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=0.5, smc_resample_method="systematic")
+        )
+        req0 = SimpleNamespace(
+            smc_group_id="g1",
+            smc_particle_idx=0,
+            finished=lambda: False,
+        )
+        req1 = SimpleNamespace(
+            smc_group_id="g1",
+            smc_particle_idx=1,
+            finished=lambda: False,
+        )
+        req2 = SimpleNamespace(
+            smc_group_id="g1",
+            smc_particle_idx=2,
+            finished=lambda: False,
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=SimpleNamespace(),
+            particle_reqs={0: req0, 1: req1, 2: req2},
+            log_weights=torch.zeros(3, dtype=torch.float64),
+            step_counts={0: 3, 1: 1, 2: 5},
+            finished_particles={
+                2: SMCFinishedParticleSnapshot(
+                    output_ids=[1, 2],
+                    finished_reason=None,
+                    finished_len=2,
+                )
+            },
+        )
+
+        self.assertEqual(manager.get_particle_lag(req0), 0)
+        self.assertEqual(manager.get_particle_lag(req1), 2)
+        self.assertEqual(manager.get_group_lag("g1"), 2)
+        self.assertEqual(manager.get_active_particle_reqs("g1"), [req0, req1])
+        self.assertEqual(
+            manager.get_active_particle_reqs_in_collection("g1", [req1, req2]),
+            [req1],
+        )
+        self.assertTrue(manager.all_active_members_present("g1", [req0, req1, req2]))
+        self.assertFalse(manager.all_active_members_present("g1", [req0]))
 
 
 class TestSMCScoreInput(TestCase):

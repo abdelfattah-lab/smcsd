@@ -38,7 +38,7 @@ class SMCGroupState:
     group_id: str
     parent_req: Req
     particle_reqs: Dict[int, Req]
-    log_weights: Dict[int, float]
+    log_weights: torch.Tensor
     step_counts: Dict[int, int] = field(default_factory=dict)
     resampled_at_step: int = 0
     finished_particles: Dict[int, SMCFinishedParticleSnapshot] = field(
@@ -69,6 +69,7 @@ class SMCManager:
         self.groups: Dict[str, SMCGroupState] = {}
         self.req_to_token_pool = None
         self.token_to_kv_pool_allocator = None
+        self.device: torch.device | str = "cpu"
 
     def has_active_groups(self) -> bool:
         return bool(self.groups)
@@ -76,11 +77,77 @@ class SMCManager:
     def clear(self) -> None:
         self.groups.clear()
 
+    def get_group(self, group_id: Optional[str]) -> Optional[SMCGroupState]:
+        if group_id is None:
+            return None
+        return self.groups.get(group_id)
+
+    def get_group_for_req(self, req: Req) -> Optional[SMCGroupState]:
+        return self.get_group(req.smc_group_id)
+
+    def get_active_particle_reqs(self, group_id: Optional[str]) -> List[Req]:
+        group = self.get_group(group_id)
+        if group is None:
+            return []
+        return [
+            group.particle_reqs[idx]
+            for idx in sorted(group.active_particle_indices())
+        ]
+
+    def get_active_particle_reqs_in_collection(
+        self,
+        group_id: Optional[str],
+        reqs: List[Req],
+    ) -> List[Req]:
+        if group_id is None:
+            return []
+        req_ids = {id(req) for req in reqs}
+        return [
+            req
+            for req in self.get_active_particle_reqs(group_id)
+            if id(req) in req_ids
+        ]
+
+    def all_active_members_present(
+        self,
+        group_id: Optional[str],
+        reqs: List[Req],
+    ) -> bool:
+        active = self.get_active_particle_reqs(group_id)
+        if not active:
+            return False
+        req_ids = {id(req) for req in reqs}
+        return all(id(req) in req_ids for req in active)
+
+    def get_particle_lag(self, req: Req) -> int:
+        group = self.get_group_for_req(req)
+        if group is None:
+            return 0
+        counts = group.step_counts
+        active = group.active_particle_indices()
+        if not active:
+            return 0
+        max_step = max(counts.get(idx, 0) for idx in active)
+        return max_step - counts.get(req.smc_particle_idx, 0)
+
+    def get_group_lag(self, group_id: Optional[str]) -> int:
+        group = self.get_group(group_id)
+        if group is None:
+            return 0
+        active = group.active_particle_indices()
+        if not active:
+            return 0
+        counts = group.step_counts
+        max_step = max(counts.get(idx, 0) for idx in active)
+        min_active_step = min(counts.get(idx, 0) for idx in active)
+        return max_step - min_active_step
+
     def create_group(self, parent_req: Req, scheduler) -> Optional[str]:
         if parent_req.rid in self.groups:
             return None
         self.req_to_token_pool = scheduler.req_to_token_pool
         self.token_to_kv_pool_allocator = scheduler.token_to_kv_pool_allocator
+        self.device = scheduler.device
 
         error = validate_smc_parent_req(parent_req)
         if error is not None:
@@ -127,7 +194,11 @@ class SMCManager:
             group_id=parent_req.rid,
             parent_req=parent_req,
             particle_reqs={req.smc_particle_idx: req for req in particle_reqs},
-            log_weights={req.smc_particle_idx: 0.0 for req in particle_reqs},
+            log_weights=torch.zeros(
+                self.server_args.smc_n_particles,
+                dtype=torch.float64,
+                device=self.device,
+            ),
             step_counts={req.smc_particle_idx: 0 for req in particle_reqs},
         )
         self.groups[parent_req.rid] = group
@@ -210,13 +281,19 @@ class SMCManager:
             finished_len=req.finished_len,
         )
 
-    def on_particle_step(self, req: Req, logprob_diff: float) -> Optional[Req]:
+    def on_particle_step(self, req: Req, logprob_diff: float | torch.Tensor) -> Optional[Req]:
         group = self.groups.get(req.smc_group_id)
         if group is None:
             return None
 
         particle_idx = req.smc_particle_idx
-        group.log_weights[particle_idx] += float(logprob_diff)
+        group.log_weights[particle_idx].add_(
+            torch.as_tensor(
+                logprob_diff,
+                dtype=group.log_weights.dtype,
+                device=group.log_weights.device,
+            )
+        )
         group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
 
         if not group.all_active_aligned():
@@ -232,22 +309,79 @@ class SMCManager:
             return self._finalize_group(group.group_id)
         return None
 
+    def on_particle_step_batch(
+        self,
+        reqs: List[Req],
+        logprob_diffs: torch.Tensor,
+    ) -> List[Req]:
+        if not reqs:
+            return []
+
+        if not torch.is_tensor(logprob_diffs):
+            logprob_diffs = torch.as_tensor(logprob_diffs, dtype=torch.float32)
+
+        grouped_reqs: Dict[str, List[tuple[int, Req]]] = {}
+        for row, req in enumerate(reqs):
+            group_id = req.smc_group_id
+            if group_id is None or group_id not in self.groups:
+                continue
+            grouped_reqs.setdefault(group_id, []).append((row, req))
+
+        finalized_reqs: List[Req] = []
+        for group_id, entries in grouped_reqs.items():
+            group = self.groups.get(group_id)
+            if group is None:
+                continue
+
+            row_indices = torch.tensor(
+                [row for row, _ in entries],
+                dtype=torch.int64,
+                device=logprob_diffs.device,
+            )
+            particle_indices = torch.tensor(
+                [req.smc_particle_idx for _, req in entries],
+                dtype=torch.int64,
+                device=group.log_weights.device,
+            )
+            group.log_weights[particle_indices] += logprob_diffs[row_indices].to(
+                dtype=group.log_weights.dtype,
+                device=group.log_weights.device,
+            )
+            for _, req in entries:
+                particle_idx = req.smc_particle_idx
+                group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
+
+            if not group.all_active_aligned():
+                continue
+
+            self._maybe_resample(group)
+            active = group.active_particle_indices()
+            if active:
+                group.resampled_at_step = group.step_counts[active[0]]
+            else:
+                finalized_req = self._finalize_group(group_id)
+                if finalized_req is not None:
+                    finalized_reqs.append(finalized_req)
+
+        return finalized_reqs
+
     def _maybe_resample(self, group: SMCGroupState) -> None:
         active_indices = group.active_particle_indices()
         if len(active_indices) <= 1:
             return
 
         normalized_weights = normalize_log_weights(
-            [group.log_weights[idx] for idx in active_indices]
+            group.log_weights[active_indices],
+            device=self.device,
         )
-        ess = effective_sample_size(normalized_weights)
+        ess = effective_sample_size(normalized_weights, device=self.device)
         if ess >= len(active_indices) * self.server_args.smc_resample_threshold:
             return
 
         if self.server_args.smc_resample_method == "multinomial":
-            ancestors = multinomial_resample(normalized_weights)
+            ancestors = multinomial_resample(normalized_weights, device=self.device)
         else:
-            ancestors = systematic_resample(normalized_weights)
+            ancestors = systematic_resample(normalized_weights, device=self.device)
 
         source_indices = [active_indices[idx] for idx in ancestors]
         snapshots = [
@@ -337,7 +471,7 @@ class SMCManager:
                 finish_reason = copy.copy(req.finished_reason)
                 finished_len = req.finished_len
 
-            key = (group.log_weights[particle_idx], len(output_ids))
+            key = (float(group.log_weights[particle_idx].item()), len(output_ids))
             if best_key is None or key > best_key:
                 best_idx = particle_idx
                 best_key = key

@@ -554,34 +554,50 @@ def cleanup_smc_request_state(
     state.released = True
 
 
-def normalize_log_weights(log_weights: Sequence[float]) -> torch.Tensor:
-    weights = torch.tensor(log_weights, dtype=torch.float64)
+def normalize_log_weights(
+    log_weights: Sequence[float] | torch.Tensor,
+    device: Optional[torch.device | str] = None,
+) -> torch.Tensor:
+    weights = torch.as_tensor(log_weights, dtype=torch.float64, device=device)
     if weights.numel() == 0:
         return weights
     weights = weights - torch.logsumexp(weights, dim=0)
     return torch.exp(weights)
 
 
-def effective_sample_size(weights: Sequence[float]) -> float:
-    weights_t = torch.as_tensor(weights, dtype=torch.float64)
+def effective_sample_size(
+    weights: Sequence[float] | torch.Tensor,
+    device: Optional[torch.device | str] = None,
+) -> float:
+    weights_t = torch.as_tensor(weights, dtype=torch.float64, device=device)
     if weights_t.numel() == 0:
         return 0.0
     return float(1.0 / torch.sum(weights_t * weights_t).item())
 
 
-def systematic_resample(weights: Sequence[float]) -> List[int]:
-    weights_t = torch.as_tensor(weights, dtype=torch.float64)
+def systematic_resample(
+    weights: Sequence[float] | torch.Tensor,
+    device: Optional[torch.device | str] = None,
+) -> List[int]:
+    weights_t = torch.as_tensor(weights, dtype=torch.float64, device=device)
     if weights_t.numel() == 0:
         return []
     cdf = torch.cumsum(weights_t, dim=0)
     step = 1.0 / weights_t.numel()
     start = torch.rand((), dtype=torch.float64).item() * step
-    positions = start + step * torch.arange(weights_t.numel(), dtype=torch.float64)
+    positions = start + step * torch.arange(
+        weights_t.numel(),
+        dtype=torch.float64,
+        device=weights_t.device,
+    )
     return torch.searchsorted(cdf, positions, right=False).tolist()
 
 
-def multinomial_resample(weights: Sequence[float]) -> List[int]:
-    weights_t = torch.as_tensor(weights, dtype=torch.float64)
+def multinomial_resample(
+    weights: Sequence[float] | torch.Tensor,
+    device: Optional[torch.device | str] = None,
+) -> List[int]:
+    weights_t = torch.as_tensor(weights, dtype=torch.float64, device=device)
     if weights_t.numel() == 0:
         return []
     return torch.multinomial(weights_t, num_samples=weights_t.numel(), replacement=True).tolist()

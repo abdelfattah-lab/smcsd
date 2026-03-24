@@ -842,11 +842,21 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
+    def preempt_to_schedule(
+        self,
+        req: Union[Req, List[Req]],
+        server_args: ServerArgs,
+        smc_manager=None,
+    ) -> bool:
         """
         Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.
         """
+        incoming_reqs = req if isinstance(req, list) else [req]
+        if not incoming_reqs:
+            return False
+        incoming_req = incoming_reqs[0]
+
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
@@ -872,18 +882,39 @@ class PrefillAdder:
 
         preemptible_reqs = []
         min_tokens_to_remove = (
-            req.extend_input_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            sum(in_req.extend_input_len for in_req in incoming_reqs)
+            + sum(
+                min(in_req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                for in_req in incoming_reqs
+            )
             - self.rem_total_tokens
         )
+        seen_smc_groups = set()
+        running_reqs = list(self.running_batch.reqs)
         for running_req in sorted_valid_running_reqs:
+            if smc_manager is not None and running_req.smc_group_id is not None:
+                if running_req.smc_group_id in seen_smc_groups:
+                    continue
+                seen_smc_groups.add(running_req.smc_group_id)
+                candidate_reqs = smc_manager.get_active_particle_reqs_in_collection(
+                    running_req.smc_group_id,
+                    running_reqs,
+                )
+                if not candidate_reqs:
+                    continue
+            else:
+                candidate_reqs = [running_req]
+
             # Priority difference needs to meet the threshold to be preemptible.
-            priority_diff = (req.priority - running_req.priority) * (-priority_sign)
+            priority_diff = (incoming_req.priority - candidate_reqs[0].priority) * (
+                -priority_sign
+            )
 
             if priority_diff > self.priority_scheduling_preemption_threshold:
-                preemptible_reqs.append(running_req)
-                min_tokens_to_remove -= self._get_running_request_total_token_offset(
-                    running_req
+                preemptible_reqs.extend(candidate_reqs)
+                min_tokens_to_remove -= sum(
+                    self._get_running_request_total_token_offset(candidate_req)
+                    for candidate_req in candidate_reqs
                 )
                 if min_tokens_to_remove <= 0:
                     break
@@ -895,20 +926,21 @@ class PrefillAdder:
             return False
 
         # Preempt running requests. Release allocated resources for immediate usage.
-        preemptible_reqs = set(preemptible_reqs)
-        keep_indices = []
-        release_counter = 0
-        for i, running_req in enumerate(self.running_batch.reqs):
-            if running_req in preemptible_reqs:
-                self.rem_total_token_offset -= (
-                    self._get_running_request_total_token_offset(running_req)
-                )
-                release_counter += 1
-                self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
-                )
-            else:
-                keep_indices.append(i)
+        preemptible_req_ids = {id(req) for req in preemptible_reqs}
+        keep_indices = [
+            i
+            for i, running_req in enumerate(self.running_batch.reqs)
+            if id(running_req) not in preemptible_req_ids
+        ]
+        remaining_req_count = len(keep_indices)
+        for i in range(len(self.running_batch.reqs) - 1, -1, -1):
+            running_req = self.running_batch.reqs[i]
+            if id(running_req) not in preemptible_req_ids:
+                continue
+            self.rem_total_token_offset -= self._get_running_request_total_token_offset(
+                running_req
+            )
+            self.running_batch.release_req(i, remaining_req_count, server_args)
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
         return True
