@@ -331,7 +331,9 @@ def resolve_smc_proposal_batch(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if proposal_tokens.numel() == 0:
         empty_len = torch.empty((0,), dtype=torch.int32, device=proposal_tokens.device)
-        empty_finished = torch.empty((0,), dtype=torch.bool, device=proposal_tokens.device)
+        empty_finished = torch.empty(
+            (0,), dtype=torch.bool, device=proposal_tokens.device
+        )
         empty_logprobs = torch.empty(
             (0,), dtype=torch.float32, device=proposal_tokens.device
         )
@@ -353,7 +355,9 @@ def resolve_smc_proposal_batch(
     )
     vocab_sizes = torch.tensor(
         [
-            int(req.vocab_size) if req.vocab_size is not None else torch.iinfo(torch.int64).max
+            int(req.vocab_size)
+            if req.vocab_size is not None
+            else torch.iinfo(torch.int64).max
             for req in reqs
         ],
         dtype=torch.int64,
@@ -624,8 +628,8 @@ class SMCDraftInput(SpecInput):
     @classmethod
     def create_idle_input(cls, device: torch.device):
         return cls(
-            last_token_ids=torch.empty((0,), device=device, dtype=torch.int64),
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            last_token_ids=torch.empty((0,), device=device, dtype=torch.int32),
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
         )
 
     def prepare_for_decode(self, batch: ScheduleBatch):
@@ -633,13 +637,18 @@ class SMCDraftInput(SpecInput):
             self.verify_done.synchronize()
         batch.maybe_evict_swa()
 
+        # Mirror EAGLE v2: overlap updates seq_lens first, then refresh the CPU
+        # mirror before any allocation or metadata work consumes it.
+        batch.seq_lens_cpu = batch.seq_lens.cpu()
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+
         server_args = get_global_server_args()
         gamma = max(int(server_args.smc_gamma or 1), 1)
         score_token_num = max(
             int(server_args.speculative_num_draft_tokens or gamma),
             gamma,
         )
-        visible_seq_lens_cpu = batch.seq_lens.cpu().to(dtype=torch.int32)
+        visible_seq_lens_cpu = batch.seq_lens_cpu.to(dtype=torch.int32)
         draft_committed_lens_cpu = (visible_seq_lens_cpu - 1).clamp_min_(0)
         current_allocated_lens_cpu = torch.tensor(
             [int(req.kv_allocated_len) for req in batch.reqs],
@@ -672,16 +681,16 @@ class SMCDraftInput(SpecInput):
             req.kv_allocated_len = int(required_len)
             req.decode_batch_idx += 1
 
-        draft_committed_lens = draft_committed_lens_cpu.to(
-            dtype=torch.int64, device=batch.device
-        )
+        draft_committed_lens = batch.seq_lens - 1
         proposal_seq_lens_cpu_steps = draft_committed_lens_cpu.unsqueeze(0) + torch.arange(
             gamma, dtype=torch.int32
         ).unsqueeze(1)
         self.proposal_seq_lens_cpu_steps = proposal_seq_lens_cpu_steps.contiguous()
-        self.proposal_seq_lens_steps = self.proposal_seq_lens_cpu_steps.to(
-            dtype=torch.int32, device=batch.device
-        )
+        draft_committed_lens_i32 = draft_committed_lens.to(dtype=torch.int32)
+        self.proposal_seq_lens_steps = (
+            draft_committed_lens_i32.unsqueeze(0)
+            + torch.arange(gamma, dtype=torch.int32, device=batch.device).unsqueeze(1)
+        ).contiguous()
         self._refresh_proposal_seq_lens_sum_steps()
         verify_positions = draft_committed_lens.unsqueeze(1) + torch.arange(
             score_token_num, dtype=torch.int64, device=batch.device
@@ -690,8 +699,6 @@ class SMCDraftInput(SpecInput):
             batch.req_pool_indices.unsqueeze(1), verify_positions
         ].transpose(0, 1).contiguous().to(dtype=torch.int64)
         self.proposal_out_cache_loc = self.verify_out_cache_loc[:gamma].contiguous()
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
@@ -797,7 +804,7 @@ class SMCDraftInput(SpecInput):
             return
         self.proposal_seq_lens_sum_steps = self.proposal_seq_lens_cpu_steps.sum(
             dim=1, dtype=torch.int64
-        ).cpu()
+        )
 
 
 @dataclass
@@ -810,6 +817,7 @@ class SMCScoreInput(SpecInput):
     custom_mask: Optional[torch.Tensor]
     draft_token_num: int
     target_temperature: float
+    linear_target_verify: bool = True
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
 
     def __post_init__(self):
@@ -820,7 +828,7 @@ class SMCScoreInput(SpecInput):
         return self.draft_token_num, self.draft_token_num
 
     def use_linear_target_verify(self) -> bool:
-        return True
+        return self.linear_target_verify
 
     def generate_attn_arg_prefill(
         self,
@@ -862,7 +870,8 @@ class SMCScoreInput(SpecInput):
 
         if self.custom_mask is None:
             raise RuntimeError(
-                "SMC custom_mask is required when using non-FlashInfer linear-verify backends."
+                "SMC custom_mask is required for attention backends that do not "
+                "natively support linear TARGET_VERIFY."
             )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -903,8 +912,15 @@ class SMCScoreInput(SpecInput):
             dtype=torch.int32,
             device=device,
         )
-        forward_batch.extend_prefix_lens_cpu = prefix_lens.cpu()
-        forward_batch.extend_seq_lens_cpu = extend_seq_lens.cpu()
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            seq_lens_cpu = forward_batch.seq_lens.cpu()
+        forward_batch.extend_prefix_lens_cpu = seq_lens_cpu
+        forward_batch.extend_seq_lens_cpu = torch.full(
+            (batch_size,),
+            self.draft_token_num,
+            dtype=torch.int32,
+        )
         forward_batch.extend_logprob_start_lens_cpu = (
             forward_batch.extend_prefix_lens_cpu
         )
@@ -922,9 +938,15 @@ class SMCScoreInput(SpecInput):
                     "SMC target verify requires precomputed verify_out_cache_loc "
                     "from SMCDraftInput.prepare_for_decode()."
                 )
-            verify_out_cache_loc = self.verify_out_cache_loc.to(
-                dtype=torch.int64, device=self.draft_token.device
-            )
+            verify_out_cache_loc = self.verify_out_cache_loc
+            if (
+                verify_out_cache_loc.device != self.draft_token.device
+                or verify_out_cache_loc.dtype != torch.int64
+            ):
+                raise RuntimeError(
+                    "SMC target verify requires int64 verify_out_cache_loc on the "
+                    "same device as draft_token."
+                )
             if verify_out_cache_loc.dim() != 2 or verify_out_cache_loc.shape != (
                 self.draft_token_num,
                 len(batch.req_pool_indices),
@@ -944,7 +966,7 @@ class SMCScoreInput(SpecInput):
         )
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
-        if not batch.forward_mode.is_idle():
+        if not batch.forward_mode.is_idle() and self.use_linear_target_verify():
             self._populate_linear_verify_metadata(verify_forward_batch)
 
         can_run_cuda_graph = bool(
@@ -969,9 +991,9 @@ class SMCScoreInput(SpecInput):
         device = self.draft_token.device
         if batch.forward_mode.is_idle():
             empty_int = torch.empty((0,), dtype=torch.int32, device=device)
-            empty_long = torch.empty((0,), dtype=torch.int64, device=device)
             empty_float = torch.empty((0,), dtype=torch.float32, device=device)
-            return empty_int, empty_int, empty_long, empty_float
+            empty_seq = torch.empty((0,), dtype=batch.seq_lens.dtype, device=device)
+            return empty_int, empty_seq, empty_int, empty_float
 
         bs = int(self.draft_lengths.shape[0])
         score_len = self.draft_token_num
@@ -987,7 +1009,6 @@ class SMCScoreInput(SpecInput):
 
         logprob_diffs = target_logprobs - self.draft_logprobs
         committed_seq_lens = batch.seq_lens + 1 + self.draft_lengths
-
         safe_last_indices = torch.clamp(
             self.draft_lengths.to(torch.int64) - 1,
             min=0,
@@ -1002,10 +1023,10 @@ class SMCScoreInput(SpecInput):
         )
 
         return (
-            self.draft_lengths.to(torch.int32),
-            committed_seq_lens.to(torch.int32),
+            self.draft_lengths,
+            committed_seq_lens,
             next_last_token_ids,
-            logprob_diffs.to(torch.float32),
+            logprob_diffs,
         )
 
 

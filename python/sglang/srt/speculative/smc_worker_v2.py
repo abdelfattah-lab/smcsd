@@ -74,7 +74,9 @@ class SMCWorkerV2(StandaloneWorkerV2):
         self, batch: Union[ScheduleBatch, ModelWorkerBatch]
     ) -> GenerationBatchResult:
         is_overlap_batch = isinstance(batch, ModelWorkerBatch)
-        draft_input = batch.spec_info if isinstance(batch.spec_info, SMCDraftInput) else None
+        draft_input = (
+            batch.spec_info if isinstance(batch.spec_info, SMCDraftInput) else None
+        )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             model_worker_batch = batch if is_overlap_batch else batch.get_model_worker_batch()
@@ -89,21 +91,25 @@ class SMCWorkerV2(StandaloneWorkerV2):
             return self._build_empty_decode_result(is_overlap_batch)
 
         reqs = list(batch.reqs)
-        visible_seq_lens = batch.seq_lens.to(dtype=torch.int64)
+        visible_seq_lens = batch.seq_lens
+        visible_seq_lens_cpu = (
+            batch.seq_lens_cpu if batch.seq_lens_cpu is not None else batch.seq_lens.cpu()
+        )
         if draft_input is None:
             last_token_ids = torch.tensor(
                 [
                     req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
                     for req in reqs
                 ],
-                dtype=torch.int64,
+                dtype=torch.int32,
                 device=self.device,
             )
         else:
-            last_token_ids = draft_input.last_token_ids.to(dtype=torch.int64)
+            last_token_ids = draft_input.last_token_ids
         draft_committed_lens = visible_seq_lens - 1
+        draft_committed_lens_cpu = visible_seq_lens_cpu - 1
 
-        self._ensure_draft_prefix_filled(reqs, draft_committed_lens.tolist())
+        self._ensure_draft_prefix_filled(reqs, draft_committed_lens_cpu.tolist())
 
         draft_sampling_info = self._make_sampling_info(
             reqs,
@@ -187,7 +193,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
             dtype=torch.int32,
             device=self.device,
         )
-        flat_predict[:, : draft_tokens.shape[1]] = draft_tokens.to(dtype=torch.int32)
+        flat_predict[:, : draft_tokens.shape[1]] = draft_tokens
 
         verify_done = None
         if is_overlap_batch:
@@ -195,15 +201,15 @@ class SMCWorkerV2(StandaloneWorkerV2):
             verify_done.record()
 
         next_draft_input = SMCDraftInput(
-            last_token_ids=next_last_token_ids.to(dtype=torch.int64),
-            new_seq_lens=committed_seq_lens.to(dtype=torch.int32),
+            last_token_ids=next_last_token_ids,
+            new_seq_lens=committed_seq_lens,
             verify_done=verify_done,
         )
         return GenerationBatchResult(
             logits_output=self._empty_logits_output() if is_overlap_batch else None,
             next_token_ids=flat_predict.reshape(-1),
-            accept_lens=accept_lens.to(dtype=torch.int32),
-            smc_logprob_diffs=smc_logprob_diffs.to(dtype=torch.float32),
+            accept_lens=accept_lens,
+            smc_logprob_diffs=smc_logprob_diffs,
             can_run_cuda_graph=draft_can_run_cuda_graph or score_can_run_cuda_graph,
             next_draft_input=next_draft_input,
         )
@@ -229,8 +235,8 @@ class SMCWorkerV2(StandaloneWorkerV2):
     ) -> SMCDraftInput:
         assert result.next_token_ids is not None
         return SMCDraftInput(
-            last_token_ids=result.next_token_ids.to(dtype=torch.int64),
-            new_seq_lens=(batch.seq_lens + 1).to(dtype=torch.int32),
+            last_token_ids=result.next_token_ids,
+            new_seq_lens=batch.seq_lens + 1,
         )
 
     def _ensure_draft_prefix_filled(
@@ -411,7 +417,6 @@ class SMCWorkerV2(StandaloneWorkerV2):
             logprob_matrix.to(torch.float32),
             current_output_lens,
         )
-
         return token_matrix.to(torch.int32), draft_logprobs, draft_lengths
 
     def _run_stepwise_draft_reqs(
@@ -434,10 +439,13 @@ class SMCWorkerV2(StandaloneWorkerV2):
         ]
 
         snapshots = []
+        seed_token_ids = [
+            int(token_id) for token_id in last_token_ids.detach().cpu().tolist()
+        ]
         for req, draft_committed_len, last_token_id in zip(
             reqs,
             draft_committed_lens.tolist(),
-            last_token_ids.tolist(),
+            seed_token_ids,
             strict=True,
         ):
             snapshots.append(
@@ -594,8 +602,8 @@ class SMCWorkerV2(StandaloneWorkerV2):
         score_token_num = self.server_args.speculative_num_draft_tokens
         score_tokens = torch.cat(
             [
-                anchor_token_ids.to(dtype=torch.int64).unsqueeze(1),
-                draft_tokens.to(dtype=torch.int64),
+                anchor_token_ids.unsqueeze(1),
+                draft_tokens,
             ],
             dim=1,
         )
@@ -604,24 +612,35 @@ class SMCWorkerV2(StandaloneWorkerV2):
             pad = score_tokens[:, -1:].expand(-1, score_token_num - score_tokens.shape[1])
             score_tokens = torch.cat([score_tokens, pad], dim=1)
 
-        seq_lens = draft_committed_lens.to(dtype=torch.int64)
-        seq_lens_cpu = seq_lens.cpu()
+        seq_lens = draft_committed_lens
+        batch_size = int(seq_lens.shape[0])
+        if base_model_worker_batch.seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.cpu()
+            seq_lens_sum = int(seq_lens_cpu.sum().item())
+        else:
+            seq_lens_cpu = base_model_worker_batch.seq_lens_cpu - 1
+            seq_lens_sum = base_model_worker_batch.seq_lens_sum - batch_size
+        use_linear_target_verify = self.server_args.attention_backend in {
+            "flashinfer",
+            "triton",
+        }
         custom_mask = None
-        if self.server_args.attention_backend != "flashinfer":
+        if not use_linear_target_verify:
             from sglang.srt.speculative.smc_info import build_smc_causal_mask
 
             custom_mask = build_smc_causal_mask(seq_lens, score_token_num)
         score_input = SMCScoreInput(
             draft_token=score_tokens.reshape(-1).contiguous(),
-            draft_lengths=draft_lengths.to(dtype=torch.int32),
-            draft_logprobs=draft_logprobs.to(dtype=torch.float32),
-            verify_out_cache_loc=verify_out_cache_loc.to(dtype=torch.int64),
+            draft_lengths=draft_lengths,
+            draft_logprobs=draft_logprobs,
+            verify_out_cache_loc=verify_out_cache_loc,
             positions=build_smc_positions(seq_lens, score_token_num),
             custom_mask=custom_mask,
             draft_token_num=score_token_num,
             target_temperature=max(
                 float(self.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
             ),
+            linear_target_verify=use_linear_target_verify,
         )
         return dataclasses.replace(
             base_model_worker_batch,
@@ -630,7 +649,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
             seq_lens=seq_lens,
             out_cache_loc=None,
             seq_lens_cpu=seq_lens_cpu,
-            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            seq_lens_sum=seq_lens_sum,
             spec_algorithm=SpeculativeAlgorithm.SMC,
             spec_info=score_input,
             capture_hidden_mode=score_input.capture_hidden_mode,

@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 from pathlib import Path
@@ -26,9 +27,21 @@ SAMPLING_PARAMS = {
 }
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default=None,
+        help="Override the global attention backend for the SMC probe.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     start = time.time()
-    with sgl.Engine(
+    engine_kwargs = dict(
         model_path=MODEL_PATH,
         speculative_algorithm="SMC",
         speculative_draft_model_path=DRAFT_MODEL_PATH,
@@ -39,7 +52,11 @@ def main():
         mem_fraction_static=0.45,
         trust_remote_code=True,
         log_level="info",
-    ) as engine:
+    )
+    if args.attention_backend is not None:
+        engine_kwargs["attention_backend"] = args.attention_backend
+
+    with sgl.Engine(**engine_kwargs) as engine:
         server_info = engine.get_server_info()
         print(
             "SERVER_INFO",
@@ -51,6 +68,7 @@ def main():
                     ),
                     "smc_n_particles": server_info.get("smc_n_particles"),
                     "smc_gamma": server_info.get("smc_gamma"),
+                    "attention_backend": server_info.get("attention_backend"),
                     "avg_spec_accept_length": server_info.get("internal_states", [{}])[
                         0
                     ].get("avg_spec_accept_length"),

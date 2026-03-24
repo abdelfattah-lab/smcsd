@@ -245,7 +245,7 @@ class SMCManager:
                 req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
                 for req in particle_reqs
             ],
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=scheduler.device,
         )
         batch.output_ids = last_token_ids
@@ -253,7 +253,7 @@ class SMCManager:
         batch.token_ids_logprobs = [None] * len(particle_reqs)
         batch.spec_info = SMCDraftInput(
             last_token_ids=last_token_ids,
-            new_seq_lens=visible_seq_lens.to(dtype=torch.int32),
+            new_seq_lens=visible_seq_lens,
         )
         if scheduler.enable_overlap and scheduler.future_map is not None:
             future_indices = scheduler.future_map.alloc_future_indices(len(particle_reqs))

@@ -111,7 +111,7 @@ class TestSMCManagerHelpers(TestCase):
 class TestSMCScoreInput(TestCase):
     def _make_score_input(self, draft_token_num: int = 4) -> SMCScoreInput:
         return SMCScoreInput(
-            draft_token=torch.tensor([17, 23, 29, 29], dtype=torch.int64),
+            draft_token=torch.tensor([17, 23, 29, 29], dtype=torch.int32),
             draft_lengths=torch.tensor([2], dtype=torch.int32),
             draft_logprobs=torch.tensor([0.5], dtype=torch.float32),
             verify_out_cache_loc=torch.tensor(
@@ -238,6 +238,11 @@ class TestSMCScoreInput(TestCase):
         score_input = self._make_score_input()
         self.assertTrue(score_input.use_linear_target_verify())
 
+    def test_score_input_can_disable_linear_target_verify(self):
+        score_input = self._make_score_input()
+        score_input.linear_target_verify = False
+        self.assertFalse(score_input.use_linear_target_verify())
+
     def test_sample_returns_batched_logprob_diffs(self):
         score_input = self._make_score_input()
         batch = SimpleNamespace(
@@ -264,8 +269,8 @@ class TestSMCScoreInput(TestCase):
         ) = score_input.sample(batch, logits_output)
 
         self.assertTrue(torch.equal(accept_lengths, torch.tensor([2], dtype=torch.int32)))
-        self.assertTrue(torch.equal(committed_seq_lens, torch.tensor([7], dtype=torch.int32)))
-        self.assertTrue(torch.equal(next_last_token_ids, torch.tensor([29], dtype=torch.int64)))
+        self.assertTrue(torch.equal(committed_seq_lens, torch.tensor([7], dtype=torch.int64)))
+        self.assertTrue(torch.equal(next_last_token_ids, torch.tensor([29], dtype=torch.int32)))
         self.assertEqual(logprob_diffs.shape, (1,))
         self.assertEqual(logprob_diffs.dtype, torch.float32)
 
@@ -309,6 +314,8 @@ class TestSMCDraftInput(TestCase):
         batch = SimpleNamespace(
             reqs=reqs,
             seq_lens=torch.tensor([6, 8], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([99, 101], dtype=torch.int64),
+            seq_lens_sum=200,
             req_pool_indices=torch.tensor([3, 4], dtype=torch.int64),
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             tree_cache=MagicMock(),
@@ -318,8 +325,8 @@ class TestSMCDraftInput(TestCase):
         )
 
         draft_input = SMCDraftInput(
-            last_token_ids=torch.tensor([7, 9], dtype=torch.int64),
-            new_seq_lens=torch.tensor([6, 8], dtype=torch.int32),
+            last_token_ids=torch.tensor([7, 9], dtype=torch.int32),
+            new_seq_lens=torch.tensor([6, 8], dtype=torch.int64),
         )
         draft_input.prepare_for_decode(batch)
 
@@ -327,6 +334,10 @@ class TestSMCDraftInput(TestCase):
         self.assertEqual(reqs[1].kv_allocated_len, 11)
         self.assertEqual(reqs[0].decode_batch_idx, 1)
         self.assertEqual(reqs[1].decode_batch_idx, 3)
+        self.assertTrue(
+            torch.equal(batch.seq_lens_cpu, torch.tensor([6, 8], dtype=torch.int64))
+        )
+        self.assertEqual(batch.seq_lens_sum, 14)
         self.assertTrue(
             torch.equal(
                 draft_input.verify_out_cache_loc,

@@ -334,7 +334,7 @@ class SMCDraftCudaGraphRunner:
                 next_token_ids = self.model_runner.sample(logits_output, forward_batch)
                 sampled_token_ids[step].copy_(next_token_ids)
                 sampled_token_logprobs[step].copy_(logits_output.next_token_logprobs)
-                working_input_ids.copy_(next_token_ids.to(torch.int64))
+                working_input_ids.copy_(next_token_ids)
                 working_positions.add_(1)
 
             return sampled_token_ids, sampled_token_logprobs
@@ -428,26 +428,50 @@ class SMCDraftCudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
 
-        seq_lens_steps = proposal_seq_lens_steps.to(dtype=torch.int32, device=self.device)
+        seq_lens_steps = proposal_seq_lens_steps
+        if seq_lens_steps is None:
+            seq_lens_steps = proposal_seq_lens_cpu_steps.to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
+        elif seq_lens_steps.device != self.device or seq_lens_steps.dtype != torch.int32:
+            seq_lens_steps = seq_lens_steps.to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
         if seq_lens_steps.shape != (self.gamma, raw_bs):
             raise RuntimeError(
                 "SMC fused draft replay received malformed proposal_seq_lens_steps: "
                 f"expected={(self.gamma, raw_bs)}, got={tuple(seq_lens_steps.shape)}"
             )
-        seq_lens_cpu_steps = proposal_seq_lens_cpu_steps.to(dtype=torch.int32, device="cpu")
+        seq_lens_cpu_steps = proposal_seq_lens_cpu_steps
+        if (
+            seq_lens_cpu_steps is None
+            or seq_lens_cpu_steps.device.type != "cpu"
+            or seq_lens_cpu_steps.dtype != torch.int32
+        ):
+            seq_lens_cpu_steps = seq_lens_steps.to(dtype=torch.int32, device="cpu")
         if seq_lens_cpu_steps.shape != (self.gamma, raw_bs):
             raise RuntimeError(
                 "SMC fused draft replay received malformed proposal_seq_lens_cpu_steps: "
                 f"expected={(self.gamma, raw_bs)}, got={tuple(seq_lens_cpu_steps.shape)}"
             )
-        seq_lens_sum_steps = proposal_seq_lens_sum_steps.to(dtype=torch.int64, device="cpu")
+        seq_lens_sum_steps = proposal_seq_lens_sum_steps
+        if (
+            seq_lens_sum_steps is None
+            or seq_lens_sum_steps.device.type != "cpu"
+            or seq_lens_sum_steps.dtype != torch.int64
+        ):
+            seq_lens_sum_steps = seq_lens_cpu_steps.sum(dim=1, dtype=torch.int64).cpu()
         if seq_lens_sum_steps.shape != (self.gamma,):
             raise RuntimeError(
                 "SMC fused draft replay received malformed proposal_seq_lens_sum_steps: "
                 f"expected={(self.gamma,)}, got={tuple(seq_lens_sum_steps.shape)}"
             )
-        base_positions = clamp_position(seq_lens_steps[0].to(torch.int64))
-        out_cache_loc = proposal_out_cache_loc.to(dtype=torch.int64, device=self.device)
+        base_positions = clamp_position(seq_lens_steps[0])
+        out_cache_loc = proposal_out_cache_loc
+        if out_cache_loc.device != self.device or out_cache_loc.dtype != torch.int64:
+            out_cache_loc = out_cache_loc.to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
         if out_cache_loc.shape != (self.gamma, raw_bs):
             raise RuntimeError(
                 "SMC fused draft replay received malformed proposal_out_cache_loc: "
@@ -467,10 +491,19 @@ class SMCDraftCudaGraphRunner:
             buffers.min_ps.zero_()
             buffers.sampling_seed.zero_()
 
-        buffers.input_ids[:raw_bs].copy_(last_token_ids[:raw_bs].to(dtype=torch.int64))
-        buffers.req_pool_indices[:raw_bs].copy_(
-            req_pool_indices[:raw_bs].to(dtype=torch.int64, device=self.device)
-        )
+        if last_token_ids.device != self.device:
+            last_token_ids = last_token_ids.to(device=self.device, non_blocking=True)
+        if last_token_ids.dtype not in (torch.int32, torch.int64):
+            raise RuntimeError(
+                "SMC fused draft replay requires last_token_ids in int32 or int64 dtype."
+            )
+        if req_pool_indices.device != self.device or req_pool_indices.dtype != torch.int64:
+            req_pool_indices = req_pool_indices.to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
+
+        buffers.input_ids[:raw_bs].copy_(last_token_ids[:raw_bs])
+        buffers.req_pool_indices[:raw_bs].copy_(req_pool_indices[:raw_bs])
         buffers.positions[:raw_bs].copy_(base_positions)
         buffers.out_cache_loc[:, :raw_bs].copy_(out_cache_loc)
         buffers.temperatures[:raw_bs].copy_(sampling_info.temperatures)
