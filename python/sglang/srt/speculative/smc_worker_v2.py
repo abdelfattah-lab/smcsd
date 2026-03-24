@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import time
 from typing import List, Sequence, Union
 
 import torch
@@ -16,19 +17,66 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req, ScheduleBa
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.smc_draft_cuda_graph_runner import SMCDraftCudaGraphRunner
 from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
     SMC_MIN_TEMPERATURE,
     SMCScoreInput,
     build_smc_positions,
-    resolve_smc_proposal_batch,
     resolve_smc_proposal_length,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
+from sglang.srt.speculative.standalone_worker_v2 import (
+    StandaloneDraftWorker,
+    _get_plan_stream,
+)
+from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.utils import get_available_gpu_memory
 
 
 logger = logging.getLogger(__name__)
+
+
+class SMCDraftWorker(StandaloneDraftWorker):
+    """StandaloneDraftWorker with SMC-specific attention backend and CUDA graphs."""
+
+    def init_attention_backend(self):
+        # SMC needs the draft model's device graphs before the attention backend.
+        self.draft_runner.init_device_graphs()
+        super().init_attention_backend()
+        self.smc_draft_attn_backend = None
+        if self.server_args.smc_gamma > 1:
+            self.smc_draft_attn_backend = DraftBackendFactory(
+                self.server_args,
+                self.draft_runner,
+                topk=1,
+                speculative_num_steps=self.server_args.smc_gamma + 1,
+            ).create_decode_backend()
+
+    def init_cuda_graphs(self):
+        self.smc_draft_cuda_graph_runner = None
+        self.cuda_graph_runner = None
+        self.cuda_graph_runner_for_draft_extend = None
+
+        if self.server_args.disable_cuda_graph:
+            return
+        if self.server_args.model_impl == "mindspore":
+            return
+        if self.smc_draft_attn_backend is None:
+            return
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Capture SMC draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+        )
+        self.smc_draft_cuda_graph_runner = SMCDraftCudaGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Capture SMC draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+        )
 
 
 class _SMCInternalTreeCache:
@@ -54,10 +102,56 @@ class _SMCInternalTreeCache:
         return False
 
 
-class SMCWorkerV2(StandaloneWorkerV2):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.smc_gamma = self.server_args.smc_gamma
+class SMCWorkerV2(EAGLEWorkerV2):
+    def __init__(
+        self,
+        server_args,
+        gpu_id,
+        tp_rank,
+        dp_rank,
+        moe_ep_rank,
+        attn_cp_rank,
+        moe_dp_rank,
+        nccl_port,
+        target_worker,
+    ):
+        self.server_args = server_args
+        self.topk = server_args.speculative_eagle_topk
+        self.speculative_num_steps = server_args.speculative_num_steps
+        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.gpu_id = gpu_id
+        self.device = server_args.device
+        self._target_worker = target_worker
+        self.page_size = server_args.page_size
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            target_worker.get_memory_pool()
+        )
+
+        server_args.context_length = target_worker.model_runner.model_config.context_len
+
+        self._draft_worker = SMCDraftWorker(
+            server_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            moe_ep_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            nccl_port,
+            target_worker,
+        )
+
+        self.num_new_pages_per_topk = torch.empty(
+            (), dtype=torch.int64, device=self.device
+        )
+        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+        self.smc_gamma = server_args.smc_gamma
         self._internal_tree_cache = _SMCInternalTreeCache(
             self.token_to_kv_pool_allocator
         )
@@ -111,11 +205,10 @@ class SMCWorkerV2(StandaloneWorkerV2):
 
         self._ensure_draft_prefix_filled(reqs, draft_committed_lens_cpu.tolist())
 
-        draft_sampling_info = self._make_sampling_info(
-            reqs,
-            self.draft_worker.draft_worker.model_config.vocab_size,
-        )
-        if self._can_use_fused_draft_cuda_graph(reqs, draft_sampling_info):
+        if self._can_use_fused_draft_cuda_graph(reqs, batch.sampling_info):
+            model_worker_batch = (
+                batch if is_overlap_batch else batch.get_model_worker_batch()
+            )
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -125,30 +218,9 @@ class SMCWorkerV2(StandaloneWorkerV2):
                     draft_lengths,
                 ) = self._run_fused_draft_reqs(
                     reqs,
-                    batch.req_pool_indices,
-                    (
-                        draft_input.proposal_out_cache_loc
-                        if draft_input is not None
-                        else None
-                    ),
-                    (
-                        draft_input.proposal_seq_lens_steps
-                        if draft_input is not None
-                        else None
-                    ),
-                    (
-                        draft_input.proposal_seq_lens_cpu_steps
-                        if draft_input is not None
-                        else None
-                    ),
-                    (
-                        draft_input.proposal_seq_lens_sum_steps
-                        if draft_input is not None
-                        else None
-                    ),
-                    visible_seq_lens,
+                    model_worker_batch,
                     last_token_ids,
-                    draft_sampling_info,
+                    model_worker_batch.sampling_info,
                 )
             draft_can_run_cuda_graph = True
         else:
@@ -182,9 +254,6 @@ class SMCWorkerV2(StandaloneWorkerV2):
             draft_tokens=draft_tokens,
             draft_logprobs=draft_logprobs,
             draft_lengths=draft_lengths,
-            verify_out_cache_loc=(
-                draft_input.verify_out_cache_loc if draft_input is not None else None
-            ),
         )
 
         stride = self.server_args.speculative_num_draft_tokens
@@ -342,82 +411,47 @@ class SMCWorkerV2(StandaloneWorkerV2):
 
         worker.forward_batch_generation(batch.get_model_worker_batch(), is_verify=True)
 
-    def _make_sampling_info(
-        self,
-        reqs: Sequence[Req],
-        vocab_size: int,
-    ) -> SamplingBatchInfo:
-        batch = ScheduleBatch.init_new(
-            reqs=list(reqs),
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            tree_cache=self._internal_tree_cache,
-            model_config=self.draft_worker.draft_worker.model_config,
-            enable_overlap=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-        )
-        return SamplingBatchInfo.from_schedule_batch(batch, vocab_size)
-
     def _can_use_fused_draft_cuda_graph(
         self,
         reqs: Sequence[Req],
         sampling_info: SamplingBatchInfo,
     ) -> bool:
         runner = getattr(self.draft_worker, "smc_draft_cuda_graph_runner", None)
-        return bool(
-            runner
-            and runner.supports_replay(reqs, sampling_info)
-            and runner.can_run(len(reqs), sampling_info)
-        )
+        # Fast gate: supports_replay checks fundamental incompatibilities.
+        # The actual can_run check happens inside prepare_for_v2_draft.
+        return bool(runner and runner.supports_replay(reqs, sampling_info))
 
     def _run_fused_draft_reqs(
         self,
         reqs: Sequence[Req],
-        req_pool_indices: torch.Tensor,
-        proposal_out_cache_loc: torch.Tensor | None,
-        proposal_seq_lens_steps: torch.Tensor | None,
-        proposal_seq_lens_cpu_steps: torch.Tensor | None,
-        proposal_seq_lens_sum_steps: torch.Tensor | None,
-        visible_seq_lens: torch.Tensor,
+        model_worker_batch: ModelWorkerBatch,
         last_token_ids: torch.Tensor,
-        sampling_info: SamplingBatchInfo,
+        draft_sampling_info: SamplingBatchInfo,
     ):
         runner = self.draft_worker.smc_draft_cuda_graph_runner
-        if proposal_out_cache_loc is None:
-            raise RuntimeError(
-                "SMC fused draft replay requires proposal_out_cache_loc prepared "
-                "during SMCDraftInput.prepare_for_decode()."
-            )
-        if (
-            proposal_seq_lens_steps is None
-            or proposal_seq_lens_cpu_steps is None
-            or proposal_seq_lens_sum_steps is None
-        ):
-            raise RuntimeError(
-                "SMC fused draft replay requires prepared proposal seq-lens metadata "
-                "from SMCDraftInput.prepare_for_decode()."
-            )
-        token_matrix, logprob_matrix = runner.replay(
-            req_pool_indices=req_pool_indices,
-            proposal_out_cache_loc=proposal_out_cache_loc,
-            proposal_seq_lens_steps=proposal_seq_lens_steps,
-            proposal_seq_lens_cpu_steps=proposal_seq_lens_cpu_steps,
-            proposal_seq_lens_sum_steps=proposal_seq_lens_sum_steps,
-            sampling_info=sampling_info,
+        draft_input = SMCDraftInput(
             last_token_ids=last_token_ids,
+            new_seq_lens=model_worker_batch.seq_lens,
         )
-        current_output_lens = visible_seq_lens.to(torch.int64) - torch.tensor(
-            [len(req.origin_input_ids) for req in reqs],
-            dtype=torch.int64,
-            device=self.device,
+        forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+            req_to_token_pool=self.req_to_token_pool,
+            batch=model_worker_batch,
+            cuda_graph_runner=runner,
+            draft_model_runner=self.draft_worker.draft_runner,
+            gamma=self.smc_gamma,
+            draft_sampling_info=draft_sampling_info,
         )
-        draft_lengths, _draft_finished, draft_logprobs = resolve_smc_proposal_batch(
-            reqs,
-            token_matrix.to(torch.int64),
-            logprob_matrix.to(torch.float32),
-            current_output_lens,
+        if not can_cuda_graph:
+            raise RuntimeError(
+                "SMC fused draft path requires CUDA graph support but can_run returned False."
+            )
+        token_matrix, logprob_matrix = runner.replay(forward_batch)
+        bs = token_matrix.shape[0]
+        draft_lengths = torch.full(
+            (bs,), self.smc_gamma, dtype=torch.int32, device=self.device
         )
-        return token_matrix.to(torch.int32), draft_logprobs, draft_lengths
+        draft_logprobs = logprob_matrix.sum(dim=1)
+        return token_matrix, draft_logprobs, draft_lengths
 
     def _run_stepwise_draft_reqs(
         self,
@@ -527,7 +561,6 @@ class SMCWorkerV2(StandaloneWorkerV2):
         draft_tokens: torch.Tensor,
         draft_logprobs: torch.Tensor,
         draft_lengths: torch.Tensor,
-        verify_out_cache_loc: torch.Tensor | None,
     ):
         model_worker_batch = self._make_score_model_worker_batch(
             base_model_worker_batch=base_model_worker_batch,
@@ -536,7 +569,6 @@ class SMCWorkerV2(StandaloneWorkerV2):
             draft_tokens=draft_tokens,
             draft_logprobs=draft_logprobs,
             draft_lengths=draft_lengths,
-            verify_out_cache_loc=verify_out_cache_loc,
         )
         score_input: SMCScoreInput = model_worker_batch.spec_info
         verify_forward_batch, can_run_cuda_graph = score_input.prepare_for_v2_verify(
@@ -551,6 +583,15 @@ class SMCWorkerV2(StandaloneWorkerV2):
             skip_attn_backend_init=True,
         )
         assert forward_output.logits_output is not None
+        # CG path bakes log_softmax(logits/T) into the graph.
+        # Non-CG fallback needs it applied here so sample() gets log_probs.
+        if not can_run_cuda_graph:
+            logits = forward_output.logits_output.next_token_logits
+            forward_output.logits_output.next_token_logits = (
+                torch.nn.functional.log_softmax(
+                    logits / score_input.target_temperature, dim=-1
+                )
+            )
         (
             accept_lens,
             committed_seq_lens,
@@ -592,13 +633,7 @@ class SMCWorkerV2(StandaloneWorkerV2):
         draft_tokens: torch.Tensor,
         draft_logprobs: torch.Tensor,
         draft_lengths: torch.Tensor,
-        verify_out_cache_loc: torch.Tensor | None,
     ) -> ModelWorkerBatch:
-        if verify_out_cache_loc is None:
-            raise RuntimeError(
-                "SMC target scoring requires verify_out_cache_loc prepared "
-                "during SMCDraftInput.prepare_for_decode()."
-            )
         score_token_num = self.server_args.speculative_num_draft_tokens
         score_tokens = torch.cat(
             [
@@ -633,7 +668,6 @@ class SMCWorkerV2(StandaloneWorkerV2):
             draft_token=score_tokens.reshape(-1).contiguous(),
             draft_lengths=draft_lengths,
             draft_logprobs=draft_logprobs,
-            verify_out_cache_loc=verify_out_cache_loc,
             positions=build_smc_positions(seq_lens, score_token_num),
             custom_mask=custom_mask,
             draft_token_num=score_token_num,

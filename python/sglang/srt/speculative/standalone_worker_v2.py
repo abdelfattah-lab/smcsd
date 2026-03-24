@@ -1,6 +1,5 @@
 import contextlib
 import logging
-import time
 from typing import Optional, Tuple
 
 import torch
@@ -9,18 +8,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
-from sglang.srt.speculative.smc_draft_cuda_graph_runner import SMCDraftCudaGraphRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.utils import (
-    empty_context,
-    get_available_gpu_memory,
-    get_bool_env_var,
-    is_cuda,
-)
+from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -124,8 +116,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         with self.draft_tp_context(
             self.draft_runner.tp_group
         ), speculative_moe_backend_context():
-            if self.speculative_algorithm.is_smc():
-                self.draft_runner.init_device_graphs()
             self.init_attention_backend()
             self.init_cuda_graphs()
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
@@ -137,49 +127,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # For standalone worker, we don't share embeddings and lm_head
         # The draft model uses its own embeddings and lm_head
         pass
-
-    def init_attention_backend(self):
-        super().init_attention_backend()
-
-        self.smc_draft_attn_backend = None
-        if self.speculative_algorithm.is_smc() and self.server_args.smc_gamma > 1:
-            self.smc_draft_attn_backend = DraftBackendFactory(
-                self.server_args,
-                self.draft_runner,
-                topk=1,
-                speculative_num_steps=self.server_args.smc_gamma + 1,
-            ).create_decode_backend()
-
-    def init_cuda_graphs(self):
-        self.smc_draft_cuda_graph_runner = None
-
-        if not self.speculative_algorithm.is_smc():
-            super().init_cuda_graphs()
-            return
-
-        self.cuda_graph_runner = None
-        # SMC does not have an EAGLE-style recurring draft_extend stage.
-        self.cuda_graph_runner_for_draft_extend = None
-
-        if self.server_args.disable_cuda_graph:
-            return
-
-        if self.server_args.model_impl == "mindspore":
-            return
-
-        if self.smc_draft_attn_backend is None:
-            return
-
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Capture SMC draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-        )
-        self.smc_draft_cuda_graph_runner = SMCDraftCudaGraphRunner(self)
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Capture SMC draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
-        )
 
 
 class StandaloneWorkerV2(EAGLEWorkerV2):

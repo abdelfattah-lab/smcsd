@@ -23,7 +23,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
-    clamp_position,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -348,11 +347,12 @@ class SMCDraftCudaGraphRunner:
         return graph, out
 
     def _supports_sampling_info(self, sampling_info: SamplingBatchInfo) -> bool:
+        penalizer = sampling_info.penalizer_orchestrator
         return (
             sampling_info.grammars is None
             and not sampling_info.has_custom_logit_processor
             and sampling_info.logit_bias is None
-            and not sampling_info.penalizer_orchestrator.is_required
+            and (penalizer is None or not penalizer.is_required)
         )
 
     def supports_replay(
@@ -388,11 +388,9 @@ class SMCDraftCudaGraphRunner:
             need_min_p_sampling=sampling_info.need_min_p_sampling,
         )
 
-    def can_run(
-        self,
-        raw_bs: int,
-        sampling_info: SamplingBatchInfo,
-    ) -> bool:
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
+        raw_bs = forward_batch.batch_size
+        sampling_info = forward_batch.sampling_info
         signature = self._sampling_signature(sampling_info)
         if signature != self.sampling_signature:
             self.sampling_signature = signature
@@ -405,79 +403,18 @@ class SMCDraftCudaGraphRunner:
             raw_bs in self.graphs if self.disable_padding else raw_bs <= self.max_bs
         )
 
-    def replay(
-        self,
-        req_pool_indices: torch.Tensor,
-        proposal_out_cache_loc: torch.Tensor,
-        proposal_seq_lens_steps: torch.Tensor,
-        proposal_seq_lens_cpu_steps: torch.Tensor,
-        proposal_seq_lens_sum_steps: torch.Tensor,
-        sampling_info: SamplingBatchInfo,
-        last_token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        raw_bs = int(req_pool_indices.shape[0])
-        if not self.can_run(raw_bs, sampling_info):
-            raise RuntimeError("SMC fused draft cuda graph replay cannot run for this batch.")
+    def replay(self, forward_batch: ForwardBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.speculative.smc_info import SMCDraftInput
 
+        raw_bs = forward_batch.batch_size
         buffers = self.buffers
+        spec_info: SMCDraftInput = forward_batch.spec_info
 
-        if self.require_mlp_tp_gather:
-            max_num_tokens = raw_bs
-            index = bisect.bisect_left(self.capture_bs, max_num_tokens)
-        else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
+        # Determine padded batch size
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
 
-        seq_lens_steps = proposal_seq_lens_steps
-        if seq_lens_steps is None:
-            seq_lens_steps = proposal_seq_lens_cpu_steps.to(
-                device=self.device, dtype=torch.int32, non_blocking=True
-            )
-        elif seq_lens_steps.device != self.device or seq_lens_steps.dtype != torch.int32:
-            seq_lens_steps = seq_lens_steps.to(
-                device=self.device, dtype=torch.int32, non_blocking=True
-            )
-        if seq_lens_steps.shape != (self.gamma, raw_bs):
-            raise RuntimeError(
-                "SMC fused draft replay received malformed proposal_seq_lens_steps: "
-                f"expected={(self.gamma, raw_bs)}, got={tuple(seq_lens_steps.shape)}"
-            )
-        seq_lens_cpu_steps = proposal_seq_lens_cpu_steps
-        if (
-            seq_lens_cpu_steps is None
-            or seq_lens_cpu_steps.device.type != "cpu"
-            or seq_lens_cpu_steps.dtype != torch.int32
-        ):
-            seq_lens_cpu_steps = seq_lens_steps.to(dtype=torch.int32, device="cpu")
-        if seq_lens_cpu_steps.shape != (self.gamma, raw_bs):
-            raise RuntimeError(
-                "SMC fused draft replay received malformed proposal_seq_lens_cpu_steps: "
-                f"expected={(self.gamma, raw_bs)}, got={tuple(seq_lens_cpu_steps.shape)}"
-            )
-        seq_lens_sum_steps = proposal_seq_lens_sum_steps
-        if (
-            seq_lens_sum_steps is None
-            or seq_lens_sum_steps.device.type != "cpu"
-            or seq_lens_sum_steps.dtype != torch.int64
-        ):
-            seq_lens_sum_steps = seq_lens_cpu_steps.sum(dim=1, dtype=torch.int64).cpu()
-        if seq_lens_sum_steps.shape != (self.gamma,):
-            raise RuntimeError(
-                "SMC fused draft replay received malformed proposal_seq_lens_sum_steps: "
-                f"expected={(self.gamma,)}, got={tuple(seq_lens_sum_steps.shape)}"
-            )
-        base_positions = clamp_position(seq_lens_steps[0])
-        out_cache_loc = proposal_out_cache_loc
-        if out_cache_loc.device != self.device or out_cache_loc.dtype != torch.int64:
-            out_cache_loc = out_cache_loc.to(
-                device=self.device, dtype=torch.int64, non_blocking=True
-            )
-        if out_cache_loc.shape != (self.gamma, raw_bs):
-            raise RuntimeError(
-                "SMC fused draft replay received malformed proposal_out_cache_loc: "
-                f"expected={(self.gamma, raw_bs)}, got={tuple(out_cache_loc.shape)}"
-            )
-
+        # Pad unused slots if needed
         if bs != raw_bs:
             buffers.input_ids.zero_()
             buffers.req_pool_indices.zero_()
@@ -491,21 +428,19 @@ class SMCDraftCudaGraphRunner:
             buffers.min_ps.zero_()
             buffers.sampling_seed.zero_()
 
-        if last_token_ids.device != self.device:
-            last_token_ids = last_token_ids.to(device=self.device, non_blocking=True)
-        if last_token_ids.dtype not in (torch.int32, torch.int64):
-            raise RuntimeError(
-                "SMC fused draft replay requires last_token_ids in int32 or int64 dtype."
-            )
-        if req_pool_indices.device != self.device or req_pool_indices.dtype != torch.int64:
-            req_pool_indices = req_pool_indices.to(
-                device=self.device, dtype=torch.int64, non_blocking=True
-            )
+        # Copy data to CG buffers.
+        # .copy_() implicitly handles dtype conversion (e.g. int64 -> int32).
+        buffers.input_ids[:raw_bs].copy_(forward_batch.input_ids[:raw_bs])
+        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices[:raw_bs])
+        buffers.positions[:raw_bs].copy_(forward_batch.positions[:raw_bs])
 
-        buffers.input_ids[:raw_bs].copy_(last_token_ids[:raw_bs])
-        buffers.req_pool_indices[:raw_bs].copy_(req_pool_indices[:raw_bs])
-        buffers.positions[:raw_bs].copy_(base_positions)
-        buffers.out_cache_loc[:, :raw_bs].copy_(out_cache_loc)
+        # Multi-step data from spec_info (populated by prepare_for_v2_draft)
+        buffers.out_cache_loc[:, :raw_bs].copy_(spec_info.out_cache_loc_steps)
+        buffers.seq_lens_steps[:, :raw_bs].copy_(spec_info.seq_lens_steps)
+        buffers.seq_lens_cpu_steps[:, :raw_bs].copy_(spec_info.seq_lens_cpu_steps)
+
+        # Sampling parameters
+        sampling_info = forward_batch.sampling_info
         buffers.temperatures[:raw_bs].copy_(sampling_info.temperatures)
         buffers.top_ps[:raw_bs].copy_(sampling_info.top_ps)
         buffers.top_ks[:raw_bs].copy_(sampling_info.top_ks)
@@ -513,22 +448,21 @@ class SMCDraftCudaGraphRunner:
         if self.enable_deterministic and sampling_info.sampling_seed is not None:
             buffers.sampling_seed[:raw_bs].copy_(sampling_info.sampling_seed)
 
-        buffers.seq_lens_steps[:, :raw_bs].copy_(seq_lens_steps)
-        buffers.seq_lens_cpu_steps[:, :raw_bs].copy_(seq_lens_cpu_steps)
-
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs)
             buffers.global_num_tokens_for_logprob_gpu.fill_(bs)
 
+        # Initialize attention metadata for multi-step replay
         self._init_replay_metadata(
             bs=bs,
             raw_bs=raw_bs,
             req_pool_indices=buffers.req_pool_indices[:bs],
             seq_lens_steps=buffers.seq_lens_steps[:, :bs],
             seq_lens_cpu_steps=buffers.seq_lens_cpu_steps[:, :bs],
-            seq_lens_sum_steps=seq_lens_sum_steps,
+            seq_lens_sum_steps=spec_info.seq_lens_sum_steps,
         )
 
+        # Run the captured CUDA graph
         self.deepep_adapter.replay()
         self.raw_bs = raw_bs
         self.bs = bs

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -20,10 +21,22 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    clamp_position,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.eagle_info_v2 import (
+    assign_draft_cache_locs_page_size_1,
+    assign_extend_cache_locs_func,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.smc_draft_cuda_graph_runner import (
+        SMCDraftCudaGraphRunner,
+    )
 
 SMC_MIN_TEMPERATURE = 1e-5
 
@@ -613,11 +626,13 @@ class SMCDraftInput(SpecInput):
     new_seq_lens: torch.Tensor
     future_indices: Optional[FutureIndices] = None
     verify_done: Optional[torch.cuda.Event] = None
-    proposal_out_cache_loc: Optional[torch.Tensor] = None
-    verify_out_cache_loc: Optional[torch.Tensor] = None
-    proposal_seq_lens_steps: Optional[torch.Tensor] = None
-    proposal_seq_lens_cpu_steps: Optional[torch.Tensor] = None
-    proposal_seq_lens_sum_steps: Optional[torch.Tensor] = None
+
+    # Transient — set by prepare_for_v2_draft(), consumed by replay(), not persisted.
+    seq_lens_steps: Optional[torch.Tensor] = None  # [gamma, bs]
+    seq_lens_cpu_steps: Optional[torch.Tensor] = None  # [gamma, bs], CPU
+    seq_lens_sum_steps: Optional[torch.Tensor] = None  # [gamma], CPU
+    out_cache_loc_steps: Optional[torch.Tensor] = None  # [gamma, bs]
+    positions: Optional[torch.Tensor] = None  # [bs]
 
     def __post_init__(self):
         super().__init__(SpecInputType.SMC_DRAFT)
@@ -631,6 +646,80 @@ class SMCDraftInput(SpecInput):
             last_token_ids=torch.empty((0,), device=device, dtype=torch.int32),
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
         )
+
+    def prepare_for_v2_draft(
+        self,
+        req_to_token_pool,
+        batch: ModelWorkerBatch,
+        cuda_graph_runner: Optional[SMCDraftCudaGraphRunner],
+        draft_model_runner: ModelRunner,
+        gamma: int,
+        draft_sampling_info: SamplingBatchInfo,
+    ):
+        bs = len(batch.seq_lens)
+        device = batch.seq_lens.device
+
+        # Compute draft_committed_lens in native int64 — no .to() cast.
+        # .copy_() to int32 CG buffers handles conversion implicitly.
+        draft_committed_lens = batch.seq_lens[:bs] - 1
+
+        # Per-step seq_lens: [gamma, bs]
+        step_offsets = torch.arange(gamma, dtype=torch.int64, device=device)
+        self.seq_lens_steps = (
+            draft_committed_lens.unsqueeze(0) + step_offsets.unsqueeze(1)
+        )
+
+        # CPU mirror for attention backend metadata
+        seq_lens_cpu = (
+            batch.seq_lens_cpu
+            if batch.seq_lens_cpu is not None
+            else batch.seq_lens.cpu()
+        )
+        draft_committed_lens_cpu = seq_lens_cpu[:bs] - 1
+        step_offsets_cpu = torch.arange(gamma, dtype=torch.int64)
+        self.seq_lens_cpu_steps = (
+            draft_committed_lens_cpu.unsqueeze(0) + step_offsets_cpu.unsqueeze(1)
+        )
+        self.seq_lens_sum_steps = self.seq_lens_cpu_steps.sum(dim=1, dtype=torch.int64)
+
+        # Compute out_cache_loc via Triton kernel (same kernel EAGLE uses).
+        # Triton JIT handles int64 draft_committed_lens — no int32 cast needed.
+        flat_out = torch.empty((bs * gamma,), dtype=torch.int64, device=device)
+        assign_draft_cache_locs_page_size_1[(bs,)](
+            batch.req_pool_indices[:bs],
+            req_to_token_pool.req_to_token,
+            draft_committed_lens,
+            flat_out,
+            req_to_token_pool.req_to_token.shape[1],
+            1,  # topk=1 for SMC
+            gamma,
+        )
+        self.out_cache_loc_steps = flat_out.view(bs, gamma).t().contiguous()
+
+        # Positions for step 0 (captured graph increments via working_positions.add_(1))
+        self.positions = clamp_position(self.seq_lens_steps[0])
+
+        # Build a modified batch for ForwardBatch.init_new().
+        # ForwardBatch.init_new picks up spec_info.positions at forward_batch_info.py:537.
+        draft_batch = dataclasses.replace(
+            batch,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=self.last_token_ids,
+            seq_lens=self.seq_lens_steps[0],
+            seq_lens_cpu=self.seq_lens_cpu_steps[0],
+            seq_lens_sum=int(self.seq_lens_sum_steps[0].item()),
+            out_cache_loc=self.out_cache_loc_steps[0],
+            sampling_info=draft_sampling_info,
+            spec_info=self,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_logprob=True,
+        )
+        forward_batch = ForwardBatch.init_new(draft_batch, draft_model_runner)
+
+        can_cuda_graph = bool(
+            cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        )
+        return forward_batch, can_cuda_graph
 
     def prepare_for_decode(self, batch: ScheduleBatch):
         if self.verify_done is not None:
@@ -681,41 +770,11 @@ class SMCDraftInput(SpecInput):
             req.kv_allocated_len = int(required_len)
             req.decode_batch_idx += 1
 
-        draft_committed_lens = batch.seq_lens - 1
-        proposal_seq_lens_cpu_steps = draft_committed_lens_cpu.unsqueeze(0) + torch.arange(
-            gamma, dtype=torch.int32
-        ).unsqueeze(1)
-        self.proposal_seq_lens_cpu_steps = proposal_seq_lens_cpu_steps.contiguous()
-        draft_committed_lens_i32 = draft_committed_lens.to(dtype=torch.int32)
-        self.proposal_seq_lens_steps = (
-            draft_committed_lens_i32.unsqueeze(0)
-            + torch.arange(gamma, dtype=torch.int32, device=batch.device).unsqueeze(1)
-        ).contiguous()
-        self._refresh_proposal_seq_lens_sum_steps()
-        verify_positions = draft_committed_lens.unsqueeze(1) + torch.arange(
-            score_token_num, dtype=torch.int64, device=batch.device
-        )
-        self.verify_out_cache_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices.unsqueeze(1), verify_positions
-        ].transpose(0, 1).contiguous().to(dtype=torch.int64)
-        self.proposal_out_cache_loc = self.verify_out_cache_loc[:gamma].contiguous()
-
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
         self.last_token_ids = self.last_token_ids[new_indices]
         self.new_seq_lens = self.new_seq_lens[new_indices]
-        if self.proposal_out_cache_loc is not None:
-            self.proposal_out_cache_loc = self.proposal_out_cache_loc[:, new_indices]
-        if self.verify_out_cache_loc is not None:
-            self.verify_out_cache_loc = self.verify_out_cache_loc[:, new_indices]
-        if self.proposal_seq_lens_steps is not None:
-            self.proposal_seq_lens_steps = self.proposal_seq_lens_steps[:, new_indices]
-        if self.proposal_seq_lens_cpu_steps is not None:
-            self.proposal_seq_lens_cpu_steps = self.proposal_seq_lens_cpu_steps[
-                :, new_indices
-            ]
-            self._refresh_proposal_seq_lens_sum_steps()
 
     def merge_batch(self, spec_info: "SMCDraftInput"):
         if self.future_indices is not None:
@@ -725,86 +784,9 @@ class SMCDraftInput(SpecInput):
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
-            if (
-                self.proposal_out_cache_loc is not None
-                and spec_info.proposal_out_cache_loc is not None
-            ):
-                self.proposal_out_cache_loc = torch.cat(
-                    [self.proposal_out_cache_loc, spec_info.proposal_out_cache_loc],
-                    dim=1,
-                )
-            if (
-                self.verify_out_cache_loc is not None
-                and spec_info.verify_out_cache_loc is not None
-            ):
-                self.verify_out_cache_loc = torch.cat(
-                    [self.verify_out_cache_loc, spec_info.verify_out_cache_loc],
-                    dim=1,
-                )
-            if (
-                self.proposal_seq_lens_steps is not None
-                and spec_info.proposal_seq_lens_steps is not None
-            ):
-                self.proposal_seq_lens_steps = torch.cat(
-                    [self.proposal_seq_lens_steps, spec_info.proposal_seq_lens_steps],
-                    dim=1,
-                )
-            if (
-                self.proposal_seq_lens_cpu_steps is not None
-                and spec_info.proposal_seq_lens_cpu_steps is not None
-            ):
-                self.proposal_seq_lens_cpu_steps = torch.cat(
-                    [
-                        self.proposal_seq_lens_cpu_steps,
-                        spec_info.proposal_seq_lens_cpu_steps,
-                    ],
-                    dim=1,
-                )
-                self._refresh_proposal_seq_lens_sum_steps()
             return
         self.last_token_ids = torch.cat([self.last_token_ids, spec_info.last_token_ids])
         self.new_seq_lens = torch.cat([self.new_seq_lens, spec_info.new_seq_lens])
-        if (
-            self.proposal_out_cache_loc is not None
-            and spec_info.proposal_out_cache_loc is not None
-        ):
-            self.proposal_out_cache_loc = torch.cat(
-                [self.proposal_out_cache_loc, spec_info.proposal_out_cache_loc], dim=1
-            )
-        if (
-            self.verify_out_cache_loc is not None
-            and spec_info.verify_out_cache_loc is not None
-        ):
-            self.verify_out_cache_loc = torch.cat(
-                [self.verify_out_cache_loc, spec_info.verify_out_cache_loc], dim=1
-            )
-        if (
-            self.proposal_seq_lens_steps is not None
-            and spec_info.proposal_seq_lens_steps is not None
-        ):
-            self.proposal_seq_lens_steps = torch.cat(
-                [self.proposal_seq_lens_steps, spec_info.proposal_seq_lens_steps], dim=1
-            )
-        if (
-            self.proposal_seq_lens_cpu_steps is not None
-            and spec_info.proposal_seq_lens_cpu_steps is not None
-        ):
-            self.proposal_seq_lens_cpu_steps = torch.cat(
-                [
-                    self.proposal_seq_lens_cpu_steps,
-                    spec_info.proposal_seq_lens_cpu_steps,
-                ],
-                dim=1,
-            )
-            self._refresh_proposal_seq_lens_sum_steps()
-
-    def _refresh_proposal_seq_lens_sum_steps(self):
-        if self.proposal_seq_lens_cpu_steps is None:
-            self.proposal_seq_lens_sum_steps = None
-            return
-        self.proposal_seq_lens_sum_steps = self.proposal_seq_lens_cpu_steps.sum(
-            dim=1, dtype=torch.int64
-        )
 
 
 @dataclass
@@ -812,7 +794,6 @@ class SMCScoreInput(SpecInput):
     draft_token: torch.Tensor
     draft_lengths: torch.Tensor
     draft_logprobs: torch.Tensor
-    verify_out_cache_loc: Optional[torch.Tensor]
     positions: torch.Tensor
     custom_mask: Optional[torch.Tensor]
     draft_token_num: int
@@ -931,34 +912,19 @@ class SMCScoreInput(SpecInput):
         batch: ModelWorkerBatch,
         target_worker,
     ):
-        del req_to_token_pool
         if not batch.forward_mode.is_idle():
-            if self.verify_out_cache_loc is None:
-                raise RuntimeError(
-                    "SMC target verify requires precomputed verify_out_cache_loc "
-                    "from SMCDraftInput.prepare_for_decode()."
-                )
-            verify_out_cache_loc = self.verify_out_cache_loc
-            if (
-                verify_out_cache_loc.device != self.draft_token.device
-                or verify_out_cache_loc.dtype != torch.int64
-            ):
-                raise RuntimeError(
-                    "SMC target verify requires int64 verify_out_cache_loc on the "
-                    "same device as draft_token."
-                )
-            if verify_out_cache_loc.dim() != 2 or verify_out_cache_loc.shape != (
-                self.draft_token_num,
-                len(batch.req_pool_indices),
-            ):
-                raise RuntimeError(
-                    "SMC target verify received malformed verify_out_cache_loc: "
-                    f"expected={(self.draft_token_num, len(batch.req_pool_indices))}, "
-                    f"got={tuple(verify_out_cache_loc.shape)}"
-                )
+            bs = len(batch.req_pool_indices)
+            device = self.draft_token.device
             batch.input_ids = self.draft_token
-            batch.out_cache_loc = verify_out_cache_loc.transpose(0, 1).contiguous().view(
-                -1
+            # Compute out_cache_loc at verify time (like EAGLE v2)
+            batch.out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + self.draft_token_num,
+                batch_size=bs,
+                draft_token_num=self.draft_token_num,
+                device=device,
             )
 
         batch.forward_mode = (
@@ -998,8 +964,9 @@ class SMCScoreInput(SpecInput):
         bs = int(self.draft_lengths.shape[0])
         score_len = self.draft_token_num
         draft_token = self.draft_token.view(bs, score_len)
-        token_logits = logits_output.next_token_logits.view(bs, score_len, -1)
-        log_probs = F.log_softmax(token_logits / self.target_temperature, dim=-1)
+        # logits_output.next_token_logits is already log_probs
+        # (log_softmax(logits/T) applied in CG capture or non-CG fallback)
+        log_probs = logits_output.next_token_logits.view(bs, score_len, -1)
         gathered = log_probs.gather(2, draft_token.unsqueeze(-1)).squeeze(-1)
         mask = (
             torch.arange(score_len - 1, device=device).unsqueeze(0)

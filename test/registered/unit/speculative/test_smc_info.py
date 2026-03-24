@@ -529,3 +529,55 @@ class TestResolveSMCProposalLength(TestCase):
 
         self.assertEqual(proposal_len, 2)
         self.assertTrue(proposal_finished)
+
+
+class TestSMCDraftCudaGraphSamplingSupport(TestCase):
+    """Tests for SMCDraftCudaGraphRunner._supports_sampling_info."""
+
+    def _make_sampling_info(self, **overrides):
+        defaults = dict(
+            grammars=None,
+            has_custom_logit_processor=False,
+            logit_bias=None,
+            penalizer_orchestrator=SimpleNamespace(is_required=False),
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _check(self, sampling_info):
+        from sglang.srt.speculative.smc_draft_cuda_graph_runner import (
+            SMCDraftCudaGraphRunner,
+        )
+
+        return SMCDraftCudaGraphRunner._supports_sampling_info(None, sampling_info)
+
+    def test_supports_standard_sampling(self):
+        self.assertTrue(self._check(self._make_sampling_info()))
+
+    def test_rejects_grammars(self):
+        self.assertFalse(self._check(self._make_sampling_info(grammars=[object()])))
+
+    def test_rejects_custom_logit_processor(self):
+        self.assertFalse(
+            self._check(self._make_sampling_info(has_custom_logit_processor=True))
+        )
+
+    def test_rejects_logit_bias(self):
+        self.assertFalse(
+            self._check(self._make_sampling_info(logit_bias=torch.zeros(10)))
+        )
+
+    def test_rejects_required_penalizer(self):
+        self.assertFalse(
+            self._check(
+                self._make_sampling_info(
+                    penalizer_orchestrator=SimpleNamespace(is_required=True)
+                )
+            )
+        )
+
+    def test_accepts_none_penalizer_orchestrator(self):
+        """Overlap path may pass sampling_info with penalizer_orchestrator=None."""
+        self.assertTrue(
+            self._check(self._make_sampling_info(penalizer_orchestrator=None))
+        )
