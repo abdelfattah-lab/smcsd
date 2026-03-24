@@ -2140,7 +2140,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         draft_logprobs=torch.zeros(
                             (batch_size,), dtype=torch.float32, device=self.device
                         ),
-                        verify_out_cache_loc=None,
                         custom_mask=buffers.custom_mask,
                         positions=None,
                         draft_token_num=num_tokens_per_bs,
