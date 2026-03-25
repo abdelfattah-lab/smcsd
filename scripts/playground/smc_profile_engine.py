@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_DRAFT_MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_PROMPTS = [
     "The capital of France is",
@@ -40,8 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=default_model_path())
     parser.add_argument("--draft-model-path", default=default_draft_model_path())
     parser.add_argument("--output-dir", default="/tmp/sglang-smc-profile")
-    parser.add_argument("--profile-steps", type=int, default=4)
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--profile-steps", type=int, default=6)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument(
         "--profile-v2",
         action=argparse.BooleanOptionalAction,
@@ -108,7 +108,7 @@ def wait_for_artifacts(run_dir: Path, timeout_sec: float = 30.0) -> list[Path]:
 
 def sampling_params(max_new_tokens: int) -> dict[str, Any]:
     return {
-        "temperature": 0,
+        "temperature": 0.8,
         "max_new_tokens": max_new_tokens,
         "ignore_eos": True,
     }
@@ -177,7 +177,7 @@ def main() -> None:
         smc_n_particles=args.smc_n_particles,
         smc_gamma=args.smc_gamma,
         page_size=1,
-        mem_fraction_static=0.6,
+        mem_fraction_static=0.4,
         trust_remote_code=True,
         log_level="info",
         random_seed=1,
