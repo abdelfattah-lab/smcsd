@@ -1317,7 +1317,7 @@ class Scheduler(
                 processed_last_batch = True
 
             if self.smc_scheduler is not None:
-                self.smc_scheduler.step(self)
+                self.smc_scheduler.step_before_forward(self)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1343,6 +1343,10 @@ class Scheduler(
             else:
                 batch_result = None
                 self.cancel_bubble_timer()
+
+            # Launch async resample KV copies while GPU runs the forward pass.
+            if self.smc_scheduler is not None:
+                self.smc_scheduler.step_after_forward(self)
 
             # Process the last batch
             if self.last_batch:

@@ -80,6 +80,23 @@ class SMCScheduler:
         self._launch_pending_resamples(scheduler)
         self._drain_wait_for_running(scheduler)
 
+    def step_before_forward(self, scheduler) -> None:
+        """Sync completed resamples and merge groups back into running_batch.
+
+        Must run BEFORE get_next_batch_to_run() so that resumed particles
+        are visible to batch selection.
+        """
+        self._sync_completed_resamples(scheduler)
+        self._drain_wait_for_running(scheduler)
+
+    def step_after_forward(self, scheduler) -> None:
+        """Launch async KV copies on resample_stream.
+
+        Should run AFTER run_batch() so that copies overlap with the GPU
+        forward pass on the compute stream.
+        """
+        self._launch_pending_resamples(scheduler)
+
     def on_batch_done(
         self,
         reqs: List[Req],
