@@ -16,7 +16,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
+    _release_internal_req,
     clone_req_for_smc_particle,
+    get_smc_reserved_kv_len,
     set_smc_reserved_kv_len,
     validate_smc_parent_req,
 )
@@ -69,6 +71,28 @@ class SMCManager:
 
     def has_active_groups(self) -> bool:
         return bool(self.groups)
+
+    def smc_held_token_count(self) -> int:
+        """Count unique token slots held by SMC particle requests.
+
+        Particles within a group share prefix token slots (via refcount),
+        so we collect the union of all referenced slot indices to avoid
+        double-counting shared slots.
+        """
+        if not self.groups or self.req_to_token_pool is None:
+            return 0
+        held: set = set()
+        for group in self.groups.values():
+            for req in group.particle_reqs.values():
+                if req.req_pool_idx is None:
+                    continue
+                reserved = get_smc_reserved_kv_len(req)
+                if reserved > 0:
+                    indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :reserved
+                    ]
+                    held.update(indices.cpu().tolist())
+        return len(held)
 
     def clear(self) -> None:
         self.groups.clear()
@@ -305,6 +329,16 @@ class SMCManager:
                 best_output_ids = output_ids
                 best_finish_reason = finish_reason
                 best_finished_len = finished_len
+
+        # Release KV cache and req_pool entries for all particle requests.
+        # Particles that were already released during decode (finished early)
+        # will be skipped by _release_internal_req (req_pool_idx is None).
+        for particle_idx, req in group.particle_reqs.items():
+            _release_internal_req(
+                req,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
 
         parent_req = group.parent_req
         parent_req.output_ids = list(best_output_ids)
