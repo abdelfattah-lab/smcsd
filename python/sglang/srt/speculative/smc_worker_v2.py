@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
 import logging
+import os
 import time
 from typing import List, Sequence, Union
 
@@ -24,7 +26,9 @@ from sglang.srt.speculative.smc_info import (
     SMC_MIN_TEMPERATURE,
     SMCScoreInput,
     build_smc_positions,
+    compute_smc_temperature,
     get_smc_reserved_kv_len,
+    resolve_smc_proposal_batch,
     resolve_smc_proposal_length,
     set_smc_reserved_kv_len,
 )
@@ -38,6 +42,19 @@ from sglang.srt.utils import get_available_gpu_memory
 
 
 logger = logging.getLogger(__name__)
+
+_SMC_DIAG_PATH_ENV = "SGLANG_SMC_DIAG_PATH"
+
+
+def _append_smc_diag_record(record: dict) -> None:
+    record_path = os.environ.get(_SMC_DIAG_PATH_ENV)
+    if not record_path:
+        return
+    payload = dict(record)
+    payload["pid"] = os.getpid()
+    payload["timestamp_ns"] = time.perf_counter_ns()
+    with open(record_path, "a", encoding="utf-8") as fout:
+        fout.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 class SMCDraftWorker(StandaloneDraftWorker):
@@ -164,6 +181,23 @@ class SMCWorkerV2(EAGLEWorkerV2):
     def model_config(self):
         return self.target_worker.model_config
 
+    def _get_forward_model_worker_batch(
+        self,
+        batch: Union[ScheduleBatch, ModelWorkerBatch],
+        is_overlap_batch: bool,
+    ) -> ModelWorkerBatch:
+        model_worker_batch = batch if is_overlap_batch else batch.get_model_worker_batch()
+        if (
+            not is_overlap_batch
+            and model_worker_batch.sampling_info is not None
+        ):
+            # Mirror overlap mode: keep a forward-local sampling copy so draft/verify
+            # sampling kernels cannot poison the reusable ScheduleBatch state.
+            model_worker_batch.sampling_info = (
+                model_worker_batch.sampling_info.copy_for_forward()
+            )
+        return model_worker_batch
+
     def forward_batch_generation(
         self, batch: Union[ScheduleBatch, ModelWorkerBatch]
     ) -> GenerationBatchResult:
@@ -173,7 +207,9 @@ class SMCWorkerV2(EAGLEWorkerV2):
         )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            model_worker_batch = batch if is_overlap_batch else batch.get_model_worker_batch()
+            model_worker_batch = self._get_forward_model_worker_batch(
+                batch, is_overlap_batch
+            )
             result = self.target_worker.forward_batch_generation(model_worker_batch)
             if is_overlap_batch:
                 result.next_draft_input = self._build_prefill_overlap_input(
@@ -183,6 +219,11 @@ class SMCWorkerV2(EAGLEWorkerV2):
 
         if not batch.reqs:
             return self._build_empty_decode_result(is_overlap_batch)
+
+        if not is_overlap_batch and draft_input is not None:
+            # Non-overlap SMC still needs the same decode-headroom reservation
+            # contract as overlap before target verify gathers out_cache_loc.
+            draft_input.prepare_for_decode(batch)
 
         reqs = list(batch.reqs)
         visible_seq_lens = batch.seq_lens
@@ -205,11 +246,15 @@ class SMCWorkerV2(EAGLEWorkerV2):
 
         self._ensure_draft_prefix_filled(reqs, draft_committed_lens_cpu.tolist())
 
-        model_worker_batch = batch if is_overlap_batch else batch.get_model_worker_batch()
+        model_worker_batch = self._get_forward_model_worker_batch(
+            batch, is_overlap_batch
+        )
         with self.draft_worker.draft_tp_context(
             self.draft_worker.draft_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            if self._can_use_fused_draft_cuda_graph(reqs, batch.sampling_info):
+            if self._can_use_fused_draft_cuda_graph(
+                reqs, model_worker_batch.sampling_info
+            ):
                 (
                     draft_tokens,
                     draft_logprobs,
@@ -236,22 +281,64 @@ class SMCWorkerV2(EAGLEWorkerV2):
                     last_token_ids,
                 )
 
-        (
-            accept_lens,
-            committed_seq_lens,
-            next_last_token_ids,
-            smc_logprob_diffs,
-            score_can_run_cuda_graph,
-        ) = self._run_score_batch(
-            base_model_worker_batch=(
-                batch if is_overlap_batch else batch.get_model_worker_batch()
-            ),
-            draft_committed_lens=draft_committed_lens,
-            anchor_token_ids=last_token_ids,
-            draft_tokens=draft_tokens,
-            draft_logprobs=draft_logprobs,
-            draft_lengths=draft_lengths,
-        )
+        committed_seq_lens_cpu = None
+        verify_done = None
+        if is_overlap_batch:
+            committed_seq_lens = visible_seq_lens + draft_lengths
+
+            score_token_num = self.server_args.speculative_num_draft_tokens
+            score_tokens = torch.cat(
+                [last_token_ids.unsqueeze(1), draft_tokens],
+                dim=1,
+            )[:, :score_token_num]
+            if score_tokens.shape[1] < score_token_num:
+                pad = score_tokens[:, -1:].expand(
+                    -1, score_token_num - score_tokens.shape[1]
+                )
+                score_tokens = torch.cat([score_tokens, pad], dim=1)
+
+            safe_last_indices = torch.clamp(
+                draft_lengths.to(torch.int64) - 1,
+                min=0,
+            )
+            gathered_last_tokens = score_tokens[:, 1:].gather(
+                1, safe_last_indices.unsqueeze(1)
+            ).squeeze(1)
+            next_last_token_ids = torch.where(
+                draft_lengths > 0,
+                gathered_last_tokens,
+                score_tokens[:, 0],
+            )
+            accept_lens = draft_lengths
+            committed_seq_lens_cpu = committed_seq_lens.to("cpu")
+            # Downstream schedule-stream mutations only need draft metadata ready;
+            # verify keeps running and is consumed later behind copy_done.
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+            smc_logprob_diffs, score_can_run_cuda_graph = self._run_score_batch(
+                base_model_worker_batch=batch,
+                draft_committed_lens=draft_committed_lens,
+                anchor_token_ids=last_token_ids,
+                draft_tokens=draft_tokens,
+                draft_logprobs=draft_logprobs,
+                draft_lengths=draft_lengths,
+                logprob_only=True,
+            )
+        else:
+            (
+                accept_lens,
+                committed_seq_lens,
+                next_last_token_ids,
+                smc_logprob_diffs,
+                score_can_run_cuda_graph,
+            ) = self._run_score_batch(
+                base_model_worker_batch=batch.get_model_worker_batch(),
+                draft_committed_lens=draft_committed_lens,
+                anchor_token_ids=last_token_ids,
+                draft_tokens=draft_tokens,
+                draft_logprobs=draft_logprobs,
+                draft_lengths=draft_lengths,
+            )
 
         stride = self.server_args.speculative_num_draft_tokens
         flat_predict = torch.zeros(
@@ -261,15 +348,11 @@ class SMCWorkerV2(EAGLEWorkerV2):
         )
         flat_predict[:, : draft_tokens.shape[1]] = draft_tokens
 
-        verify_done = None
-        if is_overlap_batch:
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
-
         next_draft_input = SMCDraftInput(
             last_token_ids=next_last_token_ids,
             new_seq_lens=committed_seq_lens,
             verify_done=verify_done,
+            committed_seq_lens_cpu=committed_seq_lens_cpu,
         )
         return GenerationBatchResult(
             logits_output=self._empty_logits_output() if is_overlap_batch else None,
@@ -300,9 +383,16 @@ class SMCWorkerV2(EAGLEWorkerV2):
         self, batch: ModelWorkerBatch, result: GenerationBatchResult
     ) -> SMCDraftInput:
         assert result.next_token_ids is not None
+        next_seq_lens = batch.seq_lens + 1
+        next_seq_lens_cpu = (
+            batch.seq_lens_cpu + 1
+            if batch.seq_lens_cpu is not None
+            else next_seq_lens.cpu()
+        )
         return SMCDraftInput(
             last_token_ids=result.next_token_ids,
-            new_seq_lens=batch.seq_lens + 1,
+            new_seq_lens=next_seq_lens,
+            committed_seq_lens_cpu=next_seq_lens_cpu,
         )
 
     def _ensure_draft_prefix_filled(
@@ -451,11 +541,48 @@ class SMCWorkerV2(EAGLEWorkerV2):
                 last_token_ids,
             )
         token_matrix, logprob_matrix = runner.replay(forward_batch)
-        bs = token_matrix.shape[0]
-        draft_lengths = torch.full(
-            (bs,), self.smc_gamma, dtype=torch.int32, device=self.device
+        for req in reqs:
+            # Fused replay keeps the accepted draft prefix resident in KV, so
+            # the next draft iteration can continue without a prefix refill.
+            req.draft_prefix_materialized = True
+        current_output_lens = torch.tensor(
+            [
+                int(visible_seq_len) - len(req.origin_input_ids)
+                for req, visible_seq_len in zip(
+                    reqs, visible_seq_lens.tolist(), strict=True
+                )
+            ],
+            dtype=torch.int64,
+            device=self.device,
         )
-        draft_logprobs = logprob_matrix.sum(dim=1)
+        draft_lengths, _draft_finished, draft_logprobs = resolve_smc_proposal_batch(
+            reqs,
+            token_matrix,
+            logprob_matrix,
+            current_output_lens,
+        )
+        _append_smc_diag_record(
+            {
+                "type": "draft_result",
+                "mode": "fused",
+                "group_ids": [getattr(req, "smc_group_id", None) for req in reqs],
+                "prompt_prefixes": [
+                    getattr(req, "origin_input_text", None)[:80]
+                    if getattr(req, "origin_input_text", None) is not None
+                    else None
+                    for req in reqs
+                ],
+                "particle_indices": [
+                    getattr(req, "smc_particle_idx", None) for req in reqs
+                ],
+                "visible_seq_lens": visible_seq_lens.tolist(),
+                "last_token_ids": last_token_ids.tolist(),
+                "draft_tokens": token_matrix.tolist(),
+                "draft_lengths": draft_lengths.tolist(),
+                "draft_logprobs": [float(x) for x in draft_logprobs.tolist()],
+                "can_run_cuda_graph": bool(can_cuda_graph),
+            }
+        )
         return token_matrix, draft_logprobs, draft_lengths, True
 
     def _run_stepwise_draft_reqs(
@@ -573,16 +700,20 @@ class SMCWorkerV2(EAGLEWorkerV2):
                 current_prefix = current_indices[:snapshot_allocated_len]
                 changed_mask = current_prefix != snapshot_indices
                 if bool(changed_mask.any().item()):
-                    indices_to_free.append(current_prefix[changed_mask])
+                    changed_indices = current_prefix[changed_mask]
+                    changed_indices = changed_indices[changed_indices != 0]
+                    if changed_indices.numel() > 0:
+                        indices_to_free.append(changed_indices)
                     self.req_to_token_pool.write(
                         (req.req_pool_idx, slice(0, snapshot_allocated_len)),
                         snapshot_indices.to(dtype=torch.int32),
                     )
 
             if current_allocated_len > snapshot_allocated_len:
-                indices_to_free.append(
-                    current_indices[snapshot_allocated_len:current_allocated_len]
-                )
+                tail_indices = current_indices[snapshot_allocated_len:current_allocated_len]
+                tail_indices = tail_indices[tail_indices != 0]
+                if tail_indices.numel() > 0:
+                    indices_to_free.append(tail_indices)
 
             if indices_to_free:
                 self.token_to_kv_pool_allocator.dec_ref_and_free(
@@ -597,6 +728,32 @@ class SMCWorkerV2(EAGLEWorkerV2):
             req.finished_output = snapshot["finished_output"]
             req.to_finish = snapshot["to_finish"]
             req.decode_batch_idx = snapshot["decode_batch_idx"]
+            # Stepwise draft restores the pre-proposal KV snapshot, so the
+            # newly committed prefix is no longer materialized for draft decode.
+            req.draft_prefix_materialized = False
+
+        _append_smc_diag_record(
+            {
+                "type": "draft_result",
+                "mode": "stepwise",
+                "group_ids": [getattr(req, "smc_group_id", None) for req in reqs],
+                "prompt_prefixes": [
+                    getattr(req, "origin_input_text", None)[:80]
+                    if getattr(req, "origin_input_text", None) is not None
+                    else None
+                    for req in reqs
+                ],
+                "particle_indices": [
+                    getattr(req, "smc_particle_idx", None) for req in reqs
+                ],
+                "visible_seq_lens": visible_seq_lens.tolist(),
+                "last_token_ids": seed_token_ids,
+                "draft_tokens": draft_tokens.tolist(),
+                "draft_lengths": draft_lengths.tolist(),
+                "draft_logprobs": [float(x) for x in draft_logprobs.tolist()],
+                "can_run_cuda_graph": bool(can_run_cuda_graph),
+            }
+        )
 
         return (
             draft_tokens,
@@ -613,6 +770,7 @@ class SMCWorkerV2(EAGLEWorkerV2):
         draft_tokens: torch.Tensor,
         draft_logprobs: torch.Tensor,
         draft_lengths: torch.Tensor,
+        logprob_only: bool = False,
     ):
         model_worker_batch = self._make_score_model_worker_batch(
             base_model_worker_batch=base_model_worker_batch,
@@ -650,14 +808,71 @@ class SMCWorkerV2(EAGLEWorkerV2):
                 )
                 .view_as(forward_output.logits_output.next_token_logits)
             )
+        if logprob_only:
+            smc_logprob_diffs = score_input.compute_logprob_diffs(
+                model_worker_batch,
+                forward_output.logits_output,
+            )
+            _append_smc_diag_record(
+                {
+                    "type": "score_result",
+                    "mode": "logprob_only",
+                    "group_ids": [
+                        getattr(req, "smc_group_id", None)
+                        for req in getattr(base_model_worker_batch, "reqs", [])
+                    ],
+                    "prompt_prefixes": [
+                        getattr(req, "origin_input_text", None)[:80]
+                        if getattr(req, "origin_input_text", None) is not None
+                        else None
+                        for req in getattr(base_model_worker_batch, "reqs", [])
+                    ],
+                    "particle_indices": [
+                        getattr(req, "smc_particle_idx", None)
+                        for req in getattr(base_model_worker_batch, "reqs", [])
+                    ],
+                    "target_temperature": float(score_input.target_temperature),
+                    "draft_lengths": draft_lengths.tolist(),
+                    "draft_logprobs": [float(x) for x in draft_logprobs.tolist()],
+                    "smc_logprob_diffs": [float(x) for x in smc_logprob_diffs.tolist()],
+                    "can_run_cuda_graph": bool(can_run_cuda_graph),
+                }
+            )
+            return smc_logprob_diffs, can_run_cuda_graph
+
         (
             accept_lens,
             committed_seq_lens,
             next_last_token_ids,
             smc_logprob_diffs,
-        ) = score_input.sample(
-            model_worker_batch,
-            forward_output.logits_output,
+        ) = score_input.sample(model_worker_batch, forward_output.logits_output)
+        _append_smc_diag_record(
+                {
+                    "type": "score_result",
+                    "mode": "sample",
+                    "group_ids": [
+                        getattr(req, "smc_group_id", None)
+                        for req in getattr(base_model_worker_batch, "reqs", [])
+                    ],
+                    "prompt_prefixes": [
+                        getattr(req, "origin_input_text", None)[:80]
+                        if getattr(req, "origin_input_text", None) is not None
+                        else None
+                        for req in getattr(base_model_worker_batch, "reqs", [])
+                    ],
+                    "particle_indices": [
+                        getattr(req, "smc_particle_idx", None)
+                        for req in getattr(base_model_worker_batch, "reqs", [])
+                ],
+                "target_temperature": float(score_input.target_temperature),
+                "draft_lengths": draft_lengths.tolist(),
+                "draft_logprobs": [float(x) for x in draft_logprobs.tolist()],
+                "accept_lens": accept_lens.tolist(),
+                "committed_seq_lens": committed_seq_lens.tolist(),
+                "next_last_token_ids": next_last_token_ids.tolist(),
+                "smc_logprob_diffs": [float(x) for x in smc_logprob_diffs.tolist()],
+                "can_run_cuda_graph": bool(can_run_cuda_graph),
+            }
         )
         return (
             accept_lens,
@@ -713,6 +928,55 @@ class SMCWorkerV2(EAGLEWorkerV2):
         else:
             seq_lens_cpu = base_model_worker_batch.seq_lens_cpu - 1
             seq_lens_sum = base_model_worker_batch.seq_lens_sum - batch_size
+        sampling_temperatures = getattr(
+            getattr(base_model_worker_batch, "sampling_info", None),
+            "temperatures",
+            None,
+        )
+        target_temperature = max(
+            float(self.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
+        )
+        batch_reqs = getattr(base_model_worker_batch, "reqs", None)
+        used_parent_target_temperature = False
+        if batch_reqs:
+            parent_target_temperatures = []
+            for req in batch_reqs:
+                parent_req = getattr(req, "smc_parent", None)
+                if parent_req is None:
+                    continue
+                parent_target_temperatures.append(
+                    compute_smc_temperature(
+                        parent_req.sampling_params.temperature,
+                        self.server_args.smc_target_temperature,
+                    )
+                )
+            if parent_target_temperatures:
+                parent_target_temperatures = torch.tensor(
+                    parent_target_temperatures,
+                    dtype=torch.float32,
+                    device=seq_lens.device,
+                )
+                if torch.allclose(
+                    parent_target_temperatures,
+                    parent_target_temperatures[:1],
+                ):
+                    target_temperature = max(
+                        float(parent_target_temperatures[0].item()),
+                        SMC_MIN_TEMPERATURE,
+                    )
+                    used_parent_target_temperature = True
+        if (
+            not used_parent_target_temperature
+            and sampling_temperatures is not None
+            and len(sampling_temperatures) > 0
+        ):
+            # (ccc) SMC verify still assumes one batch-shared target
+            # temperature. When the batch is uniform, reuse the actual request
+            # temperature when parent metadata is unavailable instead of the raw
+            # multiplier from server_args.
+            first_temperature = float(sampling_temperatures[0].item())
+            if torch.allclose(sampling_temperatures, sampling_temperatures[:1]):
+                target_temperature = max(first_temperature, SMC_MIN_TEMPERATURE)
         use_linear_target_verify = self.server_args.attention_backend in {
             "flashinfer",
             "triton",
@@ -729,12 +993,7 @@ class SMCWorkerV2(EAGLEWorkerV2):
             positions=build_smc_positions(seq_lens, score_token_num),
             custom_mask=custom_mask,
             draft_token_num=score_token_num,
-            # (ccc) SMC target verify intentionally uses one global target
-            # temperature. Do not reintroduce per-request verify temperatures
-            # without updating both the eager and CUDA-graph paths together.
-            target_temperature=max(
-                float(self.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
-            ),
+            target_temperature=target_temperature,
             linear_target_verify=use_linear_target_verify,
         )
         return dataclasses.replace(
@@ -770,11 +1029,7 @@ class SMCWorkerV2(EAGLEWorkerV2):
         )
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        batch.orig_seq_lens = torch.tensor(
-            [len(req.origin_input_ids) for req in reqs],
-            dtype=torch.int32,
-            device=self.device,
-        )
+        batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
         batch.output_ids = torch.tensor(
             [req.output_ids[-1] for req in reqs],
             dtype=torch.int64,
@@ -793,14 +1048,23 @@ class SMCWorkerV2(EAGLEWorkerV2):
         ].to(dtype=torch.int64, copy=True)
         batch.prepare_for_decode()
         new_out_cache_loc = batch.out_cache_loc
-        self.req_to_token_pool.write(
-            (batch.req_pool_indices, decode_locs),
-            reserved_out_cache_loc.to(dtype=torch.int32),
+        reuse_reserved_mask = reserved_out_cache_loc != 0
+        if bool(reuse_reserved_mask.any().item()):
+            reused_req_pool_indices = batch.req_pool_indices[reuse_reserved_mask]
+            reused_decode_locs = decode_locs[reuse_reserved_mask]
+            reused_reserved_out_cache_loc = reserved_out_cache_loc[reuse_reserved_mask]
+            self.req_to_token_pool.write(
+                (reused_req_pool_indices, reused_decode_locs),
+                reused_reserved_out_cache_loc.to(dtype=torch.int32),
+            )
+            self.token_to_kv_pool_allocator.dec_ref_and_free(
+                new_out_cache_loc[reuse_reserved_mask].to(dtype=torch.int64, copy=True)
+            )
+        batch.out_cache_loc = torch.where(
+            reuse_reserved_mask,
+            reserved_out_cache_loc,
+            new_out_cache_loc,
         )
-        self.token_to_kv_pool_allocator.dec_ref_and_free(
-            new_out_cache_loc.to(dtype=torch.int64, copy=True)
-        )
-        batch.out_cache_loc = reserved_out_cache_loc
 
         for req in reqs:
             req.kv_allocated_len = max(

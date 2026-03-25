@@ -23,6 +23,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.smc_info import (
+    SMCDraftInput,
     _release_internal_req,
     _release_smc_parent_req,
     cleanup_smc_request_state,
@@ -722,6 +723,34 @@ class SchedulerOutputProcessorMixin:
                         ),
                     )
                 )
+
+        if batch.spec_algorithm.is_smc() and not self.enable_overlap and batch.reqs:
+            refreshed_seq_lens_cpu = torch.tensor(
+                [
+                    len(req.origin_input_ids) + len(req.output_ids)
+                    for req in batch.reqs
+                ],
+                dtype=torch.int64,
+            )
+            refreshed_last_token_ids = torch.tensor(
+                [
+                    req.output_ids[-1]
+                    if req.output_ids
+                    else req.origin_input_ids[-1]
+                    for req in batch.reqs
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            batch.seq_lens_cpu = refreshed_seq_lens_cpu
+            batch.seq_lens = refreshed_seq_lens_cpu.to(device=self.device)
+            batch.seq_lens_sum = int(refreshed_seq_lens_cpu.sum().item())
+            batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            batch.output_ids = refreshed_last_token_ids
+            if isinstance(batch.spec_info, SMCDraftInput):
+                batch.spec_info.last_token_ids = refreshed_last_token_ids
+                batch.spec_info.new_seq_lens = batch.seq_lens
+                batch.spec_info.committed_seq_lens_cpu = refreshed_seq_lens_cpu
 
         self.stream_output(batch.reqs, batch.return_logprob)
         if smc_finalized_reqs:

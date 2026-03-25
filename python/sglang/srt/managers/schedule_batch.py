@@ -2194,7 +2194,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         v1_spec_info_filtered: Optional[bool] = False,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
+        # The batch has been launched but we need launch-produced draft metadata
+        # to be ready before filtering or merging.
         self.maybe_wait_verify_done()
 
         if keep_indices is None:

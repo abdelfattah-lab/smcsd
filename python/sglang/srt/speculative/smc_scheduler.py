@@ -1,20 +1,49 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
 from collections import deque
 from dataclasses import dataclass, field
+import time
 from typing import Deque, Dict, List, Optional, Set
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, SMCGroupSpan, ScheduleBatch
 from sglang.srt.speculative.smc_info import (
+    effective_sample_size,
     get_smc_reserved_kv_len,
     multinomial_resample,
     normalize_log_weights,
     set_smc_reserved_kv_len,
     systematic_resample,
 )
+
+_SMC_PROBE_RECORD_PATH_ENV = "SGLANG_SMC_PROBE_RECORD_PATH"
+_SMC_DIAG_PATH_ENV = "SGLANG_SMC_DIAG_PATH"
+
+
+def _append_smc_probe_record(record: dict) -> None:
+    record_path = os.environ.get(_SMC_PROBE_RECORD_PATH_ENV)
+    if not record_path:
+        return
+    payload = dict(record)
+    payload["pid"] = os.getpid()
+    payload["timestamp_ns"] = time.perf_counter_ns()
+    with open(record_path, "a", encoding="utf-8") as fout:
+        fout.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _append_smc_diag_record(record: dict) -> None:
+    record_path = os.environ.get(_SMC_DIAG_PATH_ENV)
+    if not record_path:
+        return
+    payload = dict(record)
+    payload["pid"] = os.getpid()
+    payload["timestamp_ns"] = time.perf_counter_ns()
+    with open(record_path, "a", encoding="utf-8") as fout:
+        fout.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 @dataclass
@@ -86,15 +115,42 @@ class SMCScheduler:
         are visible to batch selection.
         """
         self._sync_completed_resamples(scheduler)
+        # Stall and launch resamples before selecting the next batch. The
+        # resample path trims overallocated tails and rewrites req_to_token
+        # entries, so doing it after the next decode launch can mutate KV
+        # reservations that the in-flight forward is still consuming.
+        self._launch_pending_resamples(scheduler)
         self._drain_wait_for_running(scheduler)
 
     def step_after_forward(self, scheduler) -> None:
-        """Launch async KV copies on resample_stream.
+        """Resample launches happen in step_before_forward.
 
-        Should run AFTER run_batch() so that copies overlap with the GPU
-        forward pass on the compute stream.
+        Keeping the launch there guarantees stalled groups are removed from
+        running_batch before batch selection, while the queued resample-stream
+        work still overlaps with the forward that follows.
         """
+
+    def finish_pending_before_idle(self, scheduler) -> bool:
+        """Drain pending resamples before the scheduler declares itself idle.
+
+        Pending resamples temporarily rewrite req_to_token rows before
+        _complete_resample() applies the matching allocator refcount updates.
+        If the overlap loop runs its idle memory check in that window, the KV
+        pool looks artificially short. When there is no forward to overlap
+        against, block here, complete the pending work, and let the next loop
+        iteration observe the resumed requests.
+        """
+        had_pending_work = bool(self.pending_resamples or self._groups_needing_resample)
+        if not had_pending_work:
+            return False
+
         self._launch_pending_resamples(scheduler)
+        for group_id, pending in list(self.pending_resamples.items()):
+            if pending.done_event is not None:
+                pending.done_event.synchronize()
+            self._complete_resample(group_id, pending, scheduler)
+        self._drain_wait_for_running(scheduler)
+        return True
 
     def on_batch_done(
         self,
@@ -238,6 +294,16 @@ class SMCScheduler:
             for p in pidxs:
                 group.step_counts[p] += 1
 
+        _append_smc_diag_record(
+            {
+                "type": "group_update",
+                "group_id": group.group_id,
+                "particle_indices": [req.smc_particle_idx for req in reqs],
+                "logprob_diffs": [float(x) for x in logprob_diffs.tolist()],
+                "step_counts": list(group.step_counts),
+            }
+        )
+
         if not group.all_active_aligned():
             return None
 
@@ -272,8 +338,37 @@ class SMCScheduler:
 
             # Apply deferred log_weight updates before sampling ancestors
             group.flush_pending_diffs()
+            normalized_weights = normalize_log_weights(
+                group.log_weights[active_indices],
+                device=self.device,
+            )
+            ess = effective_sample_size(normalized_weights, device=self.device)
+            _append_smc_diag_record(
+                {
+                    "type": "resample_check",
+                    "group_id": group.group_id,
+                    "active_indices": list(active_indices),
+                    "log_weights": [
+                        float(x) for x in group.log_weights[active_indices].tolist()
+                    ],
+                    "normalized_weights": [
+                        float(x) for x in normalized_weights.tolist()
+                    ],
+                    "ess": float(ess),
+                }
+            )
+            if ess >= len(active_indices) * self.smc_manager.server_args.smc_resample_threshold:
+                continue
 
             ancestors = self._sample_ancestors(group, active_indices)
+            _append_smc_diag_record(
+                {
+                    "type": "resample_choice",
+                    "group_id": group.group_id,
+                    "active_indices": list(active_indices),
+                    "ancestors": list(ancestors),
+                }
+            )
             active_tensor = torch.tensor(
                 active_indices,
                 dtype=torch.int64,
@@ -489,6 +584,14 @@ class SMCScheduler:
         scheduler,
         pending: PendingResample,
     ) -> None:
+        _append_smc_probe_record(
+            {
+                "type": "resample_launch",
+                "group_id": group.group_id,
+                "active_particles": len(group.active_particle_indices()),
+                "num_evictions": len(evictions),
+            }
+        )
         req_to_token = scheduler.req_to_token_pool.req_to_token
         staged_snapshots: Dict[int, dict] = {}
         staged_copies: Dict[int, torch.Tensor] = {}

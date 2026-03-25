@@ -1354,6 +1354,15 @@ class Scheduler(
                     pop_and_process()
                     processed_last_batch = True
                 elif batch is None:
+                    if (
+                        self.smc_scheduler is not None
+                        and self.smc_scheduler.finish_pending_before_idle(self)
+                    ):
+                        # The loop is going around again without launching a new
+                        # batch, so clear last_batch now instead of leaving a
+                        # stale processed batch behind for the next iteration.
+                        self.last_batch = batch
+                        continue
                     # When the server is idle, do self-check and re-init some states
                     self.self_check_during_idle()
 
@@ -2753,7 +2762,11 @@ class Scheduler(
                 )
 
                 bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
+                future_indices = (
+                    None
+                    if self.spec_algorithm.is_smc()
+                    else self.future_map.alloc_future_indices(bs)
+                )
 
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
@@ -2766,19 +2779,26 @@ class Scheduler(
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
+                        if future_indices is not None:
+                            self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                if future_indices is not None:
+                    future_indices_or_next_token_ids = -future_indices.indices
+                else:
+                    future_indices_or_next_token_ids = (
+                        batch_result.next_draft_input.last_token_ids
+                    )
 
                 if batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
                     batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
+                    if future_indices is not None:
+                        batch.spec_info.future_indices = future_indices
 
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens

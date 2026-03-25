@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+import json
+import os
+import time
 from typing import Dict, List, Optional
 
 import torch
@@ -23,6 +26,19 @@ from sglang.srt.speculative.smc_info import (
     validate_smc_parent_req,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+_SMC_DIAG_PATH_ENV = "SGLANG_SMC_DIAG_PATH"
+
+
+def _append_smc_diag_record(record: dict) -> None:
+    record_path = os.environ.get(_SMC_DIAG_PATH_ENV)
+    if not record_path:
+        return
+    payload = dict(record)
+    payload["pid"] = os.getpid()
+    payload["timestamp_ns"] = time.perf_counter_ns()
+    with open(record_path, "a", encoding="utf-8") as fout:
+        fout.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 @dataclass
@@ -283,11 +299,7 @@ class SMCManager:
         batch.seq_lens = visible_seq_lens
         batch.seq_lens_cpu = visible_seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        batch.orig_seq_lens = torch.tensor(
-            [len(req.origin_input_ids) for req in particle_reqs],
-            dtype=torch.int32,
-            device=scheduler.device,
-        )
+        batch.orig_seq_lens = visible_seq_lens.to(dtype=torch.int32)
         last_token_ids = torch.tensor(
             [
                 req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
@@ -302,6 +314,7 @@ class SMCManager:
         batch.spec_info = SMCDraftInput(
             last_token_ids=last_token_ids,
             new_seq_lens=visible_seq_lens,
+            committed_seq_lens_cpu=batch.seq_lens_cpu,
         )
         if use_future_map and scheduler.enable_overlap and scheduler.future_map is not None:
             future_indices = scheduler.future_map.alloc_future_indices(len(particle_reqs))
@@ -360,6 +373,24 @@ class SMCManager:
                 best_output_ids = output_ids
                 best_finish_reason = finish_reason
                 best_finished_len = finished_len
+
+        _append_smc_diag_record(
+            {
+                "type": "finalize_group",
+                "group_id": group_id,
+                "log_weights": [float(x) for x in group.log_weights.tolist()],
+                "best_idx": best_idx,
+                "particle_output_ids": {
+                    str(particle_idx): (
+                        list(group.finished_particles[particle_idx].output_ids)
+                        if particle_idx in group.finished_particles
+                        else list(req.output_ids)
+                    )
+                    for particle_idx, req in group.particle_reqs.items()
+                },
+                "best_output_ids": list(best_output_ids),
+            }
+        )
 
         # Release KV cache and req_pool entries for all particle requests.
         # Particles that were already released during decode (finished early)
