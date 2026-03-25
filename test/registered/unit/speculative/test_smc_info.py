@@ -192,7 +192,7 @@ class TestSMCManagerHelpers(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1, 2: req2},
             log_weights=torch.zeros(3, dtype=torch.float64),
-            step_counts={0: 3, 1: 1, 2: 5},
+            step_counts=[3, 1, 5],
             finished_particles={
                 2: SMCFinishedParticleSnapshot(
                     output_ids=[1, 2],
@@ -354,7 +354,7 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         order = []
@@ -430,7 +430,7 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         scheduler.enqueue_group_for_running("stale")
@@ -492,14 +492,14 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: blocked_req0, 1: blocked_req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
         manager.groups["g2"] = SMCGroupState(
             group_id="g2",
             parent_req=SimpleNamespace(),
             particle_reqs={0: trailing_req0, 1: trailing_req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         scheduler.resampling_reqs["stalled"] = [SimpleNamespace(), SimpleNamespace()]
@@ -649,14 +649,14 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
         manager.groups["g2"] = SMCGroupState(
             group_id="g2",
             parent_req=SimpleNamespace(),
             particle_reqs={0: req2, 1: req3},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         with patch.object(
@@ -671,6 +671,9 @@ class TestSMCScheduler(TestCase):
 
         self.assertEqual(finalized, [])
         mock_grouped.assert_not_called()
+        # log_weight updates are deferred; flush to verify correctness
+        manager.groups["g1"].flush_pending_diffs()
+        manager.groups["g2"].flush_pending_diffs()
         self.assertTrue(
             torch.allclose(
                 manager.groups["g1"].log_weights,
@@ -683,9 +686,10 @@ class TestSMCScheduler(TestCase):
                 torch.tensor([0.3, 0.4], dtype=torch.float64),
             )
         )
-        self.assertEqual(manager.groups["g1"].step_counts, {0: 1, 1: 1})
-        self.assertEqual(manager.groups["g2"].step_counts, {0: 1, 1: 1})
-        self.assertFalse(scheduler._groups_needing_resample)
+        self.assertEqual(manager.groups["g1"].step_counts, [1, 1])
+        self.assertEqual(manager.groups["g2"].step_counts, [1, 1])
+        # Always-resample: aligned groups with >1 active particle are marked
+        self.assertEqual(scheduler._groups_needing_resample, {"g1", "g2"})
 
     @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
     def test_step_resamples_and_reinserts_group_with_matching_future_mode(
@@ -719,7 +723,7 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         req_to_token = torch.tensor(
@@ -816,7 +820,7 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         live_scheduler = SimpleNamespace(
@@ -882,7 +886,7 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         req_to_token = torch.tensor([[101, 0], [201, 0]], dtype=torch.int32)
@@ -943,7 +947,7 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         req_to_token = torch.tensor(
@@ -1022,7 +1026,7 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         req_to_token = torch.tensor([[101, 111, 0], [201, 211, 0]], dtype=torch.int32)
@@ -1091,7 +1095,7 @@ class TestSMCScheduler(TestCase):
             parent_req=SimpleNamespace(),
             particle_reqs={0: req0, 1: req1},
             log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts={0: 0, 1: 0},
+            step_counts=[0, 0],
         )
 
         req_to_token = torch.tensor([[101, 111, 0], [201, 211, 0]], dtype=torch.int32)

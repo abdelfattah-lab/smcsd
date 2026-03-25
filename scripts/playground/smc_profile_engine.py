@@ -17,11 +17,8 @@ from pathlib import Path
 from typing import Any
 
 
-LOCAL_QWEN_SNAPSHOT = Path(
-    "/home/cc2869/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/"
-    "snapshots/7ae557604adf67be50417f59c2c2f167def9a775"
-)
-DEFAULT_MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_DRAFT_MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_PROMPTS = [
     "The capital of France is",
     "Write one sentence about why overlap scheduling matters for inference systems.",
@@ -31,16 +28,17 @@ DEFAULT_PROMPTS = [
 
 
 def default_model_path() -> str:
-    if LOCAL_QWEN_SNAPSHOT.exists():
-        return str(LOCAL_QWEN_SNAPSHOT)
     return DEFAULT_MODEL_PATH
 
+def default_draft_model_path() -> str:
+    return DEFAULT_DRAFT_MODEL_PATH
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Profile overlap SMC with offline sgl.Engine()."
     )
     parser.add_argument("--model-path", default=default_model_path())
+    parser.add_argument("--draft-model-path", default=default_draft_model_path())
     parser.add_argument("--output-dir", default="/tmp/sglang-smc-profile")
     parser.add_argument("--profile-steps", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=64)
@@ -179,10 +177,12 @@ def main() -> None:
         smc_n_particles=args.smc_n_particles,
         smc_gamma=args.smc_gamma,
         page_size=1,
-        mem_fraction_static=0.40,
+        mem_fraction_static=0.6,
         trust_remote_code=True,
         log_level="info",
         random_seed=1,
+        cuda_graph_max_bs=32,
+        attention_backend="triton",
     ) as engine:
         server_info = engine.get_server_info()
         write_json(run_dir / "server_info.json", server_info)

@@ -93,7 +93,9 @@ class ProfileManager:
         raise NotImplementedError("manually start is only supported yet")
 
     def manual_stop(self):
-        raise NotImplementedError("manually stop is only supported yet")
+        if self.profiler is not None:
+            self._do_stop()
+        return ProfileReqOutput(success=True, message="Succeeded")
 
     def _do_start(self, stage: Optional[str] = None):
         logger.info(

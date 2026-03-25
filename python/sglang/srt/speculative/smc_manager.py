@@ -38,11 +38,35 @@ class SMCGroupState:
     parent_req: Req
     particle_reqs: Dict[int, Req]
     log_weights: torch.Tensor
-    step_counts: Dict[int, int] = field(default_factory=dict)
+    step_counts: List[int] = field(default_factory=list)
     resampled_at_step: int = 0
     finished_particles: Dict[int, SMCFinishedParticleSnapshot] = field(
         default_factory=dict
     )
+    # Deferred log_weight updates: list of (particle_indices, logprob_diffs)
+    # Applied lazily in _launch_pending_resamples / _finalize to keep
+    # on_batch_done 100% CPU (zero GPU kernel launches).
+    pending_diffs: List[tuple] = field(default_factory=list)
+
+    def flush_pending_diffs(self) -> None:
+        """Apply all deferred log_weight updates to the GPU tensor.
+
+        Called from _launch_pending_resamples (overlapped) or _finalize_group.
+        This is the only place GPU log_weight kernels fire.
+        """
+        if not self.pending_diffs:
+            return
+        lw = self.log_weights
+        dev = lw.device
+        for pidxs, diffs in self.pending_diffs:
+            if isinstance(pidxs, int):
+                # Single particle: pidxs is a plain int, diffs is 1-elem tensor
+                lw[pidxs] += diffs[0].to(dtype=lw.dtype, device=dev)
+            else:
+                # Multiple particles: pidxs is a Python list
+                pidx_t = torch.tensor(pidxs, dtype=torch.int64, device=dev)
+                lw[pidx_t] += diffs.to(dtype=lw.dtype, device=dev)
+        self.pending_diffs.clear()
 
     def active_particle_indices(self) -> List[int]:
         return [
@@ -57,9 +81,13 @@ class SMCGroupState:
         active = self.active_particle_indices()
         if not active:
             return True
-        counts = [self.step_counts.get(idx, 0) for idx in active]
-        # All must be at the same step and ahead of last resample point
-        return len(set(counts)) == 1 and counts[0] > self.resampled_at_step
+        first_count = self.step_counts[active[0]]
+        if first_count <= self.resampled_at_step:
+            return False
+        for idx in active[1:]:
+            if self.step_counts[idx] != first_count:
+                return False
+        return True
 
 class SMCManager:
     def __init__(self, server_args):
@@ -147,8 +175,8 @@ class SMCManager:
         active = group.active_particle_indices()
         if not active:
             return 0
-        max_step = max(counts.get(idx, 0) for idx in active)
-        return max_step - counts.get(req.smc_particle_idx, 0)
+        max_step = max(counts[idx] for idx in active)
+        return max_step - counts[req.smc_particle_idx]
 
     def get_group_lag(self, group_id: Optional[str]) -> int:
         group = self.get_group(group_id)
@@ -158,8 +186,8 @@ class SMCManager:
         if not active:
             return 0
         counts = group.step_counts
-        max_step = max(counts.get(idx, 0) for idx in active)
-        min_active_step = min(counts.get(idx, 0) for idx in active)
+        max_step = max(counts[idx] for idx in active)
+        min_active_step = min(counts[idx] for idx in active)
         return max_step - min_active_step
 
     def create_group(self, parent_req: Req, scheduler) -> Optional[str]:
@@ -220,7 +248,7 @@ class SMCManager:
                 dtype=torch.float64,
                 device=self.device,
             ),
-            step_counts={req.smc_particle_idx: 0 for req in particle_reqs},
+            step_counts=[0] * self.server_args.smc_n_particles,
         )
         self.groups[parent_req.rid] = group
         return None
@@ -305,6 +333,9 @@ class SMCManager:
         group = self.groups.pop(group_id, None)
         if group is None:
             return None
+
+        # Flush deferred log_weight diffs so best-particle selection is correct
+        group.flush_pending_diffs()
 
         best_idx = None
         best_key = None

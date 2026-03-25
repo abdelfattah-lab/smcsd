@@ -26,7 +26,7 @@ os.environ["PATH"] = f"{venv_bin}:{os.environ.get('PATH', '')}"
 import sglang as sgl
 
 
-MODEL_PATH = "/home/cc2869/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775"
+MODEL_PATH = "/home/ccchang/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775"
 DRAFT_MODEL_PATH = MODEL_PATH
 PROMPTS = [
     "The capital of France is",

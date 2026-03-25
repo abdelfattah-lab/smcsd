@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req, SMCGroupSpan, ScheduleBatch
 from sglang.srt.speculative.smc_info import (
-    effective_sample_size,
     get_smc_reserved_kv_len,
     multinomial_resample,
     normalize_log_weights,
@@ -157,13 +156,13 @@ class SMCScheduler:
             group = self.smc_manager.get_group(span.group_id)
             if group is None:
                 continue
-            finalized_req = self._apply_group_step(
+            fin = self._update_group(
                 group,
                 reqs[span.start : span.end],
                 logprob_diffs[span.start : span.end],
             )
-            if finalized_req is not None:
-                finalized_reqs.append(finalized_req)
+            if fin is not None:
+                finalized_reqs.append(fin)
         return finalized_reqs
 
     def _on_batch_done_atomic_groups(
@@ -174,13 +173,13 @@ class SMCScheduler:
     ) -> List[Req]:
         finalized_reqs: List[Req] = []
         for group, start, end in atomic_group_spans:
-            finalized_req = self._apply_group_step(
+            fin = self._update_group(
                 group,
                 reqs[start:end],
                 logprob_diffs[start:end],
             )
-            if finalized_req is not None:
-                finalized_reqs.append(finalized_req)
+            if fin is not None:
+                finalized_reqs.append(fin)
         return finalized_reqs
 
     def _on_batch_done_grouped(
@@ -206,57 +205,53 @@ class SMCScheduler:
                 dtype=torch.int64,
                 device=logprob_diffs.device,
             )
-            finalized_req = self._apply_group_step(
+            fin = self._update_group(
                 group,
                 [req for _, req in entries],
                 logprob_diffs.index_select(0, row_indices),
             )
-            if finalized_req is not None:
-                finalized_reqs.append(finalized_req)
+            if fin is not None:
+                finalized_reqs.append(fin)
 
         return finalized_reqs
 
-    def _apply_group_step(
+    def _update_group(
         self,
         group,
         reqs: List[Req],
         logprob_diffs: torch.Tensor,
     ) -> Optional[Req]:
-        particle_indices = torch.tensor(
-            [req.smc_particle_idx for req in reqs],
-            dtype=torch.int64,
-            device=group.log_weights.device,
-        )
-        group.log_weights[particle_indices] += logprob_diffs.to(
-            dtype=group.log_weights.dtype,
-            device=group.log_weights.device,
-        )
-        for req in reqs:
-            particle_idx = req.smc_particle_idx
-            group.step_counts[particle_idx] = group.step_counts.get(particle_idx, 0) + 1
+        """100% CPU — stash log_weight diffs, update step_counts, mark resample.
+
+        The GPU log_weight add is deferred to ``_launch_pending_resamples``
+        (overlapped with the next forward) or ``_finalize_group``.
+        """
+        # Stash diffs for deferred GPU application (pure Python, no torch ops)
+        n = len(reqs)
+        if n == 1:
+            idx = reqs[0].smc_particle_idx
+            group.pending_diffs.append((idx, logprob_diffs))
+            group.step_counts[idx] += 1
+        else:
+            pidxs = [req.smc_particle_idx for req in reqs]
+            group.pending_diffs.append((pidxs, logprob_diffs))
+            for p in pidxs:
+                group.step_counts[p] += 1
 
         if not group.all_active_aligned():
             return None
 
         active_indices = group.active_particle_indices()
-        if active_indices:
-            group.resampled_at_step = group.step_counts[active_indices[0]]
-            if self._should_resample(group, active_indices):
-                self._groups_needing_resample.add(group.group_id)
-            return None
+        if not active_indices:
+            return self.smc_manager._finalize_group(group.group_id)
 
-        return self.smc_manager._finalize_group(group.group_id)
-
-    def _should_resample(self, group, active_indices: List[int]) -> bool:
-        if len(active_indices) <= 1:
-            return False
-
-        normalized_weights = normalize_log_weights(
-            group.log_weights[active_indices],
-            device=self.device,
-        )
-        ess = effective_sample_size(normalized_weights, device=self.device)
-        return ess < len(active_indices) * self.smc_manager.server_args.smc_resample_threshold
+        group.resampled_at_step = group.step_counts[active_indices[0]]
+        # Always mark for resampling — the overlapped
+        # _launch_pending_resamples will no-op (no evictions) when
+        # weights are uniform, so there is no wasted KV work.
+        if len(active_indices) > 1:
+            self._groups_needing_resample.add(group.group_id)
+        return None
 
     def _launch_pending_resamples(self, scheduler) -> None:
         group_ids = list(self._groups_needing_resample)
@@ -272,7 +267,11 @@ class SMCScheduler:
 
             active_indices = group.active_particle_indices()
             if len(active_indices) <= 1:
+                group.flush_pending_diffs()
                 continue
+
+            # Apply deferred log_weight updates before sampling ancestors
+            group.flush_pending_diffs()
 
             ancestors = self._sample_ancestors(group, active_indices)
             active_tensor = torch.tensor(

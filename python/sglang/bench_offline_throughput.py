@@ -53,6 +53,8 @@ class BenchArgs:
     extra_request_body: Optional[str] = None
     apply_chat_template: bool = False
     profile: bool = False
+    profile_num_steps: Optional[int] = None
+    profile_decode_only: bool = False
     skip_warmup: bool = False
     do_not_exit: bool = False
     prompt_suffix: str = ""
@@ -170,6 +172,17 @@ class BenchArgs:
             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
+            "--profile-num-steps",
+            type=int,
+            default=None,
+            help="Number of forward steps to profile. Default profiles all steps.",
+        )
+        parser.add_argument(
+            "--profile-decode-only",
+            action="store_true",
+            help="Only profile decode steps. Requires SGLANG_PROFILE_V2=1.",
+        )
+        parser.add_argument(
             "--skip-warmup",
             action="store_true",
             help="Skip the warmup batches.",
@@ -210,6 +223,8 @@ def throughput_test_once(
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
+    profile_num_steps: Optional[int] = None,
+    profile_decode_only: bool = False,
     return_logprob: bool = False,
     logprob_start_len: int = -1,
 ):
@@ -241,7 +256,13 @@ def throughput_test_once(
             "SGLANG_TORCH_PROFILER_DIR" in os.environ
         ), "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile()
+        profile_kwargs = {}
+        if profile_num_steps is not None:
+            profile_kwargs["num_steps"] = profile_num_steps
+        if profile_decode_only:
+            profile_kwargs["profile_by_stage"] = True
+            profile_kwargs["profile_stages"] = ["decode"]
+        backend.start_profile(**profile_kwargs)
 
     st = time.perf_counter()
     gen_out = backend.generate(
@@ -395,6 +416,9 @@ def throughput_test(
     server_args: ServerArgs,
     bench_args: BenchArgs,
 ):
+    if bench_args.profile:
+        os.environ.setdefault("SGLANG_PROFILE_V2", "1")
+
     if bench_args.backend == "engine":
         if server_args.use_ray:
             backend = _create_ray_engine_backend(server_args)
@@ -455,6 +479,8 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
+        profile_num_steps=bench_args.profile_num_steps,
+        profile_decode_only=bench_args.profile_decode_only,
         return_logprob=bench_args.return_logprob,
         logprob_start_len=bench_args.logprob_start_len,
     )
