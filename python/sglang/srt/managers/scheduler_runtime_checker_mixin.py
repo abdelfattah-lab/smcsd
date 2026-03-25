@@ -184,10 +184,14 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
         session_held = self._session_held_tokens()
-        memory_leak = (available_size + evictable_size) != (
+        smc_held = 0
+        smc_manager = getattr(self, "smc_manager", None)
+        if smc_manager is not None:
+            smc_held = smc_manager.smc_held_token_count()
+        memory_leak = (available_size + evictable_size + smc_held) != (
             self.max_total_num_tokens - protected_size - session_held
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
+        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}, {smc_held=}\n"
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
@@ -236,12 +240,17 @@ class SchedulerRuntimeCheckerMixin:
             logger.info(log_msg)
 
         session_held = self._session_held_tokens()
+        smc_held = 0
+        smc_manager = getattr(self, "smc_manager", None)
+        if smc_manager is not None:
+            smc_held = smc_manager.smc_held_token_count()
         total_tokens = (
             available_size
             + evictable_size
             + protected_size
             + uncached_size
             + session_held
+            + smc_held
         )
         assert (
             total_tokens == self.max_total_num_tokens
@@ -256,11 +265,24 @@ class SchedulerRuntimeCheckerMixin:
             req_total_size = self.req_to_token_pool.size
 
         session_req_count = self._session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
+        smc_req_count = 0
+        smc_manager = getattr(self, "smc_manager", None)
+        if smc_manager is not None:
+            for group in smc_manager.groups.values():
+                for req in group.particle_reqs.values():
+                    if req.req_pool_idx is not None:
+                        smc_req_count += 1
+        if (
+            len(self.req_to_token_pool.free_slots)
+            + session_req_count
+            + smc_req_count
+            != req_total_size
+        ):
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"session_held={session_req_count}, "
+                f"smc_held={smc_req_count}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise_error_or_warn(
