@@ -44,8 +44,6 @@ class SMCDraftWorker(StandaloneDraftWorker):
     """StandaloneDraftWorker with SMC-specific attention backend and CUDA graphs."""
 
     def init_attention_backend(self):
-        # SMC needs the draft model's device graphs before the attention backend.
-        self.draft_runner.init_device_graphs()
         super().init_attention_backend()
         self.smc_draft_attn_backend = None
         if self.server_args.smc_gamma > 1:

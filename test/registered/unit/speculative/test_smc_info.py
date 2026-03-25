@@ -1809,7 +1809,7 @@ class TestSMCDecodeOutputProcessor(TestCase):
                 is_none=lambda: False,
                 is_smc=lambda: True,
             ),
-            is_spec_v2=True,
+            is_spec_v2=False,
             return_logprob=False,
             batch_size=lambda: 1,
         )

@@ -441,9 +441,14 @@ class SchedulerOutputProcessorMixin:
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
-        assert result.next_token_ids.is_cpu
-        assert result.accept_lens.is_cpu
+        """Resolve batched accept-lens token ids for speculative decoding.
+
+        Overlap scheduling copies these tensors to CPU ahead of time. The
+        synchronous SMC path does not, so this helper must also tolerate GPU
+        tensors there.
+        """
+        assert result.next_token_ids is not None
+        assert result.accept_lens is not None
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
@@ -494,9 +499,10 @@ class SchedulerOutputProcessorMixin:
         smc_logprob_diffs = None
         smc_filtered_reqs: Optional[List[Req]] = None
         smc_filtered_rows: Optional[List[int]] = None
+        uses_batched_decode_result = batch.is_spec_v2 or batch.spec_algorithm.is_smc()
 
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
+        if batch.spec_algorithm.is_none() or uses_batched_decode_result:
+            if uses_batched_decode_result:
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
             else:
                 next_token_ids = next_token_ids.tolist()
@@ -565,8 +571,8 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
-            elif batch.is_spec_v2:
-                # Only spec v2's output_ids are updated here.
+            elif uses_batched_decode_result:
+                # Spec v2 and SMC both return a batched accept-lens decode result.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
@@ -679,8 +685,8 @@ class SchedulerOutputProcessorMixin:
                     if batch.spec_algorithm.is_none():
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
+                    elif uses_batched_decode_result:
+                        # Speculative decode: next_token_id is a list of accepted tokens.
                         for token_id in next_token_id:
                             req.grammar.accept_token(token_id)
                 except ValueError as e:

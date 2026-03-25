@@ -5,13 +5,34 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.speculative.smc_info import set_smc_reserved_kv_len
-from sglang.srt.speculative.smc_worker_v2 import SMCWorkerV2
+from sglang.srt.speculative.smc_worker_v2 import SMCDraftWorker, SMCWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
 
 
 class TestSMCWorkerV2(TestCase):
+    @patch("sglang.srt.speculative.smc_worker_v2.DraftBackendFactory")
+    @patch("sglang.srt.speculative.smc_worker_v2.StandaloneDraftWorker.init_attention_backend")
+    def test_smc_draft_worker_does_not_capture_generic_draft_graphs(
+        self,
+        mock_standalone_init_attention_backend,
+        mock_draft_backend_factory,
+    ):
+        fake_backend = MagicMock()
+        mock_draft_backend_factory.return_value.create_decode_backend.return_value = (
+            fake_backend
+        )
+        worker = object.__new__(SMCDraftWorker)
+        worker.draft_runner = SimpleNamespace(init_device_graphs=MagicMock())
+        worker.server_args = SimpleNamespace(smc_gamma=3)
+
+        SMCDraftWorker.init_attention_backend(worker)
+
+        worker.draft_runner.init_device_graphs.assert_not_called()
+        mock_standalone_init_attention_backend.assert_called_once_with()
+        self.assertIs(worker.smc_draft_attn_backend, fake_backend)
+
     @patch("sglang.srt.speculative.smc_worker_v2.SamplingBatchInfo.from_schedule_batch")
     @patch("sglang.srt.speculative.smc_worker_v2.ScheduleBatch.init_new")
     def test_make_decode_batch_reuses_reserved_slots(
