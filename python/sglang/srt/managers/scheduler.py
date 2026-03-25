@@ -2693,6 +2693,12 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
+            # SMC NOTE: Re-queuing retracted SMC particles is NOT fully
+            # functional. Retracted particles will re-prefill independently but
+            # the SMC group's log_weights, step_counts, and resampling state
+            # are not reset or reconciled. This leads to group-level
+            # inconsistencies (e.g., divergent step counts, stale weights).
+            # A proper fix requires atomic group retract/re-admit.
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
         else:
