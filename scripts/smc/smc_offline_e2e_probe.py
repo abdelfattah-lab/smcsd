@@ -7,8 +7,8 @@ they overlap with the GPU forward pass.
 
 Usage:
   source .venv/bin/activate
-  python tasks/smc_offline_e2e_probe.py
-  python tasks/smc_offline_e2e_probe.py --attention-backend flashinfer
+  python scripts/smc/smc_offline_e2e_probe.py
+  python scripts/smc/smc_offline_e2e_probe.py --attention-backend flashinfer
 """
 
 import argparse
@@ -23,8 +23,6 @@ from typing import Optional
 os.environ.setdefault("SGLANG_ENABLE_SPEC_V2", "1")
 venv_bin = str(Path(sys.executable).resolve().parent)
 os.environ["PATH"] = f"{venv_bin}:{os.environ.get('PATH', '')}"
-
-import sglang as sgl
 
 
 MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -42,6 +40,10 @@ DEFAULT_SAMPLING_PARAMS = {
     "ignore_eos": True,
 }
 PROBE_RECORD_PATH_ENV = "SGLANG_SMC_PROBE_RECORD_PATH"
+DEFAULT_CORRECTNESS_PROMPT_REPEAT = 1
+DEFAULT_STRESS_PROMPT_REPEAT = 3
+CORRECTNESS_SUITE = "correctness"
+STRESS_SUITE = "stress"
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +159,71 @@ def _report_overlap(record_path: Optional[Path]) -> bool:
     return True
 
 
-def _build_prompts(prompt_repeat: int) -> list[str]:
+def _default_prompt_repeat(suite: str) -> int:
+    if suite == CORRECTNESS_SUITE:
+        return DEFAULT_CORRECTNESS_PROMPT_REPEAT
+    return DEFAULT_STRESS_PROMPT_REPEAT
+
+
+def _should_annotate_prompts(suite: str, annotate_prompts: bool) -> bool:
+    return annotate_prompts or suite == STRESS_SUITE
+
+
+def _default_cuda_graph_max_bs(
+    suite: str,
+    prompt_count: int,
+    smc_n_particles: int,
+) -> int:
+    if suite == CORRECTNESS_SUITE:
+        return max(4, prompt_count * smc_n_particles)
+    return 4
+
+
+def _build_prompts(prompt_repeat: int, annotate_prompts: bool) -> list[str]:
     prompts = []
     for repeat_idx in range(prompt_repeat):
         for base_idx, prompt in enumerate(BASE_PROMPTS, start=1):
-            prompts.append(
-                f"[probe batch {repeat_idx + 1} item {base_idx}] {prompt}"
-            )
+            if annotate_prompts:
+                prompts.append(
+                    f"[probe batch {repeat_idx + 1} item {base_idx}] {prompt}"
+                )
+            else:
+                prompts.append(prompt)
     return prompts
+
+
+def _build_engine_kwargs(args, prompt_count: int) -> dict:
+    cuda_graph_max_bs = (
+        args.cuda_graph_max_bs
+        if args.cuda_graph_max_bs is not None
+        else _default_cuda_graph_max_bs(
+            args.suite,
+            prompt_count=prompt_count,
+            smc_n_particles=args.smc_n_particles,
+        )
+    )
+
+    engine_kwargs = dict(
+        model_path=args.model_path,
+        speculative_algorithm="SMC",
+        speculative_draft_model_path=(
+            args.draft_model_path
+            if args.draft_model_path is not None
+            else args.model_path
+        ),
+        smc_n_particles=args.smc_n_particles,
+        smc_gamma=args.smc_gamma,
+        smc_draft_temperature=args.smc_draft_temperature,
+        page_size=1,
+        cuda_graph_max_bs=cuda_graph_max_bs,
+        mem_fraction_static=0.45,
+        trust_remote_code=True,
+        log_level="info",
+        attention_backend="triton",
+    )
+    if args.attention_backend is not None:
+        engine_kwargs["attention_backend"] = args.attention_backend
+    return engine_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +233,16 @@ def _build_prompts(prompt_repeat: int) -> list[str]:
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--suite",
+        choices=[CORRECTNESS_SUITE, STRESS_SUITE],
+        default=CORRECTNESS_SUITE,
+        help=(
+            "Probe suite to run. 'correctness' keeps the base prompts clean and "
+            "sizes CUDA-graph capture for the current SMC batch; 'stress' repeats "
+            "and annotates prompts to force a larger overlap batch."
+        ),
+    )
     parser.add_argument(
         "--model-path",
         type=str,
@@ -195,8 +264,11 @@ def parse_args():
     parser.add_argument(
         "--prompt-repeat",
         type=int,
-        default=DEFAULT_PROMPT_REPEAT,
-        help="Repeat the base prompt set this many times to create a larger batch.",
+        default=None,
+        help=(
+            "Repeat the base prompt set this many times. Defaults to 1 for the "
+            "correctness suite and 3 for the stress suite."
+        ),
     )
     parser.add_argument(
         "--temperature",
@@ -229,6 +301,23 @@ def parse_args():
         help="Multiplier applied to request temperature for SMC draft sampling.",
     )
     parser.add_argument(
+        "--annotate-prompts",
+        action="store_true",
+        help=(
+            "Prefix each prompt with a probe batch/item label. This is enabled "
+            "by default for the stress suite only."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph-max-bs",
+        type=int,
+        default=None,
+        help=(
+            "Override CUDA graph max batch size. Defaults to the full particle "
+            "batch for the correctness suite and 4 for the stress suite."
+        ),
+    )
+    parser.add_argument(
         "--show-all-outputs",
         action="store_true",
         help="Print every output instead of truncating to the first four.",
@@ -237,7 +326,6 @@ def parse_args():
         "--skip-overlap-check",
         action="store_true",
         help="Skip the overlap instrumentation (just do correctness check).",
-        default=True
     )
     return parser.parse_args()
 
@@ -255,15 +343,26 @@ def _drop_none(value):
 
 
 def main():
+    import sglang as sgl
+
     args = parse_args()
     start = time.time()
-    prompts = _build_prompts(args.prompt_repeat)
+    prompt_repeat = (
+        args.prompt_repeat
+        if args.prompt_repeat is not None
+        else _default_prompt_repeat(args.suite)
+    )
+    annotate_prompts = _should_annotate_prompts(
+        args.suite,
+        args.annotate_prompts,
+    )
+    prompts = _build_prompts(
+        prompt_repeat=prompt_repeat,
+        annotate_prompts=annotate_prompts,
+    )
     sampling_params = dict(DEFAULT_SAMPLING_PARAMS)
     sampling_params["temperature"] = args.temperature
     sampling_params["max_new_tokens"] = args.max_new_tokens
-    draft_model_path = (
-        args.draft_model_path if args.draft_model_path is not None else args.model_path
-    )
     record_path = Path("/tmp") / f"smc_probe_{os.getpid()}_{int(start)}.jsonl"
     if record_path.exists():
         record_path.unlink()
@@ -273,28 +372,14 @@ def main():
     if overlap_enabled and not args.skip_overlap_check:
         _install_overlap_probes()
 
-    engine_kwargs = dict(
-        model_path=args.model_path,
-        speculative_algorithm="SMC",
-        speculative_draft_model_path=draft_model_path,
-        smc_n_particles=args.smc_n_particles,
-        smc_gamma=args.smc_gamma,
-        smc_draft_temperature=args.smc_draft_temperature,
-        page_size=1,
-        cuda_graph_max_bs=4,
-        mem_fraction_static=0.45,
-        trust_remote_code=True,
-        log_level="info",
-        attention_backend="triton"
-    )
-    if args.attention_backend is not None:
-        engine_kwargs["attention_backend"] = args.attention_backend
+    engine_kwargs = _build_engine_kwargs(args, prompt_count=len(prompts))
 
     with sgl.Engine(**engine_kwargs) as engine:
         outputs = engine.generate(prompts, sampling_params)
         server_info = engine.get_server_info()
         compact_server_info = _drop_none(
             {
+                "suite": args.suite,
                 "speculative_algorithm": server_info.get("speculative_algorithm"),
                 "disable_overlap_schedule": server_info.get(
                     "disable_overlap_schedule"
@@ -303,6 +388,8 @@ def main():
                 "smc_gamma": server_info.get("smc_gamma"),
                 "attention_backend": server_info.get("attention_backend"),
                 "prompt_count": len(prompts),
+                "annotate_prompts": annotate_prompts,
+                "cuda_graph_max_bs": engine_kwargs.get("cuda_graph_max_bs"),
                 "sampling_temperature": args.temperature,
                 "avg_spec_accept_length": server_info.get("internal_states", [{}])[
                     0

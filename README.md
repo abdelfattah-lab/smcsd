@@ -29,7 +29,7 @@ for prompt, output in zip(prompts, outputs):
 engine.shutdown()
 ```
 
-See [`tasks/smc_offline_e2e_probe.py`](tasks/smc_offline_e2e_probe.py) for a more complete example with overlap probing.
+See [`scripts/smc/smc_offline_e2e_probe.py`](scripts/smc/smc_offline_e2e_probe.py) for a more complete example with overlap probing.
 
 ## Configuration
 

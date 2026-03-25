@@ -3,8 +3,8 @@ Profile overlap SMC through the offline Engine API.
 
 Examples:
   source .venv/bin/activate
-  python scripts/playground/smc_profile_engine.py --output-dir /tmp/sglang-smc-profile
-  python scripts/playground/smc_profile_engine.py --profile-v2 --decode-only
+  python scripts/smc/smc_profile_engine.py --output-dir /tmp/sglang-smc-profile
+  python scripts/smc/smc_profile_engine.py --profile-v2 --decode-only
 """
 
 from __future__ import annotations
