@@ -81,12 +81,7 @@ User Request
 
 ## Design Docs
 
-See [`smc_design_docs/README.md`](smc_design_docs/README.md) for the full index. Recommended reading order:
-
-1. **[smc_architecture_overview.md](smc_design_docs/smc_architecture_overview.md)** — End-to-end architecture, data flow, all phases
-2. **[smc_integration_v2.md](smc_design_docs/smc_integration_v2.md)** / **[v3](smc_design_docs/smc_integration_v3.md)** — Current integration details
-3. **[smc_scheduler_group_design.md](smc_design_docs/smc_scheduler_group_design.md)** — Scheduler-group abstraction design
-4. **[SMC_knowledge.md](smc_design_docs/SMC_knowledge.md)** — Algorithm background
+See **[`smc_design_docs/smc_architecture_overview.md`](smc_design_docs/smc_architecture_overview.md)** for the full architecture reference — covers data flow, two-bucket resample stream, scheduler integration, KV cache management, weight mathematics, and CUDA graph optimization.
 
 ## Base Project
 
