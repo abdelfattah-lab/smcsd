@@ -1151,6 +1151,11 @@ class Req(ReqDllmMixin):
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
+        #
+        # SMC NOTE: This reset is NOT SMC-aware. It clears kv_committed_len and
+        # kv_allocated_len without updating the SMC group's log_weights,
+        # step_counts, or resampling state. After this call the particle's
+        # cached state is gone but the SMCManager still references it as active.
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
@@ -1927,7 +1932,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def retract_decode(
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
-        """Retract the decoding requests when there is not enough memory."""
+        """Retract the decoding requests when there is not enough memory.
+
+        SMC NOTE: Scheduler-level retraction is NOT fully functional for SMC
+        particles. When SMC particles are retracted:
+        1. reset_for_retract() clears KV state (kv_allocated_len,
+           kv_committed_len) but does NOT notify the SMCManager/SMCScheduler,
+           leaving group state (log_weights, step_counts, pending_diffs,
+           resampling bookkeeping) inconsistent.
+        2. The group-level retraction at lines 1963-1978 collects sibling
+           particles but does NOT clean up or pause the SMC group atomically —
+           remaining siblings may continue forward while retracted ones are
+           reset.
+        3. Re-admission via the waiting queue re-prefills particles
+           independently, but the SMC group has no mechanism to reconcile
+           divergent step counts or restore log_weights after retraction.
+        A proper fix requires group-aware atomic retract/re-admit; see
+        smc_design_docs/smc_scheduler_group_design.md.
+        """
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -1960,6 +1982,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             retracted_reqs.append(req)
             retract_indices.append(idx)
 
+        # SMC NOTE: This block ensures all particles of a group are retracted
+        # together (no partial group in running batch). However, it does NOT
+        # pause the SMC group state or reset log_weights/step_counts, so re-
+        # admission will encounter stale group bookkeeping. Additionally,
+        # particles currently stalled in the resample bucket
+        # (SMCScheduler.resampling_reqs) are NOT handled here and may be left
+        # dangling.
         retracted_group_ids = {
             req.smc_group_id for req in retracted_reqs if req.smc_group_id is not None
         }
@@ -2017,6 +2046,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+        # SMC NOTE: For SMC particles, this releases KV cache and cleans up
+        # per-request SMC state (smc_state, draft req), but does NOT notify
+        # the SMCScheduler to pause/invalidate the group. The group may still
+        # attempt to score or resample this particle after it has been released.
         req = self.reqs[idx]
         if req.smc_state is not None:
             from sglang.srt.speculative.smc_info import cleanup_smc_request_state
