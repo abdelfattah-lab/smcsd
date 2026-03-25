@@ -223,7 +223,7 @@ class SMCManager:
                 parent_req,
                 particle_idx=particle_idx,
                 role="particle",
-                temperature_multiplier=self.server_args.smc_draft_temperature,
+                temperature=self.server_args.smc_draft_temperature,
                 return_logprob=False,
             )
             particle_req.smc_group_id = parent_req.rid

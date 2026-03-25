@@ -116,27 +116,16 @@ def validate_smc_parent_req(req: Req) -> Optional[str]:
     return None
 
 
-def compute_smc_temperature(
-    parent_temperature: Optional[float], temperature_multiplier: float
-) -> float:
-    if parent_temperature is None or parent_temperature <= 0:
-        return SMC_MIN_TEMPERATURE
-    return max(parent_temperature * temperature_multiplier, SMC_MIN_TEMPERATURE)
-
-
 def clone_req_for_smc_particle(
     parent_req: Req,
     particle_idx: int,
     role: str,
-    temperature_multiplier: float,
+    temperature: float,
     return_logprob: bool,
     output_ids: Optional[Sequence[int]] = None,
 ) -> Req:
     sampling_params = copy.copy(parent_req.sampling_params)
-    sampling_params.temperature = compute_smc_temperature(
-        sampling_params.temperature,
-        temperature_multiplier,
-    )
+    sampling_params.temperature = max(temperature, SMC_MIN_TEMPERATURE)
     if isinstance(sampling_params.custom_params, dict):
         sampling_params.custom_params = dict(sampling_params.custom_params)
 
@@ -210,7 +199,7 @@ def initialize_smc_request_state(
                 req,
                 particle_idx=i,
                 role="target",
-                temperature_multiplier=server_args.smc_target_temperature,
+                temperature=server_args.smc_target_temperature,
                 return_logprob=True,
                 output_ids=base_output_ids,
             )
@@ -220,7 +209,7 @@ def initialize_smc_request_state(
                 req,
                 particle_idx=i,
                 role="draft",
-                temperature_multiplier=server_args.smc_draft_temperature,
+                temperature=server_args.smc_draft_temperature,
                 return_logprob=True,
                 output_ids=base_output_ids,
             )

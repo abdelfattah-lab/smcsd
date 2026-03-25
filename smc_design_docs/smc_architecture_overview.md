@@ -51,7 +51,7 @@ Activated via `--speculative-algorithm SMC` with:
 | `--smc-n-particles` | 4 | Particles per request |
 | `--smc-gamma` | 4 | Max draft tokens per step |
 | `--smc-draft-temperature` | 0.7 | Draft model sampling temperature |
-| `--smc-target-temperature` | 1.0 | Temperature divisor applied to target logprobs |
+| `--smc-target-temperature` | 1.0 | Temperature for target model scoring during verification |
 | `--smc-resample-threshold` | 0.5 | ESS ratio that triggers resampling |
 | `--smc-resample-method` | systematic | `systematic` or `multinomial` |
 

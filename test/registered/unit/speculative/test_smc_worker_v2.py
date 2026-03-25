@@ -307,7 +307,7 @@ class TestSMCWorkerV2(TestCase):
             torch.equal(result.accept_lens, torch.tensor([1], dtype=torch.int32))
         )
 
-    def test_make_score_model_worker_batch_uses_parent_target_temperature(self):
+    def test_make_score_model_worker_batch_uses_server_target_temperature(self):
         fake_self = SimpleNamespace(
             server_args=SimpleNamespace(
                 attention_backend="triton",
@@ -367,7 +367,7 @@ class TestSMCWorkerV2(TestCase):
             draft_lengths=torch.tensor([1], dtype=torch.int32),
         )
 
-        self.assertAlmostEqual(score_batch.spec_info.target_temperature, 0.8)
+        self.assertAlmostEqual(score_batch.spec_info.target_temperature, 1.0)
 
     @patch("sglang.srt.speculative.smc_worker_v2.SMCDraftInput")
     def test_run_fused_draft_reqs_falls_back_when_replay_cannot_run(

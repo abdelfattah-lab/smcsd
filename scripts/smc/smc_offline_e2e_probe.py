@@ -298,7 +298,7 @@ def parse_args():
         "--smc-draft-temperature",
         type=float,
         default=1.25,
-        help="Multiplier applied to request temperature for SMC draft sampling.",
+        help="Sampling temperature for SMC draft particles.",
     )
     parser.add_argument(
         "--annotate-prompts",

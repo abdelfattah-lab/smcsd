@@ -4812,7 +4812,7 @@ class ServerArgs:
             "--smc-target-temperature",
             type=float,
             default=ServerArgs.smc_target_temperature,
-            help="Temperature divisor applied to target logprobs during SMC weight updates.",
+            help="Temperature for target model scoring during SMC verification.",
         )
         parser.add_argument(
             "--smc-resample-threshold",

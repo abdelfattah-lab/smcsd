@@ -26,7 +26,6 @@ from sglang.srt.speculative.smc_info import (
     SMC_MIN_TEMPERATURE,
     SMCScoreInput,
     build_smc_positions,
-    compute_smc_temperature,
     get_smc_reserved_kv_len,
     resolve_smc_proposal_batch,
     resolve_smc_proposal_length,
@@ -928,55 +927,9 @@ class SMCWorkerV2(EAGLEWorkerV2):
         else:
             seq_lens_cpu = base_model_worker_batch.seq_lens_cpu - 1
             seq_lens_sum = base_model_worker_batch.seq_lens_sum - batch_size
-        sampling_temperatures = getattr(
-            getattr(base_model_worker_batch, "sampling_info", None),
-            "temperatures",
-            None,
-        )
         target_temperature = max(
             float(self.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
         )
-        batch_reqs = getattr(base_model_worker_batch, "reqs", None)
-        used_parent_target_temperature = False
-        if batch_reqs:
-            parent_target_temperatures = []
-            for req in batch_reqs:
-                parent_req = getattr(req, "smc_parent", None)
-                if parent_req is None:
-                    continue
-                parent_target_temperatures.append(
-                    compute_smc_temperature(
-                        parent_req.sampling_params.temperature,
-                        self.server_args.smc_target_temperature,
-                    )
-                )
-            if parent_target_temperatures:
-                parent_target_temperatures = torch.tensor(
-                    parent_target_temperatures,
-                    dtype=torch.float32,
-                    device=seq_lens.device,
-                )
-                if torch.allclose(
-                    parent_target_temperatures,
-                    parent_target_temperatures[:1],
-                ):
-                    target_temperature = max(
-                        float(parent_target_temperatures[0].item()),
-                        SMC_MIN_TEMPERATURE,
-                    )
-                    used_parent_target_temperature = True
-        if (
-            not used_parent_target_temperature
-            and sampling_temperatures is not None
-            and len(sampling_temperatures) > 0
-        ):
-            # (ccc) SMC verify still assumes one batch-shared target
-            # temperature. When the batch is uniform, reuse the actual request
-            # temperature when parent metadata is unavailable instead of the raw
-            # multiplier from server_args.
-            first_temperature = float(sampling_temperatures[0].item())
-            if torch.allclose(sampling_temperatures, sampling_temperatures[:1]):
-                target_temperature = max(first_temperature, SMC_MIN_TEMPERATURE)
         use_linear_target_verify = self.server_args.attention_backend in {
             "flashinfer",
             "triton",
