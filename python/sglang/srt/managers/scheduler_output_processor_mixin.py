@@ -707,6 +707,11 @@ class SchedulerOutputProcessorMixin:
                     self.smc_scheduler.on_batch_done(
                         smc_step_reqs,
                         step_logprob_diffs,
+                        group_spans=(
+                            batch.smc_group_spans
+                            if smc_filtered_rows is None
+                            else None
+                        ),
                     )
                 )
 

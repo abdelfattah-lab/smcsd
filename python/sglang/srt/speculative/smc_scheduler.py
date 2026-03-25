@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, SMCGroupSpan, ScheduleBatch
 from sglang.srt.speculative.smc_info import (
     effective_sample_size,
     get_smc_reserved_kv_len,
@@ -49,6 +49,21 @@ class SMCScheduler:
         self.pending_resamples.clear()
         self._groups_needing_resample.clear()
 
+    def get_stalled_req_count(self) -> int:
+        return sum(len(reqs) for reqs in self.resampling_reqs.values())
+
+    def should_delay_admission(
+        self,
+        running_req_count: int,
+        group_size: int,
+    ) -> bool:
+        stalled_req_count = self.get_stalled_req_count()
+        if stalled_req_count <= 0:
+            return False
+        current_gap = abs(running_req_count - stalled_req_count)
+        next_gap = abs((running_req_count + group_size) - stalled_req_count)
+        return next_gap > current_gap
+
     def step(self, scheduler) -> None:
         self._sync_completed_resamples(scheduler)
         self._launch_pending_resamples(scheduler)
@@ -57,6 +72,7 @@ class SMCScheduler:
         self,
         reqs: List[Req],
         logprob_diffs: torch.Tensor,
+        group_spans: Optional[List[SMCGroupSpan]] = None,
     ) -> List[Req]:
         if not reqs:
             return []
@@ -64,6 +80,8 @@ class SMCScheduler:
         if not torch.is_tensor(logprob_diffs):
             logprob_diffs = torch.as_tensor(logprob_diffs, dtype=torch.float32)
 
+        if group_spans is not None:
+            return self._on_batch_done_group_spans(reqs, logprob_diffs, group_spans)
         atomic_group_spans = self._collect_atomic_group_spans(reqs)
         if atomic_group_spans is not None:
             return self._on_batch_done_atomic_groups(
@@ -98,6 +116,26 @@ class SMCScheduler:
             start = end
 
         return spans
+
+    def _on_batch_done_group_spans(
+        self,
+        reqs: List[Req],
+        logprob_diffs: torch.Tensor,
+        group_spans: List[SMCGroupSpan],
+    ) -> List[Req]:
+        finalized_reqs: List[Req] = []
+        for span in group_spans:
+            group = self.smc_manager.get_group(span.group_id)
+            if group is None:
+                continue
+            finalized_req = self._apply_group_step(
+                group,
+                reqs[span.start : span.end],
+                logprob_diffs[span.start : span.end],
+            )
+            if finalized_req is not None:
+                finalized_reqs.append(finalized_req)
+        return finalized_reqs
 
     def _on_batch_done_atomic_groups(
         self,
@@ -294,16 +332,22 @@ class SMCScheduler:
     ) -> None:
         self._trim_stale_overalloc(stalled_reqs, scheduler)
 
-        stalled_req_ids = {id(req) for req in stalled_reqs}
-        keep_indices = [
-            idx
-            for idx, req in enumerate(scheduler.running_batch.reqs)
-            if id(req) not in stalled_req_ids
-        ]
-        if len(keep_indices) + len(stalled_reqs) != len(scheduler.running_batch.reqs):
-            raise RuntimeError(
-                f"SMC group {group_id} could not be isolated from running_batch for resampling."
+        group_span = scheduler.running_batch.get_smc_group_span(group_id)
+        if group_span is not None and group_span.size == len(stalled_reqs):
+            keep_indices = list(range(group_span.start)) + list(
+                range(group_span.end, len(scheduler.running_batch.reqs))
             )
+        else:
+            stalled_req_ids = {id(req) for req in stalled_reqs}
+            keep_indices = [
+                idx
+                for idx, req in enumerate(scheduler.running_batch.reqs)
+                if id(req) not in stalled_req_ids
+            ]
+            if len(keep_indices) + len(stalled_reqs) != len(scheduler.running_batch.reqs):
+                raise RuntimeError(
+                    f"SMC group {group_id} could not be isolated from running_batch for resampling."
+                )
 
         batch_is_full = scheduler.running_batch.batch_is_full
         scheduler.running_batch.filter_batch(keep_indices=keep_indices)

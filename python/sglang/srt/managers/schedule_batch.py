@@ -108,6 +108,35 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass(frozen=True)
+class SMCGroupSpan:
+    group_id: str
+    start: int
+    end: int
+
+    @property
+    def size(self) -> int:
+        return self.end - self.start
+
+
+def build_smc_group_spans(reqs: List["Req"]) -> Optional[list[SMCGroupSpan]]:
+    spans: list[SMCGroupSpan] = []
+    seen_group_ids: set[str] = set()
+    start = 0
+    while start < len(reqs):
+        group_id = getattr(reqs[start], "smc_group_id", None)
+        end = start + 1
+        while end < len(reqs) and getattr(reqs[end], "smc_group_id", None) == group_id:
+            end += 1
+        if group_id is not None:
+            if group_id in seen_group_ids:
+                return None
+            spans.append(SMCGroupSpan(group_id=group_id, start=start, end=end))
+            seen_group_ids.add(group_id)
+        start = end
+    return spans
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -1230,6 +1259,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Request, memory pool, and cache
     reqs: List[Req]
+    smc_group_spans: Optional[List[SMCGroupSpan]] = None
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
@@ -1373,6 +1403,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return cls(
             reqs=reqs,
+            smc_group_spans=build_smc_group_spans(reqs),
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
@@ -2181,6 +2212,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.smc_group_spans = []
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2198,6 +2230,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        self.smc_group_spans = build_smc_group_spans(self.reqs)
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -2278,6 +2311,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        self.smc_group_spans = build_smc_group_spans(self.reqs)
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
@@ -2374,6 +2408,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # merge_batch) on the original don't corrupt this snapshot.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            smc_group_spans=(
+                list(self.smc_group_spans) if self.smc_group_spans is not None else None
+            ),
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
@@ -2396,6 +2433,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
         )
+
+    def get_smc_group_span(self, group_id: str) -> Optional[SMCGroupSpan]:
+        if self.smc_group_spans is None:
+            return None
+        for span in self.smc_group_spans:
+            if span.group_id == group_id:
+                return span
+        return None
+
+    def count_smc_particle_reqs(self) -> int:
+        if self.smc_group_spans is None:
+            return sum(1 for req in self.reqs if req.smc_group_id is not None)
+        return sum(span.size for span in self.smc_group_spans)
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():

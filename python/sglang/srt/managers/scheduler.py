@@ -1979,6 +1979,9 @@ class Scheduler(
         members.sort(key=lambda member: waiting_index[id(member)])
         return members
 
+    def _count_smc_particle_reqs(self, reqs: List[Req]) -> int:
+        return sum(1 for req in reqs if req.smc_group_id is not None)
+
     def _prepare_req_for_prefill(self, req: Req, running_loras: Optional[set]) -> bool:
         if self.enable_lora and running_loras is not None and req.lora_id not in running_loras:
             if self.enable_lora_overlap_loading:
@@ -2521,6 +2524,16 @@ class Scheduler(
                 group_reqs = self._get_waiting_smc_group_reqs(req)
                 if not group_reqs:
                     continue
+                if self.smc_scheduler is not None:
+                    running_smc_req_count = (
+                        self.running_batch.count_smc_particle_reqs()
+                        + self._count_smc_particle_reqs(adder.can_run_list)
+                    )
+                    if self.smc_scheduler.should_delay_admission(
+                        running_req_count=running_smc_req_count,
+                        group_size=len(group_reqs),
+                    ):
+                        break
                 res = self._try_add_smc_group(group_reqs, adder, running_loras)
                 if res is None:
                     continue
