@@ -1218,11 +1218,12 @@ class CudaGraphRunner:
                     custom_mask=self.buffers.custom_mask,
                     positions=None,
                     draft_token_num=self.num_tokens_per_bs,
+                    spec_steps=self.num_tokens_per_bs - 1,
                     target_temperature=max(
                         float(self.model_runner.server_args.smc_target_temperature),
                         SMC_MIN_TEMPERATURE,
                     ),
-                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
             else:
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput

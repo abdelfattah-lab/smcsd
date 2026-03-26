@@ -2968,7 +2968,7 @@ class ServerArgs:
 
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = 1
-            self.speculative_num_steps = self.smc_gamma + 1
+            self.speculative_num_steps = self.smc_gamma
             self.speculative_num_draft_tokens = self.smc_gamma + 1
             if envs.SGLANG_ENABLE_SPEC_V2.get():
                 self.disable_overlap_schedule = False

@@ -2143,11 +2143,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         custom_mask=buffers.custom_mask,
                         positions=None,
                         draft_token_num=num_tokens_per_bs,
+                        spec_steps=num_tokens_per_bs - 1,
                         target_temperature=max(
                             float(self.server_args.smc_target_temperature),
                             SMC_MIN_TEMPERATURE,
                         ),
-                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
                     )
                 else:
                     from sglang.srt.speculative.eagle_info import EagleVerifyInput

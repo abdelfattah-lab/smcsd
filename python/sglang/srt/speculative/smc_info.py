@@ -885,9 +885,11 @@ class SMCScoreInput(SpecInput):
     positions: torch.Tensor
     custom_mask: Optional[torch.Tensor]
     draft_token_num: int
+    spec_steps: int  # number of draft tokens (gamma), mirrors EAGLE's spec_steps
     target_temperature: float
     linear_target_verify: bool = True
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+    smc_logprob_diffs: Optional[torch.Tensor] = None  # filled by sample()
 
     def __post_init__(self):
         super().__init__(SpecInputType.SMC_SCORE)
@@ -1064,65 +1066,64 @@ class SMCScoreInput(SpecInput):
         batch: ModelWorkerBatch,
         logits_output,
     ):
+        """Accept all draft tokens, compute bonus + logprob diffs.
+
+        Mirrors EagleVerifyInputV2Mixin.sample() (eagle_info_v2.py:272-388).
+        Returns the same 3-tuple: (predict, accept_length, accept_index).
+        SMC logprob diffs are stored on self.smc_logprob_diffs.
+        """
         device = self.draft_token.device
         if batch.forward_mode.is_idle():
-            empty_int = torch.empty((0,), dtype=torch.int32, device=device)
-            empty_float = torch.empty((0,), dtype=torch.float32, device=device)
-            empty_seq = torch.empty((0,), dtype=batch.seq_lens.dtype, device=device)
-            return empty_int, empty_seq, empty_int, empty_float
+            predict = torch.empty(0, dtype=torch.int32, device=device)
+            accept_length = torch.empty(0, dtype=torch.int32, device=device)
+            accept_index = torch.empty(0, dtype=torch.int32, device=device)
+            return predict, accept_length, accept_index
 
-        logprob_diffs = self.compute_logprob_diffs(batch, logits_output)
-        bs = int(self.draft_lengths.shape[0])
-        score_len = self.draft_token_num
-        draft_token = self.draft_token.view(bs, score_len)
-        committed_seq_lens = batch.seq_lens + 1 + self.draft_lengths
-        safe_last_indices = torch.clamp(
-            self.draft_lengths.to(torch.int64) - 1,
-            min=0,
-        )
-        gathered_last_tokens = draft_token[:, 1:].gather(
-            1, safe_last_indices.unsqueeze(1)
-        ).squeeze(1)
-        next_last_token_ids = torch.where(
-            self.draft_lengths > 0,
-            gathered_last_tokens,
-            draft_token[:, 0],
-        )
+        bs = len(batch.seq_lens)
+        next_token_logits = logits_output.next_token_logits
+        ss = self.spec_steps
 
-        return (
-            self.draft_lengths,
-            committed_seq_lens,
-            next_last_token_ids,
-            logprob_diffs,
+        # Allocate predict and accept tensors (EAGLE naming)
+        candidates = self.draft_token.reshape(bs, self.draft_token_num)
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict = torch.zeros(
+            predict_shape, dtype=torch.int32, device=device
+        ).flatten()
+        accept_length = torch.full(
+            (bs,), ss, dtype=torch.int32, device=device
+        )
+        accept_index = (
+            torch.arange(ss + 1, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(bs, -1)
+            .contiguous()
         )
 
-    def compute_logprob_diffs(
-        self,
-        batch: ModelWorkerBatch,
-        logits_output,
-    ) -> torch.Tensor:
-        device = self.draft_token.device
-        if batch.forward_mode.is_idle():
-            return torch.empty((0,), dtype=torch.float32, device=device)
+        # Fill predict: [d0, ..., d_{ss-1}, bonus] per request
+        predict_view = predict.reshape(bs, self.draft_token_num)
+        predict_view[:, :ss] = candidates[:, 1:].to(torch.int32)
 
-        bs = int(self.draft_lengths.shape[0])
-        score_len = self.draft_token_num
-        draft_token = self.draft_token.view(bs, score_len)
-        # logits_output.next_token_logits is already log_probs
-        # (log_softmax(logits/T) applied in CG capture or non-CG fallback)
-        log_probs = logits_output.next_token_logits.view(bs, score_len, -1)
-        # TARGET_VERIFY rows score the next token after each input token. The
-        # proposal tensor is [anchor, draft_1, ..., draft_n], so the target
-        # logprob for draft_i lives on row i - 1, not row i.
+        # Apply temperature and compute log-softmax for logprob + bonus
+        log_probs = F.log_softmax(
+            next_token_logits.view(bs, self.draft_token_num, -1)
+            / self.target_temperature,
+            dim=-1,
+        )
+
+        # Bonus token: greedy argmax at last position
+        bonus = torch.argmax(log_probs[:, -1, :], dim=-1).to(torch.int32)
+        predict_view[:, ss] = bonus
+
+        # SMC logprob diffs (importance weights)
         gathered = log_probs[:, :-1].gather(
-            2, draft_token[:, 1:].unsqueeze(-1)
+            2, candidates[:, 1:].long().unsqueeze(-1)
         ).squeeze(-1)
-        mask = (
-            torch.arange(score_len - 1, device=device).unsqueeze(0)
-            < self.draft_lengths.unsqueeze(1)
-        )
-        target_logprobs = torch.sum(gathered * mask, dim=1)
-        return target_logprobs - self.draft_logprobs
+        target_logprobs = gathered.sum(dim=1)
+        self.smc_logprob_diffs = target_logprobs - self.draft_logprobs
+
+        # Include the bonus token
+        accept_length.add_(1)
+        return predict, accept_length, accept_index
 
 
 def build_smc_positions(seq_lens: torch.Tensor, score_token_num: int) -> torch.Tensor:
