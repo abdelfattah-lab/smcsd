@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 from dataclasses import dataclass
-import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
@@ -22,7 +21,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
-    clamp_position,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import (
@@ -191,6 +189,7 @@ def initialize_smc_request_state(
     base_output_ids = list(req.output_ids if seed_output_ids is None else seed_output_ids)
 
     particle_states = []
+    ### Why clone for both target_reqs and draft_reqs?
     target_reqs = []
     draft_reqs = []
     for i in range(server_args.smc_n_particles):
@@ -256,7 +255,7 @@ def initialize_smc_request_state(
     )
     return None
 
-
+### Dead code....
 def resolve_smc_seed_output_ids(
     req: Req,
     *,
@@ -285,7 +284,7 @@ def resolve_smc_seed_output_ids(
         f"(current={current_output_len}, desired={desired_output_len})."
     )
 
-
+### Dead code...
 def collect_smc_stop_token_ids(req: Req) -> List[int]:
     stop_token_ids = set(req.sampling_params.stop_token_ids or [])
     if req.eos_token_ids:
@@ -301,7 +300,7 @@ def collect_smc_stop_token_ids(req: Req) -> List[int]:
             stop_token_ids.update(additional_stop_token_ids)
     return sorted(int(token_id) for token_id in stop_token_ids)
 
-
+### Dead code....
 def resolve_smc_proposal_length(
     req: Req,
     proposal_tokens: Sequence[int],
@@ -666,36 +665,16 @@ def multinomial_resample(
 
 
 @dataclass
-class SMCDraftInput(SpecInput):
-    last_token_ids: torch.Tensor
-    new_seq_lens: torch.Tensor
-    future_indices: Optional[FutureIndices] = None
-    verify_done: Optional[torch.cuda.Event] = None
-    committed_seq_lens_cpu: Optional[torch.Tensor] = None
-
-    # Transient — set by prepare_for_v2_draft(), consumed by replay(), not persisted.
-    seq_lens_steps: Optional[torch.Tensor] = None  # [gamma, bs]
-    seq_lens_cpu_steps: Optional[torch.Tensor] = None  # [gamma, bs], CPU
-    seq_lens_sum_steps: Optional[torch.Tensor] = None  # [gamma], CPU
-    out_cache_loc_steps: Optional[torch.Tensor] = None  # [gamma, bs]
-    positions: Optional[torch.Tensor] = None  # [bs]
-
-    def __post_init__(self):
-        super().__init__(SpecInputType.SMC_DRAFT)
-
-    def get_spec_adjust_token_coefficient(self):
-        return 1, 1
-
+class SMCDraftInputV2Mixin:
     @classmethod
     def create_idle_input(cls, device: torch.device):
         return cls(
             last_token_ids=torch.empty((0,), device=device, dtype=torch.int32),
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
-            committed_seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
         )
 
     def prepare_for_v2_draft(
-        self,
+        self: "SMCDraftInput",
         req_to_token_pool,
         batch: ModelWorkerBatch,
         cuda_graph_runner: Optional[SMCDraftCudaGraphRunner],
@@ -703,61 +682,29 @@ class SMCDraftInput(SpecInput):
         gamma: int,
         draft_sampling_info: SamplingBatchInfo,
     ):
-        bs = len(batch.seq_lens)
-        device = batch.seq_lens.device
+        if not batch.forward_mode.is_idle():
+            bs = len(batch.seq_lens)
+            batch.out_cache_loc = torch.empty(
+                (bs * gamma,),
+                dtype=torch.int64,
+                device=self.last_token_ids.device,
+            )
+            assign_draft_cache_locs_page_size_1[(bs,)](
+                batch.req_pool_indices[:bs],
+                req_to_token_pool.req_to_token,
+                batch.seq_lens[:bs],
+                batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                1,
+                gamma,
+            )
 
-        # Stepwise SMC draft decode treats the visible token as already
-        # materialized in KV and starts writing newly proposed tokens at the
-        # next slot. Keep the fused CUDA-graph path aligned with that behavior
-        # to avoid replaying the anchor token into a committed position.
-        draft_committed_lens = batch.seq_lens[:bs]
-
-        # Per-step seq_lens: [gamma, bs]
-        # Step 0 uses the current visible sequence length, then increments by
-        # one token per replay step.
-        step_offsets = torch.arange(gamma, dtype=torch.int64, device=device)
-        self.seq_lens_steps = draft_committed_lens.unsqueeze(0) + step_offsets.unsqueeze(1)
-
-        # CPU mirror for attention backend metadata
-        seq_lens_cpu = (
-            batch.seq_lens_cpu
-            if batch.seq_lens_cpu is not None
-            else batch.seq_lens.cpu()
-        )
-        draft_committed_lens_cpu = seq_lens_cpu[:bs]
-        step_offsets_cpu = torch.arange(gamma, dtype=torch.int64)
-        self.seq_lens_cpu_steps = (
-            draft_committed_lens_cpu.unsqueeze(0) + step_offsets_cpu.unsqueeze(1)
-        )
-        self.seq_lens_sum_steps = self.seq_lens_cpu_steps.sum(dim=1, dtype=torch.int64)
-
-        # Compute out_cache_loc via Triton kernel (same kernel EAGLE uses).
-        # Triton JIT handles int64 draft_committed_lens — no int32 cast needed.
-        flat_out = torch.empty((bs * gamma,), dtype=torch.int64, device=device)
-        assign_draft_cache_locs_page_size_1[(bs,)](
-            batch.req_pool_indices[:bs],
-            req_to_token_pool.req_to_token,
-            draft_committed_lens,
-            flat_out,
-            req_to_token_pool.req_to_token.shape[1],
-            1,  # topk=1 for SMC
-            gamma,
-        )
-        self.out_cache_loc_steps = flat_out.view(bs, gamma).t().contiguous()
-
-        # Positions for step 0 (captured graph increments via working_positions.add_(1))
-        self.positions = clamp_position(self.seq_lens_steps[0])
-
-        # Build a modified batch for ForwardBatch.init_new().
-        # ForwardBatch.init_new picks up spec_info.positions at forward_batch_info.py:537.
+        # Mirror Eagle v2: carry the base committed prefix on the batch and let
+        # the draft loop derive per-step seq_lens/positions from it.
+        self.positions = batch.seq_lens.to(torch.int64)
         draft_batch = dataclasses.replace(
             batch,
-            forward_mode=ForwardMode.DECODE,
             input_ids=self.last_token_ids,
-            seq_lens=self.seq_lens_steps[0],
-            seq_lens_cpu=self.seq_lens_cpu_steps[0],
-            seq_lens_sum=int(self.seq_lens_sum_steps[0].item()),
-            out_cache_loc=self.out_cache_loc_steps[0],
             sampling_info=draft_sampling_info,
             spec_info=self,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -770,19 +717,15 @@ class SMCDraftInput(SpecInput):
         )
         return forward_batch, can_cuda_graph
 
-    def prepare_for_decode(self, batch: ScheduleBatch):
-        if self.committed_seq_lens_cpu is None and self.verify_done is not None:
-            self.verify_done.synchronize()
+    def prepare_for_decode(self: "SMCDraftInput", batch: ScheduleBatch):
         batch.maybe_evict_swa()
-
-        if self.committed_seq_lens_cpu is not None:
-            batch.seq_lens_cpu = self.committed_seq_lens_cpu
-        else:
-            # Mirror EAGLE v2: overlap updates seq_lens first, then refresh the CPU
-            # mirror before any allocation or metadata work consumes it.
-            batch.seq_lens_cpu = batch.seq_lens.cpu()
+        batch.maybe_wait_verify_done()
+        batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
 
+        # Pre-allocate KV slots covering the Eagle-style topk=1 draft replay
+        # plus the verify pass. The forward stream only reads from the shared
+        # req_to_token mapping after this point.
         server_args = get_global_server_args()
         gamma = max(int(server_args.smc_gamma or 1), 1)
         score_token_num = max(
@@ -823,26 +766,16 @@ class SMCDraftInput(SpecInput):
             set_smc_reserved_kv_len(req, required_len)
             req.decode_batch_idx += 1
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self: "SMCDraftInput", new_indices: torch.Tensor, has_been_filtered: bool = True
+    ):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
-            if self.committed_seq_lens_cpu is not None:
-                self.committed_seq_lens_cpu = self.committed_seq_lens_cpu[
-                    new_indices.cpu()
-                ]
             return
         self.last_token_ids = self.last_token_ids[new_indices]
         self.new_seq_lens = self.new_seq_lens[new_indices]
-        if self.committed_seq_lens_cpu is not None:
-            self.committed_seq_lens_cpu = self.committed_seq_lens_cpu[new_indices.cpu()]
 
-    def merge_batch(self, spec_info: "SMCDraftInput"):
-        if self.committed_seq_lens_cpu is None or spec_info.committed_seq_lens_cpu is None:
-            future_committed_seq_lens_cpu = None
-        else:
-            future_committed_seq_lens_cpu = torch.cat(
-                [self.committed_seq_lens_cpu, spec_info.committed_seq_lens_cpu]
-            )
+    def merge_batch(self: "SMCDraftInput", spec_info: "SMCDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = FutureIndices(
@@ -850,28 +783,24 @@ class SMCDraftInput(SpecInput):
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
-            self.committed_seq_lens_cpu = future_committed_seq_lens_cpu
             return
-        if self.committed_seq_lens_cpu is None and spec_info.committed_seq_lens_cpu is None:
-            committed_seq_lens_cpu = None
-        else:
-            committed_seq_lens_cpu = torch.cat(
-                [
-                    (
-                        self.committed_seq_lens_cpu
-                        if self.committed_seq_lens_cpu is not None
-                        else self.new_seq_lens.cpu()
-                    ),
-                    (
-                        spec_info.committed_seq_lens_cpu
-                        if spec_info.committed_seq_lens_cpu is not None
-                        else spec_info.new_seq_lens.cpu()
-                    ),
-                ]
-            )
         self.last_token_ids = torch.cat([self.last_token_ids, spec_info.last_token_ids])
         self.new_seq_lens = torch.cat([self.new_seq_lens, spec_info.new_seq_lens])
-        self.committed_seq_lens_cpu = committed_seq_lens_cpu
+
+
+@dataclass
+class SMCDraftInput(SpecInput, SMCDraftInputV2Mixin):
+    last_token_ids: torch.Tensor
+    new_seq_lens: torch.Tensor
+    future_indices: Optional[FutureIndices] = None
+    verify_done: Optional[torch.cuda.Event] = None
+    positions: Optional[torch.Tensor] = None  # [bs]
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.SMC_DRAFT)
+
+    def get_spec_adjust_token_coefficient(self):
+        return 1, 1
 
 
 @dataclass
@@ -999,16 +928,25 @@ class SMCScoreInput(SpecInput):
         batch: ModelWorkerBatch,
         target_worker,
     ):
+        verify_seq_lens = (batch.seq_lens - 1).clamp_min(0)
+        verify_seq_lens_cpu = (
+            (batch.seq_lens_cpu - 1).clamp_min(0)
+            if batch.seq_lens_cpu is not None
+            else verify_seq_lens.cpu()
+        )
+        verify_seq_lens_sum = int(verify_seq_lens_cpu.sum().item())
+
         if not batch.forward_mode.is_idle():
             bs = len(batch.req_pool_indices)
             device = self.draft_token.device
             batch.input_ids = self.draft_token
-            # Compute out_cache_loc at verify time (like EAGLE v2)
+            # SMC verify replays the visible token as an input anchor, so the
+            # effective target prefix excludes that last visible token.
             batch.out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + self.draft_token_num,
+                start_offset=verify_seq_lens,
+                end_offset=verify_seq_lens + self.draft_token_num,
                 batch_size=bs,
                 draft_token_num=self.draft_token_num,
                 device=device,
@@ -1018,32 +956,19 @@ class SMCScoreInput(SpecInput):
             ForwardMode.IDLE if batch.forward_mode.is_idle() else ForwardMode.TARGET_VERIFY
         )
         batch.capture_hidden_mode = self.capture_hidden_mode
-        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        verify_batch = copy.copy(batch)
+        verify_batch.seq_lens = verify_seq_lens
+        verify_batch.seq_lens_cpu = verify_seq_lens_cpu
+        verify_batch.seq_lens_sum = verify_seq_lens_sum
+        verify_forward_batch = ForwardBatch.init_new(
+            verify_batch, target_worker.model_runner
+        )
         if not batch.forward_mode.is_idle() and self.use_linear_target_verify():
             self._populate_linear_verify_metadata(verify_forward_batch)
 
         graph_runner = target_worker.model_runner.graph_runner
-        model_runner_server_args = getattr(target_worker.model_runner, "server_args", None)
-        captured_target_temperature = max(
-            float(
-                getattr(
-                    model_runner_server_args,
-                    "smc_target_temperature",
-                    self.target_temperature,
-                )
-            ),
-            SMC_MIN_TEMPERATURE,
-        )
-        target_temperature_matches_capture = math.isclose(
-            float(self.target_temperature),
-            captured_target_temperature,
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        )
         can_run_cuda_graph = bool(
-            graph_runner
-            and target_temperature_matches_capture
-            and graph_runner.can_run(verify_forward_batch)
+            graph_runner and graph_runner.can_run(verify_forward_batch)
         )
         # (ccc) Keep the verify-prep graph decision on the batch so ModelRunner
         # does not independently re-enter graph replay on this path.

@@ -345,15 +345,16 @@ def generate_smc_draft_decode_kv_indices(
     step = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
     num_seqs = tl.num_programs(axis=1)
+    step_len = step + 1
 
     kv_indices += kv_indices_stride * step
     kv_indptr += kv_indptr_stride * step
 
     load_offset = tl.arange(0, bs_upper)
     prev_seq_lens = tl.load(base_seq_lens + load_offset, mask=load_offset < bid, other=0)
-    prev_extra = tl.where(load_offset < num_live_seqs, step, 0)
+    prev_extra = tl.where(load_offset < num_live_seqs, step_len, 0)
     seq_len = tl.load(base_seq_lens + bid)
-    extend_len = tl.where(bid < num_live_seqs, step, 0)
+    extend_len = tl.where(bid < num_live_seqs, step_len, 0)
     cum_seq_len = tl.sum(prev_seq_lens + tl.where(load_offset < bid, prev_extra, 0))
 
     kv_ptr = kv_indices + cum_seq_len
@@ -381,7 +382,7 @@ def generate_smc_draft_decode_kv_indices(
         total_lens = tl.load(
             base_seq_lens + load_offset, mask=load_offset < num_seqs, other=0
         )
-        total_extra = tl.where(load_offset < num_live_seqs, step, 0)
+        total_extra = tl.where(load_offset < num_live_seqs, step_len, 0)
         tl.store(kv_indptr, 0)
         tl.store(kv_indptr + num_seqs, tl.sum(total_lens + total_extra))
     else:

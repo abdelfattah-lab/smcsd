@@ -1422,20 +1422,17 @@ class TritonMultiStepDraftBackend:
 
     def init_smc_forward_metadata_replay_cuda_graph(
         self,
+        forward_batch: ForwardBatch,
         *,
         bs: int,
         raw_bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens_steps: torch.Tensor,
-        seq_lens_cpu_steps: torch.Tensor,
-        seq_lens_sum_steps: torch.Tensor,
     ) -> None:
-        base_seq_lens = seq_lens_steps[0]
+        base_seq_lens = forward_batch.seq_lens[:bs]
         # 1 Triton kernel: fill kv_indices + kv_indptr for all steps
         self.generate_smc_draft_decode_kv_indices[
             (self.speculative_num_steps - 1, bs)
         ](
-            req_pool_indices,
+            forward_batch.req_pool_indices,
             self.req_to_token,
             base_seq_lens,
             self.cuda_graph_kv_indices,
@@ -1447,11 +1444,13 @@ class TritonMultiStepDraftBackend:
             next_power_of_2(bs),
             next_power_of_2(self.speculative_num_steps - 1),
         )
-        # Compute num_kv_splits once with last (largest) step's seq_lens
+        # Compute num_kv_splits once with the last step's live decode length.
         num_token = bs  # topk=1 for SMC
+        last_step_seq_lens = base_seq_lens.clone()
+        last_step_seq_lens[:raw_bs].add_(self.speculative_num_steps - 2)
         self.attn_backends[-1].get_num_kv_splits(
             self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
-            seq_lens_steps[-1, :bs],
+            last_step_seq_lens,
         )
 
 

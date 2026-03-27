@@ -45,13 +45,11 @@ class SMCDraftSamplingSignature:
 @dataclass
 class SMCDraftInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
-    working_input_ids: torch.Tensor
     req_pool_indices: torch.Tensor
-    seq_lens_steps: torch.Tensor
-    seq_lens_cpu_steps: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
-    working_positions: torch.Tensor
     mrope_positions: torch.Tensor
     temperatures: torch.Tensor
     top_ps: torch.Tensor
@@ -105,24 +103,22 @@ class SMCDraftCudaGraphRunner:
 
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_bs,), dtype=torch.int64)
-            working_input_ids = torch.zeros((self.max_bs,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
-            seq_lens_steps = torch.full(
-                (self.gamma, self.max_bs),
+            seq_lens = torch.full(
+                (self.max_bs,),
                 self.seq_len_fill_value,
                 dtype=torch.int32,
             )
-            seq_lens_cpu_steps = torch.full(
-                (self.gamma, self.max_bs),
+            seq_lens_cpu = torch.full(
+                (self.max_bs,),
                 self.seq_len_fill_value,
                 dtype=torch.int32,
                 device="cpu",
             )
             out_cache_loc = torch.zeros(
-                (self.gamma, self.max_bs), dtype=torch.int64, device=self.device
+                (self.gamma * self.max_bs,), dtype=torch.int64, device=self.device
             )
             positions = torch.zeros((self.max_bs,), dtype=torch.int64)
-            working_positions = torch.zeros((self.max_bs,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             temperatures = torch.ones((self.max_bs, 1), dtype=torch.float32)
             top_ps = torch.ones((self.max_bs,), dtype=torch.float32)
@@ -155,13 +151,11 @@ class SMCDraftCudaGraphRunner:
 
         self.buffers = SMCDraftInputBuffers(
             input_ids=input_ids,
-            working_input_ids=working_input_ids,
             req_pool_indices=req_pool_indices,
-            seq_lens_steps=seq_lens_steps,
-            seq_lens_cpu_steps=seq_lens_cpu_steps,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
             positions=positions,
-            working_positions=working_positions,
             mrope_positions=mrope_positions,
             temperatures=temperatures,
             top_ps=top_ps,
@@ -205,21 +199,19 @@ class SMCDraftCudaGraphRunner:
     ):
         del forward, stream_idx
 
+        from sglang.srt.speculative.smc_info import SMCDraftInput
+
         buffers = self.buffers
         graph = self._create_graph()
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
 
         req_pool_indices = buffers.req_pool_indices[:num_seqs]
+        seq_lens = buffers.seq_lens[:num_seqs]
+        seq_lens_cpu = buffers.seq_lens_cpu[:num_seqs]
+        out_cache_loc = buffers.out_cache_loc[: num_seqs * self.gamma]
         positions = buffers.positions[:num_seqs]
-        working_positions = buffers.working_positions[:num_seqs]
         input_ids = buffers.input_ids[:num_seqs]
-        working_input_ids = buffers.working_input_ids[:num_seqs]
-        seq_lens_steps = buffers.seq_lens_steps[:, :num_seqs]
-        seq_lens_cpu_steps = buffers.seq_lens_cpu_steps[:, :num_seqs]
-        out_cache_loc = buffers.out_cache_loc[:, :num_seqs]
-        sampled_token_ids = buffers.sampled_token_ids[:, :num_seqs]
-        sampled_token_logprobs = buffers.sampled_token_logprobs[:, :num_seqs]
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -269,31 +261,25 @@ class SMCDraftCudaGraphRunner:
             logit_bias=None,
         )
 
-        for step, attn_backend in enumerate(self.step_attn_backends):
-            seq_lens_step = seq_lens_steps[step]
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                num_seqs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens_step,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-            )
+        spec_info = SMCDraftInput(
+            last_token_ids=input_ids,
+            new_seq_lens=seq_lens.to(dtype=torch.int64),
+            positions=positions,
+        )
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
             batch_size=num_seqs,
-            input_ids=working_input_ids,
+            input_ids=input_ids,
             req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens_steps[0],
-            seq_lens_cpu=seq_lens_cpu_steps[0],
-            out_cache_loc=out_cache_loc[0],
-            seq_lens_sum=int(seq_lens_cpu_steps[0].sum().item()),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(seq_lens_cpu.sum().item()),
             return_logprob=True,
             top_logprobs_nums=[0] * num_seqs,
             token_ids_logprobs=[None] * num_seqs,
-            positions=working_positions,
+            positions=positions,
             sampling_info=sampling_info,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
@@ -301,9 +287,14 @@ class SMCDraftCudaGraphRunner:
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            attn_backend=self.step_attn_backends[0],
+            attn_backend=self.multi_step_attn_backend,
             mrope_positions=None,
+        )
+        self.multi_step_attn_backend.init_forward_metadata_capture_cuda_graph(
+            forward_batch
         )
 
         def run_once():
@@ -315,28 +306,24 @@ class SMCDraftCudaGraphRunner:
             )
             set_is_extend_in_batch(False)
 
-            working_input_ids.copy_(input_ids)
-            working_positions.copy_(positions)
+            input_ids_backup = forward_batch.input_ids
+            positions_backup = forward_batch.positions
+            seq_lens_backup = forward_batch.seq_lens
+            seq_lens_cpu_backup = forward_batch.seq_lens_cpu
+            seq_lens_sum_backup = forward_batch.seq_lens_sum
+            out_cache_loc_backup = forward_batch.out_cache_loc
+            attn_backend_backup = forward_batch.attn_backend
 
-            for step, attn_backend in enumerate(self.step_attn_backends):
-                forward_batch.input_ids = working_input_ids
-                forward_batch.seq_lens = seq_lens_steps[step]
-                forward_batch.seq_lens_cpu = seq_lens_cpu_steps[step]
-                forward_batch.seq_lens_sum = int(seq_lens_cpu_steps[step].sum().item())
-                forward_batch.out_cache_loc = out_cache_loc[step]
-                forward_batch.positions = working_positions
-                forward_batch.attn_backend = attn_backend
+            ret = self.draft_worker.draft_forward(forward_batch)
 
-                logits_output = self.model_runner.forward_decode(
-                    forward_batch, skip_attn_backend_init=True
-                )
-                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
-                sampled_token_ids[step].copy_(next_token_ids)
-                sampled_token_logprobs[step].copy_(logits_output.next_token_logprobs)
-                working_input_ids.copy_(next_token_ids)
-                working_positions.add_(1)
-
-            return sampled_token_ids, sampled_token_logprobs
+            forward_batch.input_ids = input_ids_backup
+            forward_batch.positions = positions_backup
+            forward_batch.seq_lens = seq_lens_backup
+            forward_batch.seq_lens_cpu = seq_lens_cpu_backup
+            forward_batch.seq_lens_sum = seq_lens_sum_backup
+            forward_batch.out_cache_loc = out_cache_loc_backup
+            forward_batch.attn_backend = attn_backend_backup
+            return ret
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
         self._capture_init(run_once)
@@ -404,11 +391,8 @@ class SMCDraftCudaGraphRunner:
         )
 
     def replay(self, forward_batch: ForwardBatch) -> tuple[torch.Tensor, torch.Tensor]:
-        from sglang.srt.speculative.smc_info import SMCDraftInput
-
         raw_bs = forward_batch.batch_size
         buffers = self.buffers
-        spec_info: SMCDraftInput = forward_batch.spec_info
 
         # Determine padded batch size
         index = bisect.bisect_left(self.capture_bs, raw_bs)
@@ -420,8 +404,8 @@ class SMCDraftCudaGraphRunner:
             buffers.req_pool_indices.zero_()
             buffers.positions.zero_()
             buffers.out_cache_loc.zero_()
-            buffers.seq_lens_steps.fill_(self.seq_len_fill_value)
-            buffers.seq_lens_cpu_steps.fill_(self.seq_len_fill_value)
+            buffers.seq_lens.fill_(self.seq_len_fill_value)
+            buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
             buffers.temperatures.fill_(1.0)
             buffers.top_ps.fill_(1.0)
             buffers.top_ks.fill_(TOP_K_ALL)
@@ -433,11 +417,10 @@ class SMCDraftCudaGraphRunner:
         buffers.input_ids[:raw_bs].copy_(forward_batch.input_ids[:raw_bs])
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices[:raw_bs])
         buffers.positions[:raw_bs].copy_(forward_batch.positions[:raw_bs])
-
-        # Multi-step data from spec_info (populated by prepare_for_v2_draft)
-        buffers.out_cache_loc[:, :raw_bs].copy_(spec_info.out_cache_loc_steps)
-        buffers.seq_lens_steps[:, :raw_bs].copy_(spec_info.seq_lens_steps)
-        buffers.seq_lens_cpu_steps[:, :raw_bs].copy_(spec_info.seq_lens_cpu_steps)
+        buffers.out_cache_loc[: raw_bs * self.gamma].copy_(
+            forward_batch.out_cache_loc[: raw_bs * self.gamma]
+        )
+        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens[:raw_bs])
 
         # Sampling parameters
         sampling_info = forward_batch.sampling_info
@@ -452,14 +435,35 @@ class SMCDraftCudaGraphRunner:
             buffers.global_num_tokens_gpu.fill_(bs)
             buffers.global_num_tokens_for_logprob_gpu.fill_(bs)
 
-        # Initialize attention metadata for multi-step replay
+        batch_size_backup = forward_batch.batch_size
+        input_ids_backup = forward_batch.input_ids
+        req_pool_indices_backup = forward_batch.req_pool_indices
+        positions_backup = forward_batch.positions
+        out_cache_loc_backup = forward_batch.out_cache_loc
+        seq_lens_backup = forward_batch.seq_lens
+        seq_lens_cpu_backup = forward_batch.seq_lens_cpu
+        seq_lens_sum_backup = forward_batch.seq_lens_sum
+
+        if bs != raw_bs:
+            forward_batch.batch_size = bs
+            forward_batch.input_ids = buffers.input_ids[:bs]
+            forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
+            forward_batch.positions = buffers.positions[:bs]
+            forward_batch.out_cache_loc = buffers.out_cache_loc[: bs * self.gamma]
+            forward_batch.seq_lens = buffers.seq_lens[:bs]
+
+        if seq_lens_cpu_backup is not None:
+            buffers.seq_lens_cpu[:raw_bs].copy_(seq_lens_cpu_backup[:raw_bs])
+            forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum().item())
+        else:
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens.sum().item())
+
+        # Initialize attention metadata for multi-step replay.
         self._init_replay_metadata(
+            forward_batch=forward_batch,
             bs=bs,
             raw_bs=raw_bs,
-            req_pool_indices=buffers.req_pool_indices[:bs],
-            seq_lens_steps=buffers.seq_lens_steps[:, :bs],
-            seq_lens_cpu_steps=buffers.seq_lens_cpu_steps[:, :bs],
-            seq_lens_sum_steps=spec_info.seq_lens_sum_steps,
         )
 
         # Run the captured CUDA graph
@@ -468,25 +472,27 @@ class SMCDraftCudaGraphRunner:
         self.bs = bs
         self.graphs[bs].replay()
         sampled_token_ids, sampled_token_logprobs = self.output_buffers[bs]
+        if bs != raw_bs:
+            forward_batch.batch_size = batch_size_backup
+            forward_batch.input_ids = input_ids_backup
+            forward_batch.req_pool_indices = req_pool_indices_backup
+            forward_batch.positions = positions_backup
+            forward_batch.out_cache_loc = out_cache_loc_backup
+            forward_batch.seq_lens = seq_lens_backup
+        forward_batch.seq_lens_cpu = seq_lens_cpu_backup
+        forward_batch.seq_lens_sum = seq_lens_sum_backup
         return (
-            sampled_token_ids[:, :raw_bs].transpose(0, 1).contiguous(),
-            sampled_token_logprobs[:, :raw_bs].transpose(0, 1).contiguous(),
+            sampled_token_ids[:raw_bs].contiguous(),
+            sampled_token_logprobs[:raw_bs].contiguous(),
         )
 
     def _init_replay_metadata(
         self,
         *,
+        forward_batch: ForwardBatch,
         bs: int,
         raw_bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens_steps: torch.Tensor,
-        seq_lens_cpu_steps: torch.Tensor,
-        seq_lens_sum_steps: torch.Tensor,
     ) -> None:
-        if bs != raw_bs:
-            padded_step_sums = seq_lens_sum_steps + (bs - raw_bs) * self.seq_len_fill_value
-        else:
-            padded_step_sums = seq_lens_sum_steps
         if (
             self.multi_step_attn_backend is not None
             and hasattr(
@@ -495,23 +501,31 @@ class SMCDraftCudaGraphRunner:
             )
         ):
             self.multi_step_attn_backend.init_smc_forward_metadata_replay_cuda_graph(
+                forward_batch=forward_batch,
                 bs=bs,
                 raw_bs=raw_bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens_steps=seq_lens_steps,
-                seq_lens_cpu_steps=seq_lens_cpu_steps,
-                seq_lens_sum_steps=padded_step_sums,
             )
             return
 
+        base_seq_lens = forward_batch.seq_lens[:bs]
+        base_seq_lens_cpu = forward_batch.seq_lens_cpu
+        base_seq_lens_sum = (
+            int(base_seq_lens_cpu.sum().item())
+            if base_seq_lens_cpu is not None
+            else int(base_seq_lens.sum().item())
+        )
         for step, attn_backend in enumerate(self.step_attn_backends):
-            step_seq_lens = seq_lens_steps[step, :bs]
-            step_seq_lens_cpu = seq_lens_cpu_steps[step]
+            step_seq_lens = base_seq_lens.clone()
+            step_seq_lens[:raw_bs].add_(step)
+            step_seq_lens_cpu = None
+            if base_seq_lens_cpu is not None:
+                step_seq_lens_cpu = base_seq_lens_cpu.clone()
+                step_seq_lens_cpu[:raw_bs].add_(step)
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
-                req_pool_indices,
+                forward_batch.req_pool_indices,
                 step_seq_lens,
-                int(padded_step_sums[step].item()),
+                base_seq_lens_sum + raw_bs * step,
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=None,

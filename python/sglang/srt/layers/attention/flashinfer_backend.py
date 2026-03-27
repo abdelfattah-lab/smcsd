@@ -1704,17 +1704,20 @@ class FlashInferMultiStepDraftBackend:
 
     def init_smc_forward_metadata_replay_cuda_graph(
         self,
+        forward_batch: ForwardBatch,
         *,
         bs: int,
         raw_bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens_steps: torch.Tensor,
-        seq_lens_cpu_steps: torch.Tensor,
-        seq_lens_sum_steps: torch.Tensor,
     ) -> None:
-        base_seq_lens = seq_lens_steps[0]
+        base_seq_lens = forward_batch.seq_lens[:bs]
+        base_seq_lens_cpu = forward_batch.seq_lens_cpu
+        base_seq_lens_sum = (
+            int(base_seq_lens_cpu.sum().item())
+            if base_seq_lens_cpu is not None
+            else int(base_seq_lens.sum().item())
+        )
         self.generate_smc_draft_decode_kv_indices[(self.speculative_num_steps - 1, bs)](
-            req_pool_indices,
+            forward_batch.req_pool_indices,
             self.req_to_token,
             base_seq_lens,
             self.cuda_graph_kv_indices,
@@ -1731,20 +1734,27 @@ class FlashInferMultiStepDraftBackend:
         global global_override_indptr_cpu
 
         for i in range(self.speculative_num_steps - 1):
+            step_seq_lens = base_seq_lens.clone()
+            step_seq_lens[:raw_bs].add_(i + 1)
+            step_seq_lens_cpu = None
+            if base_seq_lens_cpu is not None:
+                step_seq_lens_cpu = base_seq_lens_cpu.clone()
+                step_seq_lens_cpu[:raw_bs].add_(i + 1)
+            step_seq_lens_sum = base_seq_lens_sum + raw_bs * (i + 1)
             spec_info = SimpleNamespace(
                 kv_indptr=self.kv_indptr[i, : bs + 1],
-                kv_indices=self.cuda_graph_kv_indices[i][: int(seq_lens_sum_steps[i].item())],
+                kv_indices=self.cuda_graph_kv_indices[i][:step_seq_lens_sum],
             )
             global_override_indptr_cpu = indptr_cpu_whole[i]
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                 bs,
-                req_pool_indices,
-                base_seq_lens,
-                seq_lens_sum=int(seq_lens_sum_steps[i].item()),
+                forward_batch.req_pool_indices,
+                step_seq_lens,
+                seq_lens_sum=step_seq_lens_sum,
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=spec_info,
-                seq_lens_cpu=None,
+                seq_lens_cpu=step_seq_lens_cpu,
             )
         global_override_indptr_cpu = None
 

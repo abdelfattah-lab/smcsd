@@ -750,7 +750,6 @@ class SchedulerOutputProcessorMixin:
             if isinstance(batch.spec_info, SMCDraftInput):
                 batch.spec_info.last_token_ids = refreshed_last_token_ids
                 batch.spec_info.new_seq_lens = batch.seq_lens
-                batch.spec_info.committed_seq_lens_cpu = refreshed_seq_lens_cpu
 
         self.stream_output(batch.reqs, batch.return_logprob)
         if smc_finalized_reqs:

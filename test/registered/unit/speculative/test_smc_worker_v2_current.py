@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 from sglang.srt.speculative.smc_info import SMCDraftInput
 from sglang.srt.speculative.smc_worker_v2 import SMCDraftWorker, SMCWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,10 +22,11 @@ class TestSMCDraftWorker(TestCase):
         def record_prefix_fill(reqs, committed_lens):
             observed["fill_lens"] = list(committed_lens)
 
-        def run_stepwise(reqs, visible_seq_lens, draft_committed_lens, last_token_ids):
+        def run_draft(reqs, model_worker_batch, last_token_ids, draft_sampling_info, visible_seq_lens, draft_committed_lens):
             observed["visible_seq_lens"] = visible_seq_lens.clone()
             observed["draft_committed_lens"] = draft_committed_lens.clone()
             observed["last_token_ids"] = last_token_ids.clone()
+            observed["sampling_info"] = draft_sampling_info
             return (
                 torch.tensor([[31, 32, 33, 34], [41, 42, 43, 44]], dtype=torch.int32),
                 torch.tensor([0.1, 0.2], dtype=torch.float32),
@@ -41,8 +43,7 @@ class TestSMCDraftWorker(TestCase):
             ),
             smc_gamma=4,
             _ensure_draft_prefix_filled=record_prefix_fill,
-            _can_use_fused_draft_cuda_graph=lambda reqs, sampling_info: False,
-            _run_stepwise_draft_reqs=run_stepwise,
+            _run_eagle_style_draft_reqs=run_draft,
         )
 
         model_worker_batch = SimpleNamespace(
@@ -88,32 +89,77 @@ class TestSMCDraftWorker(TestCase):
 
 
 class TestSMCWorkerV2(TestCase):
-    def test_can_use_fused_draft_cuda_graph_requires_runner_support(self):
-        worker = SMCWorkerV2.__new__(SMCWorkerV2)
-        sampling_info = MagicMock()
-        reqs = [SimpleNamespace()]
+    def test_triton_smc_graph_replay_uses_raw_last_step_seq_lens_for_kv_splits(self):
+        class _FakeKernel:
+            def __init__(self):
+                self.calls = []
 
-        worker._draft_worker = SimpleNamespace(smc_draft_cuda_graph_runner=None)
-        self.assertFalse(
-            worker._can_use_fused_draft_cuda_graph(reqs, sampling_info)
+            def __getitem__(self, grid):
+                def _launch(
+                    req_pool_indices,
+                    req_to_token,
+                    base_seq_lens,
+                    cuda_graph_kv_indices,
+                    kv_indptr,
+                    raw_bs,
+                    pool_len,
+                    kv_indices_stride,
+                    kv_indptr_stride,
+                    bs_upper,
+                    num_steps_upper,
+                ):
+                    self.calls.append(
+                        {
+                            "grid": grid,
+                            "base_seq_lens": base_seq_lens.clone(),
+                            "raw_bs": raw_bs,
+                            "pool_len": pool_len,
+                        }
+                    )
+
+                return _launch
+
+        fake_kernel = _FakeKernel()
+        fake_last_backend = SimpleNamespace(
+            cuda_graph_num_kv_splits=torch.zeros((8,), dtype=torch.int32),
+            get_num_kv_splits=MagicMock(),
+        )
+        fake_backend = SimpleNamespace(
+            speculative_num_steps=5,
+            generate_smc_draft_decode_kv_indices=fake_kernel,
+            req_to_token=torch.zeros((4, 32), dtype=torch.int32),
+            cuda_graph_kv_indices=torch.zeros((5, 64), dtype=torch.int64),
+            kv_indptr=torch.zeros((5, 8), dtype=torch.int32),
+            pool_len=32,
+            attn_backends=[object(), object(), object(), object(), fake_last_backend],
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([5, 7], dtype=torch.int32),
         )
 
-        runner = MagicMock()
-        runner.supports_replay.return_value = False
-        worker._draft_worker = SimpleNamespace(smc_draft_cuda_graph_runner=runner)
-        self.assertFalse(
-            worker._can_use_fused_draft_cuda_graph(reqs, sampling_info)
+        TritonMultiStepDraftBackend.init_smc_forward_metadata_replay_cuda_graph(
+            fake_backend,
+            forward_batch=forward_batch,
+            bs=2,
+            raw_bs=2,
         )
-        runner.supports_replay.assert_called_once_with(reqs, sampling_info)
 
-        runner.supports_replay.reset_mock()
-        runner.supports_replay.return_value = True
+        self.assertEqual(len(fake_kernel.calls), 1)
+        self.assertEqual(fake_kernel.calls[0]["grid"], (4, 2))
         self.assertTrue(
-            worker._can_use_fused_draft_cuda_graph(reqs, sampling_info)
+            torch.equal(
+                fake_kernel.calls[0]["base_seq_lens"],
+                torch.tensor([5, 7], dtype=torch.int32),
+            )
         )
-        runner.supports_replay.assert_called_once_with(reqs, sampling_info)
+        fake_last_backend.get_num_kv_splits.assert_called_once()
+        split_arg = fake_last_backend.get_num_kv_splits.call_args.args[1]
+        self.assertTrue(
+            torch.equal(split_arg, torch.tensor([8, 10], dtype=torch.int32))
+        )
 
-    def test_run_fused_draft_reqs_falls_back_to_stepwise_when_prepare_rejects_graph(
+    def test_run_eagle_style_draft_reqs_uses_draft_forward_when_prepare_rejects_graph(
         self,
     ):
         @dataclass
@@ -128,12 +174,26 @@ class TestSMCWorkerV2(TestCase):
         worker.device = torch.device("cpu")
         worker.smc_gamma = 4
         worker.req_to_token_pool = SimpleNamespace(req_to_token=torch.zeros((4, 16)))
+        fake_forward_batch = MagicMock()
+        fake_forward_batch.forward_mode.is_idle.return_value = False
+        fake_token_matrix = torch.tensor(
+            [[31, 32, 33, 34], [41, 42, 43, 44]], dtype=torch.int32
+        )
+        fake_logprob_matrix = torch.tensor(
+            [[0.01, 0.02, 0.03, 0.04], [0.11, 0.12, 0.13, 0.14]],
+            dtype=torch.float32,
+        )
         worker._draft_worker = SimpleNamespace(
             smc_draft_cuda_graph_runner=MagicMock(),
             draft_runner=MagicMock(),
+            smc_draft_attn_backend=SimpleNamespace(init_forward_metadata=MagicMock()),
+            draft_forward=MagicMock(return_value=(fake_token_matrix, fake_logprob_matrix)),
         )
 
-        reqs = [SimpleNamespace(), SimpleNamespace()]
+        reqs = [
+            SimpleNamespace(draft_prefix_materialized=False),
+            SimpleNamespace(draft_prefix_materialized=False),
+        ]
         visible_seq_lens = torch.tensor([6, 8], dtype=torch.int64)
         draft_committed_lens = torch.tensor([5, 7], dtype=torch.int64)
         model_worker_batch = _Batch(
@@ -145,9 +205,6 @@ class TestSMCWorkerV2(TestCase):
         )
         last_token_ids = torch.tensor([17, 19], dtype=torch.int32)
         draft_sampling_info = MagicMock()
-
-        stepwise_result = ("tokens", "logprobs", "lengths", False)
-        worker._run_stepwise_draft_reqs = MagicMock(return_value=stepwise_result)
 
         observed = {}
 
@@ -164,7 +221,7 @@ class TestSMCWorkerV2(TestCase):
             observed["seq_lens_cpu"] = batch.seq_lens_cpu.clone()
             observed["seq_lens_sum"] = batch.seq_lens_sum
             observed["new_seq_lens"] = self_input.new_seq_lens.clone()
-            return MagicMock(), False
+            return fake_forward_batch, False
 
         with patch.object(
             SMCDraftInput,
@@ -172,7 +229,7 @@ class TestSMCWorkerV2(TestCase):
             autospec=True,
             side_effect=_prepare,
         ):
-            result = worker._run_fused_draft_reqs(
+            result = worker._run_eagle_style_draft_reqs(
                 reqs,
                 model_worker_batch,
                 last_token_ids,
@@ -181,7 +238,18 @@ class TestSMCWorkerV2(TestCase):
                 draft_committed_lens,
             )
 
-        self.assertEqual(result, stepwise_result)
+        token_matrix, draft_logprobs, draft_lengths, can_cuda_graph = result
+        self.assertTrue(torch.equal(token_matrix, fake_token_matrix))
+        self.assertTrue(
+            torch.allclose(
+                draft_logprobs,
+                torch.tensor([0.10, 0.50], dtype=torch.float32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(draft_lengths, torch.tensor([4, 4], dtype=torch.int32))
+        )
+        self.assertFalse(can_cuda_graph)
         self.assertTrue(
             torch.equal(observed["seq_lens"], torch.tensor([5, 7], dtype=torch.int64))
         )
@@ -194,12 +262,11 @@ class TestSMCWorkerV2(TestCase):
         self.assertTrue(
             torch.equal(observed["new_seq_lens"], torch.tensor([6, 8], dtype=torch.int64))
         )
-        worker._run_stepwise_draft_reqs.assert_called_once_with(
-            reqs,
-            visible_seq_lens,
-            draft_committed_lens,
-            last_token_ids,
+        worker.draft_worker.smc_draft_attn_backend.init_forward_metadata.assert_called_once_with(
+            fake_forward_batch
         )
+        worker.draft_worker.draft_forward.assert_called_once_with(fake_forward_batch)
+        self.assertTrue(all(req.draft_prefix_materialized for req in reqs))
 
     def test_draft_extend_for_decode_falls_back_without_cuda_graph(self):
         worker = SMCDraftWorker.__new__(SMCDraftWorker)

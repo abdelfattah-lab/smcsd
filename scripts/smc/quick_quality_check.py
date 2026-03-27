@@ -50,7 +50,7 @@ def run_smc(prompts, sampling_params, args):
     )
     results = engine.generate(prompts, sampling_params)
     for i, r in enumerate(results):
-        print(f"  OUTPUT_{i+1}: {r['text'][:200]}")
+        print(f"  OUTPUT_{i+1}: {r['text']}")
     engine.shutdown()
     print()
 
@@ -67,7 +67,7 @@ def main():
     sampling_params = {
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
-        "ignore_eos": True,
+        #"ignore_eos": True,
     }
     print(f"Sampling: temperature={args.temperature}, max_new_tokens={args.max_new_tokens}")
     print()

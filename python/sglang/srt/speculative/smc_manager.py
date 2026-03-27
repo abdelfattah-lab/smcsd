@@ -314,7 +314,6 @@ class SMCManager:
         batch.spec_info = SMCDraftInput(
             last_token_ids=last_token_ids,
             new_seq_lens=visible_seq_lens,
-            committed_seq_lens_cpu=batch.seq_lens_cpu,
         )
         if use_future_map and scheduler.enable_overlap and scheduler.future_map is not None:
             future_indices = scheduler.future_map.alloc_future_indices(len(particle_reqs))

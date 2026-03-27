@@ -1003,22 +1003,6 @@ class CudaGraphRunner:
                 forward_batch,
                 **kwargs,
             )
-            # Bake temperature-scaled log_softmax into the graph for SMC scoring.
-            # get_spec_info() creates SMCScoreInput with target_temperature at
-            # capture time. The target model's CG runner for SMC is only used
-            # for verify, so this is safe.
-            if isinstance(logits_output_or_pp_proxy_tensors, LogitsProcessorOutput):
-                from sglang.srt.speculative.smc_info import SMCScoreInput
-
-                smc_spec = forward_batch.spec_info
-                if isinstance(smc_spec, SMCScoreInput):
-                    logits_output_or_pp_proxy_tensors.next_token_logits[:] = (
-                        torch.nn.functional.log_softmax(
-                            logits_output_or_pp_proxy_tensors.next_token_logits
-                            / smc_spec.target_temperature,
-                            dim=-1,
-                        )
-                    )
             return logits_output_or_pp_proxy_tensors
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1222,6 +1206,10 @@ class CudaGraphRunner:
                     target_temperature=max(
                         float(self.model_runner.server_args.smc_target_temperature),
                         SMC_MIN_TEMPERATURE,
+                    ),
+                    linear_target_verify=(
+                        self.model_runner.server_args.attention_backend
+                        in {"flashinfer", "triton"}
                     ),
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
