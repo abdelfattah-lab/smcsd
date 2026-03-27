@@ -17,6 +17,7 @@ PROMPTS = [
     "Write one sentence about why overlap scheduling matters for inference systems.",
     "List two prime numbers and one composite number.",
     "In one short paragraph, explain speculative decoding.",
+    "What is 1+1?",
 ]
 
 
@@ -24,7 +25,11 @@ def run_vanilla(prompts, sampling_params):
     print("=" * 60)
     print("VANILLA (no spec decode)")
     print("=" * 60)
-    engine = sgl.Engine(model_path=MODEL, mem_fraction_static=0.45)
+    engine = sgl.Engine(
+        model_path=MODEL,
+        mem_fraction_static=0.45,
+        attention_backend="triton",
+    )
     results = engine.generate(prompts, sampling_params)
     for i, r in enumerate(results):
         print(f"  OUTPUT_{i+1}: {r['text'][:200]}")
@@ -47,6 +52,7 @@ def run_smc(prompts, sampling_params, args):
         mem_fraction_static=0.45,
         disable_piecewise_cuda_graph=False,
         cuda_graph_max_bs=16,
+        attention_backend="triton",
     )
     results = engine.generate(prompts, sampling_params)
     for i, r in enumerate(results):
@@ -58,7 +64,7 @@ def run_smc(prompts, sampling_params, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--mode", choices=["vanilla", "smc", "both"], default="both")
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--gamma", type=int, default=4)

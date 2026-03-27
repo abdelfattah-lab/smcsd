@@ -786,13 +786,8 @@ class Req(ReqDllmMixin):
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
         self.spec_acceptance_histogram: List[int] = []
 
-        # SMC lifecycle state.
-        self.smc_state = None
-        self.smc_parent = None
         self.smc_group_id: Optional[str] = None
         self.smc_particle_idx: Optional[int] = None
-        self.smc_logprob_diff: Optional[float] = None
-        self.smc_target_temperature: Optional[float] = None
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
@@ -2045,20 +2040,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
-        # SMC NOTE: For SMC particles, this releases KV cache and cleans up
-        # per-request SMC state (smc_state, draft req), but does NOT notify
-        # the SMCScheduler to pause/invalidate the group. The group may still
-        # attempt to score or resample this particle after it has been released.
         req = self.reqs[idx]
-        if req.smc_state is not None:
-            from sglang.srt.speculative.smc_info import cleanup_smc_request_state
-
-            cleanup_smc_request_state(
-                req.smc_state,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            )
-            req.smc_state = None
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(

@@ -25,15 +25,11 @@ from sglang.srt.speculative.smc_manager import (
 )
 from sglang.srt.speculative.smc_info import SMCDraftInput, SMCScoreInput
 from sglang.srt.speculative.smc_info import (
-    SMCParticleState,
-    SMCRequestState,
     _release_internal_req,
     _release_smc_parent_req,
     effective_sample_size,
     multinomial_resample,
     normalize_log_weights,
-    resolve_smc_proposal_length, #dead code
-    resolve_smc_seed_output_ids,
     systematic_resample,
     validate_smc_parent_req,
 )
@@ -41,25 +37,6 @@ from sglang.srt.speculative.smc_scheduler import PendingResample, SMCScheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-cpu-only")
-
-
-def _make_particle(output_len: int, log_weight: float, finished: bool = False):
-    target_req = MagicMock()
-    target_req.output_ids = list(range(output_len))
-    target_req.finished.return_value = finished
-    target_req.finished_reason = None
-    target_req.finished_len = None
-
-    draft_req = MagicMock()
-    draft_req.output_ids = list(range(output_len))
-    draft_req.finished.return_value = finished
-
-    return SMCParticleState(
-        target_req=target_req,
-        draft_req=draft_req,
-        log_weight=log_weight,
-    )
-
 
 def _make_scheduler_req(
     *,
@@ -2229,41 +2206,6 @@ class TestSMCDraftInput(TestCase):
         self.assertEqual(batch.seq_lens_sum, 5)
         self.assertEqual(req.kv_allocated_len, 9)
         self.assertEqual(req.decode_batch_idx, 1)
-
-
-class TestSMCRequestState(TestCase):
-    def test_get_best_particle_prefers_higher_weight(self):
-        short_heavier = _make_particle(output_len=2, log_weight=10.0)
-        long_lighter = _make_particle(output_len=3, log_weight=1.0)
-        state = SMCRequestState(
-            parent_req_id="parent",
-            particles=[short_heavier, long_lighter],
-            n_particles=2,
-            gamma=2,
-            resample_threshold=0.5,
-            resample_method="systematic",
-        )
-
-        best = state.get_best_particle()
-        self.assertIs(best, short_heavier)
-        self.assertEqual(state.best_particle_idx, 0)
-
-    def test_active_particles_excludes_finished(self):
-        active = _make_particle(output_len=2, log_weight=0.0, finished=False)
-        finished = _make_particle(output_len=3, log_weight=1.0, finished=True)
-        state = SMCRequestState(
-            parent_req_id="parent",
-            particles=[active, finished],
-            n_particles=2,
-            gamma=2,
-            resample_threshold=0.5,
-            resample_method="systematic",
-        )
-
-        self.assertEqual(state.active_particles(), [active])
-        self.assertFalse(state.is_terminal())
-
-
 class TestValidateSMCParentReq(TestCase):
     def test_validate_rejects_stop_strings_and_hidden_states(self):
         req = MagicMock()
@@ -2278,114 +2220,6 @@ class TestValidateSMCParentReq(TestCase):
         req.return_hidden_states = False
         req.sampling_params.stop_strs = ["stop"]
         self.assertIn("stop strings", validate_smc_parent_req(req))
-
-
-class TestResolveSMCSeedOutputIds(TestCase):
-    def test_uses_overlap_token_when_parent_lags_by_one(self):
-        req = MagicMock()
-        req.origin_input_ids = [1, 2, 3]
-        req.output_ids = []
-
-        seeded = resolve_smc_seed_output_ids(
-            req,
-            overlap_last_token_id=99,
-            overlap_new_seq_len=4,
-        )
-
-        self.assertEqual(seeded, [99])
-
-    def test_accepts_already_synchronized_parent(self):
-        req = MagicMock()
-        req.origin_input_ids = [1, 2, 3]
-        req.output_ids = [99]
-
-        seeded = resolve_smc_seed_output_ids(
-            req,
-            overlap_last_token_id=99,
-            overlap_new_seq_len=4,
-        )
-
-        self.assertEqual(seeded, [99])
-
-    def test_rejects_large_overlap_gap(self):
-        req = MagicMock()
-        req.origin_input_ids = [1, 2, 3]
-        req.output_ids = []
-
-        with self.assertRaisesRegex(ValueError, "at most one missing output token"):
-            resolve_smc_seed_output_ids(
-                req,
-                overlap_last_token_id=99,
-                overlap_new_seq_len=5,
-            )
-
-
-class TestResolveSMCProposalLength(TestCase):
-    def _make_req(
-        self,
-        *,
-        output_len: int = 0,
-        max_new_tokens: int = 16,
-        ignore_eos: bool = False,
-        stop_token_ids=None,
-        eos_token_ids=None,
-        tokenizer_eos_id=None,
-        additional_stop_token_ids=None,
-        vocab_size: int = 32000,
-        to_finish=None,
-    ):
-        req = MagicMock()
-        req.finished.return_value = False
-        req.output_ids = [1] * output_len
-        req.sampling_params.max_new_tokens = max_new_tokens
-        req.sampling_params.ignore_eos = ignore_eos
-        req.sampling_params.stop_token_ids = stop_token_ids
-        req.eos_token_ids = eos_token_ids
-        req.tokenizer = (
-            None
-            if tokenizer_eos_id is None and additional_stop_token_ids is None
-            else SimpleNamespace(
-                eos_token_id=tokenizer_eos_id,
-                additional_stop_token_ids=additional_stop_token_ids,
-            )
-        )
-        req.vocab_size = vocab_size
-        req.to_finish = to_finish
-        return req
-
-    def test_truncates_at_eos_without_changing_fixed_width_contract(self):
-        req = self._make_req(
-            eos_token_ids={99},
-            tokenizer_eos_id=100,
-            additional_stop_token_ids=[101],
-        )
-
-        proposal_len, proposal_finished = resolve_smc_proposal_length(
-            req, [7, 99, 88, 77]
-        )
-
-        self.assertEqual(proposal_len, 2)
-        self.assertTrue(proposal_finished)
-
-    def test_ignore_eos_keeps_full_proposal_length(self):
-        req = self._make_req(ignore_eos=True, eos_token_ids={99})
-
-        proposal_len, proposal_finished = resolve_smc_proposal_length(
-            req, [7, 99, 88, 77]
-        )
-
-        self.assertEqual(proposal_len, 4)
-        self.assertFalse(proposal_finished)
-
-    def test_max_new_tokens_is_counted_in_sample_phase(self):
-        req = self._make_req(output_len=3, max_new_tokens=5)
-
-        proposal_len, proposal_finished = resolve_smc_proposal_length(req, [7, 8, 9])
-
-        self.assertEqual(proposal_len, 2)
-        self.assertTrue(proposal_finished)
-
-
 class TestSMCDraftCudaGraphSamplingSupport(TestCase):
     """Tests for SMCDraftCudaGraphRunner._supports_sampling_info."""
 
@@ -2488,65 +2322,18 @@ class TestSMCDraftGraphReplayMetadata(TestCase):
         )
 
         fake_kernel = self._make_fake_smc_kernel()
-        last_backend = SimpleNamespace(
-            cuda_graph_num_kv_splits=torch.zeros((2,), dtype=torch.int32),
-            get_num_kv_splits=MagicMock(),
-        )
-        backend = TritonMultiStepDraftBackend.__new__(TritonMultiStepDraftBackend)
-        backend.speculative_num_steps = 5
-        backend.attn_backends = [
-            SimpleNamespace(),
-            SimpleNamespace(),
-            SimpleNamespace(),
-            last_backend,
-        ]
-        backend.req_to_token = torch.zeros((4, 32), dtype=torch.int32)
-        backend.pool_len = backend.req_to_token.shape[1]
-        backend.cuda_graph_kv_indices = torch.zeros((4, 128), dtype=torch.int64)
-        backend.kv_indptr = torch.zeros((4, 3), dtype=torch.int32)
-        backend.generate_smc_draft_decode_kv_indices = fake_kernel
-
-        seq_lens_steps = torch.tensor(
-            [5, 7], dtype=torch.int64
-        )
-        forward_batch = SimpleNamespace(
-            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
-            seq_lens=seq_lens_steps,
-        )
-
-        backend.init_smc_forward_metadata_replay_cuda_graph(
-            forward_batch=forward_batch,
-            bs=2,
-            raw_bs=2,
-        )
-
-        self.assertEqual(len(fake_kernel.calls), 1)
-        self.assertTrue(
-            torch.equal(
-                fake_kernel.calls[0]["base_seq_lens"],
-                torch.tensor([5, 7], dtype=torch.int64),
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                last_backend.get_num_kv_splits.call_args.args[1],
-                torch.tensor([8, 10], dtype=torch.int64),
-            )
-        )
-
-    def test_flashinfer_replay_uses_step_lengths_including_current_token(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
-            FlashInferMultiStepDraftBackend,
-        )
-
-        fake_kernel = self._make_fake_smc_kernel()
         attn_backends = [
             SimpleNamespace(init_forward_metadata_replay_cuda_graph=MagicMock())
-            for _ in range(4)
+            for _ in range(3)
         ]
-        backend = FlashInferMultiStepDraftBackend.__new__(
-            FlashInferMultiStepDraftBackend
+        attn_backends.append(
+            SimpleNamespace(
+                init_forward_metadata_replay_cuda_graph=MagicMock(),
+                cuda_graph_num_kv_splits=torch.zeros((8,), dtype=torch.int32),
+                get_num_kv_splits=MagicMock(),
+            )
         )
+        backend = TritonMultiStepDraftBackend.__new__(TritonMultiStepDraftBackend)
         backend.speculative_num_steps = 5
         backend.attn_backends = attn_backends
         backend.req_to_token = torch.zeros((4, 32), dtype=torch.int32)
@@ -2571,17 +2358,30 @@ class TestSMCDraftGraphReplayMetadata(TestCase):
         )
 
         self.assertEqual(len(fake_kernel.calls), 1)
-        for step, attn_backend in enumerate(attn_backends):
-            args = attn_backend.init_forward_metadata_replay_cuda_graph.call_args.args
-            kwargs = attn_backend.init_forward_metadata_replay_cuda_graph.call_args.kwargs
-            expected_seq_lens = base_seq_lens + (step + 1)
-            expected_seq_lens_sum = int(base_seq_lens.sum().item()) + 2 * (step + 1)
-            self.assertTrue(torch.equal(args[2], expected_seq_lens))
-            self.assertEqual(kwargs["seq_lens_sum"], expected_seq_lens_sum)
-            self.assertTrue(
-                torch.equal(kwargs["seq_lens_cpu"], expected_seq_lens.cpu())
-            )
-            self.assertEqual(kwargs["spec_info"].kv_indices.numel(), expected_seq_lens_sum)
+        self.assertEqual(fake_kernel.calls[0]["grid"], (4, 2))
+        self.assertTrue(torch.equal(fake_kernel.calls[0]["base_seq_lens"], base_seq_lens))
+        attn_backends[-1].get_num_kv_splits.assert_called_once()
+        split_arg = attn_backends[-1].get_num_kv_splits.call_args.args[1]
+        self.assertTrue(torch.equal(split_arg, torch.tensor([8, 10], dtype=torch.int64)))
+
+
+class TestGenerationBatchResult(TestCase):
+    def test_copy_to_cpu_moves_smc_logprob_diffs(self):
+        copied_diffs = object()
+        smc_logprob_diffs = MagicMock()
+        smc_logprob_diffs.to.return_value = copied_diffs
+        copy_done = SimpleNamespace(record=MagicMock())
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor([1], dtype=torch.int32),
+            copy_done=copy_done,
+            smc_logprob_diffs=smc_logprob_diffs,
+        )
+
+        result.copy_to_cpu(return_logprob=False)
+
+        smc_logprob_diffs.to.assert_called_once_with("cpu", non_blocking=True)
+        self.assertIs(result.smc_logprob_diffs, copied_diffs)
+        copy_done.record.assert_called_once()
 
 
 class TestSMCDraftCudaGraphCapture(TestCase):
@@ -2796,7 +2596,6 @@ class TestSMCPrefillOutputProcessor(TestCase):
             finished=lambda: False,
             is_retracted=False,
             is_chunked=0,
-            smc_state=None,
             smc_particle_idx=None,
             return_logprob=False,
             return_hidden_states=False,

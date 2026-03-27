@@ -26,7 +26,6 @@ from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
     _release_internal_req,
     _release_smc_parent_req,
-    cleanup_smc_request_state,
 )
 
 if TYPE_CHECKING:
@@ -86,83 +85,6 @@ class SchedulerOutputProcessorMixin:
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
         return None
-
-    def _maybe_init_smc_state_after_prefill(self, req: Req):
-        if req.finished() or req.is_retracted or req.smc_state is not None:
-            return
-
-        from sglang.srt.speculative.smc_info import (
-            initialize_smc_request_state,
-        )
-
-        error = initialize_smc_request_state(
-            req,
-            server_args=self.server_args,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-        )
-        if error is not None:
-            req.finished_reason = FINISH_ABORT(error)
-
-    def _process_batch_result_decode_smc(
-        self: "Scheduler",
-        batch: ScheduleBatch,
-        result: "GenerationBatchResult",
-    ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-
-        updates = result.smc_parent_updates or []
-        if self.enable_metrics:
-            self.metrics_collector.increment_decode_cuda_graph_pass(
-                value=result.can_run_cuda_graph
-            )
-
-        self.token_to_kv_pool_allocator.free_group_begin()
-
-        for i, req in enumerate(batch.reqs):
-            if self.enable_overlap and (req.finished() or req.is_retracted):
-                continue
-
-            req.time_stats.set_last_decode_finish_time()
-            prev_output_len = len(req.output_ids)
-
-            if i < len(updates):
-                update = updates[i]
-                if update.best_output_ids is not None:
-                    req.output_ids = list(update.best_output_ids)
-                self.num_generated_tokens += max(len(req.output_ids) - prev_output_len, 0)
-
-                if update.done:
-                    req.finished_reason = update.finish_reason
-                    req.finished_len = update.finished_len
-
-                    if req.smc_state is not None:
-                        from sglang.srt.speculative.smc_info import cleanup_smc_request_state
-
-                        cleanup_smc_request_state(
-                            req.smc_state,
-                            req_to_token_pool=self.req_to_token_pool,
-                            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                        )
-                        req.smc_state = None
-
-                    self.maybe_collect_routed_experts(req)
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
-                    req.time_stats.set_completion_time()
-
-            if result.logits_output is not None:
-                self.maybe_collect_customized_info(i, req, result.logits_output)
-
-        self.stream_output(batch.reqs, False)
-        self.token_to_kv_pool_allocator.free_group_end()
-
-        self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        self.report_decode_stats(
-            result.can_run_cuda_graph,
-            running_batch=batch,
-            num_accepted_tokens=0,
-        )
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -257,13 +179,6 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        if req.smc_state is not None:
-                            cleanup_smc_request_state(
-                                req.smc_state,
-                                req_to_token_pool=self.req_to_token_pool,
-                                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                            )
-                            req.smc_state = None
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()

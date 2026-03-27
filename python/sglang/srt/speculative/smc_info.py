@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
     ModelWorkerBatch,
     Req,
     ScheduleBatch,
@@ -40,59 +39,6 @@ if TYPE_CHECKING:
 SMC_MIN_TEMPERATURE = 1e-5
 
 
-@dataclass
-class SMCParticleState:
-    target_req: Req
-    draft_req: Req
-    log_weight: float = 0.0
-
-    @property
-    def is_finished(self) -> bool:
-        return self.target_req.finished()
-
-    @property
-    def output_ids(self) -> List[int]:
-        return self.target_req.output_ids
-
-
-@dataclass
-class SMCRequestState:
-    parent_req_id: str
-    particles: List[SMCParticleState]
-    n_particles: int
-    gamma: int
-    resample_threshold: float
-    resample_method: str
-    released: bool = False
-    step_index: int = 0
-    best_particle_idx: int = 0
-
-    def active_particles(self) -> List[SMCParticleState]:
-        return [particle for particle in self.particles if not particle.is_finished]
-
-    def is_terminal(self) -> bool:
-        return all(particle.is_finished for particle in self.particles)
-
-    def get_best_particle(self) -> SMCParticleState:
-        self.best_particle_idx = max(
-            range(len(self.particles)),
-            key=lambda idx: (
-                self.particles[idx].log_weight,
-                len(self.particles[idx].output_ids),
-            ),
-        )
-        return self.particles[self.best_particle_idx]
-
-
-@dataclass
-class SMCParentUpdate:
-    done: bool
-    best_particle_idx: int
-    best_output_ids: Optional[List[int]] = None
-    finish_reason: Optional[BaseFinishReason] = None
-    finished_len: Optional[int] = None
-
-
 def validate_smc_parent_req(req: Req) -> Optional[str]:
     if req.__dict__.get("multimodal_inputs") is not None:
         return "SMC speculative decoding does not yet support multimodal inputs."
@@ -116,7 +62,6 @@ def validate_smc_parent_req(req: Req) -> Optional[str]:
 def clone_req_for_smc_particle(
     parent_req: Req,
     particle_idx: int,
-    role: str,
     temperature: float,
     return_logprob: bool,
     output_ids: Optional[Sequence[int]] = None,
@@ -127,7 +72,7 @@ def clone_req_for_smc_particle(
         sampling_params.custom_params = dict(sampling_params.custom_params)
 
     particle_req = Req(
-        rid=f"{parent_req.rid}_smc_p{particle_idx}_{role}",
+        rid=f"{parent_req.rid}_smc_p{particle_idx}_particle",
         origin_input_text=parent_req.origin_input_text,
         origin_input_ids=list(parent_req.origin_input_ids),
         sampling_params=sampling_params,
@@ -168,268 +113,8 @@ def clone_req_for_smc_particle(
     particle_req.decoded_text = parent_req.decoded_text
     particle_req.surr_offset = parent_req.surr_offset
     particle_req.read_offset = parent_req.read_offset
-    particle_req.smc_parent = parent_req
     particle_req.smc_particle_idx = particle_idx
     return particle_req
-
-
-def initialize_smc_request_state(
-    req: Req,
-    *,
-    server_args,
-    req_to_token_pool,
-    token_to_kv_pool_allocator,
-    seed_output_ids: Optional[Sequence[int]] = None,
-) -> Optional[str]:
-    error = validate_smc_parent_req(req)
-    if error is not None:
-        return error
-
-    base_output_ids = list(req.output_ids if seed_output_ids is None else seed_output_ids)
-
-    particle_states = []
-    ### Why clone for both target_reqs and draft_reqs?
-    target_reqs = []
-    draft_reqs = []
-    for i in range(server_args.smc_n_particles):
-        target_reqs.append(
-            clone_req_for_smc_particle(
-                req,
-                particle_idx=i,
-                role="target",
-                temperature=server_args.smc_target_temperature,
-                return_logprob=True,
-                output_ids=base_output_ids,
-            )
-        )
-        draft_reqs.append(
-            clone_req_for_smc_particle(
-                req,
-                particle_idx=i,
-                role="draft",
-                temperature=server_args.smc_draft_temperature,
-                return_logprob=True,
-                output_ids=base_output_ids,
-            )
-        )
-
-    particle_reqs = target_reqs + draft_reqs
-    if req_to_token_pool.alloc(particle_reqs) is None:
-        return "SMC particle allocation failed because req_to_token_pool is full."
-
-    shared_seq_len = compute_smc_shared_prefix_len(req, output_ids=base_output_ids)
-    for particle_req in particle_reqs:
-        req_to_token_pool.copy_block_table(
-            req.req_pool_idx,
-            particle_req.req_pool_idx,
-            shared_seq_len,
-            token_to_kv_pool_allocator,
-        )
-        particle_req.kv_committed_len = shared_seq_len
-        particle_req.kv_allocated_len = shared_seq_len
-        particle_req.prefix_indices = req_to_token_pool.req_to_token[
-            particle_req.req_pool_idx, :shared_seq_len
-        ].to(dtype=torch.int64, copy=True)
-        particle_req.cache_protected_len = shared_seq_len
-
-    for target_req, draft_req in zip(target_reqs, draft_reqs, strict=True):
-        particle_states.append(
-            SMCParticleState(target_req=target_req, draft_req=draft_req)
-        )
-
-    req.smc_state = SMCRequestState(
-        parent_req_id=req.rid,
-        particles=particle_states,
-        n_particles=server_args.smc_n_particles,
-        gamma=server_args.smc_gamma,
-        resample_threshold=server_args.smc_resample_threshold,
-        resample_method=server_args.smc_resample_method,
-    )
-    return None
-
-### Dead code....
-def resolve_smc_seed_output_ids(
-    req: Req,
-    *,
-    overlap_last_token_id: Optional[int],
-    overlap_new_seq_len: Optional[int],
-) -> List[int]:
-    seed_output_ids = list(req.output_ids)
-    if overlap_last_token_id is None or overlap_new_seq_len is None:
-        return seed_output_ids
-
-    desired_output_len = int(overlap_new_seq_len) - len(req.origin_input_ids)
-    if desired_output_len < 0:
-        raise ValueError(
-            "SMC overlap lazy init received a sequence length shorter than the prompt."
-        )
-
-    current_output_len = len(seed_output_ids)
-    if desired_output_len == current_output_len:
-        return seed_output_ids
-    if desired_output_len == current_output_len + 1:
-        seed_output_ids.append(int(overlap_last_token_id))
-        return seed_output_ids
-
-    raise ValueError(
-        "SMC overlap lazy init can only recover at most one missing output token "
-        f"(current={current_output_len}, desired={desired_output_len})."
-    )
-
-### Dead code...
-def collect_smc_stop_token_ids(req: Req) -> List[int]:
-    stop_token_ids = set(req.sampling_params.stop_token_ids or [])
-    if req.eos_token_ids:
-        stop_token_ids.update(req.eos_token_ids)
-    if req.tokenizer is not None:
-        eos_token_id = getattr(req.tokenizer, "eos_token_id", None)
-        if eos_token_id is not None:
-            stop_token_ids.add(eos_token_id)
-        additional_stop_token_ids = getattr(
-            req.tokenizer, "additional_stop_token_ids", None
-        )
-        if additional_stop_token_ids:
-            stop_token_ids.update(additional_stop_token_ids)
-    return sorted(int(token_id) for token_id in stop_token_ids)
-
-### Dead code....
-def resolve_smc_proposal_length(
-    req: Req,
-    proposal_tokens: Sequence[int],
-    *,
-    current_output_len: Optional[int] = None,
-) -> tuple[int, bool]:
-    stop_token_ids = set(collect_smc_stop_token_ids(req))
-
-    current_output_len = (
-        len(req.output_ids) if current_output_len is None else current_output_len
-    )
-    proposal_len = 0
-    for token_id in proposal_tokens:
-        proposal_len += 1
-        if current_output_len + proposal_len >= req.sampling_params.max_new_tokens:
-            return proposal_len, True
-        if req.vocab_size is not None and (token_id > req.vocab_size or token_id < 0):
-            return proposal_len, True
-        if not req.sampling_params.ignore_eos and token_id in stop_token_ids:
-            return proposal_len, True
-
-    return proposal_len, False
-
-
-def resolve_smc_proposal_batch(
-    reqs: Sequence[Req],
-    proposal_tokens: torch.Tensor,
-    proposal_logprobs: torch.Tensor,
-    current_output_lens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if proposal_tokens.numel() == 0:
-        empty_len = torch.empty((0,), dtype=torch.int32, device=proposal_tokens.device)
-        empty_finished = torch.empty(
-            (0,), dtype=torch.bool, device=proposal_tokens.device
-        )
-        empty_logprobs = torch.empty(
-            (0,), dtype=torch.float32, device=proposal_tokens.device
-        )
-        return empty_len, empty_finished, empty_logprobs
-
-    device = proposal_tokens.device
-    bs, gamma = proposal_tokens.shape
-    steps = torch.arange(1, gamma + 1, dtype=torch.int64, device=device).unsqueeze(0)
-    current_output_lens = current_output_lens.to(dtype=torch.int64, device=device)
-    max_new_tokens = torch.tensor(
-        [
-            int(req.sampling_params.max_new_tokens)
-            if req.sampling_params.max_new_tokens is not None
-            else torch.iinfo(torch.int64).max
-            for req in reqs
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
-    vocab_sizes = torch.tensor(
-        [
-            int(req.vocab_size)
-            if req.vocab_size is not None
-            else torch.iinfo(torch.int64).max
-            for req in reqs
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
-
-    max_token_mask = (
-        current_output_lens.unsqueeze(1) + steps >= max_new_tokens.unsqueeze(1)
-    )
-    invalid_token_mask = (proposal_tokens < 0) | (
-        proposal_tokens > vocab_sizes.unsqueeze(1)
-    )
-
-    stop_token_lists = [
-        [] if req.sampling_params.ignore_eos else collect_smc_stop_token_ids(req)
-        for req in reqs
-    ]
-    max_stop_tokens = max((len(stop_ids) for stop_ids in stop_token_lists), default=0)
-    if max_stop_tokens > 0:
-        stop_ids = torch.full(
-            (bs, max_stop_tokens),
-            fill_value=-1,
-            dtype=torch.int64,
-            device=device,
-        )
-        stop_ids_mask = torch.zeros(
-            (bs, max_stop_tokens), dtype=torch.bool, device=device
-        )
-        for row, stop_token_ids in enumerate(stop_token_lists):
-            if not stop_token_ids:
-                continue
-            stop_token_tensor = torch.tensor(
-                stop_token_ids, dtype=torch.int64, device=device
-            )
-            stop_ids[row, : stop_token_tensor.numel()] = stop_token_tensor
-            stop_ids_mask[row, : stop_token_tensor.numel()] = True
-        stop_token_mask = (
-            proposal_tokens.unsqueeze(-1) == stop_ids.unsqueeze(1)
-        ) & stop_ids_mask.unsqueeze(1)
-        stop_token_mask = stop_token_mask.any(dim=-1)
-    else:
-        stop_token_mask = torch.zeros_like(proposal_tokens, dtype=torch.bool)
-
-    finish_mask = invalid_token_mask | max_token_mask | stop_token_mask
-    proposal_finished = finish_mask.any(dim=1)
-    first_finish = torch.argmax(finish_mask.to(torch.int32), dim=1)
-    draft_lengths = torch.where(
-        proposal_finished,
-        first_finish + 1,
-        torch.full_like(first_finish, gamma),
-    )
-    active_mask = (
-        torch.arange(gamma, dtype=torch.int64, device=device).unsqueeze(0)
-        < draft_lengths.unsqueeze(1)
-    )
-    draft_logprobs = torch.sum(
-        proposal_logprobs.to(torch.float32) * active_mask, dim=1
-    )
-    return (
-        draft_lengths.to(torch.int32),
-        proposal_finished,
-        draft_logprobs.to(torch.float32),
-    )
-
-
-def _copy_generation_state(src_req: Req, dst_req: Req):
-    dst_req.output_ids = list(src_req.output_ids)
-    dst_req.finished_reason = copy.copy(src_req.finished_reason)
-    dst_req.finished_len = src_req.finished_len
-    dst_req.finished_output = src_req.finished_output
-    dst_req.to_finish = copy.copy(src_req.to_finish)
-    dst_req.kv_committed_len = src_req.kv_committed_len
-    dst_req.kv_allocated_len = src_req.kv_allocated_len
-    dst_req.decoded_text = src_req.decoded_text
-    dst_req.surr_offset = src_req.surr_offset
-    dst_req.read_offset = src_req.read_offset
-    dst_req.cache_protected_len = src_req.cache_protected_len
-    dst_req.logprob_start_len = src_req.logprob_start_len
 
 
 def _empty_prefix_indices() -> torch.Tensor:
@@ -508,104 +193,6 @@ def _release_smc_parent_req(
     req_to_token_pool.free(req)
     if req.last_node is not None:
         tree_cache.dec_lock_ref(req.last_node)
-
-
-def _alias_req_state(
-    src_req: Req,
-    dst_req: Req,
-    req_to_token_pool,
-    token_to_kv_pool_allocator,
-):
-    if src_req.req_pool_idx == dst_req.req_pool_idx:
-        _copy_generation_state(src_req, dst_req)
-        if dst_req.kv_committed_len > 0:
-            dst_req.prefix_indices = req_to_token_pool.req_to_token[
-                dst_req.req_pool_idx, : dst_req.kv_committed_len
-            ].to(dtype=torch.int64, copy=True)
-        else:
-            dst_req.prefix_indices = _empty_prefix_indices()
-        return
-
-    dst_allocated_len = int(dst_req.kv_allocated_len)
-    if dst_req.req_pool_idx is not None and dst_allocated_len > 0:
-        old_indices = req_to_token_pool.req_to_token[
-            dst_req.req_pool_idx, :dst_allocated_len
-        ].to(dtype=torch.int64, copy=True)
-        token_to_kv_pool_allocator.dec_ref_and_free(old_indices)
-
-    seq_len = src_req.kv_committed_len
-    if seq_len > 0:
-        copied = req_to_token_pool.req_to_token[
-            src_req.req_pool_idx, :seq_len
-        ].clone()
-        token_to_kv_pool_allocator.inc_ref(copied.to(torch.int64))
-        req_to_token_pool.write((dst_req.req_pool_idx, slice(0, seq_len)), copied)
-        dst_req.prefix_indices = copied.to(dtype=torch.int64, copy=True)
-    else:
-        dst_req.prefix_indices = _empty_prefix_indices()
-
-    _copy_generation_state(src_req, dst_req)
-    dst_req.kv_allocated_len = seq_len
-
-
-def alias_smc_req_state(
-    src_req: Req,
-    dst_req: Req,
-    req_to_token_pool,
-    token_to_kv_pool_allocator,
-):
-    _alias_req_state(
-        src_req,
-        dst_req,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-    )
-
-
-def alias_particle_state(
-    src_particle: SMCParticleState,
-    dst_particle: SMCParticleState,
-    req_to_token_pool,
-    token_to_kv_pool_allocator,
-):
-    _alias_req_state(
-        src_particle.target_req,
-        dst_particle.target_req,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-    )
-    _alias_req_state(
-        src_particle.draft_req,
-        dst_particle.draft_req,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-    )
-    dst_particle.log_weight = src_particle.log_weight
-
-
-def cleanup_smc_request_state(
-    state: Optional[SMCRequestState],
-    req_to_token_pool,
-    token_to_kv_pool_allocator,
-):
-    if state is None or state.released:
-        return
-
-    for particle in state.particles:
-        _release_internal_req(
-            particle.target_req,
-            req_to_token_pool,
-            token_to_kv_pool_allocator,
-        )
-        _release_internal_req(
-            particle.draft_req,
-            req_to_token_pool,
-            token_to_kv_pool_allocator,
-        )
-
-    state.released = True
-
-
 def normalize_log_weights(
     log_weights: Sequence[float] | torch.Tensor,
     device: Optional[torch.device | str] = None,

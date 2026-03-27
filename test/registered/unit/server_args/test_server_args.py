@@ -70,7 +70,7 @@ class TestSMCServerArgs(unittest.TestCase):
         self.assertTrue(server_args.disable_overlap_schedule)
         self.assertEqual(server_args.max_running_requests, 48)
         self.assertEqual(server_args.speculative_eagle_topk, 1)
-        self.assertEqual(server_args.speculative_num_steps, server_args.smc_gamma + 1)
+        self.assertEqual(server_args.speculative_num_steps, server_args.smc_gamma)
         self.assertEqual(
             server_args.speculative_num_draft_tokens, server_args.smc_gamma + 1
         )
@@ -93,13 +93,13 @@ class TestSMCServerArgs(unittest.TestCase):
                 disaggregation_mode="decode",
             )
 
-    def test_smc_rejects_non_positive_temperatures(self):
+    def test_smc_rejects_negative_temperatures(self):
         with self.assertRaisesRegex(ValueError, "--smc-draft-temperature"):
             ServerArgs(
                 model_path="dummy",
                 speculative_algorithm="SMC",
                 speculative_draft_model_path="draft",
-                smc_draft_temperature=0.0,
+                smc_draft_temperature=-0.1,
             )
 
         with self.assertRaisesRegex(ValueError, "--smc-target-temperature"):
@@ -107,8 +107,41 @@ class TestSMCServerArgs(unittest.TestCase):
                 model_path="dummy",
                 speculative_algorithm="SMC",
                 speculative_draft_model_path="draft",
-                smc_target_temperature=0.0,
+                smc_target_temperature=-0.1,
             )
+
+    def test_smc_allows_zero_temperatures(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="SMC",
+            speculative_draft_model_path="draft",
+            smc_draft_temperature=0.0,
+            smc_target_temperature=0.0,
+        )
+        self.assertEqual(server_args.smc_draft_temperature, 0.0)
+        self.assertEqual(server_args.smc_target_temperature, 0.0)
+
+    def test_smc_rejects_non_triton_attention_backends(self):
+        cases = [
+            dict(attention_backend="flashinfer"),
+            dict(attention_backend="triton", decode_attention_backend="fa3"),
+            dict(
+                attention_backend="triton",
+                speculative_draft_attention_backend="fa3",
+            ),
+        ]
+
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(
+                    ValueError, "only supports the triton attention backend"
+                ):
+                    ServerArgs(
+                        model_path="dummy",
+                        speculative_algorithm="SMC",
+                        speculative_draft_model_path="draft",
+                        **kwargs,
+                    )
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

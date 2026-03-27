@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-import json
-import os
-import time
 from typing import Dict, List, Optional
 
 import torch
@@ -17,6 +14,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.smc_debug_utils import append_smc_diag_record
 from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
     _release_internal_req,
@@ -25,19 +23,6 @@ from sglang.srt.speculative.smc_info import (
     validate_smc_parent_req,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-_SMC_DIAG_PATH_ENV = "SGLANG_SMC_DIAG_PATH"
-
-
-def _append_smc_diag_record(record: dict) -> None:
-    record_path = os.environ.get(_SMC_DIAG_PATH_ENV)
-    if not record_path:
-        return
-    payload = dict(record)
-    payload["pid"] = os.getpid()
-    payload["timestamp_ns"] = time.perf_counter_ns()
-    with open(record_path, "a", encoding="utf-8") as fout:
-        fout.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 @dataclass
@@ -221,7 +206,6 @@ class SMCManager:
             particle_req = clone_req_for_smc_particle(
                 parent_req,
                 particle_idx=particle_idx,
-                role="particle",
                 temperature=self.server_args.smc_draft_temperature,
                 return_logprob=False,
             )
@@ -365,7 +349,7 @@ class SMCManager:
                 best_finish_reason = finish_reason
                 best_finished_len = finished_len
 
-        _append_smc_diag_record(
+        append_smc_diag_record(
             {
                 "type": "finalize_group",
                 "group_id": group_id,

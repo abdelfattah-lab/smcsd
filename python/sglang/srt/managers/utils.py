@@ -16,7 +16,6 @@ from sglang.srt.server_args import ServerArgs
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
-    from sglang.srt.speculative.smc_info import SMCParentUpdate
 
 
 logger = logging.getLogger(__name__)
@@ -47,7 +46,6 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
-    smc_parent_updates: Optional[List["SMCParentUpdate"]] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
@@ -89,6 +87,10 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+        if self.smc_logprob_diffs is not None:
+            self.smc_logprob_diffs = self.smc_logprob_diffs.to(
+                "cpu", non_blocking=True
+            )
         if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()
 

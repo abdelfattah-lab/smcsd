@@ -108,7 +108,6 @@ def wait_for_artifacts(run_dir: Path, timeout_sec: float = 30.0) -> list[Path]:
 
 def sampling_params(max_new_tokens: int) -> dict[str, Any]:
     return {
-        "temperature": 0.8,
         "max_new_tokens": max_new_tokens,
         "ignore_eos": True,
     }
@@ -183,6 +182,8 @@ def main() -> None:
         random_seed=1,
         cuda_graph_max_bs=32,
         attention_backend="triton",
+        smc_draft_temperature=0.8,
+        smc_target_temperature=0.8,
     ) as engine:
         server_info = engine.get_server_info()
         write_json(run_dir / "server_info.json", server_info)

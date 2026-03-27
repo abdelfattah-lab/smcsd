@@ -2960,6 +2960,36 @@ class ServerArgs:
                 raise ValueError("--smc-target-temperature must be >= 0.")
             if not 0 < self.smc_resample_threshold <= 1:
                 raise ValueError("--smc-resample-threshold must be in (0, 1].")
+            prefill_attention_backend, decode_attention_backend = (
+                self.get_attention_backends()
+            )
+            draft_attention_backend = self.speculative_draft_attention_backend
+            if draft_attention_backend is None:
+                draft_attention_backend = (
+                    decode_attention_backend
+                    if self.speculative_attention_mode == "decode"
+                    else prefill_attention_backend
+                )
+            smc_attention_backends = {
+                "attention_backend": self.attention_backend,
+                "prefill_attention_backend": prefill_attention_backend,
+                "decode_attention_backend": decode_attention_backend,
+                "speculative_draft_attention_backend": draft_attention_backend,
+            }
+            unsupported_attention_backends = {
+                name: backend
+                for name, backend in smc_attention_backends.items()
+                if backend is not None and backend != "triton"
+            }
+            if unsupported_attention_backends:
+                unsupported_text = ", ".join(
+                    f"{name}={backend}"
+                    for name, backend in unsupported_attention_backends.items()
+                )
+                raise ValueError(
+                    "Currently SMC speculative decoding only supports the triton "
+                    f"attention backend. Got {unsupported_text}."
+                )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(

@@ -1,47 +1,23 @@
 from __future__ import annotations
 
 import copy
-import json
-import os
 from collections import deque
 from dataclasses import dataclass, field
-import time
 from typing import Deque, Dict, List, Optional, Set
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, SMCGroupSpan, ScheduleBatch
+from sglang.srt.speculative.smc_debug_utils import (
+    append_smc_diag_record,
+    append_smc_probe_record,
+)
 from sglang.srt.speculative.smc_info import (
     effective_sample_size,
     multinomial_resample,
     normalize_log_weights,
     systematic_resample,
 )
-
-_SMC_PROBE_RECORD_PATH_ENV = "SGLANG_SMC_PROBE_RECORD_PATH"
-_SMC_DIAG_PATH_ENV = "SGLANG_SMC_DIAG_PATH"
-
-
-def _append_smc_probe_record(record: dict) -> None:
-    record_path = os.environ.get(_SMC_PROBE_RECORD_PATH_ENV)
-    if not record_path:
-        return
-    payload = dict(record)
-    payload["pid"] = os.getpid()
-    payload["timestamp_ns"] = time.perf_counter_ns()
-    with open(record_path, "a", encoding="utf-8") as fout:
-        fout.write(json.dumps(payload, sort_keys=True) + "\n")
-
-
-def _append_smc_diag_record(record: dict) -> None:
-    record_path = os.environ.get(_SMC_DIAG_PATH_ENV)
-    if not record_path:
-        return
-    payload = dict(record)
-    payload["pid"] = os.getpid()
-    payload["timestamp_ns"] = time.perf_counter_ns()
-    with open(record_path, "a", encoding="utf-8") as fout:
-        fout.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 @dataclass
@@ -292,7 +268,7 @@ class SMCScheduler:
             for p in pidxs:
                 group.step_counts[p] += 1
 
-        _append_smc_diag_record(
+        append_smc_diag_record(
             {
                 "type": "group_update",
                 "group_id": group.group_id,
@@ -336,19 +312,17 @@ class SMCScheduler:
 
             # Apply deferred log_weight updates before sampling ancestors
             group.flush_pending_diffs()
+            group_log_weights = group.log_weights[active_indices]
             normalized_weights = normalize_log_weights(
-                group.log_weights[active_indices],
-                device=self.device,
+                group_log_weights, device=self.device
             )
             ess = effective_sample_size(normalized_weights, device=self.device)
-            _append_smc_diag_record(
+            append_smc_diag_record(
                 {
                     "type": "resample_check",
                     "group_id": group.group_id,
                     "active_indices": list(active_indices),
-                    "log_weights": [
-                        float(x) for x in group.log_weights[active_indices].tolist()
-                    ],
+                    "log_weights": [float(x) for x in group_log_weights.tolist()],
                     "normalized_weights": [
                         float(x) for x in normalized_weights.tolist()
                     ],
@@ -358,8 +332,8 @@ class SMCScheduler:
             if ess >= len(active_indices) * self.smc_manager.server_args.smc_resample_threshold:
                 continue
 
-            ancestors = self._sample_ancestors(group, active_indices)
-            _append_smc_diag_record(
+            ancestors = self._sample_ancestors(normalized_weights)
+            append_smc_diag_record(
                 {
                     "type": "resample_choice",
                     "group_id": group.group_id,
@@ -516,11 +490,7 @@ class SMCScheduler:
         result_queue = getattr(scheduler, "result_queue", None)
         return result_queue is not None and len(result_queue) > 0
 
-    def _sample_ancestors(self, group, active_indices: List[int]) -> List[int]:
-        normalized_weights = normalize_log_weights(
-            group.log_weights[active_indices],
-            device=self.device,
-        )
+    def _sample_ancestors(self, normalized_weights: torch.Tensor) -> List[int]:
         if self.smc_manager.server_args.smc_resample_method == "multinomial":
             return multinomial_resample(normalized_weights, device=self.device)
         return systematic_resample(normalized_weights, device=self.device)
@@ -550,15 +520,10 @@ class SMCScheduler:
                     f"SMC group {group_id} could not be isolated from running_batch for resampling."
                 )
 
-        batch_is_full = scheduler.running_batch.batch_is_full
         scheduler.running_batch.filter_batch(keep_indices=keep_indices)
         scheduler.running_batch.batch_is_full = False
         if not keep_indices:
-            scheduler.running_batch = ScheduleBatch(
-                reqs=[],
-                batch_is_full=batch_is_full,
-            )
-            scheduler.running_batch.batch_is_full = False
+            scheduler.running_batch = ScheduleBatch(reqs=[])
 
         self.resampling_reqs[group_id] = stalled_reqs
 
@@ -581,7 +546,7 @@ class SMCScheduler:
         scheduler,
         pending: PendingResample,
     ) -> None:
-        _append_smc_probe_record(
+        append_smc_probe_record(
             {
                 "type": "resample_launch",
                 "group_id": group.group_id,

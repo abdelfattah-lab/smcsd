@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
 import time
 from typing import List, Optional, Sequence, Union
 
@@ -18,6 +16,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.smc_debug_utils import append_smc_diag_record
 from sglang.srt.speculative.smc_draft_cuda_graph_runner import SMCDraftCudaGraphRunner
 from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
@@ -34,21 +33,7 @@ from sglang.srt.speculative.standalone_worker_v2 import (
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.utils import get_available_gpu_memory
 
-
 logger = logging.getLogger(__name__)
-
-_SMC_DIAG_PATH_ENV = "SGLANG_SMC_DIAG_PATH"
-
-
-def _append_smc_diag_record(record: dict) -> None:
-    record_path = os.environ.get(_SMC_DIAG_PATH_ENV)
-    if not record_path:
-        return
-    payload = dict(record)
-    payload["pid"] = os.getpid()
-    payload["timestamp_ns"] = time.perf_counter_ns()
-    with open(record_path, "a", encoding="utf-8") as fout:
-        fout.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 class SMCDraftWorker(StandaloneDraftWorker):
@@ -197,22 +182,18 @@ class SMCDraftWorker(StandaloneDraftWorker):
         target_temperature = max(
             float(outer.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
         )
-        use_linear = outer.server_args.attention_backend in {"flashinfer", "triton"}
-        custom_mask = None
-        if not use_linear:
-            from sglang.srt.speculative.smc_info import build_smc_causal_mask
-            custom_mask = build_smc_causal_mask(model_worker_batch.seq_lens, score_token_num)
 
         return SMCScoreInput(
             draft_token=score_tokens.reshape(-1).contiguous(),
             draft_lengths=draft_lengths,
             draft_logprobs=draft_logprobs,
             positions=build_smc_positions(model_worker_batch.seq_lens, score_token_num),
-            custom_mask=custom_mask,
+            custom_mask=None,
             draft_token_num=score_token_num,
             spec_steps=smc_gamma,
             target_temperature=target_temperature,
-            linear_target_verify=use_linear,
+            # ServerArgs enforces a Triton-only target path for SMC.
+            linear_target_verify=True,
         )
 
     def draft_forward(
@@ -651,7 +632,7 @@ class SMCWorkerV2(EAGLEWorkerV2):
         )
         draft_logprobs = logprob_matrix.sum(dim=1)
 
-        _append_smc_diag_record(
+        append_smc_diag_record(
             {
                 "type": "draft_result",
                 "mode": "cuda_graph" if can_cuda_graph else "draft_forward",
