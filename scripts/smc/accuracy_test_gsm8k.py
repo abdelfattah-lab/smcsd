@@ -1,6 +1,20 @@
 """GSM8K benchmark for SMC speculative decoding (offline engine API).
 
-Uses sglang's offline Engine API instead of a running server.
+Usage:
+  # SMC mode (default) — just run it
+  python scripts/smc/accuracy_test_gsm8k.py
+
+  # Baseline (no speculative decoding)
+  python scripts/smc/accuracy_test_gsm8k.py --mode baseline
+
+  # Custom model
+  python scripts/smc/accuracy_test_gsm8k.py --model meta-llama/Llama-3-8B
+
+  # Override SMC parameters
+  python scripts/smc/accuracy_test_gsm8k.py --particles 8 --gamma 6 --temperature 0.5
+
+  # More questions for a thorough benchmark
+  python scripts/smc/accuracy_test_gsm8k.py --num-questions 200
 """
 import argparse
 import ast
@@ -14,6 +28,7 @@ import sglang as sgl
 from sglang.utils import download_and_cache_file, read_jsonl
 
 INVALID = -9999999
+DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
 def get_one_example(lines, i, include_answer):
@@ -49,7 +64,45 @@ def extract_first_answer(text):
     return text
 
 
+def build_engine_kwargs(args):
+    """Build engine kwargs from args, applying mode-based defaults."""
+    kwargs = dict(
+        model_path=args.model,
+        trust_remote_code=True,
+        log_level="info",
+    )
+
+    if args.mode == "smc":
+        kwargs["speculative_algorithm"] = "SMC"
+        kwargs["speculative_draft_model_path"] = args.draft_model or args.model
+        kwargs["smc_n_particles"] = args.particles
+        kwargs["smc_gamma"] = args.gamma
+        kwargs["smc_draft_temperature"] = args.temperature
+        kwargs["smc_target_temperature"] = args.temperature
+        kwargs["page_size"] = 1
+        kwargs["attention_backend"] = "triton"
+
+    if args.mem_fraction_static is not None:
+        kwargs["mem_fraction_static"] = args.mem_fraction_static
+    if args.cuda_graph_max_bs is not None:
+        kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
+    if args.max_running_requests is not None:
+        kwargs["max_running_requests"] = args.max_running_requests
+
+    return kwargs
+
+
 def main(args):
+    # Print config
+    print(f"Mode: {args.mode} | Model: {args.model}")
+    if args.mode == "smc":
+        draft = args.draft_model or args.model
+        print(f"SMC: particles={args.particles}, gamma={args.gamma}, "
+              f"temperature={args.temperature}, draft={draft}")
+    print(f"Questions: {args.num_questions}, shots: {args.num_shots}, "
+          f"max_new_tokens: {args.max_new_tokens}")
+    print()
+
     # Read data
     data_path = args.data_path
     gsm8k_url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
@@ -66,41 +119,15 @@ def main(args):
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
 
-    # Build engine kwargs
-    engine_kwargs = dict(
-        model_path=args.model_path,
-        trust_remote_code=True,
-        log_level="info",
-    )
-    if args.speculative_algorithm:
-        engine_kwargs["speculative_algorithm"] = args.speculative_algorithm
-        engine_kwargs["speculative_draft_model_path"] = (
-            args.speculative_draft_model_path or args.model_path
-        )
-        engine_kwargs["smc_n_particles"] = args.smc_n_particles
-        engine_kwargs["smc_gamma"] = args.smc_gamma
-        engine_kwargs["smc_draft_temperature"] = args.smc_draft_temperature
-        engine_kwargs["smc_target_temperature"] = args.smc_target_temperature
-        engine_kwargs["page_size"] = 1
-        engine_kwargs["attention_backend"] = "triton"
-    if args.mem_fraction_static is not None:
-        engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
-    if args.cuda_graph_max_bs is not None:
-        engine_kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
-    if args.max_running_requests is not None:
-        engine_kwargs["max_running_requests"] = args.max_running_requests
-
+    engine_kwargs = build_engine_kwargs(args)
     sampling_params = {"max_new_tokens": args.max_new_tokens}
 
-    batch_size = args.batch_size
-
     with sgl.Engine(**engine_kwargs) as engine:
-        # Run inference in small batches
         preds = []
         total_output_tokens = 0
         tic = time.perf_counter()
-        for start in range(0, len(questions), batch_size):
-            batch = questions[start : start + batch_size]
+        for start in range(0, len(questions), args.batch_size):
+            batch = questions[start : start + args.batch_size]
             outputs = engine.generate(batch, sampling_params)
             for i, output in enumerate(outputs):
                 qi = start + i
@@ -135,23 +162,39 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, required=True)
-    parser.add_argument("--speculative-algorithm", type=str, default=None,
-                        help="e.g. SMC")
-    parser.add_argument("--speculative-draft-model-path", type=str, default=None)
-    parser.add_argument("--smc-n-particles", type=int, default=4)
-    parser.add_argument("--smc-gamma", type=int, default=4)
-    parser.add_argument("--smc-draft-temperature", type=float, default=0.7)
-    parser.add_argument("--smc-target-temperature", type=float, default=0.7)
-    parser.add_argument("--mem-fraction-static", type=float, default=None)
-    parser.add_argument("--cuda-graph-max-bs", type=int, default=None)
-    parser.add_argument("--max-running-requests", type=int, default=None)
-    parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
-    parser.add_argument("--num-questions", type=int, default=20)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Number of questions per engine.generate() call")
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # Core
+    parser.add_argument("--mode", choices=["baseline", "smc"], default="smc",
+                        help="baseline = vanilla, smc = speculative (default: smc)")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        help=f"target model path (default: {DEFAULT_MODEL})")
+    parser.add_argument("--draft-model", type=str, default=None,
+                        help="draft model path (default: same as --model)")
+
+    # SMC parameters (only used when --mode smc)
+    smc = parser.add_argument_group("SMC parameters (--mode smc)")
+    smc.add_argument("--particles", type=int, default=4)
+    smc.add_argument("--gamma", type=int, default=4)
+    smc.add_argument("--temperature", type=float, default=0.7,
+                     help="draft and target temperature (default: 0.7)")
+
+    # Benchmark
+    bench = parser.add_argument_group("benchmark")
+    bench.add_argument("--num-questions", type=int, default=20)
+    bench.add_argument("--num-shots", type=int, default=5)
+    bench.add_argument("--max-new-tokens", type=int, default=512)
+    bench.add_argument("--batch-size", type=int, default=4)
+    bench.add_argument("--data-path", type=str, default="test.jsonl")
+
+    # Engine overrides
+    eng = parser.add_argument_group("engine overrides")
+    eng.add_argument("--mem-fraction-static", type=float, default=0.45)
+    eng.add_argument("--cuda-graph-max-bs", type=int, default=16)
+    eng.add_argument("--max-running-requests", type=int, default=8)
+
     args = parser.parse_args()
     main(args)
