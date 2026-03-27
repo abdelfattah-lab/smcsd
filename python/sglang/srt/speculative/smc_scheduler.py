@@ -656,6 +656,15 @@ class SMCScheduler:
             "cache_protected_len": req.cache_protected_len,
             "logprob_start_len": req.logprob_start_len,
             "draft_prefix_materialized": req.draft_prefix_materialized,
+            "decoded_text": req.decoded_text,
+            "surr_offset": req.surr_offset,
+            "read_offset": req.read_offset,
+            "surr_and_decode_ids": (
+                list(req.surr_and_decode_ids)
+                if getattr(req, "surr_and_decode_ids", None) is not None
+                else None
+            ),
+            "cur_decode_ids_len": getattr(req, "cur_decode_ids_len", None),
         }
 
     def _restore_req_state(self, req: Req, snapshot: dict) -> None:
@@ -676,6 +685,20 @@ class SMCScheduler:
         req.cache_protected_len = snapshot["cache_protected_len"]
         req.logprob_start_len = snapshot["logprob_start_len"]
         req.draft_prefix_materialized = snapshot["draft_prefix_materialized"]
+        req.decoded_text = snapshot.get(
+            "decoded_text",
+            getattr(req, "decoded_text", ""),
+        )
+        req.surr_offset = snapshot.get("surr_offset", getattr(req, "surr_offset", None))
+        req.read_offset = snapshot.get("read_offset", getattr(req, "read_offset", None))
+        surr_and_decode_ids = snapshot.get("surr_and_decode_ids", None)
+        req.surr_and_decode_ids = (
+            list(surr_and_decode_ids) if surr_and_decode_ids is not None else None
+        )
+        req.cur_decode_ids_len = snapshot.get(
+            "cur_decode_ids_len",
+            getattr(req, "cur_decode_ids_len", None),
+        )
 
     def _running_batch_uses_future_indices(self, running_batch) -> bool:
         if running_batch is None or running_batch.is_empty():

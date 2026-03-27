@@ -70,6 +70,11 @@ def _make_scheduler_req(
     output_ids: list[int],
     kv_indices: list[int],
     allocated_kv_indices: list[int] | None = None,
+    decoded_text: str = "",
+    surr_offset: int | None = None,
+    read_offset: int | None = None,
+    surr_and_decode_ids: list[int] | None = None,
+    cur_decode_ids_len: int | None = None,
 ):
     allocated_kv_indices = (
         list(allocated_kv_indices)
@@ -92,6 +97,13 @@ def _make_scheduler_req(
         finished_len=None,
         finished_output=None,
         to_finish=None,
+        decoded_text=decoded_text,
+        surr_offset=surr_offset,
+        read_offset=read_offset,
+        surr_and_decode_ids=(
+            list(surr_and_decode_ids) if surr_and_decode_ids is not None else None
+        ),
+        cur_decode_ids_len=cur_decode_ids_len,
         finished=lambda: False,
     )
 
@@ -1161,6 +1173,11 @@ class TestSMCScheduler(TestCase):
             req_pool_idx=0,
             output_ids=[10, 11],
             kv_indices=[101, 102],
+            decoded_text="req0-text",
+            surr_offset=4,
+            read_offset=7,
+            surr_and_decode_ids=[1, 2, 10, 11],
+            cur_decode_ids_len=2,
         )
         req1 = _make_scheduler_req(
             group_id="g1",
@@ -1168,6 +1185,11 @@ class TestSMCScheduler(TestCase):
             req_pool_idx=1,
             output_ids=[20, 21],
             kv_indices=[201, 202],
+            decoded_text="req1-text",
+            surr_offset=5,
+            read_offset=8,
+            surr_and_decode_ids=[3, 4, 20, 21],
+            cur_decode_ids_len=2,
         )
         manager.groups["g1"] = SMCGroupState(
             group_id="g1",
@@ -1203,6 +1225,16 @@ class TestSMCScheduler(TestCase):
 
         self.assertEqual(req0.output_ids, [20, 21])
         self.assertEqual(req1.output_ids, [10, 11])
+        self.assertEqual(req0.decoded_text, "req1-text")
+        self.assertEqual(req1.decoded_text, "req0-text")
+        self.assertEqual(req0.surr_offset, 5)
+        self.assertEqual(req1.surr_offset, 4)
+        self.assertEqual(req0.read_offset, 8)
+        self.assertEqual(req1.read_offset, 7)
+        self.assertEqual(req0.surr_and_decode_ids, [3, 4, 20, 21])
+        self.assertEqual(req1.surr_and_decode_ids, [1, 2, 10, 11])
+        self.assertEqual(req0.cur_decode_ids_len, 2)
+        self.assertEqual(req1.cur_decode_ids_len, 2)
         self.assertTrue(
             torch.equal(
                 req_to_token[0, :2],
@@ -1500,6 +1532,54 @@ class TestSMCScoreInput(TestCase):
 
     @patch("sglang.srt.speculative.smc_info.assign_extend_cache_locs_func")
     @patch("sglang.srt.speculative.smc_info.ForwardBatch.init_new")
+    def test_prepare_for_v2_verify_falls_back_without_graph_runner(
+        self, mock_init_forward_batch, mock_assign_extend_cache_locs
+    ):
+        score_input = self._make_score_input()
+        req = SimpleNamespace(req_pool_idx=5, kv_allocated_len=8, rid="r-4")
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.tensor([5], dtype=torch.int64),
+            seq_lens=torch.tensor([4], dtype=torch.int64),
+            input_ids=None,
+            reqs=[req],
+            capture_hidden_mode=None,
+        )
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((8, 32), dtype=torch.int32),
+            write=MagicMock(),
+        )
+        attn_backend = MagicMock()
+        mock_assign_extend_cache_locs.return_value = torch.tensor(
+            [21, 22, 23, 24],
+            dtype=torch.int64,
+        )
+        target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                token_to_kv_pool_allocator=MagicMock(),
+                graph_runner=None,
+                attn_backend=attn_backend,
+            )
+        )
+        fake_forward_batch = SimpleNamespace(
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens.to(dtype=torch.int32),
+        )
+        mock_init_forward_batch.return_value = fake_forward_batch
+
+        verify_forward_batch, can_run_cuda_graph = score_input.prepare_for_v2_verify(
+            req_to_token_pool,
+            batch,
+            target_worker,
+        )
+
+        self.assertIs(verify_forward_batch, fake_forward_batch)
+        self.assertFalse(can_run_cuda_graph)
+        attn_backend.init_forward_metadata.assert_called_once_with(fake_forward_batch)
+        self.assertTrue(verify_forward_batch.disable_graph_runner)
+
+    @patch("sglang.srt.speculative.smc_info.assign_extend_cache_locs_func")
+    @patch("sglang.srt.speculative.smc_info.ForwardBatch.init_new")
     def test_prepare_for_v2_verify_disables_graph_runner_on_temperature_mismatch(
         self, mock_init_forward_batch, mock_assign_extend_cache_locs
     ):
@@ -1594,6 +1674,80 @@ class TestSMCScoreInput(TestCase):
         # log_softmax internally (temperature=1.0), so the value differs.
         # Just check it's a finite float.
         self.assertTrue(torch.isfinite(score_input.smc_logprob_diffs).all())
+
+    def test_sample_accept_index_uses_global_flat_offsets_for_multi_request(self):
+        """accept_index must use global flat offsets into predict, not local
+        per-request [0..gamma].  Without this, predict[accept_index] reads
+        request 0's tokens for all requests."""
+        bs = 3
+        dt = 4  # draft_token_num
+        ss = 3  # spec_steps = dt - 1
+        vocab = 30
+
+        draft_tokens = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23], [5, 6, 7, 8]],
+            dtype=torch.int32,
+        )
+        score_input = SMCScoreInput(
+            draft_token=draft_tokens.flatten(),
+            draft_lengths=torch.tensor([ss, ss, ss], dtype=torch.int32),
+            draft_logprobs=torch.zeros(bs, dtype=torch.float32),
+            positions=torch.arange(bs * dt, dtype=torch.int64),
+            custom_mask=None,
+            draft_token_num=dt,
+            spec_steps=ss,
+            target_temperature=1.0,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.tensor([4, 4, 4], dtype=torch.int64),
+        )
+        logits = torch.zeros((bs * dt, vocab), dtype=torch.float32)
+        logits[0 * dt + (dt - 1), 5] = 10.0
+        logits[1 * dt + (dt - 1), 15] = 10.0
+        logits[2 * dt + (dt - 1), 25] = 10.0
+        logits_output = SimpleNamespace(next_token_logits=logits)
+
+        predict, accept_length, accept_index = score_input.sample(batch, logits_output)
+
+        for i in range(bs):
+            for j in range(ss + 1):
+                self.assertEqual(accept_index[i, j].item(), i * dt + j)
+
+        per_req = predict[accept_index]
+        self.assertEqual(per_req[0, 0].item(), 11)
+        self.assertEqual(per_req[1, 0].item(), 21)
+        self.assertEqual(per_req[2, 0].item(), 6)
+
+    def test_sample_bonus_is_stochastic_at_nonzero_temperature(self):
+        """Bonus should be sampled, not always argmax."""
+        dt = 2
+        ss = 1
+        vocab = 10
+        draft_tokens = torch.tensor([[7, 8]], dtype=torch.int32)
+        score_input = SMCScoreInput(
+            draft_token=draft_tokens.flatten(),
+            draft_lengths=torch.tensor([1], dtype=torch.int32),
+            draft_logprobs=torch.zeros(1, dtype=torch.float32),
+            positions=torch.arange(dt, dtype=torch.int64),
+            custom_mask=None,
+            draft_token_num=dt,
+            spec_steps=ss,
+            target_temperature=1.0,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.tensor([4], dtype=torch.int64),
+        )
+        logits = torch.zeros((dt, vocab), dtype=torch.float32)
+        logits_output = SimpleNamespace(next_token_logits=logits)
+
+        bonus_tokens = set()
+        for _ in range(50):
+            predict, _, _ = score_input.sample(batch, logits_output)
+            bonus_tokens.add(predict[ss].item())
+
+        self.assertGreaterEqual(len(bonus_tokens), 3)
 
 
 class TestSMCVerifyGraphGate(TestCase):
@@ -1753,7 +1907,7 @@ class TestSMCDraftInput(TestCase):
         self.assertTrue(
             torch.equal(
                 fake_kernel.calls[0]["seq_lens"],
-                torch.tensor([5, 7], dtype=torch.int64),
+                torch.tensor([6, 8], dtype=torch.int64),
             )
         )
         self.assertEqual(fake_kernel.calls[0]["pool_len"], 32)

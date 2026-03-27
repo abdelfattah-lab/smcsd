@@ -183,12 +183,13 @@ class SMCDraftWorker(StandaloneDraftWorker):
                 device=outer.device,
             )
 
-        # With bonus + draft_extend, all tokens (including previous bonus)
-        # have KV committed. No -1 adjustment needed — same as EAGLE.
-        seq_lens = visible_seq_lens
-        seq_lens_cpu = visible_seq_lens_cpu
+        # SMC keeps the latest visible token outside the committed prefix so the
+        # draft decode can consume it as the next input token. Align the draft
+        # and verify phases on that shared-prefix length.
+        draft_committed_lens = (visible_seq_lens - 1).clamp_min(0)
+        draft_committed_lens_cpu = (visible_seq_lens_cpu - 1).clamp_min(0)
 
-        outer._ensure_draft_prefix_filled(reqs, seq_lens_cpu.tolist())
+        outer._ensure_draft_prefix_filled(reqs, draft_committed_lens_cpu.tolist())
 
         if outer._can_use_fused_draft_cuda_graph(
             reqs, model_worker_batch.sampling_info
@@ -197,13 +198,13 @@ class SMCDraftWorker(StandaloneDraftWorker):
                 outer._run_fused_draft_reqs(
                     reqs, model_worker_batch, last_token_ids,
                     model_worker_batch.sampling_info,
-                    visible_seq_lens, seq_lens,
+                    visible_seq_lens, draft_committed_lens,
                 )
             )
         else:
             draft_tokens, draft_logprobs, draft_lengths, _ = (
                 outer._run_stepwise_draft_reqs(
-                    reqs, visible_seq_lens, seq_lens, last_token_ids,
+                    reqs, visible_seq_lens, draft_committed_lens, last_token_ids,
                 )
             )
 
@@ -227,13 +228,13 @@ class SMCDraftWorker(StandaloneDraftWorker):
         custom_mask = None
         if not use_linear:
             from sglang.srt.speculative.smc_info import build_smc_causal_mask
-            custom_mask = build_smc_causal_mask(seq_lens, score_token_num)
+            custom_mask = build_smc_causal_mask(draft_committed_lens, score_token_num)
 
         return SMCScoreInput(
             draft_token=score_tokens.reshape(-1).contiguous(),
             draft_lengths=draft_lengths,
             draft_logprobs=draft_logprobs,
-            positions=build_smc_positions(seq_lens, score_token_num),
+            positions=build_smc_positions(draft_committed_lens, score_token_num),
             custom_mask=custom_mask,
             draft_token_num=score_token_num,
             spec_steps=smc_gamma,
@@ -659,13 +660,24 @@ class SMCWorkerV2(EAGLEWorkerV2):
         draft_committed_lens: torch.Tensor,
     ):
         runner = self.draft_worker.smc_draft_cuda_graph_runner
+        draft_seq_lens_cpu = (
+            draft_committed_lens.cpu()
+            if model_worker_batch.seq_lens_cpu is None
+            else draft_committed_lens.to(dtype=model_worker_batch.seq_lens_cpu.dtype).cpu()
+        )
+        draft_batch = dataclasses.replace(
+            model_worker_batch,
+            seq_lens=draft_committed_lens,
+            seq_lens_cpu=draft_seq_lens_cpu,
+            seq_lens_sum=int(draft_seq_lens_cpu.sum().item()),
+        )
         draft_input = SMCDraftInput(
             last_token_ids=last_token_ids,
             new_seq_lens=model_worker_batch.seq_lens,
         )
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             req_to_token_pool=self.req_to_token_pool,
-            batch=model_worker_batch,
+            batch=draft_batch,
             cuda_graph_runner=runner,
             draft_model_runner=self.draft_worker.draft_runner,
             gamma=self.smc_gamma,

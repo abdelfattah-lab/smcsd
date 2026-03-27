@@ -2954,10 +2954,10 @@ class ServerArgs:
                 raise ValueError("--smc-n-particles must be >= 1.")
             if self.smc_gamma < 1:
                 raise ValueError("--smc-gamma must be >= 1.")
-            if self.smc_draft_temperature <= 0:
-                raise ValueError("--smc-draft-temperature must be > 0.")
-            if self.smc_target_temperature <= 0:
-                raise ValueError("--smc-target-temperature must be > 0.")
+            if self.smc_draft_temperature < 0:
+                raise ValueError("--smc-draft-temperature must be >= 0.")
+            if self.smc_target_temperature < 0:
+                raise ValueError("--smc-target-temperature must be >= 0.")
             if not 0 < self.smc_resample_threshold <= 1:
                 raise ValueError("--smc-resample-threshold must be in (0, 1].")
             if self.max_running_requests is None:

@@ -706,20 +706,17 @@ class SMCDraftInput(SpecInput):
         bs = len(batch.seq_lens)
         device = batch.seq_lens.device
 
-        # Compute draft_committed_lens in native int64 — no .to() cast.
-        # .copy_() to int32 CG buffers handles conversion implicitly.
-        draft_committed_lens = batch.seq_lens[:bs] - 1
+        # Stepwise SMC draft decode treats the visible token as already
+        # materialized in KV and starts writing newly proposed tokens at the
+        # next slot. Keep the fused CUDA-graph path aligned with that behavior
+        # to avoid replaying the anchor token into a committed position.
+        draft_committed_lens = batch.seq_lens[:bs]
 
         # Per-step seq_lens: [gamma, bs]
-        # `draft_committed_lens` is the KV prefix length before replaying the
-        # visible anchor token. Decode positions are derived from `seq_lens - 1`,
-        # so replay step 0 must use `draft_committed_lens + 1` to place that
-        # anchor at the current visible position while still reusing the tail
-        # slots that start at `draft_committed_lens`.
+        # Step 0 uses the current visible sequence length, then increments by
+        # one token per replay step.
         step_offsets = torch.arange(gamma, dtype=torch.int64, device=device)
-        self.seq_lens_steps = (
-            draft_committed_lens.unsqueeze(0) + 1 + step_offsets.unsqueeze(1)
-        )
+        self.seq_lens_steps = draft_committed_lens.unsqueeze(0) + step_offsets.unsqueeze(1)
 
         # CPU mirror for attention backend metadata
         seq_lens_cpu = (
@@ -727,10 +724,10 @@ class SMCDraftInput(SpecInput):
             if batch.seq_lens_cpu is not None
             else batch.seq_lens.cpu()
         )
-        draft_committed_lens_cpu = seq_lens_cpu[:bs] - 1
+        draft_committed_lens_cpu = seq_lens_cpu[:bs]
         step_offsets_cpu = torch.arange(gamma, dtype=torch.int64)
         self.seq_lens_cpu_steps = (
-            draft_committed_lens_cpu.unsqueeze(0) + 1 + step_offsets_cpu.unsqueeze(1)
+            draft_committed_lens_cpu.unsqueeze(0) + step_offsets_cpu.unsqueeze(1)
         )
         self.seq_lens_sum_steps = self.seq_lens_cpu_steps.sum(dim=1, dtype=torch.int64)
 
@@ -1092,12 +1089,20 @@ class SMCScoreInput(SpecInput):
         accept_length = torch.full(
             (bs,), ss, dtype=torch.int32, device=device
         )
+        # accept_index must use GLOBAL flat offsets into predict (not local
+        # per-request [0..gamma]).  predict is flat (bs * draft_token_num,) and
+        # fill_new_verified_id indexes it with accept_index to extract the
+        # bonus token for each request.
+        req_offsets = (
+            torch.arange(bs, device=device, dtype=torch.int32).unsqueeze(1)
+            * self.draft_token_num
+        )
         accept_index = (
             torch.arange(ss + 1, device=device, dtype=torch.int32)
             .unsqueeze(0)
             .expand(bs, -1)
-            .contiguous()
-        )
+            + req_offsets
+        ).contiguous()
 
         # Fill predict: [d0, ..., d_{ss-1}, bonus] per request
         predict_view = predict.reshape(bs, self.draft_token_num)
@@ -1110,8 +1115,10 @@ class SMCScoreInput(SpecInput):
             dim=-1,
         )
 
-        # Bonus token: greedy argmax at last position
-        bonus = torch.argmax(log_probs[:, -1, :], dim=-1).to(torch.int32)
+        # Bonus token: sample from target distribution (not greedy) to
+        # preserve the output distribution at non-zero temperature.
+        bonus_probs = log_probs[:, -1, :].exp()
+        bonus = torch.multinomial(bonus_probs, num_samples=1).squeeze(-1).to(torch.int32)
         predict_view[:, ss] = bonus
 
         # SMC logprob diffs (importance weights)

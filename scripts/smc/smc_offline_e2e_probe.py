@@ -35,10 +35,11 @@ BASE_PROMPTS = [
 ]
 DEFAULT_PROMPT_REPEAT = 3
 DEFAULT_SAMPLING_PARAMS = {
-    "temperature": 0.8,
+    "temperature": 0.0,
     "max_new_tokens": 64,
     "ignore_eos": True,
 }
+SMC_MIN_TEMPERATURE = 1e-5
 PROBE_RECORD_PATH_ENV = "SGLANG_SMC_PROBE_RECORD_PATH"
 DEFAULT_CORRECTNESS_PROMPT_REPEAT = 1
 DEFAULT_STRESS_PROMPT_REPEAT = 3
@@ -192,7 +193,25 @@ def _build_prompts(prompt_repeat: int, annotate_prompts: bool) -> list[str]:
     return prompts
 
 
+def _resolve_smc_temperature(
+    explicit_value: Optional[float],
+    request_temperature: float,
+) -> float:
+    return max(
+        request_temperature if explicit_value is None else explicit_value,
+        SMC_MIN_TEMPERATURE,
+    )
+
+
 def _build_engine_kwargs(args, prompt_count: int) -> dict:
+    smc_draft_temperature = _resolve_smc_temperature(
+        args.smc_draft_temperature,
+        args.temperature,
+    )
+    smc_target_temperature = _resolve_smc_temperature(
+        args.smc_target_temperature,
+        args.temperature,
+    )
     cuda_graph_max_bs = (
         args.cuda_graph_max_bs
         if args.cuda_graph_max_bs is not None
@@ -213,13 +232,15 @@ def _build_engine_kwargs(args, prompt_count: int) -> dict:
         ),
         smc_n_particles=args.smc_n_particles,
         smc_gamma=args.smc_gamma,
-        smc_draft_temperature=args.smc_draft_temperature,
+        smc_draft_temperature=smc_draft_temperature,
+        smc_target_temperature=smc_target_temperature,
         page_size=1,
         cuda_graph_max_bs=cuda_graph_max_bs,
         mem_fraction_static=0.45,
         trust_remote_code=True,
         log_level="info",
         attention_backend="triton",
+        disable_cuda_graph=args.disable_cuda_graph,
     )
     if args.attention_backend is not None:
         engine_kwargs["attention_backend"] = args.attention_backend
@@ -274,7 +295,10 @@ def parse_args():
         "--temperature",
         type=float,
         default=DEFAULT_SAMPLING_PARAMS["temperature"],
-        help="Request sampling temperature. Non-zero values make resampling more likely.",
+        help=(
+            "Request sampling temperature. Unless --smc-target-temperature is set, "
+            "the probe also mirrors this into SMC target scoring temperature."
+        ),
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -297,8 +321,20 @@ def parse_args():
     parser.add_argument(
         "--smc-draft-temperature",
         type=float,
-        default=1.25,
-        help="Sampling temperature for SMC draft particles.",
+        default=None,
+        help=(
+            "Sampling temperature for SMC draft particles. Defaults to "
+            "--temperature (clamped to a small positive value)."
+        ),
+    )
+    parser.add_argument(
+        "--smc-target-temperature",
+        type=float,
+        default=None,
+        help=(
+            "Override the SMC target scoring temperature. Defaults to "
+            "--temperature (clamped to a small positive value)."
+        ),
     )
     parser.add_argument(
         "--annotate-prompts",
@@ -316,6 +352,11 @@ def parse_args():
             "Override CUDA graph max batch size. Defaults to the full particle "
             "batch for the correctness suite and 4 for the stress suite."
         ),
+    )
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        help="Disable CUDA graphs so SMC falls back to the stepwise draft path.",
     )
     parser.add_argument(
         "--show-all-outputs",
@@ -386,10 +427,13 @@ def main():
                 ),
                 "smc_n_particles": server_info.get("smc_n_particles"),
                 "smc_gamma": server_info.get("smc_gamma"),
+                "smc_draft_temperature": server_info.get("smc_draft_temperature"),
+                "smc_target_temperature": server_info.get("smc_target_temperature"),
                 "attention_backend": server_info.get("attention_backend"),
                 "prompt_count": len(prompts),
                 "annotate_prompts": annotate_prompts,
                 "cuda_graph_max_bs": engine_kwargs.get("cuda_graph_max_bs"),
+                "disable_cuda_graph": engine_kwargs.get("disable_cuda_graph"),
                 "sampling_temperature": args.temperature,
                 "avg_spec_accept_length": server_info.get("internal_states", [{}])[
                     0
@@ -405,16 +449,16 @@ def main():
         ):
             print(f"PROMPT_{i}: {prompt}")
             print(f"OUTPUT_{i}: {output['text']}")
-            print(
-                "META_{}: {}".format(
-                    i,
-                    json.dumps(
-                        _drop_none(output.get("meta_info", {})),
-                        indent=2,
-                        default=str,
-                    ),
-                )
-            )
+            # print(
+            #     "META_{}: {}".format(
+            #         i,
+            #         json.dumps(
+            #             _drop_none(output.get("meta_info", {})),
+            #             indent=2,
+            #             default=str,
+            #         ),
+            #     )
+            # )
             print("-" * 80)
         if len(outputs_to_show) < len(outputs):
             print(
