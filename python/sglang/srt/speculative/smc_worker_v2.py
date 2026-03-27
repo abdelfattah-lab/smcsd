@@ -529,7 +529,6 @@ class SMCWorkerV2(EAGLEWorkerV2):
             new_seq_lens=batch.seq_lens,
         )
 
-    #NOTE: CCC Probably dead code?
     def materialize_smc_parent_draft_prefix(self, req: Req) -> None:
         committed_seq_len = compute_smc_shared_prefix_len(req)
         if committed_seq_len <= 0:
@@ -538,36 +537,18 @@ class SMCWorkerV2(EAGLEWorkerV2):
         with self.draft_worker.draft_tp_context(
             self.draft_worker.draft_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            self._run_draft_prefix_fill_batch(
-                [req],
-                [committed_seq_len],
-                worker=self.draft_worker.draft_worker,
-            )
+            self._run_draft_prefix_fill_batch([req], [committed_seq_len])
 
-    #NOTE: CCC Probably dead code?
     def _run_draft_prefix_fill_batch(
         self,
         reqs: Sequence[Req],
         committed_seq_lens: Sequence[int],
-        worker,
-        existing_prefix_lens: Optional[Sequence[int]] = None,
-        explicit_fill_ids: Optional[Sequence[Sequence[int]]] = None,
     ) -> None:
-        """Fill draft model KV cache for committed positions.
-
-        When ``existing_prefix_lens`` is provided, the draft model already has
-        KV at ``[0, existing_prefix_len)`` and only the range
-        ``[existing_prefix_len, committed_seq_len)`` is filled (incremental).
-        Otherwise the entire ``[0, committed_seq_len)`` is filled from scratch.
-
-        When ``explicit_fill_ids`` is provided, token IDs for the fill range
-        are taken from it instead of ``req.origin_input_ids + req.output_ids``.
-        This is needed when the fill runs before the scheduler commits tokens
-        to ``output_ids`` (e.g. incremental draft extend after verify).
-        """
+        """Fill draft-model KV for the committed parent prefix before cloning."""
         if not reqs:
             return
 
+        worker = self.draft_worker.draft_worker
         batch = ScheduleBatch.init_new(
             reqs=list(reqs),
             req_to_token_pool=self.req_to_token_pool,
@@ -589,39 +570,26 @@ class SMCWorkerV2(EAGLEWorkerV2):
         for idx, (req, committed_seq_len) in enumerate(
             zip(reqs, committed_seq_lens, strict=True)
         ):
-            plen = (
-                existing_prefix_lens[idx]
-                if existing_prefix_lens is not None
-                else 0
-            )
-            elen = committed_seq_len - plen
+            prompt_len = len(req.origin_input_ids)
+            committed_output_len = committed_seq_len - prompt_len
+            if committed_output_len < 0 or committed_output_len > len(req.output_ids):
+                raise AssertionError(
+                    "SMC draft prefix fill received inconsistent lengths: "
+                    f"rid={req.rid}, prompt_len={prompt_len}, "
+                    f"committed_seq_len={committed_seq_len}, "
+                    f"output_len={len(req.output_ids)}"
+                )
 
-            if explicit_fill_ids is not None:
-                fill_ids = list(explicit_fill_ids[idx])
-            else:
-                prompt_len = len(req.origin_input_ids)
-                committed_output_len = committed_seq_len - prompt_len
-                if committed_output_len < 0 or committed_output_len > len(
-                    req.output_ids
-                ):
-                    raise AssertionError(
-                        "SMC draft prefix fill received inconsistent lengths: "
-                        f"rid={req.rid}, prompt_len={prompt_len}, "
-                        f"committed_seq_len={committed_seq_len}, "
-                        f"output_len={len(req.output_ids)}"
-                    )
-                all_ids = req.origin_input_ids + req.output_ids[:committed_output_len]
-                fill_ids = all_ids[plen:]
-
+            fill_ids = req.origin_input_ids + req.output_ids[:committed_output_len]
             input_ids.extend(fill_ids)
             out_cache_loc.append(
                 self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, plen:committed_seq_len
+                    req.req_pool_idx, :committed_seq_len
                 ].to(dtype=torch.int64, copy=True)
             )
             seq_lens.append(committed_seq_len)
-            prefix_lens.append(plen)
-            extend_lens.append(elen)
+            prefix_lens.append(0)
+            extend_lens.append(committed_seq_len)
 
         batch.input_ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
         batch.req_pool_indices = torch.tensor(

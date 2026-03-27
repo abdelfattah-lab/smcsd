@@ -102,7 +102,6 @@ class TestSMCDraftWorker(TestCase):
         worker._run_draft_prefix_fill_batch.assert_called_once_with(
             [req],
             [4],
-            worker=worker.draft_worker.draft_worker,
         )
 
 
