@@ -13,10 +13,8 @@ import torch
 from sglang.srt.managers.schedule_batch import Req, SMCGroupSpan, ScheduleBatch
 from sglang.srt.speculative.smc_info import (
     effective_sample_size,
-    get_smc_reserved_kv_len,
     multinomial_resample,
     normalize_log_weights,
-    set_smc_reserved_kv_len,
     systematic_resample,
 )
 
@@ -566,16 +564,15 @@ class SMCScheduler:
 
     def _trim_stale_overalloc(self, reqs: List[Req], scheduler) -> None:
         for req in reqs:
-            reserved_len = get_smc_reserved_kv_len(req)
-            if reserved_len <= req.kv_committed_len:
+            allocated_len = int(req.kv_allocated_len)
+            if allocated_len <= req.kv_committed_len:
                 continue
             indices_to_free = scheduler.req_to_token_pool.req_to_token[
                 req.req_pool_idx,
-                req.kv_committed_len:reserved_len,
+                req.kv_committed_len:allocated_len,
             ].to(dtype=torch.int64, copy=True)
             scheduler.token_to_kv_pool_allocator.dec_ref_and_free(indices_to_free)
             req.kv_allocated_len = req.kv_committed_len
-            set_smc_reserved_kv_len(req, req.kv_committed_len)
 
     def _prepare_pending_resample(
         self,
@@ -602,11 +599,11 @@ class SMCScheduler:
             src_req = group.particle_reqs[src_idx]
             src_len = src_req.kv_committed_len
 
-            dst_reserved_len = get_smc_reserved_kv_len(dst_req)
-            if dst_reserved_len > 0:
+            dst_allocated_len = int(dst_req.kv_allocated_len)
+            if dst_allocated_len > 0:
                 pending.dec_ref.append(
                     req_to_token[
-                        dst_req.req_pool_idx, :dst_reserved_len
+                        dst_req.req_pool_idx, :dst_allocated_len
                     ].to(dtype=torch.int64, copy=True)
                 )
 
@@ -653,6 +650,7 @@ class SMCScheduler:
             "finished_output": req.finished_output,
             "to_finish": copy.copy(req.to_finish),
             "kv_committed_len": req.kv_committed_len,
+            "kv_allocated_len": req.kv_allocated_len,
             "cache_protected_len": req.cache_protected_len,
             "logprob_start_len": req.logprob_start_len,
             "draft_prefix_materialized": req.draft_prefix_materialized,
@@ -680,8 +678,10 @@ class SMCScheduler:
         req.finished_output = snapshot["finished_output"]
         req.to_finish = copy.copy(snapshot["to_finish"])
         req.kv_committed_len = snapshot["kv_committed_len"]
-        req.kv_allocated_len = snapshot["kv_committed_len"]
-        set_smc_reserved_kv_len(req, snapshot["kv_committed_len"])
+        req.kv_allocated_len = snapshot.get(
+            "kv_allocated_len",
+            snapshot["kv_committed_len"],
+        )
         req.cache_protected_len = snapshot["cache_protected_len"]
         req.logprob_start_len = snapshot["logprob_start_len"]
         req.draft_prefix_materialized = snapshot["draft_prefix_materialized"]

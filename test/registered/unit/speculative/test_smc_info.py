@@ -30,12 +30,10 @@ from sglang.srt.speculative.smc_info import (
     _release_internal_req,
     _release_smc_parent_req,
     effective_sample_size,
-    get_smc_reserved_kv_len,
     multinomial_resample,
     normalize_log_weights,
     resolve_smc_proposal_length, #dead code
     resolve_smc_seed_output_ids,
-    set_smc_reserved_kv_len,
     systematic_resample,
     validate_smc_parent_req,
 )
@@ -234,10 +232,9 @@ class TestSMCManagerHelpers(TestCase):
         req = SimpleNamespace(
             req_pool_idx=0,
             kv_committed_len=1,
-            kv_allocated_len=1,
+            kv_allocated_len=2,
             prefix_indices=torch.tensor([11], dtype=torch.int64),
         )
-        set_smc_reserved_kv_len(req, 2)
         req_to_token = torch.tensor([[11, 99, 0]], dtype=torch.int32)
         allocator = _FakeAllocator()
         req_to_token_pool = SimpleNamespace(
@@ -253,7 +250,6 @@ class TestSMCManagerHelpers(TestCase):
         )
         self.assertIsNone(req.req_pool_idx)
         self.assertEqual(req.kv_allocated_len, 0)
-        self.assertEqual(get_smc_reserved_kv_len(req), 0)
 
 
 class TestSMCReleaseHelpers(TestCase):
@@ -1348,8 +1344,8 @@ class TestSMCScheduler(TestCase):
             output_ids=[20],
             kv_indices=[201],
         )
-        set_smc_reserved_kv_len(req0, 2)
-        set_smc_reserved_kv_len(req1, 2)
+        req0.kv_allocated_len = 2
+        req1.kv_allocated_len = 2
         manager.groups["g1"] = SMCGroupState(
             group_id="g1",
             parent_req=SimpleNamespace(),
@@ -1379,8 +1375,6 @@ class TestSMCScheduler(TestCase):
 
         self.assertEqual(req0.kv_allocated_len, req0.kv_committed_len)
         self.assertEqual(req1.kv_allocated_len, req1.kv_committed_len)
-        self.assertEqual(get_smc_reserved_kv_len(req0), req0.kv_committed_len)
-        self.assertEqual(get_smc_reserved_kv_len(req1), req1.kv_committed_len)
         self.assertEqual(len(allocator.dec_calls), 3)
         self.assertTrue(
             torch.equal(allocator.dec_calls[0], torch.tensor([111], dtype=torch.int64))
@@ -2155,8 +2149,7 @@ class TestSMCDraftInput(TestCase):
             speculative_num_draft_tokens=4,
         )
 
-        req = SimpleNamespace(req_pool_idx=3, kv_allocated_len=5, decode_batch_idx=0)
-        set_smc_reserved_kv_len(req, 9)
+        req = SimpleNamespace(req_pool_idx=3, kv_allocated_len=9, decode_batch_idx=0)
         req_to_token = torch.zeros((8, 32), dtype=torch.int32)
         batch = SimpleNamespace(
             reqs=[req],
@@ -2181,7 +2174,6 @@ class TestSMCDraftInput(TestCase):
         mock_alloc_token_slots.assert_not_called()
         mock_assign_req_to_token_pool.assert_not_called()
         self.assertEqual(req.kv_allocated_len, 9)
-        self.assertEqual(get_smc_reserved_kv_len(req), 9)
         self.assertEqual(req.decode_batch_idx, 1)
         batch.maybe_wait_verify_done.assert_called_once_with()
 
@@ -2199,8 +2191,7 @@ class TestSMCDraftInput(TestCase):
             speculative_num_draft_tokens=4,
         )
 
-        req = SimpleNamespace(req_pool_idx=3, kv_allocated_len=5, decode_batch_idx=0)
-        set_smc_reserved_kv_len(req, 9)
+        req = SimpleNamespace(req_pool_idx=3, kv_allocated_len=9, decode_batch_idx=0)
         batch_seq_lens = MagicMock()
         batch_seq_lens.cpu.return_value = torch.tensor([6], dtype=torch.int64)
         maybe_wait_verify_done = MagicMock()

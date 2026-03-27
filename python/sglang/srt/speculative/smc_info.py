@@ -438,22 +438,10 @@ def _copy_generation_state(src_req: Req, dst_req: Req):
     dst_req.read_offset = src_req.read_offset
     dst_req.cache_protected_len = src_req.cache_protected_len
     dst_req.logprob_start_len = src_req.logprob_start_len
-    set_smc_reserved_kv_len(dst_req, get_smc_reserved_kv_len(src_req))
 
 
 def _empty_prefix_indices() -> torch.Tensor:
     return torch.empty((0,), dtype=torch.int64)
-
-
-def get_smc_reserved_kv_len(req: Req) -> int:
-    reserved_len = getattr(req, "_smc_reserved_kv_len", None)
-    if reserved_len is None:
-        return int(req.kv_allocated_len)
-    return max(int(reserved_len), int(req.kv_allocated_len))
-
-
-def set_smc_reserved_kv_len(req: Req, reserved_len: int) -> None:
-    req._smc_reserved_kv_len = max(int(reserved_len), 0)
 
 
 def _release_internal_req(
@@ -464,10 +452,10 @@ def _release_internal_req(
     if req.req_pool_idx is None:
         return
 
-    reserved_len = get_smc_reserved_kv_len(req)
-    if reserved_len > 0:
+    allocated_len = int(req.kv_allocated_len)
+    if allocated_len > 0:
         indices = req_to_token_pool.req_to_token[
-            req.req_pool_idx, :reserved_len
+            req.req_pool_idx, :allocated_len
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(indices)
 
@@ -475,7 +463,6 @@ def _release_internal_req(
     req.prefix_indices = _empty_prefix_indices()
     req.kv_committed_len = 0
     req.kv_allocated_len = 0
-    set_smc_reserved_kv_len(req, 0)
 
 
 def _release_smc_parent_req(
@@ -533,10 +520,10 @@ def _alias_req_state(
             dst_req.prefix_indices = _empty_prefix_indices()
         return
 
-    dst_reserved_len = get_smc_reserved_kv_len(dst_req)
-    if dst_req.req_pool_idx is not None and dst_reserved_len > 0:
+    dst_allocated_len = int(dst_req.kv_allocated_len)
+    if dst_req.req_pool_idx is not None and dst_allocated_len > 0:
         old_indices = req_to_token_pool.req_to_token[
-            dst_req.req_pool_idx, :dst_reserved_len
+            dst_req.req_pool_idx, :dst_allocated_len
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(old_indices)
 
@@ -553,7 +540,6 @@ def _alias_req_state(
 
     _copy_generation_state(src_req, dst_req)
     dst_req.kv_allocated_len = seq_len
-    set_smc_reserved_kv_len(dst_req, seq_len)
 
 
 def alias_smc_req_state(
@@ -735,7 +721,7 @@ class SMCDraftInputV2Mixin:
         visible_seq_lens_cpu = batch.seq_lens_cpu.to(dtype=torch.int32)
         draft_committed_lens_cpu = (visible_seq_lens_cpu - 1).clamp_min_(0)
         current_allocated_lens_cpu = torch.tensor(
-            [get_smc_reserved_kv_len(req) for req in batch.reqs],
+            [int(req.kv_allocated_len) for req in batch.reqs],
             dtype=torch.int32,
             device="cpu",
         )
@@ -763,7 +749,6 @@ class SMCDraftInputV2Mixin:
             strict=True,
         ):
             req.kv_allocated_len = int(required_len)
-            set_smc_reserved_kv_len(req, required_len)
             req.decode_batch_idx += 1
 
     def filter_batch(

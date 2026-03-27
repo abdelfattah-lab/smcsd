@@ -21,8 +21,6 @@ from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
     _release_internal_req,
     clone_req_for_smc_particle,
-    get_smc_reserved_kv_len,
-    set_smc_reserved_kv_len,
     validate_smc_parent_req,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -130,10 +128,10 @@ class SMCManager:
             for req in group.particle_reqs.values():
                 if req.req_pool_idx is None:
                     continue
-                reserved = get_smc_reserved_kv_len(req)
-                if reserved > 0:
+                allocated = int(req.kv_allocated_len)
+                if allocated > 0:
                     indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, :reserved
+                        req.req_pool_idx, :allocated
                     ]
                     held.update(indices.cpu().tolist())
         return len(held)
@@ -248,7 +246,6 @@ class SMCManager:
             )
             particle_req.kv_committed_len = shared_seq_len
             particle_req.kv_allocated_len = shared_seq_len
-            set_smc_reserved_kv_len(particle_req, shared_seq_len)
             particle_req.prefix_indices = scheduler.req_to_token_pool.req_to_token[
                 particle_req.req_pool_idx, :shared_seq_len
             ].to(dtype=torch.int64, copy=True)
