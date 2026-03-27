@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import os
@@ -25,6 +24,7 @@ from sglang.srt.speculative.smc_info import (
     SMC_MIN_TEMPERATURE,
     SMCScoreInput,
     build_smc_positions,
+    compute_smc_shared_prefix_len,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.standalone_worker_v2 import (
@@ -161,12 +161,6 @@ class SMCDraftWorker(StandaloneDraftWorker):
         """
         outer = self._smc_outer_worker
         reqs = list(model_worker_batch.reqs) if hasattr(model_worker_batch, 'reqs') and model_worker_batch.reqs else []
-        visible_seq_lens = model_worker_batch.seq_lens
-        visible_seq_lens_cpu = (
-            model_worker_batch.seq_lens_cpu
-            if model_worker_batch.seq_lens_cpu is not None
-            else model_worker_batch.seq_lens.cpu()
-        )
         draft_input = model_worker_batch.spec_info
         if draft_input is not None and hasattr(draft_input, 'last_token_ids') and draft_input.last_token_ids is not None:
             last_token_ids = draft_input.last_token_ids
@@ -180,21 +174,11 @@ class SMCDraftWorker(StandaloneDraftWorker):
                 device=outer.device,
             )
 
-        # SMC keeps the latest visible token outside the committed prefix so the
-        # draft decode can consume it as the next input token. Align the draft
-        # and verify phases on that shared-prefix length.
-        draft_committed_lens = (visible_seq_lens - 1).clamp_min(0)
-        draft_committed_lens_cpu = (visible_seq_lens_cpu - 1).clamp_min(0)
-
-        outer._ensure_draft_prefix_filled(reqs, draft_committed_lens_cpu.tolist())
-
         draft_tokens, draft_logprobs, draft_lengths, _ = outer._run_eagle_style_draft_reqs(
             reqs=reqs,
             model_worker_batch=model_worker_batch,
             last_token_ids=last_token_ids,
             draft_sampling_info=model_worker_batch.sampling_info,
-            visible_seq_lens=visible_seq_lens,
-            draft_committed_lens=draft_committed_lens,
         )
 
         # Build score tokens: [anchor, d0, ..., d_{gamma-1}]
@@ -217,13 +201,13 @@ class SMCDraftWorker(StandaloneDraftWorker):
         custom_mask = None
         if not use_linear:
             from sglang.srt.speculative.smc_info import build_smc_causal_mask
-            custom_mask = build_smc_causal_mask(draft_committed_lens, score_token_num)
+            custom_mask = build_smc_causal_mask(model_worker_batch.seq_lens, score_token_num)
 
         return SMCScoreInput(
             draft_token=score_tokens.reshape(-1).contiguous(),
             draft_lengths=draft_lengths,
             draft_logprobs=draft_logprobs,
-            positions=build_smc_positions(draft_committed_lens, score_token_num),
+            positions=build_smc_positions(model_worker_batch.seq_lens, score_token_num),
             custom_mask=custom_mask,
             draft_token_num=score_token_num,
             spec_steps=smc_gamma,
@@ -540,41 +524,27 @@ class SMCWorkerV2(EAGLEWorkerV2):
         self, batch: ModelWorkerBatch, result: GenerationBatchResult
     ) -> SMCDraftInput:
         assert result.next_token_ids is not None
-        next_seq_lens = batch.seq_lens + 1
         return SMCDraftInput(
             last_token_ids=result.next_token_ids,
-            new_seq_lens=next_seq_lens,
+            new_seq_lens=batch.seq_lens,
         )
 
-    def _ensure_draft_prefix_filled(
-        self,
-        reqs: Sequence[Req],
-        draft_committed_lens: Sequence[int],
-    ) -> None:
-        fill_reqs: List[Req] = []
-        fill_lens: List[int] = []
-        for req, committed_seq_len in zip(reqs, draft_committed_lens, strict=True):
-            if req.draft_prefix_materialized or committed_seq_len <= 0:
-                req.draft_prefix_materialized = True
-                continue
-            fill_reqs.append(req)
-            fill_lens.append(int(committed_seq_len))
-
-        if not fill_reqs:
+    #NOTE: CCC Probably dead code?
+    def materialize_smc_parent_draft_prefix(self, req: Req) -> None:
+        committed_seq_len = compute_smc_shared_prefix_len(req)
+        if committed_seq_len <= 0:
             return
 
         with self.draft_worker.draft_tp_context(
             self.draft_worker.draft_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self._run_draft_prefix_fill_batch(
-                fill_reqs,
-                fill_lens,
+                [req],
+                [committed_seq_len],
                 worker=self.draft_worker.draft_worker,
             )
 
-        for req in fill_reqs:
-            req.draft_prefix_materialized = True
-
+    #NOTE: CCC Probably dead code?
     def _run_draft_prefix_fill_batch(
         self,
         reqs: Sequence[Req],
@@ -684,28 +654,15 @@ class SMCWorkerV2(EAGLEWorkerV2):
         model_worker_batch: ModelWorkerBatch,
         last_token_ids: torch.Tensor,
         draft_sampling_info: SamplingBatchInfo,
-        visible_seq_lens: torch.Tensor,
-        draft_committed_lens: torch.Tensor,
     ):
         runner = self.draft_worker.smc_draft_cuda_graph_runner
-        draft_seq_lens_cpu = (
-            draft_committed_lens.cpu()
-            if model_worker_batch.seq_lens_cpu is None
-            else draft_committed_lens.to(dtype=model_worker_batch.seq_lens_cpu.dtype).cpu()
-        )
-        draft_batch = dataclasses.replace(
-            model_worker_batch,
-            seq_lens=draft_committed_lens,
-            seq_lens_cpu=draft_seq_lens_cpu,
-            seq_lens_sum=int(draft_seq_lens_cpu.sum().item()),
-        )
         draft_input = SMCDraftInput(
             last_token_ids=last_token_ids,
             new_seq_lens=model_worker_batch.seq_lens,
         )
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             req_to_token_pool=self.req_to_token_pool,
-            batch=draft_batch,
+            batch=model_worker_batch,
             cuda_graph_runner=runner,
             draft_model_runner=self.draft_worker.draft_runner,
             gamma=self.smc_gamma,
@@ -719,9 +676,6 @@ class SMCWorkerV2(EAGLEWorkerV2):
                     forward_batch
                 )
             token_matrix, logprob_matrix = self.draft_worker.draft_forward(forward_batch)
-
-        for req in reqs:
-            req.draft_prefix_materialized = True
 
         batch_size = len(reqs)
         draft_lengths = torch.full(
@@ -743,7 +697,7 @@ class SMCWorkerV2(EAGLEWorkerV2):
                 "particle_indices": [
                     getattr(req, "smc_particle_idx", None) for req in reqs
                 ],
-                "visible_seq_lens": visible_seq_lens.tolist(),
+                "committed_seq_lens": model_worker_batch.seq_lens.tolist(),
                 "last_token_ids": last_token_ids.tolist(),
                 "draft_tokens": token_matrix.tolist(),
                 "draft_lengths": draft_lengths.tolist(),

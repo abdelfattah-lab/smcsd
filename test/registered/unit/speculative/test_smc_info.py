@@ -90,7 +90,6 @@ def _make_scheduler_req(
         kv_allocated_len=len(allocated_kv_indices),
         cache_protected_len=len(kv_indices),
         logprob_start_len=0,
-        draft_prefix_materialized=True,
         prefix_indices=torch.tensor(kv_indices, dtype=torch.int64),
         finished_reason=None,
         finished_len=None,
@@ -400,7 +399,6 @@ class TestSMCScheduler(TestCase):
                     "kv_committed_len": 1,
                     "cache_protected_len": 1,
                     "logprob_start_len": 0,
-                    "draft_prefix_materialized": True,
                 }
             ],
             inc_ref=[torch.tensor([101], dtype=torch.int64)],
@@ -1411,9 +1409,9 @@ class TestSMCScoreInput(TestCase):
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
                 req_pool_indices=torch.tensor([3], dtype=torch.int64),
-                seq_lens=torch.tensor([4], dtype=torch.int64),
-                seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
-                seq_lens_sum=4,
+                seq_lens=torch.tensor([3], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([3], dtype=torch.int64),
+                seq_lens_sum=3,
                 input_ids=None,
                 reqs=[req],
                 capture_hidden_mode=None,
@@ -1502,9 +1500,9 @@ class TestSMCScoreInput(TestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             req_pool_indices=torch.tensor([2], dtype=torch.int64),
-            seq_lens=torch.tensor([4], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
-            seq_lens_sum=4,
+            seq_lens=torch.tensor([3], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int64),
+            seq_lens_sum=3,
             input_ids=None,
             reqs=[req],
             capture_hidden_mode=None,
@@ -1559,9 +1557,9 @@ class TestSMCScoreInput(TestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             req_pool_indices=torch.tensor([5], dtype=torch.int64),
-            seq_lens=torch.tensor([4], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
-            seq_lens_sum=4,
+            seq_lens=torch.tensor([3], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int64),
+            seq_lens_sum=3,
             input_ids=None,
             reqs=[req],
             capture_hidden_mode=None,
@@ -1614,9 +1612,9 @@ class TestSMCScoreInput(TestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             req_pool_indices=torch.tensor([2], dtype=torch.int64),
-            seq_lens=torch.tensor([4], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
-            seq_lens_sum=4,
+            seq_lens=torch.tensor([3], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int64),
+            seq_lens_sum=3,
             input_ids=None,
             reqs=[req],
             capture_hidden_mode=None,
@@ -1850,7 +1848,7 @@ class TestSMCVerifyGraphGate(TestCase):
 
 
 class TestSMCDraftInput(TestCase):
-    def test_prepare_for_v2_draft_replays_anchor_at_visible_position(self):
+    def test_prepare_for_v2_draft_replays_anchor_at_committed_prefix_boundary(self):
         @dataclass
         class _DraftBatch:
             seq_lens: torch.Tensor
@@ -1862,6 +1860,8 @@ class TestSMCDraftInput(TestCase):
             spec_info: object | None = None
             capture_hidden_mode: object | None = None
             return_logprob: bool = False
+            top_logprobs_nums: list[int] | None = None
+            token_ids_logprobs: list[object | None] | None = None
             forward_mode: object | None = None
             seq_lens_sum: int | None = None
 
@@ -1902,12 +1902,12 @@ class TestSMCDraftInput(TestCase):
 
         fake_kernel = _FakeDraftCacheKernel()
         batch = _DraftBatch(
-            seq_lens=torch.tensor([6, 8], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([6, 8], dtype=torch.int64),
+            seq_lens=torch.tensor([5, 7], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([5, 7], dtype=torch.int64),
             req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
             input_ids=torch.tensor([17, 19], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            seq_lens_sum=14,
+            seq_lens_sum=12,
         )
         draft_input = SMCDraftInput(
             last_token_ids=torch.tensor([17, 19], dtype=torch.int32),
@@ -1937,7 +1937,7 @@ class TestSMCDraftInput(TestCase):
 
         self.assertIs(returned_forward_batch, forward_batch)
         self.assertTrue(can_cuda_graph)
-        self.assertTrue(torch.equal(draft_input.positions, torch.tensor([6, 8])))
+        self.assertTrue(torch.equal(draft_input.positions, torch.tensor([5, 7])))
         self.assertEqual(len(fake_kernel.calls), 1)
         self.assertEqual(fake_kernel.calls[0]["grid"], (2,))
         self.assertTrue(
@@ -1949,7 +1949,7 @@ class TestSMCDraftInput(TestCase):
         self.assertTrue(
             torch.equal(
                 fake_kernel.calls[0]["seq_lens"],
-                torch.tensor([6, 8], dtype=torch.int64),
+                torch.tensor([5, 7], dtype=torch.int64),
             )
         )
         self.assertEqual(fake_kernel.calls[0]["pool_len"], 32)
@@ -1966,15 +1966,17 @@ class TestSMCDraftInput(TestCase):
         self.assertTrue(
             torch.equal(draft_batch.input_ids, torch.tensor([17, 19], dtype=torch.int32))
         )
+        self.assertEqual(draft_batch.top_logprobs_nums, [0, 0])
+        self.assertEqual(draft_batch.token_ids_logprobs, [None, None])
         self.assertTrue(
-            torch.equal(draft_batch.seq_lens, torch.tensor([6, 8], dtype=torch.int64))
+            torch.equal(draft_batch.seq_lens, torch.tensor([5, 7], dtype=torch.int64))
         )
         self.assertTrue(
             torch.equal(
-                draft_batch.seq_lens_cpu, torch.tensor([6, 8], dtype=torch.int64)
+                draft_batch.seq_lens_cpu, torch.tensor([5, 7], dtype=torch.int64)
             )
         )
-        self.assertEqual(draft_batch.seq_lens_sum, 14)
+        self.assertEqual(draft_batch.seq_lens_sum, 12)
         self.assertIs(draft_batch.spec_info, draft_input)
 
     def test_filter_batch_with_future_indices_only_updates_future_map_view(self):
@@ -2095,7 +2097,7 @@ class TestSMCDraftInput(TestCase):
         req_to_token = torch.zeros((8, 32), dtype=torch.int32)
         batch = SimpleNamespace(
             reqs=reqs,
-            seq_lens=torch.tensor([6, 8], dtype=torch.int64),
+            seq_lens=torch.tensor([5, 7], dtype=torch.int64),
             seq_lens_cpu=torch.tensor([99, 101], dtype=torch.int64),
             seq_lens_sum=200,
             req_pool_indices=torch.tensor([3, 4], dtype=torch.int64),
@@ -2109,7 +2111,7 @@ class TestSMCDraftInput(TestCase):
 
         draft_input = SMCDraftInput(
             last_token_ids=torch.tensor([7, 9], dtype=torch.int32),
-            new_seq_lens=torch.tensor([6, 8], dtype=torch.int64),
+            new_seq_lens=torch.tensor([5, 7], dtype=torch.int64),
         )
         draft_input.prepare_for_decode(batch)
 
@@ -2118,9 +2120,9 @@ class TestSMCDraftInput(TestCase):
         self.assertEqual(reqs[0].decode_batch_idx, 1)
         self.assertEqual(reqs[1].decode_batch_idx, 3)
         self.assertTrue(
-            torch.equal(batch.seq_lens_cpu, torch.tensor([6, 8], dtype=torch.int64))
+            torch.equal(batch.seq_lens_cpu, torch.tensor([5, 7], dtype=torch.int64))
         )
-        self.assertEqual(batch.seq_lens_sum, 14)
+        self.assertEqual(batch.seq_lens_sum, 12)
         batch.maybe_wait_verify_done.assert_called_once_with()
         self.assertTrue(
             torch.equal(
@@ -2153,7 +2155,7 @@ class TestSMCDraftInput(TestCase):
         req_to_token = torch.zeros((8, 32), dtype=torch.int32)
         batch = SimpleNamespace(
             reqs=[req],
-            seq_lens=torch.tensor([6], dtype=torch.int64),
+            seq_lens=torch.tensor([5], dtype=torch.int64),
             seq_lens_cpu=torch.tensor([99], dtype=torch.int64),
             seq_lens_sum=99,
             req_pool_indices=torch.tensor([3], dtype=torch.int64),
@@ -2167,7 +2169,7 @@ class TestSMCDraftInput(TestCase):
 
         draft_input = SMCDraftInput(
             last_token_ids=torch.tensor([7], dtype=torch.int32),
-            new_seq_lens=torch.tensor([6], dtype=torch.int64),
+            new_seq_lens=torch.tensor([5], dtype=torch.int64),
         )
         draft_input.prepare_for_decode(batch)
 
@@ -2193,12 +2195,9 @@ class TestSMCDraftInput(TestCase):
 
         req = SimpleNamespace(req_pool_idx=3, kv_allocated_len=9, decode_batch_idx=0)
         batch_seq_lens = MagicMock()
-        batch_seq_lens.cpu.return_value = torch.tensor([6], dtype=torch.int64)
+        batch_seq_lens.cpu.return_value = torch.tensor([5], dtype=torch.int64)
         maybe_wait_verify_done = MagicMock()
         maybe_wait_verify_done.side_effect = lambda: None
-        batch_seq_lens.sum.side_effect = AssertionError(
-            "prepare_for_decode should use the refreshed CPU mirror for seq_lens_sum"
-        )
         batch = SimpleNamespace(
             reqs=[req],
             seq_lens=batch_seq_lens,
@@ -2215,7 +2214,7 @@ class TestSMCDraftInput(TestCase):
 
         draft_input = SMCDraftInput(
             last_token_ids=torch.tensor([7], dtype=torch.int32),
-            new_seq_lens=torch.tensor([6], dtype=torch.int64),
+            new_seq_lens=torch.tensor([5], dtype=torch.int64),
             verify_done=MagicMock(),
         )
         draft_input.prepare_for_decode(batch)
@@ -2225,9 +2224,9 @@ class TestSMCDraftInput(TestCase):
         mock_alloc_token_slots.assert_not_called()
         mock_assign_req_to_token_pool.assert_not_called()
         self.assertTrue(
-            torch.equal(batch.seq_lens_cpu, torch.tensor([6], dtype=torch.int64))
+            torch.equal(batch.seq_lens_cpu, torch.tensor([5], dtype=torch.int64))
         )
-        self.assertEqual(batch.seq_lens_sum, 6)
+        self.assertEqual(batch.seq_lens_sum, 5)
         self.assertEqual(req.kv_allocated_len, 9)
         self.assertEqual(req.decode_batch_idx, 1)
 
@@ -2790,6 +2789,7 @@ class TestSMCPrefillOutputProcessor(TestCase):
         self,
         mock_release_parent,
     ):
+        call_order = []
         req = SimpleNamespace(
             rid="parent-1",
             output_ids=[],
@@ -2829,9 +2829,24 @@ class TestSMCPrefillOutputProcessor(TestCase):
         processor = _FakeOutputProcessor()
         processor.is_generation = True
         processor.enable_metrics = False
-        processor.smc_manager = SimpleNamespace(create_group=MagicMock(return_value=None))
+        processor.model_worker = SimpleNamespace(
+            materialize_smc_parent_draft_prefix=MagicMock(
+                side_effect=lambda target_req: call_order.append(
+                    ("materialize", target_req.rid)
+                )
+            )
+        )
+        processor.smc_manager = SimpleNamespace(
+            create_group=MagicMock(
+                side_effect=lambda target_req, scheduler: call_order.append(
+                    ("create_group", target_req.rid)
+                )
+            )
+        )
         processor.smc_scheduler = SimpleNamespace(
-            enqueue_group_for_running=MagicMock()
+            enqueue_group_for_running=MagicMock(
+                side_effect=lambda group_id: call_order.append(("enqueue", group_id))
+            )
         )
         processor.req_to_token_pool = MagicMock()
         processor.token_to_kv_pool_allocator = MagicMock()
@@ -2841,9 +2856,16 @@ class TestSMCPrefillOutputProcessor(TestCase):
         processor.stream_output = MagicMock()
         processor.report_prefill_stats = MagicMock()
 
+        mock_release_parent.side_effect = (
+            lambda *args, **kwargs: call_order.append(("release_parent", req.rid))
+        )
+
         processor.process_batch_result_prefill(batch, result)
 
         self.assertEqual(req.output_ids, [41])
+        processor.model_worker.materialize_smc_parent_draft_prefix.assert_called_once_with(
+            req
+        )
         processor.smc_manager.create_group.assert_called_once_with(req, processor)
         mock_release_parent.assert_called_once_with(
             req,
@@ -2853,6 +2875,15 @@ class TestSMCPrefillOutputProcessor(TestCase):
         )
         processor.smc_scheduler.enqueue_group_for_running.assert_called_once_with(
             "parent-1"
+        )
+        self.assertEqual(
+            call_order,
+            [
+                ("materialize", "parent-1"),
+                ("create_group", "parent-1"),
+                ("release_parent", "parent-1"),
+                ("enqueue", "parent-1"),
+            ],
         )
         batch.filter_batch.assert_called_once_with(keep_indices=[])
 
@@ -2865,7 +2896,6 @@ class TestSMCDecodeOutputProcessor(TestCase):
             origin_input_ids=[1, 2, 3],
             kv_committed_len=3,
             kv_allocated_len=8,
-            draft_prefix_materialized=True,
             finished=lambda: False,
             is_retracted=False,
             check_finished=lambda new_tokens: None,
@@ -2895,14 +2925,14 @@ class TestSMCDecodeOutputProcessor(TestCase):
             is_spec_v2=False,
             return_logprob=False,
             batch_size=lambda: 1,
-            seq_lens=torch.tensor([4], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
-            seq_lens_sum=4,
-            orig_seq_lens=torch.tensor([4], dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int64),
+            seq_lens_sum=3,
+            orig_seq_lens=torch.tensor([3], dtype=torch.int32),
             output_ids=torch.tensor([17], dtype=torch.int32),
             spec_info=SMCDraftInput(
                 last_token_ids=torch.tensor([17], dtype=torch.int32),
-                new_seq_lens=torch.tensor([4], dtype=torch.int64),
+                new_seq_lens=torch.tensor([3], dtype=torch.int64),
             ),
         )
         result = GenerationBatchResult(
@@ -2942,19 +2972,18 @@ class TestSMCDecodeOutputProcessor(TestCase):
         self.assertEqual(req.output_ids, [17, 41, 43])
         self.assertEqual(req.kv_committed_len, 5)
         self.assertEqual(req.kv_allocated_len, 8)
-        self.assertTrue(req.draft_prefix_materialized)
-        self.assertTrue(torch.equal(batch.seq_lens, torch.tensor([6], dtype=torch.int64)))
+        self.assertTrue(torch.equal(batch.seq_lens, torch.tensor([5], dtype=torch.int64)))
         self.assertTrue(
-            torch.equal(batch.seq_lens_cpu, torch.tensor([6], dtype=torch.int64))
+            torch.equal(batch.seq_lens_cpu, torch.tensor([5], dtype=torch.int64))
         )
-        self.assertEqual(batch.seq_lens_sum, 6)
-        self.assertTrue(torch.equal(batch.orig_seq_lens, torch.tensor([6], dtype=torch.int32)))
+        self.assertEqual(batch.seq_lens_sum, 5)
+        self.assertTrue(torch.equal(batch.orig_seq_lens, torch.tensor([5], dtype=torch.int32)))
         self.assertTrue(torch.equal(batch.output_ids, torch.tensor([43], dtype=torch.int32)))
         self.assertTrue(
             torch.equal(batch.spec_info.last_token_ids, torch.tensor([43], dtype=torch.int32))
         )
         self.assertTrue(
-            torch.equal(batch.spec_info.new_seq_lens, torch.tensor([6], dtype=torch.int64))
+            torch.equal(batch.spec_info.new_seq_lens, torch.tensor([5], dtype=torch.int64))
         )
         self.assertEqual(req.spec_verify_ct, 1)
         self.assertEqual(req.spec_accepted_tokens, 1)

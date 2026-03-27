@@ -21,6 +21,7 @@ from sglang.srt.speculative.smc_info import (
     SMCDraftInput,
     _release_internal_req,
     clone_req_for_smc_particle,
+    compute_smc_shared_prefix_len,
     validate_smc_parent_req,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -225,17 +226,12 @@ class SMCManager:
                 return_logprob=False,
             )
             particle_req.smc_group_id = parent_req.rid
-            particle_req.draft_prefix_materialized = False
             particle_reqs.append(particle_req)
 
         if scheduler.req_to_token_pool.alloc(particle_reqs) is None:
             return "SMC particle allocation failed because req_to_token_pool is full."
 
-        if parent_req.output_ids:
-            desired_seq_len = len(parent_req.origin_input_ids) + len(parent_req.output_ids) - 1
-            shared_seq_len = min(parent_req.kv_committed_len, desired_seq_len)
-        else:
-            shared_seq_len = parent_req.kv_committed_len
+        shared_seq_len = compute_smc_shared_prefix_len(parent_req)
 
         for particle_req in particle_reqs:
             scheduler.req_to_token_pool.copy_block_table(
@@ -250,7 +246,6 @@ class SMCManager:
                 particle_req.req_pool_idx, :shared_seq_len
             ].to(dtype=torch.int64, copy=True)
             particle_req.cache_protected_len = shared_seq_len
-            particle_req.draft_prefix_materialized = shared_seq_len == 0
 
         group = SMCGroupState(
             group_id=parent_req.rid,
@@ -288,15 +283,15 @@ class SMCManager:
             dtype=torch.int64,
             device=scheduler.device,
         )
-        visible_seq_lens = torch.tensor(
-            [len(req.origin_input_ids) + len(req.output_ids) for req in particle_reqs],
+        committed_seq_lens = torch.tensor(
+            [compute_smc_shared_prefix_len(req) for req in particle_reqs],
             dtype=torch.int64,
             device=scheduler.device,
         )
-        batch.seq_lens = visible_seq_lens
-        batch.seq_lens_cpu = visible_seq_lens.cpu()
+        batch.seq_lens = committed_seq_lens
+        batch.seq_lens_cpu = committed_seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        batch.orig_seq_lens = visible_seq_lens.to(dtype=torch.int32)
+        batch.orig_seq_lens = committed_seq_lens.to(dtype=torch.int32)
         last_token_ids = torch.tensor(
             [
                 req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
@@ -310,7 +305,7 @@ class SMCManager:
         batch.token_ids_logprobs = [None] * len(particle_reqs)
         batch.spec_info = SMCDraftInput(
             last_token_ids=last_token_ids,
-            new_seq_lens=visible_seq_lens,
+            new_seq_lens=committed_seq_lens,
         )
         if use_future_map and scheduler.enable_overlap and scheduler.future_map is not None:
             future_indices = scheduler.future_map.alloc_future_indices(len(particle_reqs))

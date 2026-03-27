@@ -268,6 +268,19 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif is_smc and req.smc_particle_idx is None:
+                        try:
+                            self.model_worker.materialize_smc_parent_draft_prefix(req)
+                        except Exception as exc:
+                            error = (
+                                "SMC parent draft prefill failed: "
+                                f"{exc}"
+                            )
+                            req.finished_reason = FINISH_ABORT(error)
+                            req.finished_len = len(req.output_ids)
+                            self.maybe_collect_routed_experts(req)
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
+                            continue
                         error = self.smc_manager.create_group(req, self)
                         if error is not None:
                             req.finished_reason = FINISH_ABORT(error)
@@ -727,7 +740,7 @@ class SchedulerOutputProcessorMixin:
         if batch.spec_algorithm.is_smc() and not self.enable_overlap and batch.reqs:
             refreshed_seq_lens_cpu = torch.tensor(
                 [
-                    len(req.origin_input_ids) + len(req.output_ids)
+                    max(len(req.origin_input_ids) + len(req.output_ids) - 1, 0)
                     for req in batch.reqs
                 ],
                 dtype=torch.int64,

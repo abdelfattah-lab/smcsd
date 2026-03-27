@@ -793,7 +793,6 @@ class Req(ReqDllmMixin):
         self.smc_particle_idx: Optional[int] = None
         self.smc_logprob_diff: Optional[float] = None
         self.smc_target_temperature: Optional[float] = None
-        self.draft_prefix_materialized: bool = True
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0

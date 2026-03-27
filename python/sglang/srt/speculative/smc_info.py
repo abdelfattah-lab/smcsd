@@ -66,7 +66,6 @@ class SMCRequestState:
     released: bool = False
     step_index: int = 0
     best_particle_idx: int = 0
-    draft_prefix_materialized: bool = False
 
     def active_particles(self) -> List[SMCParticleState]:
         return [particle for particle in self.particles if not particle.is_finished]
@@ -218,14 +217,7 @@ def initialize_smc_request_state(
     if req_to_token_pool.alloc(particle_reqs) is None:
         return "SMC particle allocation failed because req_to_token_pool is full."
 
-    if base_output_ids:
-        # SMC advances through ordinary extend batches, so keep one generated token
-        # outside the committed prefix when possible. This handles overlap paths where
-        # the parent request may already have committed the latest output token.
-        desired_seq_len = len(req.origin_input_ids) + len(base_output_ids) - 1
-        shared_seq_len = min(req.kv_committed_len, desired_seq_len)
-    else:
-        shared_seq_len = req.kv_committed_len
+    shared_seq_len = compute_smc_shared_prefix_len(req, output_ids=base_output_ids)
     for particle_req in particle_reqs:
         req_to_token_pool.copy_block_table(
             req.req_pool_idx,
@@ -444,6 +436,20 @@ def _empty_prefix_indices() -> torch.Tensor:
     return torch.empty((0,), dtype=torch.int64)
 
 
+def compute_smc_shared_prefix_len(
+    req: Req,
+    *,
+    output_ids: Optional[Sequence[int]] = None,
+) -> int:
+    output_ids = req.output_ids if output_ids is None else output_ids
+    if output_ids:
+        visible_seq_len = len(req.origin_input_ids) + len(output_ids)
+        # Keep the latest visible token outside the committed prefix so it can
+        # act as the anchor input for the next draft/verify step.
+        return min(int(req.kv_committed_len), visible_seq_len - 1)
+    return int(req.kv_committed_len)
+
+
 def _release_internal_req(
     req: Req,
     req_to_token_pool,
@@ -554,7 +560,6 @@ def alias_smc_req_state(
         req_to_token_pool,
         token_to_kv_pool_allocator,
     )
-    dst_req.draft_prefix_materialized = src_req.draft_prefix_materialized
 
 
 def alias_particle_state(
@@ -685,8 +690,8 @@ class SMCDraftInputV2Mixin:
                 gamma,
             )
 
-        # Mirror Eagle v2: carry the base committed prefix on the batch and let
-        # the draft loop derive per-step seq_lens/positions from it.
+        # Mirror Eagle v2: the live batch already carries the committed prefix
+        # preceding the carried anchor token (`last_token_ids`).
         self.positions = batch.seq_lens.to(torch.int64)
         draft_batch = dataclasses.replace(
             batch,
@@ -695,6 +700,8 @@ class SMCDraftInputV2Mixin:
             spec_info=self,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_logprob=True,
+            top_logprobs_nums=[0] * len(batch.seq_lens),
+            token_ids_logprobs=[None] * len(batch.seq_lens),
         )
         forward_batch = ForwardBatch.init_new(draft_batch, draft_model_runner)
 
@@ -718,18 +725,17 @@ class SMCDraftInputV2Mixin:
             int(server_args.speculative_num_draft_tokens or gamma),
             gamma,
         )
-        visible_seq_lens_cpu = batch.seq_lens_cpu.to(dtype=torch.int32)
-        draft_committed_lens_cpu = (visible_seq_lens_cpu - 1).clamp_min_(0)
-        current_allocated_lens_cpu = torch.tensor(
+        committed_seq_lens_cpu = batch.seq_lens_cpu.to(dtype=torch.int32)
+        cur_kv_lens_cpu = torch.tensor(
             [int(req.kv_allocated_len) for req in batch.reqs],
             dtype=torch.int32,
             device="cpu",
         )
-        required_lens_cpu = torch.maximum(
-            current_allocated_lens_cpu,
-            draft_committed_lens_cpu + score_token_num,
+        nxt_kv_lens_cpu = torch.maximum(
+            cur_kv_lens_cpu,
+            committed_seq_lens_cpu + score_token_num,
         )
-        missing_lens_cpu = required_lens_cpu - current_allocated_lens_cpu
+        missing_lens_cpu = nxt_kv_lens_cpu - cur_kv_lens_cpu
         num_needed_tokens = int(missing_lens_cpu.sum().item())
 
         if num_needed_tokens > 0:
@@ -737,18 +743,18 @@ class SMCDraftInputV2Mixin:
             assign_req_to_token_pool_func(
                 batch.req_pool_indices,
                 batch.req_to_token_pool.req_to_token,
-                current_allocated_lens_cpu.to(device=batch.device),
-                required_lens_cpu.to(device=batch.device),
+                cur_kv_lens_cpu.to(device=batch.device),
+                nxt_kv_lens_cpu.to(device=batch.device),
                 out_cache_loc,
                 batch.batch_size(),
             )
 
-        for req, required_len in zip(
+        for req, next_len in zip(
             batch.reqs,
-            required_lens_cpu.tolist(),
+            nxt_kv_lens_cpu.tolist(),
             strict=True,
         ):
-            req.kv_allocated_len = int(required_len)
+            req.kv_allocated_len = int(next_len)
             req.decode_batch_idx += 1
 
     def filter_batch(
@@ -913,9 +919,9 @@ class SMCScoreInput(SpecInput):
         batch: ModelWorkerBatch,
         target_worker,
     ):
-        verify_seq_lens = (batch.seq_lens - 1).clamp_min(0)
+        verify_seq_lens = batch.seq_lens
         verify_seq_lens_cpu = (
-            (batch.seq_lens_cpu - 1).clamp_min(0)
+            batch.seq_lens_cpu
             if batch.seq_lens_cpu is not None
             else verify_seq_lens.cpu()
         )
@@ -925,8 +931,8 @@ class SMCScoreInput(SpecInput):
             bs = len(batch.req_pool_indices)
             device = self.draft_token.device
             batch.input_ids = self.draft_token
-            # SMC verify replays the visible token as an input anchor, so the
-            # effective target prefix excludes that last visible token.
+            # The live SMC batch already carries the committed prefix before the
+            # anchor token, matching Eagle's verify start-offset contract.
             batch.out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token=req_to_token_pool.req_to_token,

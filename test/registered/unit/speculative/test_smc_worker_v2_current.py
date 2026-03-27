@@ -15,16 +15,12 @@ register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
 
 
 class TestSMCDraftWorker(TestCase):
-    def test_draft_uses_committed_prefix_lengths(self):
+    def test_draft_uses_live_committed_prefix_lengths(self):
         worker = SMCDraftWorker.__new__(SMCDraftWorker)
         observed = {}
 
-        def record_prefix_fill(reqs, committed_lens):
-            observed["fill_lens"] = list(committed_lens)
-
-        def run_draft(reqs, model_worker_batch, last_token_ids, draft_sampling_info, visible_seq_lens, draft_committed_lens):
-            observed["visible_seq_lens"] = visible_seq_lens.clone()
-            observed["draft_committed_lens"] = draft_committed_lens.clone()
+        def run_draft(reqs, model_worker_batch, last_token_ids, draft_sampling_info):
+            observed["seq_lens"] = model_worker_batch.seq_lens.clone()
             observed["last_token_ids"] = last_token_ids.clone()
             observed["sampling_info"] = draft_sampling_info
             return (
@@ -42,7 +38,6 @@ class TestSMCDraftWorker(TestCase):
                 attention_backend="triton",
             ),
             smc_gamma=4,
-            _ensure_draft_prefix_filled=record_prefix_fill,
             _run_eagle_style_draft_reqs=run_draft,
         )
 
@@ -63,8 +58,8 @@ class TestSMCDraftWorker(TestCase):
                     smc_particle_idx=0,
                 ),
             ],
-            seq_lens=torch.tensor([6, 8], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([6, 8], dtype=torch.int64),
+            seq_lens=torch.tensor([5, 7], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([5, 7], dtype=torch.int64),
             spec_info=SimpleNamespace(
                 last_token_ids=torch.tensor([17, 19], dtype=torch.int32),
             ),
@@ -73,10 +68,9 @@ class TestSMCDraftWorker(TestCase):
 
         verify_input = worker.draft(model_worker_batch)
 
-        self.assertEqual(observed["fill_lens"], [5, 7])
         self.assertTrue(
             torch.equal(
-                observed["draft_committed_lens"],
+                observed["seq_lens"],
                 torch.tensor([5, 7], dtype=torch.int64),
             )
         )
@@ -85,6 +79,30 @@ class TestSMCDraftWorker(TestCase):
                 verify_input.positions,
                 torch.tensor([5, 6, 7, 8, 9, 7, 8, 9, 10, 11], dtype=torch.int64),
             )
+        )
+
+    def test_materialize_parent_draft_prefix_uses_shared_prefix_len(self):
+        worker = SMCWorkerV2.__new__(SMCWorkerV2)
+        worker._draft_worker = SimpleNamespace(
+            draft_tp_context=lambda tp_group: nullcontext(),
+            draft_runner=SimpleNamespace(tp_group=object()),
+            draft_worker=SimpleNamespace(),
+        )
+        worker._run_draft_prefix_fill_batch = MagicMock()
+
+        req = SimpleNamespace(
+            rid="parent-1",
+            origin_input_ids=[1, 2, 3, 4],
+            output_ids=[9],
+            kv_committed_len=6,
+        )
+
+        worker.materialize_smc_parent_draft_prefix(req)
+
+        worker._run_draft_prefix_fill_batch.assert_called_once_with(
+            [req],
+            [4],
+            worker=worker.draft_worker.draft_worker,
         )
 
 
@@ -190,17 +208,13 @@ class TestSMCWorkerV2(TestCase):
             draft_forward=MagicMock(return_value=(fake_token_matrix, fake_logprob_matrix)),
         )
 
-        reqs = [
-            SimpleNamespace(draft_prefix_materialized=False),
-            SimpleNamespace(draft_prefix_materialized=False),
-        ]
-        visible_seq_lens = torch.tensor([6, 8], dtype=torch.int64)
-        draft_committed_lens = torch.tensor([5, 7], dtype=torch.int64)
+        reqs = [SimpleNamespace(), SimpleNamespace()]
+        committed_seq_lens = torch.tensor([5, 7], dtype=torch.int64)
         model_worker_batch = _Batch(
             reqs=reqs,
-            seq_lens=visible_seq_lens,
-            seq_lens_cpu=visible_seq_lens.cpu(),
-            seq_lens_sum=int(visible_seq_lens.sum().item()),
+            seq_lens=committed_seq_lens,
+            seq_lens_cpu=committed_seq_lens.cpu(),
+            seq_lens_sum=int(committed_seq_lens.sum().item()),
             sampling_info=MagicMock(),
         )
         last_token_ids = torch.tensor([17, 19], dtype=torch.int32)
@@ -234,8 +248,6 @@ class TestSMCWorkerV2(TestCase):
                 model_worker_batch,
                 last_token_ids,
                 draft_sampling_info,
-                visible_seq_lens,
-                draft_committed_lens,
             )
 
         token_matrix, draft_logprobs, draft_lengths, can_cuda_graph = result
@@ -260,13 +272,12 @@ class TestSMCWorkerV2(TestCase):
         )
         self.assertEqual(observed["seq_lens_sum"], 12)
         self.assertTrue(
-            torch.equal(observed["new_seq_lens"], torch.tensor([6, 8], dtype=torch.int64))
+            torch.equal(observed["new_seq_lens"], torch.tensor([5, 7], dtype=torch.int64))
         )
         worker.draft_worker.smc_draft_attn_backend.init_forward_metadata.assert_called_once_with(
             fake_forward_batch
         )
         worker.draft_worker.draft_forward.assert_called_once_with(fake_forward_batch)
-        self.assertTrue(all(req.draft_prefix_materialized for req in reqs))
 
     def test_draft_extend_for_decode_falls_back_without_cuda_graph(self):
         worker = SMCDraftWorker.__new__(SMCDraftWorker)

@@ -653,7 +653,6 @@ class SMCScheduler:
             "kv_allocated_len": req.kv_allocated_len,
             "cache_protected_len": req.cache_protected_len,
             "logprob_start_len": req.logprob_start_len,
-            "draft_prefix_materialized": req.draft_prefix_materialized,
             "decoded_text": req.decoded_text,
             "surr_offset": req.surr_offset,
             "read_offset": req.read_offset,
@@ -684,7 +683,6 @@ class SMCScheduler:
         )
         req.cache_protected_len = snapshot["cache_protected_len"]
         req.logprob_start_len = snapshot["logprob_start_len"]
-        req.draft_prefix_materialized = snapshot["draft_prefix_materialized"]
         req.decoded_text = snapshot.get(
             "decoded_text",
             getattr(req, "decoded_text", ""),
