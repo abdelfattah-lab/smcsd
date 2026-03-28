@@ -325,6 +325,14 @@ class SMCManager:
         # Flush deferred log_weight diffs so best-particle selection is correct
         group.flush_pending_diffs()
 
+        def _visible_output_len(
+            output_ids: List[int],
+            finished_len: Optional[int],
+        ) -> int:
+            if finished_len is None:
+                return len(output_ids)
+            return min(finished_len, len(output_ids))
+
         best_idx = None
         best_key = None
         best_output_ids: List[int] = []
@@ -341,7 +349,10 @@ class SMCManager:
                 finish_reason = copy.copy(req.finished_reason)
                 finished_len = req.finished_len
 
-            key = (float(group.log_weights[particle_idx].item()), len(output_ids))
+            key = (
+                float(group.log_weights[particle_idx].item()),
+                _visible_output_len(output_ids, finished_len),
+            )
             if best_key is None or key > best_key:
                 best_idx = particle_idx
                 best_key = key

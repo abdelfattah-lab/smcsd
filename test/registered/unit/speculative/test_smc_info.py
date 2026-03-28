@@ -204,6 +204,63 @@ class TestSMCManagerHelpers(TestCase):
         self.assertTrue(manager.all_active_members_present("g1", [req0, req1, req2]))
         self.assertFalse(manager.all_active_members_present("g1", [req0]))
 
+    def test_finalize_group_tiebreak_uses_visible_finished_length(self):
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=0.5, smc_resample_method="systematic")
+        )
+        manager.req_to_token_pool = SimpleNamespace(
+            free=lambda released_req: setattr(released_req, "req_pool_idx", None)
+        )
+        manager.token_to_kv_pool_allocator = SimpleNamespace(
+            dec_ref_and_free=lambda _indices: None
+        )
+
+        finish_reason = SimpleNamespace(type="stop")
+        req0 = SimpleNamespace(
+            smc_particle_idx=0,
+            req_pool_idx=None,
+            output_ids=[11, 99, 100, 101],
+            finished_reason=finish_reason,
+            finished_len=2,
+        )
+        req1 = SimpleNamespace(
+            smc_particle_idx=1,
+            req_pool_idx=None,
+            output_ids=[11, 12, 99],
+            finished_reason=finish_reason,
+            finished_len=3,
+        )
+        parent_req = SimpleNamespace(
+            output_ids=[],
+            finished_reason=None,
+            finished_len=None,
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=parent_req,
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.tensor([0.0, 0.0], dtype=torch.float64),
+            step_counts=[1, 1],
+            finished_particles={
+                0: SMCFinishedParticleSnapshot(
+                    output_ids=list(req0.output_ids),
+                    finished_reason=finish_reason,
+                    finished_len=req0.finished_len,
+                ),
+                1: SMCFinishedParticleSnapshot(
+                    output_ids=list(req1.output_ids),
+                    finished_reason=finish_reason,
+                    finished_len=req1.finished_len,
+                ),
+            },
+        )
+
+        finalized = manager._finalize_group("g1")
+
+        self.assertIs(finalized, parent_req)
+        self.assertEqual(parent_req.output_ids, [11, 12, 99])
+        self.assertEqual(parent_req.finished_len, 3)
+
     def test_release_internal_req_frees_reserved_tail_when_visible_len_shrinks(self):
         req = SimpleNamespace(
             req_pool_idx=0,
