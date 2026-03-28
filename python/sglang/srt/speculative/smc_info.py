@@ -611,24 +611,29 @@ class SMCScoreInput(SpecInput):
         predict_view = predict.reshape(bs, self.draft_token_num)
         predict_view[:, :ss] = candidates[:, 1:].to(torch.int32)
 
-        # Apply temperature and compute log-softmax for logprob + bonus
-        log_probs = F.log_softmax(
-            next_token_logits.view(bs, self.draft_token_num, -1)
-            / self.target_temperature,
+        logits = next_token_logits.view(bs, self.draft_token_num, -1)
+        base_log_probs = F.log_softmax(logits, dim=-1)
+        # Keep importance weights aligned with the native SMC reference, which
+        # scores the drafted continuation with the target model's base
+        # logprobs and applies temperature as a post-hoc 1 / T scaling. The
+        # live decode path still samples the bonus token from the tempered
+        # target distribution.
+        sampling_log_probs = F.log_softmax(
+            logits / self.target_temperature,
             dim=-1,
         )
 
         # Bonus token: sample from target distribution (not greedy) to
         # preserve the output distribution at non-zero temperature.
-        bonus_probs = log_probs[:, -1, :].exp()
+        bonus_probs = sampling_log_probs[:, -1, :].exp()
         bonus = torch.multinomial(bonus_probs, num_samples=1).squeeze(-1).to(torch.int32)
         predict_view[:, ss] = bonus
 
         # SMC logprob diffs (importance weights)
-        gathered = log_probs[:, :-1].gather(
+        gathered = base_log_probs[:, :-1].gather(
             2, candidates[:, 1:].long().unsqueeze(-1)
         ).squeeze(-1)
-        target_logprobs = gathered.sum(dim=1)
+        target_logprobs = gathered.sum(dim=1) / self.target_temperature
         self.smc_logprob_diffs = target_logprobs - self.draft_logprobs
 
         # Include the bonus token

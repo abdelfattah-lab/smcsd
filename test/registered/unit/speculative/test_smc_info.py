@@ -1708,6 +1708,48 @@ class TestSMCScoreInput(TestCase):
         # Just check it's a finite float.
         self.assertTrue(torch.isfinite(score_input.smc_logprob_diffs).all())
 
+    def test_sample_scales_target_logprob_diffs_like_native_reference(self):
+        draft_tokens = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+        score_input = SMCScoreInput(
+            draft_token=draft_tokens.flatten(),
+            draft_lengths=torch.tensor([3], dtype=torch.int32),
+            draft_logprobs=torch.tensor([1.25], dtype=torch.float32),
+            positions=torch.arange(4, dtype=torch.int64),
+            custom_mask=None,
+            draft_token_num=4,
+            spec_steps=3,
+            target_temperature=0.5,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.tensor([4], dtype=torch.int64),
+        )
+        logits = torch.tensor(
+            [
+                [0.1, 2.0, -0.5, 0.0, -1.0],
+                [-0.2, 0.0, 3.0, 0.5, -0.1],
+                [0.0, -0.3, 0.4, 4.0, 0.2],
+                [-1.0, 0.0, 0.1, 6.0, -0.2],
+            ],
+            dtype=torch.float32,
+        )
+        logits_output = SimpleNamespace(next_token_logits=logits)
+
+        score_input.sample(batch, logits_output)
+
+        base_log_probs = torch.log_softmax(logits.view(1, 4, -1), dim=-1)
+        expected = (
+            base_log_probs[:, :-1]
+            .gather(2, draft_tokens[:, 1:].long().unsqueeze(-1))
+            .squeeze(-1)
+            .sum(dim=1)
+            / score_input.target_temperature
+            - score_input.draft_logprobs
+        )
+        self.assertTrue(
+            torch.allclose(score_input.smc_logprob_diffs, expected.to(torch.float32))
+        )
+
     def test_sample_accept_index_uses_global_flat_offsets_for_multi_request(self):
         """accept_index must use global flat offsets into predict, not local
         per-request [0..gamma].  Without this, predict[accept_index] reads
