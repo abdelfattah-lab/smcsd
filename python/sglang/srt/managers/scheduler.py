@@ -1267,9 +1267,6 @@ class Scheduler(
                 self.cancel_bubble_timer()
                 continue
 
-            if self.smc_scheduler is not None:
-                self.smc_scheduler.step(self)
-
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1279,6 +1276,51 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
+                # When the server is idle, do self-check and re-init some states.
+                self.self_check_during_idle()
+
+            # Update last_batch
+            self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
+
+    @DynamicGradMode()
+    def event_loop_normal_smc(self):
+        """A serialized SMC scheduler loop (no overlap).
+
+        Uses the v1 (non-overlap) worker contract — no result_queue,
+        no forward_stream, synchronous resampling.
+        """
+        while True:
+            # Receive requests
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                self.cancel_bubble_timer()
+                continue
+
+            # SMC pre-forward: sync completed resamples, launch pending, drain wait queue
+            if self.smc_scheduler is not None:
+                self.smc_scheduler.step_before_forward(self)
+
+            # Get the next batch to run
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            # Launch the current batch
+            if batch:
+                result = self.run_batch(batch)
+                if self.smc_scheduler is not None:
+                    self.smc_scheduler.step_after_forward(self)
+                self.process_batch_result(batch, result)
+            else:
+                # Before going idle, drain any pending SMC resamples
+                if (
+                    self.smc_scheduler is not None
+                    and self.smc_scheduler.finish_pending_before_idle(self)
+                ):
+                    self.last_batch = batch
+                    continue
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
 
@@ -1307,6 +1349,73 @@ class Scheduler(
                 continue
 
             processed_last_batch = False
+
+            # Get the next batch to run
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            # If we do not need to overlap the current batch with the last batch,
+            # we can process the last batch immediately.
+            if disable_overlap_for_batch and self.last_batch and not processed_last_batch:
+                pop_and_process()
+                processed_last_batch = True
+
+            # Launch the current batch
+            if batch:
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
+            else:
+                batch_result = None
+                self.cancel_bubble_timer()
+
+            # Process the last batch
+            if self.last_batch:
+                if not disable_overlap_for_batch and not processed_last_batch:
+                    pop_and_process()
+                    processed_last_batch = True
+                elif batch is None:
+                    # When the server is idle, do self-check and re-init some states
+                    self.self_check_during_idle()
+
+            # Run sample of the current batch
+            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(batch_result)
+
+            # Update last_batch
+            self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
+
+    @DynamicGradMode()
+    def event_loop_overlap_smc(self):
+        """An overlap SMC scheduler loop.
+
+        Uses the result_queue pattern for CPU/GPU overlap with SMC hooks.
+        Both step_before_forward and step_after_forward run before run_batch
+        since fully async resampling is not yet implemented.
+        """
+        self.result_queue: Deque[
+            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+        ] = deque()
+
+        def pop_and_process():
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+
+        while True:
+            # Receive requests
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            processed_last_batch = False
+
+            # Early decode pop: process last SMC decode result before
+            # step_before_forward so that on_batch_done() resample
+            # decisions are visible.
             if (
                 self.last_batch is not None
                 and self.last_batch.forward_mode.is_decode()
@@ -1316,6 +1425,8 @@ class Scheduler(
                 pop_and_process()
                 processed_last_batch = True
 
+            # SMC pre/post-forward hooks (both run before run_batch since
+            # fully async resampling is not yet implemented)
             if self.smc_scheduler is not None:
                 self.smc_scheduler.step_before_forward(self)
 
@@ -1329,11 +1440,15 @@ class Scheduler(
                 and batch.forward_mode.is_extend()
             )
 
-            # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
+            # If overlap is disabled for this batch, process last batch now
             if disable_overlap_for_batch and self.last_batch and not processed_last_batch:
                 pop_and_process()
                 processed_last_batch = True
+
+            # SMC post-forward hook (runs before run_batch until async
+            # resampling lands)
+            if self.smc_scheduler is not None:
+                self.smc_scheduler.step_after_forward(self)
 
             # Launch the current batch
             if batch:
@@ -1344,28 +1459,23 @@ class Scheduler(
                 batch_result = None
                 self.cancel_bubble_timer()
 
-            # Launch async resample KV copies while GPU runs the forward pass.
-            if self.smc_scheduler is not None:
-                self.smc_scheduler.step_after_forward(self)
-
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch and not processed_last_batch:
                     pop_and_process()
                     processed_last_batch = True
                 elif batch is None:
+                    # Before going idle, drain pending SMC resamples
                     if (
                         self.smc_scheduler is not None
                         and self.smc_scheduler.finish_pending_before_idle(self)
                     ):
-                        # The loop is going around again without launching a new
-                        # batch, so clear last_batch now instead of leaving a
-                        # stale processed batch behind for the next iteration.
                         self.last_batch = batch
                         continue
                     # When the server is idle, do self-check and re-init some states
                     self.self_check_during_idle()
 
+            # Process SMC prefill results immediately
             if process_smc_prefill_immediately:
                 assert batch is not None and batch_result is not None
                 self.process_batch_result(batch, batch_result)
@@ -1373,7 +1483,6 @@ class Scheduler(
                 batch = None
 
             # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
 
@@ -3558,6 +3667,11 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_pdmux()
         elif server_args.pp_size > 1:
             scheduler.event_loop_pp()
+        elif scheduler.spec_algorithm.is_smc():
+            if server_args.smc_resampling_overlap:
+                scheduler.event_loop_overlap_smc()
+            else:
+                scheduler.event_loop_normal_smc()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:

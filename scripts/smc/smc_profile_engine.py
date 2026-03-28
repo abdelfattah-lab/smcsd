@@ -1,10 +1,11 @@
 """
-Profile overlap SMC through the offline Engine API.
+Profile SMC scheduler variants through the offline Engine API.
 
 Examples:
   source .venv/bin/activate
   python scripts/smc/smc_profile_engine.py --output-dir /tmp/sglang-smc-profile
   python scripts/smc/smc_profile_engine.py --profile-v2 --decode-only
+  python scripts/smc/smc_profile_engine.py --smc-resampling-overlap
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ def default_draft_model_path() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Profile overlap SMC with offline sgl.Engine()."
+        description="Profile SMC scheduler variants with offline sgl.Engine()."
     )
     parser.add_argument("--model-path", default=default_model_path())
     parser.add_argument("--draft-model-path", default=default_draft_model_path())
@@ -68,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--smc-n-particles", type=int, default=8)
     parser.add_argument("--smc-gamma", type=int, default=8)
+    parser.add_argument(
+        "--smc-resampling-overlap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the experimental SMC overlap scheduler instead of the baseline normal SMC scheduler.",
+    )
     parser.add_argument(
         "--prompt",
         action="append",
@@ -120,6 +127,7 @@ def summarize_server_info(server_info: dict[str, Any]) -> dict[str, Any]:
         "model_path": server_info.get("model_path"),
         "speculative_algorithm": server_info.get("speculative_algorithm"),
         "disable_overlap_schedule": server_info.get("disable_overlap_schedule"),
+        "smc_resampling_overlap": server_info.get("smc_resampling_overlap"),
         "smc_n_particles": server_info.get("smc_n_particles"),
         "smc_gamma": server_info.get("smc_gamma"),
         "avg_spec_accept_length": first_state.get("avg_spec_accept_length"),
@@ -132,7 +140,6 @@ def main() -> None:
     if args.profile_steps <= 0:
         raise SystemExit("--profile-steps must be positive.")
 
-    os.environ.setdefault("SGLANG_ENABLE_SPEC_V2", "1")
     if args.profile_v2:
         os.environ["SGLANG_PROFILE_V2"] = "1"
 
@@ -165,6 +172,7 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "smc_n_particles": args.smc_n_particles,
             "smc_gamma": args.smc_gamma,
+            "smc_resampling_overlap": args.smc_resampling_overlap,
             "prompts": prompts,
         },
     )
@@ -184,6 +192,7 @@ def main() -> None:
         attention_backend="triton",
         smc_draft_temperature=0.8,
         smc_target_temperature=0.8,
+        smc_resampling_overlap=args.smc_resampling_overlap,
     ) as engine:
         server_info = engine.get_server_info()
         write_json(run_dir / "server_info.json", server_info)

@@ -5,6 +5,7 @@ Usage:
   python scripts/smc/quick_quality_check.py --temperature 0.8
   python scripts/smc/quick_quality_check.py --temperature 0.0 --mode smc
   python scripts/smc/quick_quality_check.py --mode both
+  python scripts/smc/quick_quality_check.py --mode smc --smc-resampling-overlap
 """
 
 import argparse
@@ -39,7 +40,10 @@ def run_vanilla(prompts, sampling_params):
 
 def run_smc(prompts, sampling_params, args):
     print("=" * 60)
-    print(f"SMC (particles={args.particles}, gamma={args.gamma})")
+    scheduler_mode = "resampling-overlap" if args.smc_resampling_overlap else "normal"
+    print(
+        f"SMC (particles={args.particles}, gamma={args.gamma}, scheduler={scheduler_mode})"
+    )
     print("=" * 60)
     engine = sgl.Engine(
         model_path=MODEL,
@@ -53,6 +57,7 @@ def run_smc(prompts, sampling_params, args):
         disable_piecewise_cuda_graph=False,
         cuda_graph_max_bs=16,
         attention_backend="triton",
+        smc_resampling_overlap=args.smc_resampling_overlap,
     )
     results = engine.generate(prompts, sampling_params)
     for i, r in enumerate(results):
@@ -68,6 +73,11 @@ def main():
     parser.add_argument("--mode", choices=["vanilla", "smc", "both"], default="both")
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--gamma", type=int, default=4)
+    parser.add_argument(
+        "--smc-resampling-overlap",
+        action="store_true",
+        help="Use the experimental SMC overlap scheduler instead of the baseline normal SMC scheduler.",
+    )
     args = parser.parse_args()
 
     sampling_params = {

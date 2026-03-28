@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.environ import envs
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -61,13 +60,14 @@ class TestPrepareServerArgs(CustomTestCase):
 
 
 class TestSMCServerArgs(unittest.TestCase):
-    def test_smc_defaults_disable_overlap_and_size_running_batch(self):
+    def test_smc_defaults_use_normal_scheduler_policy_and_size_running_batch(self):
         server_args = ServerArgs(
             model_path="dummy",
             speculative_algorithm="SMC",
             speculative_draft_model_path="draft",
         )
         self.assertTrue(server_args.disable_overlap_schedule)
+        self.assertFalse(server_args.smc_resampling_overlap)
         self.assertEqual(server_args.max_running_requests, 48)
         self.assertEqual(server_args.speculative_eagle_topk, 1)
         self.assertEqual(server_args.speculative_num_steps, server_args.smc_gamma)
@@ -75,14 +75,15 @@ class TestSMCServerArgs(unittest.TestCase):
             server_args.speculative_num_draft_tokens, server_args.smc_gamma + 1
         )
 
-    def test_smc_enables_overlap_when_spec_v2_is_enabled(self):
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            server_args = ServerArgs(
-                model_path="dummy",
-                speculative_algorithm="SMC",
-                speculative_draft_model_path="draft",
-            )
+    def test_smc_can_enable_resampling_overlap_scheduler(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="SMC",
+            speculative_draft_model_path="draft",
+            smc_resampling_overlap=True,
+        )
         self.assertFalse(server_args.disable_overlap_schedule)
+        self.assertTrue(server_args.smc_resampling_overlap)
 
     def test_smc_rejects_disaggregation(self):
         with self.assertRaisesRegex(ValueError, "does not support disaggregation"):

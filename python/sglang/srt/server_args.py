@@ -505,6 +505,7 @@ class ServerArgs:
     smc_target_temperature: float = 1.0
     smc_resample_threshold: float = 0.5
     smc_resample_method: Literal["systematic", "multinomial"] = "systematic"
+    smc_resampling_overlap: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -3000,15 +3001,19 @@ class ServerArgs:
             self.speculative_eagle_topk = 1
             self.speculative_num_steps = self.smc_gamma
             self.speculative_num_draft_tokens = self.smc_gamma + 1
-            if envs.SGLANG_ENABLE_SPEC_V2.get():
-                self.disable_overlap_schedule = False
+            # Normal SMC uses the v1 (non-overlap) worker contract —
+            # no result_queue, no forward_stream, synchronous resampling.
+            # Overlap SMC uses the v2 contract for CPU/GPU pipelining.
+            self.disable_overlap_schedule = not self.smc_resampling_overlap
+            if self.smc_resampling_overlap:
                 logger.warning(
-                    "Spec v2 overlap scheduling is enabled for SMC speculative decoding."
+                    "SMC resampling-overlap scheduler is enabled."
                 )
             else:
-                self.disable_overlap_schedule = True
                 logger.warning(
-                    "Overlap scheduler is disabled for SMC speculative decoding unless SGLANG_ENABLE_SPEC_V2=True."
+                    "SMC uses the normal scheduler policy by default. Set "
+                    "--smc-resampling-overlap to enable the experimental SMC "
+                    "overlap scheduler."
                 )
             if self.speculative_draft_model_path is None:
                 raise ValueError(
@@ -4856,6 +4861,13 @@ class ServerArgs:
             choices=["systematic", "multinomial"],
             default=ServerArgs.smc_resample_method,
             help="Resampling method for SMC speculative decoding.",
+        )
+        parser.add_argument(
+            "--smc-resampling-overlap",
+            action="store_true",
+            default=ServerArgs.smc_resampling_overlap,
+            help="Enable the experimental SMC overlap scheduler. By default "
+            "SMC uses the baseline normal scheduler policy.",
         )
 
         # Speculative decoding (ngram)
