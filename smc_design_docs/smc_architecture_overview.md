@@ -215,7 +215,7 @@ Resampling:
 **Partially-finished particles**: finished particles are excluded from draft/score batches and snapshotted via `SMCFinishedParticleSnapshot`. Their weights freeze (0 - 0 = 0 importance each step), so active particles that score well naturally dominate. Finished particles can still be duplicated or eliminated during resampling.
 
 **Resampling algorithms**:
-- **Systematic** (default): evenly-spaced CDF positions with random offset — low variance
+- **Systematic** (default): evenly-spaced CDF positions with random offset — low variance, unbiased
 - **Multinomial**: `torch.multinomial()` — higher variance, unbiased
 
 Both produce ancestor indices. When `ancestor[i] != i`, particle `i` is evicted and replaced with a copy of `ancestor[i]` (KV + CPU state). Weights reset to 0 after resampling.
