@@ -1836,12 +1836,10 @@ class TestSMCScoreInput(TestCase):
 
         predict, accept_length, accept_index = score_input.sample(batch, logits_output)
 
-        # accept_length = spec_steps(3) + 1 (bonus) = 4
-        self.assertTrue(torch.equal(accept_length, torch.tensor([4], dtype=torch.int32)))
-        # predict has draft_token_num(4) entries: [d0, d1, d2, bonus]
+        # accept_length = spec_steps(3), no bonus
+        self.assertTrue(torch.equal(accept_length, torch.tensor([3], dtype=torch.int32)))
+        # predict has draft_token_num(4) entries: [d0, d1, d2, 0_unused]
         self.assertEqual(predict.shape[0], 4)
-        # bonus = argmax(log_probs[0, -1]) = 29 (highest logit at last position)
-        self.assertEqual(predict[3].item(), 29)
         # smc_logprob_diffs stored on score_input
         self.assertIsNotNone(score_input.smc_logprob_diffs)
         self.assertEqual(score_input.smc_logprob_diffs.shape, (1,))
@@ -1936,37 +1934,6 @@ class TestSMCScoreInput(TestCase):
         self.assertEqual(per_req[0, 0].item(), 11)
         self.assertEqual(per_req[1, 0].item(), 21)
         self.assertEqual(per_req[2, 0].item(), 6)
-
-    def test_sample_bonus_is_stochastic_at_nonzero_temperature(self):
-        """Bonus should be sampled, not always argmax."""
-        dt = 2
-        ss = 1
-        vocab = 10
-        draft_tokens = torch.tensor([[7, 8]], dtype=torch.int32)
-        score_input = SMCScoreInput(
-            draft_token=draft_tokens.flatten(),
-            draft_lengths=torch.tensor([1], dtype=torch.int32),
-            draft_logprobs=torch.zeros(1, dtype=torch.float32),
-            positions=torch.arange(dt, dtype=torch.int64),
-            custom_mask=None,
-            draft_token_num=dt,
-            spec_steps=ss,
-            target_temperature=1.0,
-        )
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE,
-            seq_lens=torch.tensor([4], dtype=torch.int64),
-        )
-        logits = torch.zeros((dt, vocab), dtype=torch.float32)
-        logits_output = SimpleNamespace(next_token_logits=logits)
-
-        bonus_tokens = set()
-        for _ in range(50):
-            predict, _, _ = score_input.sample(batch, logits_output)
-            bonus_tokens.add(predict[ss].item())
-
-        self.assertGreaterEqual(len(bonus_tokens), 3)
-
 
 class TestSMCVerifyGraphGate(TestCase):
     def test_model_runner_forward_respects_disable_graph_runner(self):

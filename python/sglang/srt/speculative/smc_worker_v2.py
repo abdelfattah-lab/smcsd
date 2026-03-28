@@ -183,7 +183,7 @@ class SMCDraftWorker(StandaloneDraftWorker):
             float(outer.server_args.smc_target_temperature), SMC_MIN_TEMPERATURE
         )
 
-        return SMCScoreInput(
+        score_input = SMCScoreInput(
             draft_token=score_tokens.reshape(-1).contiguous(),
             draft_lengths=draft_lengths,
             draft_logprobs=draft_logprobs,
@@ -195,6 +195,7 @@ class SMCDraftWorker(StandaloneDraftWorker):
             # ServerArgs enforces a Triton-only target path for SMC.
             linear_target_verify=True,
         )
+        return score_input
 
     def draft_forward(
         self, forward_batch: ForwardBatch
@@ -365,7 +366,7 @@ class SMCWorkerV2(EAGLEWorkerV2):
         draft_input = (
             batch.spec_info if isinstance(batch.spec_info, SMCDraftInput) else None
         )
-
+        
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             model_worker_batch = self._get_forward_model_worker_batch(
                 batch, is_overlap_batch
@@ -396,17 +397,14 @@ class SMCWorkerV2(EAGLEWorkerV2):
         model_worker_batch.spec_info = verify_input
         batch_output = self.verify(model_worker_batch)
 
-        with self.draft_worker.draft_tp_context(
-            self.draft_worker.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            self.draft_worker._draft_extend_for_decode(
-                model_worker_batch, batch_output
-            )
+        # No draft_extend needed: without a bonus token, the last draft
+        # token is the anchor for the next step and its draft KV already
+        # exists from draft_forward().
 
         return batch_output
 
     def verify(self, batch: ModelWorkerBatch) -> GenerationBatchResult:
-        """SMC verify: accept ALL draft tokens, compute logprob diffs, add bonus.
+        """SMC verify: accept ALL draft tokens, compute logprob diffs.
 
         Mirrors EAGLEWorkerV2.verify(batch) — same single-arg interface.
         Reads SMCScoreInput from batch.spec_info (set by draft()).
