@@ -998,7 +998,7 @@ class TestSMCScheduler(TestCase):
         self.assertTrue(
             torch.equal(
                 manager.groups["g1"].log_weights,
-                torch.zeros(2, dtype=torch.float64),
+                torch.tensor([9.0, 0.0], dtype=torch.float64),
             )
         )
 

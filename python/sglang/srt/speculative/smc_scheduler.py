@@ -341,13 +341,6 @@ class SMCScheduler:
                     "ancestors": list(ancestors),
                 }
             )
-            active_tensor = torch.tensor(
-                active_indices,
-                dtype=torch.int64,
-                device=group.log_weights.device,
-            )
-            group.log_weights[active_tensor] = 0.0
-
             evictions = [
                 (dst_idx, active_indices[src_pos])
                 for dst_idx, src_pos in zip(active_indices, ancestors, strict=True)
@@ -355,6 +348,13 @@ class SMCScheduler:
             ]
             if not evictions:
                 continue
+
+            active_tensor = torch.tensor(
+                active_indices,
+                dtype=torch.int64,
+                device=group.log_weights.device,
+            )
+            group.log_weights[active_tensor] = 0.0
 
             stalled_reqs = [group.particle_reqs[idx] for idx in active_indices]
             self._stall_group_reqs(group_id, stalled_reqs, scheduler)
