@@ -490,11 +490,12 @@ class SchedulerOutputProcessorMixin:
                         smc_filtered_rows = list(range(i))
                     if req.finished() and self.smc_manager is not None:
                         self.smc_manager.on_particle_finished(req)
-                    _release_internal_req(
-                        req,
-                        req_to_token_pool=self.req_to_token_pool,
-                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    )
+                    if req.is_retracted:
+                        _release_internal_req(
+                            req,
+                            req_to_token_pool=self.req_to_token_pool,
+                            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        )
                 continue
 
             new_accepted_len = 1
@@ -554,11 +555,9 @@ class SchedulerOutputProcessorMixin:
                         self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
                     if batch.spec_algorithm.is_smc():
-                        _release_internal_req(
-                            req,
-                            req_to_token_pool=self.req_to_token_pool,
-                            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                        )
+                        # Keep finished SMC particles alive until group
+                        # finalization so resampling can still copy them.
+                        pass
                     else:
                         release_kv_cache(req, self.tree_cache)
 

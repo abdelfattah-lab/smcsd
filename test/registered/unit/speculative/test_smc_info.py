@@ -1224,6 +1224,92 @@ class TestSMCScheduler(TestCase):
         self.assertEqual([op for op, _ in allocator.ops[:2]], ["inc", "inc"])
 
     @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
+    def test_step_can_finalize_group_when_resample_clones_finished_particle(
+        self,
+        mock_systematic_resample,
+    ):
+        mock_systematic_resample.return_value = [1, 1]
+
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+        scheduler = SMCScheduler(manager, device="cpu")
+        scheduler.init_streams(enable_overlap=False)
+
+        req0 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[10],
+            kv_indices=[101],
+        )
+        finish_reason = SimpleNamespace(type="stop")
+        req1 = _make_scheduler_req(
+            group_id="g1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[20],
+            kv_indices=[201],
+        )
+        req1.finished_reason = finish_reason
+        req1.finished_len = 1
+        req1.finished = lambda: True
+        parent_req = SimpleNamespace(
+            output_ids=[],
+            finished_reason=None,
+            finished_len=None,
+            time_stats=SimpleNamespace(set_completion_time=MagicMock()),
+        )
+        manager.groups["g1"] = SMCGroupState(
+            group_id="g1",
+            parent_req=parent_req,
+            particle_reqs={0: req0, 1: req1},
+            log_weights=torch.tensor([0.0, 4.0], dtype=torch.float64),
+            step_counts=[0, 0],
+            finished_particles={
+                1: SMCFinishedParticleSnapshot(
+                    output_ids=[20],
+                    finished_reason=finish_reason,
+                    finished_len=1,
+                )
+            },
+        )
+
+        req_to_token = torch.tensor([[101, 0, 0], [201, 0, 0]], dtype=torch.int32)
+        allocator = _FakeAllocator()
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=req_to_token,
+            write=lambda indices, values: req_to_token.__setitem__(indices, values),
+            free=MagicMock(
+                side_effect=lambda released_req: setattr(
+                    released_req, "req_pool_idx", None
+                )
+            ),
+        )
+        live_scheduler = SimpleNamespace(
+            running_batch=_FakeRunningBatch([req0]),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            schedule_stream=SimpleNamespace(wait_event=lambda _event: None),
+            stream_output=MagicMock(),
+        )
+        manager.req_to_token_pool = req_to_token_pool
+        manager.token_to_kv_pool_allocator = allocator
+
+        scheduler.on_batch_done(
+            [req0],
+            torch.tensor([0.0], dtype=torch.float32),
+        )
+        scheduler.step(live_scheduler)
+
+        self.assertIsNone(manager.get_group("g1"))
+        self.assertEqual(parent_req.output_ids, [20])
+        self.assertEqual(parent_req.finished_reason.type, finish_reason.type)
+        parent_req.time_stats.set_completion_time.assert_called_once_with()
+        live_scheduler.stream_output.assert_called_once_with([parent_req], False)
+        self.assertFalse(scheduler.wait_for_running)
+
+    @patch("sglang.srt.speculative.smc_scheduler.systematic_resample")
     def test_step_trims_stale_overalloc_before_reinsert(
         self,
         mock_systematic_resample,
@@ -3058,7 +3144,7 @@ class TestSMCDecodeOutputProcessor(TestCase):
             processor.smc_scheduler.on_batch_done.call_args.kwargs["group_spans"]
         )
 
-    def test_process_batch_result_decode_releases_already_finished_smc_req_in_overlap(self):
+    def test_process_batch_result_decode_keeps_already_finished_smc_req_in_overlap(self):
         req = SimpleNamespace(
             rid="r-2",
             output_ids=[17],
@@ -3137,12 +3223,6 @@ class TestSMCDecodeOutputProcessor(TestCase):
 
         processor.process_batch_result_decode(batch, result)
 
-        self.assertEqual(len(allocator.dec_calls), 1)
-        self.assertTrue(
-            torch.equal(
-                allocator.dec_calls[0],
-                torch.tensor([11, 12, 13, 14, 15], dtype=torch.int64),
-            )
-        )
-        self.assertIsNone(req.req_pool_idx)
+        self.assertEqual(len(allocator.dec_calls), 0)
+        self.assertEqual(req.req_pool_idx, 0)
         processor.smc_manager.on_particle_finished.assert_called_once_with(req)
