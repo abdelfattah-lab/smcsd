@@ -272,3 +272,8 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+
+
+CLAUDE.md
+AGENTS.md
+tasks/
