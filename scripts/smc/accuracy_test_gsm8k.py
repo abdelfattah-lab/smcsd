@@ -413,7 +413,9 @@ def run_engine_eval(args, prompts, labels):
         engine_kwargs["smc_target_temperature"] = args.temperature
         engine_kwargs["page_size"] = 1
         engine_kwargs["attention_backend"] = "triton"
-        engine_kwargs["smc_resampling_overlap"] =True
+        engine_kwargs["smc_resampling_overlap"] = True
+        if args.pingpong:
+            engine_kwargs["smc_pingpong_overlap"] = True
     if args.mem_fraction_static is not None:
         engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
     if args.cuda_graph_max_bs is not None:
@@ -598,6 +600,10 @@ if __name__ == "__main__":
     )
     smc_grp.add_argument(
         "--seed", type=int, default=None, help="numpy seed for reproducibility"
+    )
+    smc_grp.add_argument(
+        "--pingpong", action="store_true",
+        help="use ping-pong double-buffer scheduler (multi-group overlap)",
     )
 
     # Benchmark

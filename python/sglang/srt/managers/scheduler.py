@@ -1493,6 +1493,117 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
+    def event_loop_pingpong_smc(self):
+        """Ping-pong double-buffer SMC scheduler loop.
+
+        Two independent ScheduleBatches alternate: one forwards on the
+        forward_stream while the other processes results and resamples on
+        the schedule_stream.  Targets multi-group workloads.
+
+        Phase 1: Process decode results from process_slot
+        Phase 2: Resample (inline on schedule_stream, slot-local)
+        Phase 3: Dispatch new groups from prefill to slots
+        Phase 4: Prepare forward_slot's batch (refresh or rebuild)
+        Phase 5: Forward (with prefill preemption handling)
+        Phase 6: Swap slots
+        """
+        resampler = self.smc_resampler
+
+        while True:
+            forward_slot = resampler.forward_slot
+            process_slot = resampler.process_slot
+
+            # Receive requests
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            # ── PHASE 1: Process decode results from process_slot ──
+            if process_slot.saved_result is not None:
+                self.process_batch_result(
+                    process_slot.saved_batch, process_slot.saved_result
+                )
+                process_slot.saved_batch = None
+                process_slot.saved_result = None
+                # Route resample marks from global set into the process_slot
+                for gid in list(resampler._groups_needing_resample):
+                    if gid in process_slot.group_ids:
+                        process_slot.groups_needing_resample.add(gid)
+                        resampler._groups_needing_resample.discard(gid)
+                # Remove finalized groups from the slot
+                for gid in list(process_slot.group_ids):
+                    if self.smc_manager.get_group(gid) is None:
+                        process_slot.remove_group(gid)
+
+            # ── PHASE 2: Resample (slot-local, inline on schedule_stream) ──
+            resampler.launch_resamples_for_slot(process_slot, self)
+
+            # ── PHASE 3: Dispatch new groups from prefill ──
+            resampler.dispatch_pending_groups(self)
+
+            # ── PHASE 4: Prepare forward_slot's batch ──
+            resampler.prepare_forward_batch(forward_slot, self)
+
+            # ── PHASE 5: Forward (with prefill handling) ──
+            batch = forward_slot.batch
+            batch_result = None
+
+            # Set running_batch so get_next_batch_to_run sees decode reqs.
+            # If forward_slot is empty, use an empty batch so prefill can still run.
+            if batch is not None and batch.reqs:
+                self.running_batch = batch
+            else:
+                self.running_batch = ScheduleBatch(reqs=[])
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if batch is not None:
+                is_smc_prefill = (
+                    batch.spec_algorithm.is_smc()
+                    and batch.forward_mode.is_extend()
+                )
+
+                if is_smc_prefill:
+                    # Prefill: run + process synchronously, don't save.
+                    # The decode batch in forward_slot is NOT forwarded this
+                    # iteration — its particles are delayed by one cycle.
+                    # This matches existing process_smc_prefill_immediately
+                    # behavior where prefill always preempts decode.
+                    batch_result = self.run_batch(batch)
+                    self.process_batch_result(batch, batch_result)
+                    # Particles enqueued via enqueue_new_group,
+                    # available in next Phase 3
+                    if self.is_generation:
+                        self.launch_batch_sample_if_needed(batch_result)
+                    batch_result = None
+                else:
+                    # Decode: launch async, save for next iteration
+                    forward_slot.saved_batch = batch.copy()
+                    batch_result = self.run_batch(batch)
+                    forward_slot.saved_result = batch_result
+            else:
+                self.cancel_bubble_timer()
+                # Idle: drain pending resamples and self-check
+                if resampler.finish_all_pending_pingpong(self):
+                    resampler.swap()
+                    continue
+                self.self_check_during_idle()
+
+            # Sample the current batch result
+            if self.is_generation and batch_result is not None:
+                self.launch_batch_sample_if_needed(batch_result)
+
+            # Update last_batch for capacity checks
+            self.last_batch = None  # ping-pong doesn't use result_queue
+
+            # ── PHASE 6: Swap ──
+            resampler.swap()
+
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
+
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
@@ -3678,7 +3789,9 @@ def dispatch_event_loop(scheduler: Scheduler):
         elif server_args.pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.spec_algorithm.is_smc():
-            if server_args.smc_resampling_overlap:
+            if server_args.smc_pingpong_overlap:
+                scheduler.event_loop_pingpong_smc()
+            elif server_args.smc_resampling_overlap:
                 scheduler.event_loop_overlap_smc()
             else:
                 scheduler.event_loop_normal_smc()

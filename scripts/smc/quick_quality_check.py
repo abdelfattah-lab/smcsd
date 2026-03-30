@@ -40,7 +40,7 @@ def run_vanilla(prompts, sampling_params):
 
 def run_smc(prompts, sampling_params, args):
     print("=" * 60)
-    scheduler_mode = "resampling-overlap" if args.smc_resampling_overlap else "normal"
+    scheduler_mode = "pingpong" if args.pingpong else ("resampling-overlap" if args.smc_resampling_overlap else "normal")
     print(
         f"SMC (particles={args.particles}, gamma={args.gamma}, scheduler={scheduler_mode})"
     )
@@ -58,6 +58,7 @@ def run_smc(prompts, sampling_params, args):
         cuda_graph_max_bs=16,
         attention_backend="triton",
         smc_resampling_overlap=args.smc_resampling_overlap,
+        smc_pingpong_overlap=args.pingpong,
     )
     results = engine.generate(prompts, sampling_params)
     for i, r in enumerate(results):
@@ -77,6 +78,11 @@ def main():
         "--smc-resampling-overlap",
         action="store_true",
         help="Use the experimental SMC overlap scheduler instead of the baseline normal SMC scheduler.",
+    )
+    parser.add_argument(
+        "--pingpong",
+        action="store_true",
+        help="Use ping-pong double-buffer scheduler (multi-group overlap).",
     )
     args = parser.parse_args()
 
