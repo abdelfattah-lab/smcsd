@@ -6,7 +6,7 @@ NUM_PROMPTS_LIST=(4 8 16)
 # (gamma, n) pairs
 GAMMA_N_PAIRS=(
   "8 8"
-  "8 10"
+  "10 8"
   "10 6"
   "12 8"
   "16 8"
@@ -22,8 +22,8 @@ DRAFT_TEMP=0.7
 TARGET_TEMP=0.7
 ATTENTION_BACKEND="triton"
 MEM_FRACTION=0.60
+INPUT_LEN=256
 OUTPUT_LEN=512
-NUM_SHOTS=5
 
 # --- Output CSV ---
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -39,7 +39,7 @@ for b in "${NUM_PROMPTS_LIST[@]}"; do
     # max-running-requests = num_prompts * n_particles (each prompt fans out)
     max_rr=$((b * n))
     # cuda-graph-bs = max_running_requests (cover the full batch)
-    cuda_bs=$((max_rr*2))  # add some slack to ensure we cover the full batch (in case of some stragglers) and get good graph reuse. We don't want this to be too large though to avoid OOMs.
+    cuda_bs=$((max_rr))  # add some slack to ensure we cover the full batch (in case of some stragglers) and get good graph reuse. We don't want this to be too large though to avoid OOMs.
 
     echo "=== b=$b  gamma=$gamma  n=$n  max_rr=$max_rr  cuda_bs=$cuda_bs ==="
 
@@ -57,11 +57,9 @@ for b in "${NUM_PROMPTS_LIST[@]}"; do
         --mem-fraction-static "$MEM_FRACTION" \
         --max-running-requests "$max_rr" \
         --cuda-graph-bs "$cuda_bs" \
-        --dataset-name gsm8k \
-        --sharegpt-output-len "$OUTPUT_LEN" \
-        --gsm8k-num-shots "$NUM_SHOTS" \
-        --apply-chat-template \
-        --disable-ignore-eos \
+        --dataset-name random \
+        --random-input-len "$INPUT_LEN" \
+        --random-output-len "$OUTPUT_LEN" \
         --num-prompts "$b" \
         2>&1 | tee "$LOGFILE"; then
 
