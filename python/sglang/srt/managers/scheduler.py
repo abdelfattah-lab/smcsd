@@ -1496,31 +1496,35 @@ class Scheduler(
     def event_loop_pingpong_smc(self):
         """Ping-pong double-buffer SMC scheduler loop.
 
-        Two independent ScheduleBatches alternate: one forwards on the
-        forward_stream while the other processes results and resamples on
-        the schedule_stream.  Targets multi-group workloads.
+        Two slots alternate roles each iteration.  The forward launches
+        on forward_stream FIRST, then CPU processing and schedule_stream
+        GPU ops overlap with the in-flight forward:
 
-        The forward is launched FIRST so GPU work overlaps with CPU
-        processing/resampling of the other slot:
+        Stream layout per iteration (fwd=slot A, proc=slot B):
+        ┌──────────────────────────────────────────────────────┐
+        │ forward_stream:  ████ Forward A (draft+verify) ████  │
+        │ schedule_stream:       │Proc B│Resamp B│Prep B│      │
+        │                        ←── overlapped, hidden ──→    │
+        └──────────────────────────────────────────────────────┘
+        Sync: forward_stream.wait_stream(schedule_stream) at
+              the start of each forward ensures Prepare(prev)
+              is complete before the forward reads the batch.
 
-        Phase 1: Forward forward_slot (GPU launches, batch prepared last iter)
-        Phase 2: Process decode results from process_slot (CPU, overlaps GPU)
-        Phase 3: Resample process_slot (CPU, overlaps GPU)
-        Phase 4: Dispatch new groups from prefill to slots
-        Phase 5: Prepare process_slot's batch (next iter's forward after swap)
-        Phase 6: Swap slots
+        Phase 1  [forward_stream]  Forward forward_slot's batch
+        Phase 2  [schedule_stream] Process process_slot's results
+        Phase 3  [schedule_stream] Resample process_slot
+        Phase 4  [schedule_stream] Dispatch new groups
+        Phase 5  [schedule_stream] Prepare process_slot (next fwd)
+        Phase 6                    Swap slots
         """
         resampler = self.smc_resampler
         resampler.pingpong_active = True
 
-        # Ping-pong requires two-stream execution: forward_stream for GPU
-        # forward, schedule_stream for processing/resampling the other slot.
-        # Without this, all phases serialize on one stream and ping-pong is
-        # strictly worse than non-ping-pong.  This is independent of the
-        # standard overlap scheduler — we just need run_batch to dispatch
-        # the forward onto forward_stream.
-        if not self.enable_overlap:
-            self.enable_overlap = True
+        # Tensor reference buffer for run_batch_pingpong — keeps GPU
+        # tensors alive while forward_stream uses them (prevents GC).
+        # forward_stream_ctx is always created by init_overlap (unconditional).
+        self._pingpong_batch_record_buf = [None] * 2
+        self._pingpong_batch_record_ct = 0
 
         while True:
             forward_slot = resampler.forward_slot
@@ -1532,16 +1536,17 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # ── PHASE 1: Forward (launch GPU early for overlap) ──
-            # The forward_slot's batch was prepared at the end of the
-            # previous iteration (or is empty on the first iteration).
+            # ── PHASE 1 [forward_stream]: Forward ──────────────────
+            # Launch GPU work early so Phases 2-5 overlap on
+            # schedule_stream.  run_batch internally enters
+            # forward_stream_ctx, calls forward_stream.wait_stream
+            # (schedule_stream), submits kernels, and returns.
+            # The GPU executes asynchronously on forward_stream.
             batch = forward_slot.batch
             batch_result = None
 
-            # Set running_batch so get_next_batch_to_run sees decode reqs.
-            # NOTE: This only counts forward_slot particles for capacity checks
-            # in get_new_batch_prefill(). Process_slot particles are not counted,
-            # which may lead to over-admission under tight KV cache budgets.
+            # Set running_batch so get_next_batch_to_run sees decode
+            # reqs for capacity checks.
             if batch is not None and batch.reqs:
                 self.running_batch = batch
             else:
@@ -1564,10 +1569,12 @@ class Scheduler(
                         self.launch_batch_sample_if_needed(batch_result)
                     batch_result = None
                 else:
-                    # Decode: launch async, save for next iteration.
-                    # GPU starts working — CPU phases below overlap.
+                    # Decode: launch on forward_stream via
+                    # run_batch_pingpong (explicit two-stream, no
+                    # dependency on enable_overlap / future_map).
+                    # CPU returns immediately — GPU still executing.
                     forward_slot.saved_batch = batch.copy()
-                    batch_result = self.run_batch(batch)
+                    batch_result = self.run_batch_pingpong(batch)
                     forward_slot.saved_result = batch_result
             else:
                 self.cancel_bubble_timer()
@@ -1580,8 +1587,9 @@ class Scheduler(
             if self.is_generation and batch_result is not None:
                 self.launch_batch_sample_if_needed(batch_result)
 
-            # ── PHASE 2: Process decode results from process_slot ──
-            # (CPU work, overlaps with the GPU forward launched above)
+            # ── PHASE 2 [schedule_stream]: Process results ─────────
+            # CPU work + copy_done.synchronize (instant for old
+            # results).  Overlaps with forward on forward_stream.
             if process_slot.saved_result is not None:
                 self.process_batch_result(
                     process_slot.saved_batch, process_slot.saved_result
@@ -1593,28 +1601,29 @@ class Scheduler(
                     if gid in process_slot.group_ids:
                         process_slot.groups_needing_resample.add(gid)
                         resampler._groups_needing_resample.discard(gid)
-                # Remove finalized groups from the slot and clean up
-                # any orphaned resample marks in the global set
+                # Remove finalized groups and clean orphaned marks
                 for gid in list(process_slot.group_ids):
                     if self.smc_manager.get_group(gid) is None:
                         process_slot.remove_group(gid)
                         resampler._groups_needing_resample.discard(gid)
 
-            # ── PHASE 3: Resample (slot-local, inline on schedule_stream) ──
+            # ── PHASE 3 [schedule_stream]: Resample ────────────────
+            # KV cache writes for process_slot particles — no conflict
+            # with forward_stream which reads forward_slot particles.
             resampler.launch_resamples_for_slot(process_slot, self)
 
-            # ── PHASE 4: Dispatch new groups from prefill ──
+            # ── PHASE 4 [schedule_stream]: Dispatch ────────────────
             resampler.dispatch_pending_groups(self)
 
-            # ── PHASE 5: Prepare process_slot's batch for next iteration ──
-            # After swap, process_slot becomes the forward_slot, so its
-            # batch must be ready for Phase 1 of the next iteration.
+            # ── PHASE 5 [schedule_stream]: Prepare next forward ────
+            # After swap, process_slot becomes forward_slot.  Its batch
+            # must be ready before Phase 1's forward_stream.wait_stream
+            # (schedule_stream) in the next iteration.
             resampler.prepare_forward_batch(process_slot, self)
 
-            # Update last_batch for capacity checks
             self.last_batch = None  # ping-pong doesn't use result_queue
 
-            # ── PHASE 6: Swap ──
+            # ── PHASE 6: Swap ──────────────────────────────────────
             resampler.swap()
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -2963,6 +2972,51 @@ class Scheduler(
         #       we shall keep its reference not being release during all the forwarding pass
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
+
+    def run_batch_pingpong(
+        self,
+        batch: ScheduleBatch,
+    ) -> GenerationBatchResult:
+        """Forward a decode batch on forward_stream for ping-pong overlap.
+
+        Minimal two-stream forward that does NOT depend on enable_overlap
+        or the overlap scheduler's future_map / result_queue machinery.
+        Uses forward_stream_ctx (always created by init_overlap) directly.
+
+        No future_indices needed: ping-pong slots are independent — slot B's
+        batch preparation reads from B's own previous result (already synced),
+        never from slot A's in-flight forward.
+        """
+        self.forward_ct += 1
+        self._profile_batch_predicate(batch)
+
+        model_worker_batch = batch.get_model_worker_batch()
+
+        # Keep reference alive while forward_stream uses the tensors.
+        self._pingpong_batch_record_ct = (self._pingpong_batch_record_ct + 1) % 2
+        self._pingpong_batch_record_buf[self._pingpong_batch_record_ct] = (
+            model_worker_batch
+        )
+
+        # Forward modifies sampling_info in place — copy to avoid aliasing
+        # with the schedule_stream's batch state.
+        model_worker_batch.sampling_info = (
+            model_worker_batch.sampling_info.copy_for_forward()
+        )
+
+        with self.forward_stream_ctx:
+            self.forward_stream.wait_stream(self.schedule_stream)
+            batch_result = self.model_worker.forward_batch_generation(
+                model_worker_batch
+            )
+            batch_result.copy_done = self.device_module.Event()
+            batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+
+        # Update batch state for process_batch_result (no future_indices).
+        batch.spec_info = batch_result.next_draft_input
+        batch.output_ids = batch_result.next_draft_input.verified_id
+
+        return batch_result
 
     def run_batch(
         self,
