@@ -3,6 +3,13 @@
 This branch implements **Sequential Monte Carlo (SMC) speculative decoding** in SGLang. SMC runs N particles (parallel generation paths) per request: a lightweight draft model proposes tokens, the target model scores them, and particles are resampled by importance weight so compute focuses on the most promising paths.
 <img width="772" height="424" alt="image" src="https://github.com/user-attachments/assets/3cda3320-e257-4079-99b3-93e3a7bec627" />
 
+## Installation
+
+```bash
+uv venv --python 3.12
+uv pip install -e "python"
+```
+
 ## Quick Start
 
 ```python
@@ -30,7 +37,7 @@ for prompt, output in zip(prompts, outputs):
 engine.shutdown()
 ```
 
-See [`scripts/smc/smc_offline_e2e_probe.py`](scripts/smc/smc_offline_e2e_probe.py) for a more complete example with overlap probing.
+See [`scripts/smc/`](scripts/smc/) for experiment scripts including GSM8K accuracy benchmarks, quality checks, and profiling.
 
 ## Configuration
 

@@ -410,7 +410,7 @@ def run_engine_eval(args, prompts, labels):
         engine_kwargs["smc_n_particles"] = args.particles
         engine_kwargs["smc_gamma"] = args.gamma
         engine_kwargs["smc_draft_temperature"] = args.temperature
-        engine_kwargs["smc_target_temperature"] = 1.0
+        engine_kwargs["smc_target_temperature"] = args.temperature
         engine_kwargs["page_size"] = 1
         engine_kwargs["attention_backend"] = "triton"
         engine_kwargs["smc_resampling_overlap"] =True
