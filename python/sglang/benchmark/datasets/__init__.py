@@ -5,6 +5,7 @@ from sglang.benchmark.datasets.custom import CustomDataset
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
 )
+from sglang.benchmark.datasets.gsm8k import GSM8KDataset
 from sglang.benchmark.datasets.image import ImageDataset
 from sglang.benchmark.datasets.mmmu import MMMUDataset
 from sglang.benchmark.datasets.mooncake import MooncakeDataset
@@ -24,6 +25,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "mmmu": MMMUDataset,
     "image": ImageDataset,
     "mooncake": MooncakeDataset,
+    "gsm8k": GSM8KDataset,
 }
 
 

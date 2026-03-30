@@ -48,6 +48,7 @@ class BenchArgs:
     gsp_system_prompt_len: int = 2048
     gsp_question_len: int = 128
     gsp_output_len: int = 256
+    gsm8k_num_shots: int = 5
     seed: int = 1
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
@@ -71,7 +72,7 @@ class BenchArgs:
             "--dataset-name",
             type=str,
             default="sharegpt",
-            choices=["sharegpt", "random", "generated-shared-prefix"],
+            choices=["sharegpt", "random", "generated-shared-prefix", "gsm8k"],
             help="Name of the dataset to benchmark on.",
         )
         parser.add_argument(
@@ -145,6 +146,12 @@ class BenchArgs:
             type=int,
             default=BenchArgs.gsp_output_len,
             help="Target length in tokens for outputs in generated-shared-prefix dataset",
+        )
+        parser.add_argument(
+            "--gsm8k-num-shots",
+            type=int,
+            default=5,
+            help="Number of few-shot examples for GSM8K dataset.",
         )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
         parser.add_argument(

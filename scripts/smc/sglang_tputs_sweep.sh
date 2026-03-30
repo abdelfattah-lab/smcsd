@@ -13,12 +13,14 @@ INPUT_LEN=256
 OUTPUT_LEN=512
 
 # --- Output CSV ---
-OUTFILE="${1:-results_baseline.csv}"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTFILE="${1:-results_baseline_${TIMESTAMP}.csv}"
 echo "method,gamma,n,tps,b" > "$OUTFILE"
 echo "Writing results to $OUTFILE"
 
 # ---- sglang baseline (no speculation) ----
 for b in "${NUM_PROMPTS_LIST[@]}"; do
+    sleep 5  # brief pause between runs to let system stabilize
   echo "=== sglang  b=$b ==="
 
   LOGFILE=$(mktemp /tmp/bench_sglang_XXXXXX.log)
