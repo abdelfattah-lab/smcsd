@@ -97,9 +97,9 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorker
         elif self.is_smc():
-            from sglang.srt.speculative.smc_worker_v2 import SMCWorkerV2
+            from sglang.srt.smc.smc_workers import SMCWorker
 
-            return SMCWorkerV2
+            return SMCWorker
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
@@ -120,6 +120,7 @@ class SpecInputType(IntEnum):
     EAGLE_VERIFY = auto()
     SMC_DRAFT = auto()
     SMC_SCORE = auto()
+    SMC_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 

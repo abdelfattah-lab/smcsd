@@ -331,13 +331,13 @@ class Scheduler(
             server_args.speculative_algorithm
         )
         self.smc_manager = None
-        self.smc_scheduler = None
+        self.smc_resampler = None
         if self.spec_algorithm.is_smc():
-            from sglang.srt.speculative.smc_manager import SMCManager
-            from sglang.srt.speculative.smc_scheduler import SMCScheduler
+            from sglang.srt.smc.smc_manager import SMCManager
+            from sglang.srt.smc.smc_resampler import SMCResampler
 
             self.smc_manager = SMCManager(server_args)
-            self.smc_scheduler = SMCScheduler(self.smc_manager, device=None)
+            self.smc_resampler = SMCResampler(self.smc_manager, device=None)
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -927,7 +927,9 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
+            if self.spec_algorithm.is_smc():
+                draft_runner = self.draft_worker._draft_worker.model_runner
+            elif self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -1058,9 +1060,9 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
-        if self.smc_scheduler is not None:
-            self.smc_scheduler.device = self.device
-            self.smc_scheduler.init_streams(enable_overlap=self.enable_overlap)
+        if self.smc_resampler is not None:
+            self.smc_resampler.device = self.device
+            self.smc_resampler.init_streams(enable_overlap=self.enable_overlap)
 
         if not self.enable_overlap:
             self.future_map = None
@@ -1300,8 +1302,8 @@ class Scheduler(
                 continue
 
             # SMC pre-forward: sync completed resamples, launch pending, drain wait queue
-            if self.smc_scheduler is not None:
-                self.smc_scheduler.step_before_forward(self)
+            if self.smc_resampler is not None:
+                self.smc_resampler.step_before_forward(self)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1310,14 +1312,14 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                if self.smc_scheduler is not None:
-                    self.smc_scheduler.step_after_forward(self)
+                if self.smc_resampler is not None:
+                    self.smc_resampler.step_after_forward(self)
                 self.process_batch_result(batch, result)
             else:
                 # Before going idle, drain any pending SMC resamples
                 if (
-                    self.smc_scheduler is not None
-                    and self.smc_scheduler.finish_pending_before_idle(self)
+                    self.smc_resampler is not None
+                    and self.smc_resampler.finish_pending_before_idle(self)
                 ):
                     self.last_batch = batch
                     continue
@@ -1427,8 +1429,8 @@ class Scheduler(
 
             # SMC pre/post-forward hooks (both run before run_batch since
             # fully async resampling is not yet implemented)
-            if self.smc_scheduler is not None:
-                self.smc_scheduler.step_before_forward(self)
+            if self.smc_resampler is not None:
+                self.smc_resampler.step_before_forward(self)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1447,8 +1449,8 @@ class Scheduler(
 
             # SMC post-forward hook (runs before run_batch until async
             # resampling lands)
-            if self.smc_scheduler is not None:
-                self.smc_scheduler.step_after_forward(self)
+            if self.smc_resampler is not None:
+                self.smc_resampler.step_after_forward(self)
 
             # Launch the current batch
             if batch:
@@ -1467,8 +1469,8 @@ class Scheduler(
                 elif batch is None:
                     # Before going idle, drain pending SMC resamples
                     if (
-                        self.smc_scheduler is not None
-                        and self.smc_scheduler.finish_pending_before_idle(self)
+                        self.smc_resampler is not None
+                        and self.smc_resampler.finish_pending_before_idle(self)
                     ):
                         self.last_batch = batch
                         continue
@@ -2904,11 +2906,19 @@ class Scheduler(
                 if future_indices is not None:
                     future_indices_or_next_token_ids = -future_indices.indices
                 else:
+                    ndi = batch_result.next_draft_input
                     future_indices_or_next_token_ids = (
-                        batch_result.next_draft_input.last_token_ids
+                        ndi.verified_id if hasattr(ndi, "verified_id")
+                        else ndi.last_token_ids
                     )
 
-                if batch.is_spec_v2:
+                if batch.spec_algorithm.is_smc():
+                    # SMC: store spec_info for overlap, but don't overwrite
+                    # seq_lens — it was already advanced in prepare_for_decode.
+                    batch.spec_info = batch_result.next_draft_input
+                    if future_indices is not None:
+                        batch.spec_info.future_indices = future_indices
+                elif batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
                     batch.spec_info = batch_result.next_draft_input
@@ -3236,8 +3246,8 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.reset_metrics()
-            if self.smc_scheduler is not None:
-                self.smc_scheduler.clear()
+            if self.smc_resampler is not None:
+                self.smc_resampler.clear()
             if self.smc_manager is not None:
                 self.smc_manager.clear()
 

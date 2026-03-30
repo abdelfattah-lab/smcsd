@@ -14,9 +14,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.speculative.smc_debug_utils import append_smc_diag_record
-from sglang.srt.speculative.smc_info import (
-    SMCDraftInput,
+from sglang.srt.smc.smc_debug_utils import append_smc_diag_record
+from sglang.srt.smc.smc_info import SMCDraftInput
+from sglang.srt.smc.smc_utils import (
     _release_internal_req,
     clone_req_for_smc_particle,
     compute_smc_shared_prefix_len,
@@ -287,9 +287,12 @@ class SMCManager:
         batch.output_ids = last_token_ids
         batch.top_logprobs_nums = [0] * len(particle_reqs)
         batch.token_ids_logprobs = [None] * len(particle_reqs)
+        from sglang.srt.server_args import get_global_server_args
+        server_args = get_global_server_args()
         batch.spec_info = SMCDraftInput(
-            last_token_ids=last_token_ids,
+            verified_id=last_token_ids,
             new_seq_lens=committed_seq_lens,
+            num_tokens_per_req=server_args.speculative_num_draft_tokens,
         )
         if use_future_map and scheduler.enable_overlap and scheduler.future_map is not None:
             future_indices = scheduler.future_map.alloc_future_indices(len(particle_reqs))
@@ -325,6 +328,14 @@ class SMCManager:
         # Flush deferred log_weight diffs so best-particle selection is correct
         group.flush_pending_diffs()
 
+        def _visible_output_len(
+            output_ids: List[int],
+            finished_len: Optional[int],
+        ) -> int:
+            if finished_len is None:
+                return len(output_ids)
+            return min(finished_len, len(output_ids))
+
         best_idx = None
         best_key = None
         best_output_ids: List[int] = []
@@ -341,7 +352,10 @@ class SMCManager:
                 finish_reason = copy.copy(req.finished_reason)
                 finished_len = req.finished_len
 
-            key = (float(group.log_weights[particle_idx].item()), len(output_ids))
+            key = (
+                float(group.log_weights[particle_idx].item()),
+                _visible_output_len(output_ids, finished_len),
+            )
             if best_key is None or key > best_key:
                 best_idx = particle_idx
                 best_key = key

@@ -303,7 +303,7 @@ class SchedulerRuntimeCheckerMixin:
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             smc_manager = getattr(self, "smc_manager", None)
-            smc_scheduler = getattr(self, "smc_scheduler", None)
+            smc_resampler = getattr(self, "smc_resampler", None)
             if smc_manager is not None and smc_manager.groups:
                 group_msgs = []
                 for group_id, group in smc_manager.groups.items():
@@ -320,11 +320,11 @@ class SchedulerRuntimeCheckerMixin:
                         + "; ".join(particle_msgs)
                     )
                 msg += "SMC_GROUPS:\n" + "\n".join(group_msgs) + "\n"
-            if smc_scheduler is not None:
+            if smc_resampler is not None:
                 msg += (
-                    f"SMC_BUCKETS: stalled={list(smc_scheduler.resampling_reqs.keys())}, "
-                    f"pending={list(smc_scheduler.pending_resamples.keys())}, "
-                    f"wait_for_running={list(smc_scheduler.wait_for_running)}\n"
+                    f"SMC_BUCKETS: stalled={list(smc_resampler.resampling_reqs.keys())}, "
+                    f"pending={list(smc_resampler.pending_resamples.keys())}, "
+                    f"wait_for_running={list(smc_resampler.wait_for_running)}\n"
                 )
             tracked_req_msgs = []
             tracked_rows = set()

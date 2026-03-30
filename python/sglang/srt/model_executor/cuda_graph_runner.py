@@ -1183,35 +1183,13 @@ class CudaGraphRunner:
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             elif self.model_runner.spec_algorithm.is_smc():
-                from sglang.srt.speculative.smc_info import (
-                    SMC_MIN_TEMPERATURE,
-                    SMCScoreInput,
-                )
+                from sglang.srt.smc.smc_info import SMCVerifyInput
 
-                batch_size = num_tokens // self.num_tokens_per_bs
-                spec_info = SMCScoreInput(
-                    draft_token=torch.zeros(
-                        (num_tokens,), dtype=torch.int64, device=self.device
-                    ),
-                    draft_lengths=torch.zeros(
-                        (batch_size,), dtype=torch.int32, device=self.device
-                    ),
-                    draft_logprobs=torch.zeros(
-                        (batch_size,), dtype=torch.float32, device=self.device
-                    ),
-                    custom_mask=self.buffers.custom_mask,
-                    positions=None,
+                spec_info = SMCVerifyInput(
                     draft_token_num=self.num_tokens_per_bs,
-                    spec_steps=self.num_tokens_per_bs - 1,
-                    target_temperature=max(
-                        float(self.model_runner.server_args.smc_target_temperature),
-                        SMC_MIN_TEMPERATURE,
-                    ),
-                    linear_target_verify=(
-                        self.model_runner.server_args.attention_backend
-                        in {"flashinfer", "triton"}
-                    ),
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    positions=None,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    num_tokens_per_req=self.num_tokens_per_bs,
                 )
             else:
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput

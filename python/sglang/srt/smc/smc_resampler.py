@@ -8,11 +8,12 @@ from typing import Deque, Dict, List, Optional, Set
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, SMCGroupSpan, ScheduleBatch
-from sglang.srt.speculative.smc_debug_utils import (
+from sglang.srt.smc.smc_debug_utils import (
     append_smc_diag_record,
     append_smc_probe_record,
 )
-from sglang.srt.speculative.smc_info import (
+from sglang.srt.smc.smc_manager import SMCFinishedParticleSnapshot
+from sglang.srt.smc.smc_utils import (
     effective_sample_size,
     multinomial_resample,
     normalize_log_weights,
@@ -30,7 +31,7 @@ class PendingResample:
     done_event: Optional[torch.cuda.Event] = None
 
 
-class SMCScheduler:
+class SMCResampler:
     def __init__(self, smc_manager, device):
         self.smc_manager = smc_manager
         self.device = device
@@ -286,10 +287,10 @@ class SMCScheduler:
             return self.smc_manager._finalize_group(group.group_id)
 
         group.resampled_at_step = group.step_counts[active_indices[0]]
-        # Always mark for resampling — the overlapped
-        # _launch_pending_resamples will no-op (no evictions) when
-        # weights are uniform, so there is no wasted KV work.
-        if len(active_indices) > 1:
+        # Always mark aligned multi-particle groups for resampling. Finished
+        # particles keep participating in the SMC population, so a group with
+        # one live particle and finished siblings can still need resampling.
+        if len(group.particle_reqs) > 1:
             self._groups_needing_resample.add(group.group_id)
         return None
 
@@ -306,13 +307,14 @@ class SMCScheduler:
                 continue
 
             active_indices = group.active_particle_indices()
-            if len(active_indices) <= 1:
+            resample_indices = sorted(group.particle_reqs)
+            if len(resample_indices) <= 1:
                 group.flush_pending_diffs()
                 continue
 
             # Apply deferred log_weight updates before sampling ancestors
             group.flush_pending_diffs()
-            group_log_weights = group.log_weights[active_indices]
+            group_log_weights = group.log_weights[resample_indices]
             normalized_weights = normalize_log_weights(
                 group_log_weights, device=self.device
             )
@@ -321,6 +323,7 @@ class SMCScheduler:
                 {
                     "type": "resample_check",
                     "group_id": group.group_id,
+                    "resample_indices": list(resample_indices),
                     "active_indices": list(active_indices),
                     "log_weights": [float(x) for x in group_log_weights.tolist()],
                     "normalized_weights": [
@@ -329,7 +332,11 @@ class SMCScheduler:
                     "ess": float(ess),
                 }
             )
-            if ess >= len(active_indices) * self.smc_manager.server_args.smc_resample_threshold:
+            if (
+                ess
+                >= len(resample_indices)
+                * self.smc_manager.server_args.smc_resample_threshold
+            ):
                 continue
 
             ancestors = self._sample_ancestors(normalized_weights)
@@ -337,20 +344,21 @@ class SMCScheduler:
                 {
                     "type": "resample_choice",
                     "group_id": group.group_id,
+                    "resample_indices": list(resample_indices),
                     "active_indices": list(active_indices),
                     "ancestors": list(ancestors),
                 }
             )
             evictions = [
-                (dst_idx, active_indices[src_pos])
-                for dst_idx, src_pos in zip(active_indices, ancestors, strict=True)
-                if dst_idx != active_indices[src_pos]
+                (dst_idx, resample_indices[src_pos])
+                for dst_idx, src_pos in zip(resample_indices, ancestors, strict=True)
+                if dst_idx != resample_indices[src_pos]
             ]
             if not evictions:
                 continue
 
             active_tensor = torch.tensor(
-                active_indices,
+                resample_indices,
                 dtype=torch.int64,
                 device=group.log_weights.device,
             )
@@ -395,9 +403,38 @@ class SMCScheduler:
         ):
             self._restore_req_state(dst_req, snapshot)
 
-        self.resampling_reqs.pop(group_id)
-        self.enqueue_group_for_running(group_id)
+        self.resampling_reqs.pop(group_id, None)
         del self.pending_resamples[group_id]
+
+        group = self.smc_manager.get_group(group_id)
+        if group is not None:
+            for dst_req, snapshot in zip(
+                pending.dst_reqs,
+                pending.src_snapshots,
+                strict=True,
+            ):
+                particle_idx = dst_req.smc_particle_idx
+                if snapshot["finished_reason"] is None:
+                    group.finished_particles.pop(particle_idx, None)
+                else:
+                    group.finished_particles[particle_idx] = (
+                        SMCFinishedParticleSnapshot(
+                            output_ids=list(snapshot["output_ids"]),
+                            finished_reason=copy.copy(snapshot["finished_reason"]),
+                            finished_len=snapshot["finished_len"],
+                        )
+                    )
+
+            if not group.active_particle_indices():
+                finalized_req = self.smc_manager._finalize_group(group_id)
+                if finalized_req is not None:
+                    time_stats = getattr(finalized_req, "time_stats", None)
+                    if time_stats is not None:
+                        time_stats.set_completion_time()
+                    scheduler.stream_output([finalized_req], False)
+                return
+
+        self.enqueue_group_for_running(group_id)
 
     def _drain_wait_for_running(self, scheduler) -> None:
         while self.wait_for_running:
