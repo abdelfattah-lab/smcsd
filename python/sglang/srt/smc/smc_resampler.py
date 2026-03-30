@@ -108,6 +108,7 @@ class SMCResampler:
         self.forward_slot_idx: int = 0
         self.pending_groups: Deque[str] = deque()
         self._pending_group_ids: Set[str] = set()
+        self.pingpong_active: bool = False
 
     def init_streams(self, enable_overlap: bool) -> None:
         self.device_module = torch.get_device_module(self.device)
@@ -128,10 +129,12 @@ class SMCResampler:
             return
         # Ping-pong path: uses pending_groups queue
         self.enqueue_new_group(group_id)
-        # Legacy path: uses wait_for_running queue
-        if group_id not in self._wait_for_running_members:
-            self.wait_for_running.append(group_id)
-            self._wait_for_running_members.add(group_id)
+        # Legacy path: uses wait_for_running queue (skip in ping-pong mode
+        # since _drain_wait_for_running is never called there)
+        if not self.pingpong_active:
+            if group_id not in self._wait_for_running_members:
+                self.wait_for_running.append(group_id)
+                self._wait_for_running_members.add(group_id)
 
     def get_stalled_req_count(self) -> int:
         return sum(len(reqs) for reqs in self.resampling_reqs.values())
@@ -1049,6 +1052,14 @@ class SMCResampler:
                         time_stats.set_completion_time()
                     scheduler.stream_output([finalized_req], False)
                 slot.remove_group(group_id)
+
+            # Resampling modified req states (output_ids, kv_committed_len,
+            # finished_reason, etc.) via _restore_req_state.  Force a full
+            # rebuild so the batch picks up the new particle set from
+            # get_active_particle_reqs instead of relying on the stale
+            # batch.reqs list that _refresh_slot_batch would use.
+            if evictions:
+                slot.needs_rebuild = True
 
             scheduler.token_to_kv_pool_allocator.free_group_end()
 

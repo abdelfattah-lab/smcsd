@@ -1508,6 +1508,7 @@ class Scheduler(
         Phase 6: Swap slots
         """
         resampler = self.smc_resampler
+        resampler.pingpong_active = True
 
         while True:
             forward_slot = resampler.forward_slot
@@ -1531,10 +1532,12 @@ class Scheduler(
                     if gid in process_slot.group_ids:
                         process_slot.groups_needing_resample.add(gid)
                         resampler._groups_needing_resample.discard(gid)
-                # Remove finalized groups from the slot
+                # Remove finalized groups from the slot and clean up
+                # any orphaned resample marks in the global set
                 for gid in list(process_slot.group_ids):
                     if self.smc_manager.get_group(gid) is None:
                         process_slot.remove_group(gid)
+                        resampler._groups_needing_resample.discard(gid)
 
             # ── PHASE 2: Resample (slot-local, inline on schedule_stream) ──
             resampler.launch_resamples_for_slot(process_slot, self)
@@ -1551,6 +1554,9 @@ class Scheduler(
 
             # Set running_batch so get_next_batch_to_run sees decode reqs.
             # If forward_slot is empty, use an empty batch so prefill can still run.
+            # NOTE: This only counts forward_slot particles for capacity checks
+            # in get_new_batch_prefill(). Process_slot particles are not counted,
+            # which may lead to over-admission under tight KV cache budgets.
             if batch is not None and batch.reqs:
                 self.running_batch = batch
             else:
