@@ -1500,11 +1500,14 @@ class Scheduler(
         forward_stream while the other processes results and resamples on
         the schedule_stream.  Targets multi-group workloads.
 
-        Phase 1: Process decode results from process_slot
-        Phase 2: Resample (inline on schedule_stream, slot-local)
-        Phase 3: Dispatch new groups from prefill to slots
-        Phase 4: Prepare forward_slot's batch (refresh or rebuild)
-        Phase 5: Forward (with prefill preemption handling)
+        The forward is launched FIRST so GPU work overlaps with CPU
+        processing/resampling of the other slot:
+
+        Phase 1: Forward forward_slot (GPU launches, batch prepared last iter)
+        Phase 2: Process decode results from process_slot (CPU, overlaps GPU)
+        Phase 3: Resample process_slot (CPU, overlaps GPU)
+        Phase 4: Dispatch new groups from prefill to slots
+        Phase 5: Prepare process_slot's batch (next iter's forward after swap)
         Phase 6: Swap slots
         """
         resampler = self.smc_resampler
@@ -1520,40 +1523,13 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # ── PHASE 1: Process decode results from process_slot ──
-            if process_slot.saved_result is not None:
-                self.process_batch_result(
-                    process_slot.saved_batch, process_slot.saved_result
-                )
-                process_slot.saved_batch = None
-                process_slot.saved_result = None
-                # Route resample marks from global set into the process_slot
-                for gid in list(resampler._groups_needing_resample):
-                    if gid in process_slot.group_ids:
-                        process_slot.groups_needing_resample.add(gid)
-                        resampler._groups_needing_resample.discard(gid)
-                # Remove finalized groups from the slot and clean up
-                # any orphaned resample marks in the global set
-                for gid in list(process_slot.group_ids):
-                    if self.smc_manager.get_group(gid) is None:
-                        process_slot.remove_group(gid)
-                        resampler._groups_needing_resample.discard(gid)
-
-            # ── PHASE 2: Resample (slot-local, inline on schedule_stream) ──
-            resampler.launch_resamples_for_slot(process_slot, self)
-
-            # ── PHASE 3: Dispatch new groups from prefill ──
-            resampler.dispatch_pending_groups(self)
-
-            # ── PHASE 4: Prepare forward_slot's batch ──
-            resampler.prepare_forward_batch(forward_slot, self)
-
-            # ── PHASE 5: Forward (with prefill handling) ──
+            # ── PHASE 1: Forward (launch GPU early for overlap) ──
+            # The forward_slot's batch was prepared at the end of the
+            # previous iteration (or is empty on the first iteration).
             batch = forward_slot.batch
             batch_result = None
 
             # Set running_batch so get_next_batch_to_run sees decode reqs.
-            # If forward_slot is empty, use an empty batch so prefill can still run.
             # NOTE: This only counts forward_slot particles for capacity checks
             # in get_new_batch_prefill(). Process_slot particles are not counted,
             # which may lead to over-admission under tight KV cache budgets.
@@ -1573,25 +1549,19 @@ class Scheduler(
 
                 if is_smc_prefill:
                     # Prefill: run + process synchronously, don't save.
-                    # The decode batch in forward_slot is NOT forwarded this
-                    # iteration — its particles are delayed by one cycle.
-                    # This matches existing process_smc_prefill_immediately
-                    # behavior where prefill always preempts decode.
                     batch_result = self.run_batch(batch)
                     self.process_batch_result(batch, batch_result)
-                    # Particles enqueued via enqueue_new_group,
-                    # available in next Phase 3
                     if self.is_generation:
                         self.launch_batch_sample_if_needed(batch_result)
                     batch_result = None
                 else:
-                    # Decode: launch async, save for next iteration
+                    # Decode: launch async, save for next iteration.
+                    # GPU starts working — CPU phases below overlap.
                     forward_slot.saved_batch = batch.copy()
                     batch_result = self.run_batch(batch)
                     forward_slot.saved_result = batch_result
             else:
                 self.cancel_bubble_timer()
-                # Idle: drain pending resamples and self-check
                 if resampler.finish_all_pending_pingpong(self):
                     resampler.swap()
                     continue
@@ -1600,6 +1570,37 @@ class Scheduler(
             # Sample the current batch result
             if self.is_generation and batch_result is not None:
                 self.launch_batch_sample_if_needed(batch_result)
+
+            # ── PHASE 2: Process decode results from process_slot ──
+            # (CPU work, overlaps with the GPU forward launched above)
+            if process_slot.saved_result is not None:
+                self.process_batch_result(
+                    process_slot.saved_batch, process_slot.saved_result
+                )
+                process_slot.saved_batch = None
+                process_slot.saved_result = None
+                # Route resample marks from global set into the process_slot
+                for gid in list(resampler._groups_needing_resample):
+                    if gid in process_slot.group_ids:
+                        process_slot.groups_needing_resample.add(gid)
+                        resampler._groups_needing_resample.discard(gid)
+                # Remove finalized groups from the slot and clean up
+                # any orphaned resample marks in the global set
+                for gid in list(process_slot.group_ids):
+                    if self.smc_manager.get_group(gid) is None:
+                        process_slot.remove_group(gid)
+                        resampler._groups_needing_resample.discard(gid)
+
+            # ── PHASE 3: Resample (slot-local, inline on schedule_stream) ──
+            resampler.launch_resamples_for_slot(process_slot, self)
+
+            # ── PHASE 4: Dispatch new groups from prefill ──
+            resampler.dispatch_pending_groups(self)
+
+            # ── PHASE 5: Prepare process_slot's batch for next iteration ──
+            # After swap, process_slot becomes the forward_slot, so its
+            # batch must be ready for Phase 1 of the next iteration.
+            resampler.prepare_forward_batch(process_slot, self)
 
             # Update last_batch for capacity checks
             self.last_batch = None  # ping-pong doesn't use result_queue
