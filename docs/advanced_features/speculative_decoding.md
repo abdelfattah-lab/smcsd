@@ -554,12 +554,6 @@ Then gradually increase `--speculative-num-draft-tokens`, `--speculative-eagle-t
 
 ---
 
-## Developer Architecture Guide
-
-For a detailed technical walkthrough of the speculative decoding internals — the draft-verify cycle, KV cache management, tree construction, the V2 overlap scheduler, CUDA stream synchronization, and key source files — see the [Speculative Decoding Architecture](../developer_guide/speculative_decoding_architecture.md) developer guide.
-
----
-
 ## References
 
 EAGLE process is as follows:
