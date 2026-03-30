@@ -1513,6 +1513,15 @@ class Scheduler(
         resampler = self.smc_resampler
         resampler.pingpong_active = True
 
+        # Ping-pong requires two-stream execution: forward_stream for GPU
+        # forward, schedule_stream for processing/resampling the other slot.
+        # Without this, all phases serialize on one stream and ping-pong is
+        # strictly worse than non-ping-pong.  This is independent of the
+        # standard overlap scheduler — we just need run_batch to dispatch
+        # the forward onto forward_stream.
+        if not self.enable_overlap:
+            self.enable_overlap = True
+
         while True:
             forward_slot = resampler.forward_slot
             process_slot = resampler.process_slot
