@@ -12,7 +12,6 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
@@ -59,10 +58,6 @@ if is_flashinfer_available():
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
-
-
-def _is_linear_target_verify(spec_info: Optional[SpecInput]) -> bool:
-    return bool(spec_info is not None and spec_info.use_linear_target_verify())
 
 
 @dataclass
@@ -458,42 +453,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_paged, False, False
             )
         elif forward_batch.forward_mode.is_target_verify():
-            if _is_linear_target_verify(forward_batch.spec_info):
-                prefix_lens = forward_batch.extend_prefix_lens
-                total_seq_lens = prefix_lens + forward_batch.extend_seq_lens
-                total_seq_lens_cpu = (
-                    forward_batch.extend_prefix_lens_cpu
-                    + forward_batch.extend_seq_lens_cpu
-                )
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    total_seq_lens,
-                    total_seq_lens_cpu,
-                    int(total_seq_lens_cpu.sum().item()),
-                    prefix_lens=prefix_lens,
-                    prefill_wrappers=self.prefill_wrappers_paged,
-                    use_ragged=False,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=None,
-                )
-                self.forward_metadata = PrefillMetadata(
-                    self.prefill_wrappers_paged, False, False
-                )
-            else:
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_cpu,
-                    forward_batch.seq_lens_sum,
-                    prefix_lens=None,
-                    prefill_wrappers=self.prefill_wrappers_verify,
-                    use_ragged=False,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=forward_batch.spec_info,
-                )
-                self.forward_metadata = PrefillMetadata(
-                    self.prefill_wrappers_verify, False, False
-                )
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=self.prefill_wrappers_verify,
+                use_ragged=False,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=forward_batch.spec_info,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_verify, False, False
+            )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -619,67 +592,36 @@ class FlashInferAttnBackend(AttentionBackend):
                     fast_decode_plan, decode_wrappers[i]
                 )
         elif forward_mode.is_target_verify():
-            if _is_linear_target_verify(spec_info):
-                prefill_wrappers = []
-                for i in range(self.num_wrappers):
-                    prefill_wrappers.append(
-                        BatchPrefillWithPagedKVCacheWrapper(
-                            self.workspace_buffer,
-                            "NHD",
-                            use_cuda_graph=True,
-                            backend=self.prefill_backend,
-                            qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                            paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                            paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                            paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        )
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        backend=self.prefill_backend,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                        custom_mask_buf=self.cuda_graph_custom_mask,
+                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
                     )
-                total_seq_lens = seq_lens + spec_info.draft_token_num
-                total_seq_lens_sum = int(total_seq_lens.sum().item())
-                self.indices_updater_prefill.update(
-                    req_pool_indices,
-                    total_seq_lens,
-                    total_seq_lens.cpu(),  # may add a little overhead in capture stage
-                    total_seq_lens_sum,
-                    prefix_lens=seq_lens,
-                    prefill_wrappers=prefill_wrappers,
-                    use_ragged=False,
-                    encoder_lens=encoder_lens,
-                    spec_info=None,
                 )
-                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-                self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
-            else:
-                prefill_wrappers = []
-                for i in range(self.num_wrappers):
-                    prefill_wrappers.append(
-                        BatchPrefillWithPagedKVCacheWrapper(
-                            self.workspace_buffer,
-                            "NHD",
-                            use_cuda_graph=True,
-                            backend=self.prefill_backend,
-                            qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                            paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                            paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                            paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                            custom_mask_buf=self.cuda_graph_custom_mask,
-                            mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
-                        )
-                    )
-                seq_lens_sum = seq_lens.sum().item()
-                self.indices_updater_prefill.update(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens.cpu(),  # may add a little overhead in capture stage
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    prefill_wrappers=prefill_wrappers,
-                    use_ragged=False,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
-                )
-                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-                self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),  # may add a little overhead in capture stage
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=False,
+                encoder_lens=encoder_lens,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -766,37 +708,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
-            if _is_linear_target_verify(spec_info):
-                prefix_lens = seq_lens[:bs]
-                total_seq_lens = prefix_lens + spec_info.draft_token_num
-                total_seq_lens_cpu = (
-                    seq_lens_cpu[:bs] + spec_info.draft_token_num
-                    if seq_lens_cpu is not None
-                    else None
-                )
-                self.indices_updater_prefill.update(
-                    req_pool_indices[:bs],
-                    total_seq_lens,
-                    total_seq_lens_cpu,
-                    seq_lens_sum + bs * spec_info.draft_token_num,
-                    prefix_lens=prefix_lens,
-                    prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                    use_ragged=False,
-                    encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                    spec_info=None,
-                )
-            else:
-                self.indices_updater_prefill.update(
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                    use_ragged=False,
-                    encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                    spec_info=spec_info,
-                )
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=False,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=spec_info,
+            )
         elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
@@ -1553,17 +1475,12 @@ class FlashInferMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.spec_utils import (
-            generate_draft_decode_kv_indices,
-            generate_smc_draft_decode_kv_indices,
-        )
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-        self.generate_smc_draft_decode_kv_indices = generate_smc_draft_decode_kv_indices
         self.page_size = model_runner.page_size
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
@@ -1701,62 +1618,6 @@ class FlashInferMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
-
-    def init_smc_forward_metadata_replay_cuda_graph(
-        self,
-        forward_batch: ForwardBatch,
-        *,
-        bs: int,
-        raw_bs: int,
-    ) -> None:
-        base_seq_lens = forward_batch.seq_lens[:bs]
-        base_seq_lens_cpu = forward_batch.seq_lens_cpu
-        base_seq_lens_sum = (
-            int(base_seq_lens_cpu.sum().item())
-            if base_seq_lens_cpu is not None
-            else int(base_seq_lens.sum().item())
-        )
-        self.generate_smc_draft_decode_kv_indices[(self.speculative_num_steps - 1, bs)](
-            forward_batch.req_pool_indices,
-            self.req_to_token,
-            base_seq_lens,
-            self.cuda_graph_kv_indices,
-            self.kv_indptr,
-            raw_bs,
-            self.pool_len,
-            self.cuda_graph_kv_indices.shape[1],
-            self.kv_indptr.shape[1],
-            next_power_of_2(bs),
-            next_power_of_2(self.speculative_num_steps - 1),
-        )
-
-        indptr_cpu_whole = self.kv_indptr[: self.speculative_num_steps - 1, : bs + 1].cpu()
-        global global_override_indptr_cpu
-
-        for i in range(self.speculative_num_steps - 1):
-            step_seq_lens = base_seq_lens.clone()
-            step_seq_lens[:raw_bs].add_(i + 1)
-            step_seq_lens_cpu = None
-            if base_seq_lens_cpu is not None:
-                step_seq_lens_cpu = base_seq_lens_cpu.clone()
-                step_seq_lens_cpu[:raw_bs].add_(i + 1)
-            step_seq_lens_sum = base_seq_lens_sum + raw_bs * (i + 1)
-            spec_info = SimpleNamespace(
-                kv_indptr=self.kv_indptr[i, : bs + 1],
-                kv_indices=self.cuda_graph_kv_indices[i][:step_seq_lens_sum],
-            )
-            global_override_indptr_cpu = indptr_cpu_whole[i]
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                step_seq_lens,
-                seq_lens_sum=step_seq_lens_sum,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=spec_info,
-                seq_lens_cpu=step_seq_lens_cpu,
-            )
-        global_override_indptr_cpu = None
 
 
 def should_use_tensor_core(
