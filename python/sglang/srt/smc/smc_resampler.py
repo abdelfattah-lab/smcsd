@@ -8,12 +8,12 @@ from typing import Deque, Dict, List, Optional, Set
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, SMCGroupSpan, ScheduleBatch
-from sglang.srt.speculative.smc_debug_utils import (
+from sglang.srt.smc.smc_debug_utils import (
     append_smc_diag_record,
     append_smc_probe_record,
 )
-from sglang.srt.speculative.smc_manager import SMCFinishedParticleSnapshot
-from sglang.srt.speculative.smc_info import (
+from sglang.srt.smc.smc_manager import SMCFinishedParticleSnapshot
+from sglang.srt.smc.smc_utils import (
     effective_sample_size,
     multinomial_resample,
     normalize_log_weights,
@@ -31,7 +31,7 @@ class PendingResample:
     done_event: Optional[torch.cuda.Event] = None
 
 
-class SMCScheduler:
+class SMCResampler:
     def __init__(self, smc_manager, device):
         self.smc_manager = smc_manager
         self.device = device

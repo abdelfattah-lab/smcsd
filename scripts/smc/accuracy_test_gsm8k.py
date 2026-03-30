@@ -608,7 +608,7 @@ if __name__ == "__main__":
 
     # Engine overrides (smc / baseline modes)
     eng = parser.add_argument_group("engine overrides (smc/baseline)")
-    eng.add_argument("--mem-fraction-static", type=float, default=0.45)
+    eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=16)
     eng.add_argument("--max-running-requests", type=int, default=8)
 

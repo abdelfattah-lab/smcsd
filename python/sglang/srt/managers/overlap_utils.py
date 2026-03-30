@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
-    from sglang.srt.speculative.smc_info import SMCDraftInput
+    from sglang.srt.smc.smc_info import SMCDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _is_cuda = is_cuda()
@@ -125,11 +125,12 @@ class FutureMap:
                 device=self.device,
             )
 
-    def _lazy_init_smc_buf(self, draft_input: "SMCDraftInput"):
+    def _lazy_init_smc_buf(self, draft_input):
         self.buf_initialized = True
+        verified_id = draft_input.verified_id
         self.last_token_ids_buf = torch.empty(
-            (self.future_buffer_len, *draft_input.last_token_ids[0].shape),
-            dtype=draft_input.last_token_ids.dtype,
+            (self.future_buffer_len, *verified_id[0].shape),
+            dtype=verified_id.dtype,
             device=self.device,
         )
         self.new_seq_lens_buf = torch.empty(
@@ -159,7 +160,7 @@ class FutureMap:
                 return
             indices = draft_input.future_indices.indices
             indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.last_token_ids = self.last_token_ids_buf[indices]
+            draft_input.verified_id = self.last_token_ids_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
@@ -228,5 +229,5 @@ class FutureMap:
         if not self.buf_initialized:
             self._lazy_init_smc_buf(draft_input)
 
-        self.last_token_ids_buf[intv] = draft_input.last_token_ids
+        self.last_token_ids_buf[intv] = draft_input.verified_id
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens

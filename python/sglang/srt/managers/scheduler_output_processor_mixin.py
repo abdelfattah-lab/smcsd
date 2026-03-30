@@ -22,8 +22,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.smc_info import (
-    SMCDraftInput,
+from sglang.srt.smc.smc_info import SMCDraftInput
+from sglang.srt.smc.smc_utils import (
     _release_internal_req,
     _release_smc_parent_req,
 )
@@ -204,14 +204,14 @@ class SchedulerOutputProcessorMixin:
                             release_kv_cache(req, self.tree_cache)
                             req.time_stats.set_completion_time()
                         else:
-                            assert self.smc_scheduler is not None
+                            assert self.smc_resampler is not None
                             _release_smc_parent_req(
                                 req,
                                 tree_cache=self.tree_cache,
                                 req_to_token_pool=self.req_to_token_pool,
                                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                             )
-                            self.smc_scheduler.enqueue_group_for_running(req.rid)
+                            self.smc_resampler.enqueue_group_for_running(req.rid)
                             smc_req_indices_to_remove.add(i)
                     elif is_smc and req.smc_particle_idx is not None:
                         if not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -436,12 +436,12 @@ class SchedulerOutputProcessorMixin:
             else:
                 next_token_ids = next_token_ids.tolist()
             if batch.spec_algorithm.is_smc():
-                assert result.smc_logprob_diffs is not None
-                if torch.is_tensor(result.smc_logprob_diffs):
-                    smc_logprob_diffs = result.smc_logprob_diffs
+                assert result.logprob_diff is not None
+                if torch.is_tensor(result.logprob_diff):
+                    smc_logprob_diffs = result.logprob_diff
                 else:
                     smc_logprob_diffs = torch.as_tensor(
-                        result.smc_logprob_diffs,
+                        result.logprob_diff,
                         dtype=torch.float32,
                         device=self.device,
                     )
@@ -626,7 +626,7 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        if batch.spec_algorithm.is_smc() and self.smc_scheduler is not None:
+        if batch.spec_algorithm.is_smc() and self.smc_resampler is not None:
             assert smc_logprob_diffs is not None
             smc_step_reqs = batch.reqs if smc_filtered_reqs is None else smc_filtered_reqs
             if smc_step_reqs:
@@ -640,7 +640,7 @@ class SchedulerOutputProcessorMixin:
                     )
                     step_logprob_diffs = smc_logprob_diffs.index_select(0, row_indices)
                 smc_finalized_reqs.extend(
-                    self.smc_scheduler.on_batch_done(
+                    self.smc_resampler.on_batch_done(
                         smc_step_reqs,
                         step_logprob_diffs,
                         group_spans=(
@@ -652,14 +652,12 @@ class SchedulerOutputProcessorMixin:
                 )
 
         if batch.spec_algorithm.is_smc() and not self.enable_overlap and batch.reqs:
+            # seq_lens = kv_committed_len (actual KV coverage)
             refreshed_seq_lens_cpu = torch.tensor(
-                [
-                    max(len(req.origin_input_ids) + len(req.output_ids) - 1, 0)
-                    for req in batch.reqs
-                ],
+                [int(req.kv_committed_len) for req in batch.reqs],
                 dtype=torch.int64,
             )
-            refreshed_last_token_ids = torch.tensor(
+            refreshed_verified_ids = torch.tensor(
                 [
                     req.output_ids[-1]
                     if req.output_ids
@@ -673,9 +671,9 @@ class SchedulerOutputProcessorMixin:
             batch.seq_lens = refreshed_seq_lens_cpu.to(device=self.device)
             batch.seq_lens_sum = int(refreshed_seq_lens_cpu.sum().item())
             batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-            batch.output_ids = refreshed_last_token_ids
+            batch.output_ids = refreshed_verified_ids
             if isinstance(batch.spec_info, SMCDraftInput):
-                batch.spec_info.last_token_ids = refreshed_last_token_ids
+                batch.spec_info.verified_id = refreshed_verified_ids
                 batch.spec_info.new_seq_lens = batch.seq_lens
 
         self.stream_output(batch.reqs, batch.return_logprob)

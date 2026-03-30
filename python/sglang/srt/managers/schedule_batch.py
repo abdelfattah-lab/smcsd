@@ -1931,7 +1931,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         SMC NOTE: Scheduler-level retraction is NOT fully functional for SMC
         particles. When SMC particles are retracted:
         1. reset_for_retract() clears KV state (kv_allocated_len,
-           kv_committed_len) but does NOT notify the SMCManager/SMCScheduler,
+           kv_committed_len) but does NOT notify the SMCManager/SMCResampler,
            leaving group state (log_weights, step_counts, pending_diffs,
            resampling bookkeeping) inconsistent.
         2. The group-level retraction at lines 1963-1978 collects sibling
@@ -1942,7 +1942,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
            independently, but the SMC group has no mechanism to reconcile
            divergent step counts or restore log_weights after retraction.
         A proper fix requires group-aware atomic retract/re-admit; see
-        smc_design_docs/smc_scheduler_group_design.md.
+        smc_design_docs/smc_resampler_group_design.md.
         """
         sorted_indices = list(range(len(self.reqs)))
 
@@ -1981,7 +1981,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # pause the SMC group state or reset log_weights/step_counts, so re-
         # admission will encounter stale group bookkeeping. Additionally,
         # particles currently stalled in the resample bucket
-        # (SMCScheduler.resampling_reqs) are NOT handled here and may be left
+        # (SMCResampler.resampling_reqs) are NOT handled here and may be left
         # dangling.
         retracted_group_ids = {
             req.smc_group_id for req in retracted_reqs if req.smc_group_id is not None
@@ -2048,7 +2048,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
         if req.smc_particle_idx is not None:
-            from sglang.srt.speculative.smc_info import _release_internal_req
+            from sglang.srt.smc.smc_utils import _release_internal_req
 
             _release_internal_req(
                 req,
@@ -2102,9 +2102,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
             self.nsa_cp_metadata = None
 
-        if self.is_spec_v2:
-            # TODO(spec-v2): all spec v2 should go through this path
-            draft_input: EagleDraftInput = self.spec_info
+        if self.is_spec_v2 or self.spec_algorithm.is_smc():
+            # Spec v2 (EAGLE) and SMC both manage their own KV allocation
+            # and seq_lens advancement inside prepare_for_decode.
+            draft_input = self.spec_info
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
