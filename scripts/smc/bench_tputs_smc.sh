@@ -9,10 +9,10 @@ python -m sglang.bench_offline_throughput \
     --smc-pingpong-overlap \
     --attention-backend triton \
     --mem-fraction-static 0.60 \
-    --max-running-requests 64 \
-    --cuda-graph-bs 64 \
+    --max-running-requests 96 \
+    --cuda-graph-max-bs 96 \
     --dataset-name random \
-    --random-input-len 256 \
+    --random-input-len 128 \
     --random-output-len 512 \
     --num-prompts 16
     # --profile \

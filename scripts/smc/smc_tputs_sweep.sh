@@ -56,7 +56,7 @@ for b in "${NUM_PROMPTS_LIST[@]}"; do
         --attention-backend "$ATTENTION_BACKEND" \
         --mem-fraction-static "$MEM_FRACTION" \
         --max-running-requests "$max_rr" \
-        --cuda-graph-bs "$cuda_bs" \
+        --cuda-graph-max-bs "$cuda_bs" \
         --dataset-name random \
         --random-input-len "$INPUT_LEN" \
         --random-output-len "$OUTPUT_LEN" \
