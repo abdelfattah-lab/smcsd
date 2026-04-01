@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
-DEFAULT_DRAFT_MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_PATH = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_PROMPTS = [
     "The capital of France is",
     "Write one sentence about why overlap scheduling matters for inference systems.",
@@ -74,6 +74,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Use the experimental SMC overlap scheduler instead of the baseline normal SMC scheduler.",
+    )
+    parser.add_argument(
+        "--pingpong",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the experimental pingpong scheduling instead of the baseline normal SMC scheduler.",
     )
     parser.add_argument(
         "--prompt",
@@ -189,10 +195,11 @@ def main() -> None:
         log_level="info",
         random_seed=1,
         cuda_graph_max_bs=32,
-        attention_backend="triton",
+        attention_backend="fa3",
         smc_draft_temperature=0.8,
         smc_target_temperature=0.8,
         smc_resampling_overlap=args.smc_resampling_overlap,
+        smc_pingpong_overlap=args.pingpong
     ) as engine:
         server_info = engine.get_server_info()
         write_json(run_dir / "server_info.json", server_info)
