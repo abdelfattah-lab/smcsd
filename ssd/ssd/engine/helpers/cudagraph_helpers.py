@@ -373,7 +373,9 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         False, -1,
     ]
     if wrapper._backend == "fa2":
-        plan_args.extend([-1, False])
+        # FlashInfer 0.6.6 fa2 decode plan expects:
+        # fixed_split_size, disable_split_kv, num_colocated_ctas
+        plan_args.extend([-1, False, 0])
     wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
 
     if PROFILE_DRAFT:
