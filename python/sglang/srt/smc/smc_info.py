@@ -300,8 +300,8 @@ class SMCDraftInput(SpecInput):
         # Set positions via spec_info so ForwardBatch.init_new picks them up
         self.positions = all_positions[:, 0].contiguous()
 
-        # Clear spec_info so the attn backend uses standard decode path
-        # (not multi-step draft path which expects EAGLE-style backends)
+        # Clear spec_info for ForwardBatch creation and CUDA graph compatibility.
+        # The multi-step path re-sets it before calling init_forward_metadata.
         draft_batch.spec_info = None
         forward_batch = ForwardBatch.init_new(draft_batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)

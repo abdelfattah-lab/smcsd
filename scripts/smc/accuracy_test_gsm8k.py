@@ -412,7 +412,7 @@ def run_engine_eval(args, prompts, labels):
         engine_kwargs["smc_draft_temperature"] = args.temperature
         engine_kwargs["smc_target_temperature"] = args.temperature
         engine_kwargs["page_size"] = 1
-        engine_kwargs["attention_backend"] = "triton"
+        engine_kwargs["attention_backend"] = args.attention_backend
         engine_kwargs["smc_resampling_overlap"] = True
         if args.pingpong:
             engine_kwargs["smc_pingpong_overlap"] = True
@@ -614,6 +614,9 @@ if __name__ == "__main__":
 
     # Engine overrides (smc / baseline modes)
     eng = parser.add_argument_group("engine overrides (smc/baseline)")
+    eng.add_argument("--attention-backend", type=str, default="triton",
+                      choices=["triton", "fa3"],
+                      help="attention backend for SMC mode (default: triton)")
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=16)
     eng.add_argument("--max-running-requests", type=int, default=8)

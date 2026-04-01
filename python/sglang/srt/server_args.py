@@ -2978,10 +2978,12 @@ class ServerArgs:
                 "decode_attention_backend": decode_attention_backend,
                 "speculative_draft_attention_backend": draft_attention_backend,
             }
+            smc_supported_backends = {"triton", "fa3"}
             unsupported_attention_backends = {
                 name: backend
                 for name, backend in smc_attention_backends.items()
-                if backend is not None and backend != "triton"
+                if backend is not None
+                and backend not in smc_supported_backends
             }
             if unsupported_attention_backends:
                 unsupported_text = ", ".join(
@@ -2989,8 +2991,9 @@ class ServerArgs:
                     for name, backend in unsupported_attention_backends.items()
                 )
                 raise ValueError(
-                    "Currently SMC speculative decoding only supports the triton "
-                    f"attention backend. Got {unsupported_text}."
+                    "Currently SMC speculative decoding only supports the "
+                    f"{smc_supported_backends} attention backends. "
+                    f"Got {unsupported_text}."
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48

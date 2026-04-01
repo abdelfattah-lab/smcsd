@@ -90,6 +90,21 @@ class SMCWorker(BaseSpecWorker):
         self.draft_runner = self._draft_worker.model_runner
         self.score_runner = self._target_worker.model_runner
 
+        # Create multi-step draft attention backend (FA3, triton, etc.)
+        # This pre-computes per-step attention metadata in one call,
+        # avoiding per-step replay_prepare overhead.
+        from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
+        # MultiStepBackend creates (num_steps - 1) sub-backends.
+        # SMC needs gamma+1 forwards, so pass gamma+2 to get gamma+1 backends.
+        factory = DraftBackendFactory(
+            server_args,
+            self.draft_runner,
+            topk=1,
+            speculative_num_steps=self.gamma + 2,
+        )
+        self.draft_attn_backend = factory.create_decode_backend()
+
         # Restore cuda graph flag and capture graphs for the draft model
         server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
@@ -198,6 +213,20 @@ class SMCWorker(BaseSpecWorker):
         )
 
         # ---- 2. Draft AR: gamma+1 decode steps ----
+        # Initialize multi-step attention metadata ONCE for all steps.
+        # Each sub-backend uses its speculative_step_id to compute the
+        # correct per-step cache_seqlens and page_table.
+        use_multistep = (
+            self.draft_attn_backend is not None and not can_cuda_graph
+        )
+        if use_multistep and not draft_fb.forward_mode.is_idle():
+            # Set spec_info and base prefix seq_lens for multi-step metadata init.
+            # Each sub-backend adds its speculative_step_id to get per-step values.
+            draft_fb.spec_info = draft_input
+            draft_fb.seq_lens = draft_input._orig_seq_lens
+            draft_fb.seq_lens_cpu = draft_input._orig_seq_lens_cpu
+            self.draft_attn_backend.init_forward_metadata(draft_fb)
+
         x0 = draft_input.verified_id  # (bs,)
         all_tokens = [x0]
         draft_logprobs = []
@@ -207,12 +236,24 @@ class SMCWorker(BaseSpecWorker):
             # Update only the fields that change per step — no GPU→CPU sync
             draft_fb.input_ids = current_ids
             draft_fb.positions = all_positions[:, step].contiguous()
-            draft_fb.seq_lens = all_seq_lens[:, step].contiguous()
-            draft_fb.seq_lens_sum = draft_input._orig_seq_lens_sum + bs * (step + 1)
             draft_fb.out_cache_loc = cache_locs[:, step].contiguous()
 
-            # model_runner.forward() uses CUDA graph when available
-            draft_out = self.draft_runner.forward(draft_fb)
+            if use_multistep:
+                # Swap to this step's pre-initialized attention backend
+                draft_fb.attn_backend = self.draft_attn_backend.attn_backends[step]
+                draft_out = self.draft_runner.forward(
+                    draft_fb, skip_attn_backend_init=True
+                )
+            else:
+                # Fallback: per-step forward with full metadata init
+                draft_fb.seq_lens = all_seq_lens[:, step].contiguous()
+                draft_fb.seq_lens_sum = (
+                    draft_input._orig_seq_lens_sum + bs * (step + 1)
+                )
+                draft_fb.seq_lens_cpu = (
+                    draft_input._orig_seq_lens_cpu + (step + 1)
+                )
+                draft_out = self.draft_runner.forward(draft_fb)
             logits = draft_out.logits_output.next_token_logits  # (bs, vocab)
 
             # Sample next token
