@@ -62,9 +62,33 @@ class BenchArgs:
     return_logprob: bool = False
     logprob_start_len: int = -1
 
+    # SSD backend options
+    ssd_temperature: float = 0.0
+    ssd_draft_temperature: Optional[float] = None
+    ssd_num_gpus: int = 1
+    ssd_speculate: bool = False
+    ssd_speculate_k: int = 6
+    ssd_draft_model: Optional[str] = None
+    ssd_draft_async: bool = False
+    ssd_async_fan_out: int = 3
+    ssd_fan_out_list: Optional[List[int]] = None
+    ssd_fan_out_list_miss: Optional[List[int]] = None
+    ssd_sampler_x: Optional[float] = None
+    ssd_backup: str = "jit"
+    ssd_kvcache_block_size: int = 256
+    ssd_max_num_seqs: int = 1
+    ssd_max_model_len: int = 8192
+    ssd_enforce_eager: bool = False
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        parser.add_argument("--backend", type=str, default=BenchArgs.backend)
+        parser.add_argument(
+            "--backend",
+            type=str,
+            default=BenchArgs.backend,
+            choices=["engine", "runtime", "ssd"],
+            help="Backend used to run offline generation.",
+        )
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
@@ -217,6 +241,89 @@ class BenchArgs:
             help="Start length for logprob. -1 means only return logprobs for output tokens (default). 0 means return logprobs for all tokens including input.",
         )
 
+        # SSD backend options
+        parser.add_argument(
+            "--ssd-temperature",
+            type=float,
+            default=BenchArgs.ssd_temperature,
+            help="Sampling temperature for the SSD backend.",
+        )
+        parser.add_argument(
+            "--ssd-draft-temperature",
+            type=float,
+            default=BenchArgs.ssd_draft_temperature,
+            help="Optional draft temperature for the SSD backend.",
+        )
+        parser.add_argument(
+            "--ssd-num-gpus", type=int, default=BenchArgs.ssd_num_gpus,
+            help="Number of GPUs for SSD tensor parallelism.",
+        )
+        parser.add_argument(
+            "--ssd-speculate", action="store_true",
+            help="Enable speculative decoding in SSD backend.",
+        )
+        parser.add_argument(
+            "--ssd-speculate-k", type=int, default=BenchArgs.ssd_speculate_k,
+            help="Number of speculative tokens for SSD.",
+        )
+        parser.add_argument(
+            "--ssd-draft-model", type=str, default=None,
+            help="Draft model path for SSD speculative decoding.",
+        )
+        parser.add_argument(
+            "--ssd-draft-async", action="store_true",
+            help="Enable async draft in SSD.",
+        )
+        parser.add_argument(
+            "--ssd-async-fan-out", type=int, default=BenchArgs.ssd_async_fan_out,
+            help="Async fan out value for SSD.",
+        )
+        parser.add_argument(
+            "--ssd-fan-out-list",
+            type=int,
+            nargs="+",
+            default=BenchArgs.ssd_fan_out_list,
+            help="Per-position fan out list for SSD async speculation.",
+        )
+        parser.add_argument(
+            "--ssd-fan-out-list-miss",
+            type=int,
+            nargs="+",
+            default=BenchArgs.ssd_fan_out_list_miss,
+            help="Per-position fan out list used on cache misses for SSD async speculation.",
+        )
+        parser.add_argument(
+            "--ssd-sampler-x",
+            type=float,
+            default=BenchArgs.ssd_sampler_x,
+            help="SSD sampler_x rescaling factor.",
+        )
+        parser.add_argument(
+            "--ssd-backup",
+            type=str,
+            choices=["jit", "fast"],
+            default=BenchArgs.ssd_backup,
+            help="SSD backup strategy. 'jit' matches SSD's native benchmark default.",
+        )
+        parser.add_argument(
+            "--ssd-kvcache-block-size",
+            type=int,
+            default=BenchArgs.ssd_kvcache_block_size,
+            help="SSD KV-cache block size.",
+        )
+        parser.add_argument(
+            "--ssd-max-num-seqs", type=int, default=BenchArgs.ssd_max_num_seqs,
+            help="Maximum batch size for SSD.",
+        )
+        parser.add_argument(
+            "--ssd-max-model-len", type=int, default=BenchArgs.ssd_max_model_len,
+            help="Maximum model length for SSD.",
+        )
+        parser.add_argument(
+            "--ssd-enforce-eager", action="store_true",
+            help="Disable CUDA graphs in SSD (eager mode).",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         attrs = [attr.name for attr in dataclasses.fields(cls)]
@@ -248,53 +355,99 @@ def throughput_test_once(
     }
 
     prompt = [r.prompt for r in reqs]
-    sampling_params = [
-        {
-            "temperature": 0,
-            "max_new_tokens": r.output_len,
-            "ignore_eos": ignore_eos,
-            **extra_request_body,
+
+    if backend_name == "ssd":
+        _, SSDSamplingParams = _import_ssd_backend()
+
+        ssd_param_fields = {
+            field.name for field in dataclasses.fields(SSDSamplingParams)
         }
-        for r in reqs
-    ]
+        protected_keys = {"max_new_tokens", "ignore_eos"}
+        unsupported_keys = sorted(set(extra_request_body) - ssd_param_fields)
+        overridden_keys = sorted(set(extra_request_body) & protected_keys)
+        if unsupported_keys:
+            logging.warning(
+                "Ignoring unsupported SSD sampling params: %s",
+                ", ".join(unsupported_keys),
+            )
+        if overridden_keys:
+            logging.warning(
+                "Ignoring SSD sampling params managed by the benchmark: %s",
+                ", ".join(overridden_keys),
+            )
+        ssd_extra_sampling_params = {
+            key: value
+            for key, value in extra_request_body.items()
+            if key in ssd_param_fields and key not in protected_keys
+        }
 
-    if profile:
-        assert (
-            "SGLANG_TORCH_PROFILER_DIR" in os.environ
-        ), "Please set SGLANG_TORCH_PROFILER_DIR."
-        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        profile_kwargs = {}
-        if profile_num_steps is not None:
-            profile_kwargs["num_steps"] = profile_num_steps
-        if profile_decode_only:
-            profile_kwargs["profile_by_stage"] = True
-            profile_kwargs["profile_stages"] = ["decode"]
-        backend.start_profile(**profile_kwargs)
+        ssd_params = [
+            SSDSamplingParams(
+                **{
+                    "temperature": 0,
+                    **ssd_extra_sampling_params,
+                    "max_new_tokens": r.output_len,
+                    "ignore_eos": ignore_eos,
+                }
+            )
+            for r in reqs
+        ]
 
-    st = time.perf_counter()
-    gen_out = backend.generate(
-        prompt=prompt,
-        sampling_params=sampling_params,
-        return_logprob=return_logprob,
-        logprob_start_len=logprob_start_len,
-    )
-    latency = time.perf_counter() - st
+        st = time.perf_counter()
+        gen_out, _ssd_metrics = backend.generate(prompt, ssd_params, use_tqdm=False)
+        latency = time.perf_counter() - st
 
-    if profile:
-        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
-        known_files = set(os.listdir(dir))
-        backend.stop_profile()
-        monitor_trace_file(known_files, dir)
+        measurement_results["total_latency"] = latency
+        measurement_results["total_output_tokens"] = sum(
+            len(o["token_ids"]) for o in gen_out
+        )
+    else:
+        sampling_params = [
+            {
+                "temperature": 0,
+                "max_new_tokens": r.output_len,
+                "ignore_eos": ignore_eos,
+                **extra_request_body,
+            }
+            for r in reqs
+        ]
 
-    if backend_name == "runtime":
-        gen_out = json.loads(gen_out)
+        if profile:
+            assert (
+                "SGLANG_TORCH_PROFILER_DIR" in os.environ
+            ), "Please set SGLANG_TORCH_PROFILER_DIR."
+            os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
+            profile_kwargs = {}
+            if profile_num_steps is not None:
+                profile_kwargs["num_steps"] = profile_num_steps
+            if profile_decode_only:
+                profile_kwargs["profile_by_stage"] = True
+                profile_kwargs["profile_stages"] = ["decode"]
+            backend.start_profile(**profile_kwargs)
 
-    server_info = backend.get_server_info()
+        st = time.perf_counter()
+        gen_out = backend.generate(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+        )
+        latency = time.perf_counter() - st
 
-    measurement_results["total_latency"] = latency
-    measurement_results["total_output_tokens"] = sum(
-        o["meta_info"]["completion_tokens"] for o in gen_out
-    )
+        if profile:
+            dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+            known_files = set(os.listdir(dir))
+            backend.stop_profile()
+            monitor_trace_file(known_files, dir)
+
+        if backend_name == "runtime":
+            gen_out = json.loads(gen_out)
+
+        measurement_results["total_latency"] = latency
+        measurement_results["total_output_tokens"] = sum(
+            o["meta_info"]["completion_tokens"] for o in gen_out
+        )
+
     measurement_results["request_throughput"] = (
         measurement_results["successful_requests"] / latency
     )
@@ -309,12 +462,17 @@ def throughput_test_once(
         + measurement_results["total_output_tokens"]
     ) / latency
 
-    if inspect.isawaitable(server_info):
-        server_info = asyncio.run(server_info)
-
-    measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
-        "last_gen_throughput"
-    ]
+    if backend_name == "ssd":
+        measurement_results["last_gen_throughput"] = (
+            measurement_results["total_output_tokens"] / latency
+        )
+    else:
+        server_info = backend.get_server_info()
+        if inspect.isawaitable(server_info):
+            server_info = asyncio.run(server_info)
+        measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
+            "last_gen_throughput"
+        ]
 
     return measurement_results
 
@@ -349,6 +507,216 @@ def monitor_trace_file(known_files, directory, interval=1):
                 time.sleep(interval)
         if flag:
             break
+
+
+def _import_ssd_backend():
+    """Import SSD from either the installed package or the repo-local source tree."""
+    import importlib
+
+    import_attempts = []
+    for module_name in ("ssd", "ssd.ssd"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            import_attempts.append(f"{module_name}: {exc!r}")
+            continue
+
+        llm_cls = getattr(module, "LLM", None)
+        sampling_params_cls = getattr(module, "SamplingParams", None)
+        if llm_cls is not None and sampling_params_cls is not None:
+            return llm_cls, sampling_params_cls
+
+        import_attempts.append(
+            f"{module_name}: missing LLM/SamplingParams exports"
+        )
+
+    raise ImportError(
+        "Failed to import SSD backend. "
+        "If you are launching from the repo root, the top-level `ssd/` directory "
+        "can shadow the installed package namespace. "
+        + "Tried "
+        + "; ".join(import_attempts)
+    )
+
+
+def _resolve_ssd_artifact_path(
+    artifact_path: Optional[str],
+    artifact_name: str,
+    require_config: bool = False,
+) -> Optional[str]:
+    """Resolve an SSD model/tokenizer path to a local directory."""
+    if not artifact_path:
+        return None
+
+    if os.path.isdir(artifact_path):
+        return _resolve_ssd_snapshot_path(
+            artifact_path,
+            artifact_name=artifact_name,
+            require_config=require_config,
+        )
+
+    if os.path.exists(artifact_path):
+        raise ValueError(
+            f"SSD {artifact_name} path exists but is not a directory: {artifact_path}"
+        )
+
+    if os.path.isabs(artifact_path) or artifact_path.startswith("."):
+        raise ValueError(f"SSD {artifact_name} path does not exist: {artifact_path}")
+
+    from huggingface_hub import snapshot_download
+
+    cache_dir = os.environ.get("SSD_HF_CACHE") or os.environ.get("HF_HUB_CACHE")
+    offline = os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true")
+    offline = offline or os.environ.get("TRANSFORMERS_OFFLINE", "").lower() in (
+        "1",
+        "true",
+    )
+
+    logging.info(
+        "Resolving SSD %s repo '%s' to a local snapshot...",
+        artifact_name,
+        artifact_path,
+    )
+    resolved_path = snapshot_download(
+        repo_id=artifact_path,
+        cache_dir=cache_dir,
+        token=os.environ.get("HF_TOKEN") or None,
+        local_files_only=offline,
+        library_name="sglang",
+    )
+    logging.info(
+        "Resolved SSD %s repo '%s' to '%s'",
+        artifact_name,
+        artifact_path,
+        resolved_path,
+    )
+    return _resolve_ssd_snapshot_path(
+        resolved_path,
+        artifact_name=artifact_name,
+        require_config=require_config,
+    )
+
+
+def _resolve_ssd_snapshot_path(
+    base_path: str,
+    artifact_name: str,
+    require_config: bool,
+) -> str:
+    """Resolve a local SSD artifact path to a snapshot directory when possible."""
+    if not os.path.isdir(base_path):
+        return base_path
+
+    if not require_config or os.path.exists(os.path.join(base_path, "config.json")):
+        return base_path
+
+    snapshots_dir = os.path.join(base_path, "snapshots")
+    if os.path.isdir(snapshots_dir):
+        for item in sorted(os.listdir(snapshots_dir)):
+            candidate = os.path.join(snapshots_dir, item)
+            if os.path.isdir(candidate) and os.path.exists(
+                os.path.join(candidate, "config.json")
+            ):
+                return candidate
+
+    for item in sorted(os.listdir(base_path)):
+        candidate = os.path.join(base_path, item)
+        if os.path.isdir(candidate) and os.path.exists(
+            os.path.join(candidate, "config.json")
+        ):
+            return candidate
+
+    if require_config:
+        raise ValueError(
+            f"SSD {artifact_name} path does not contain a snapshot with config.json: "
+            f"{base_path}"
+        )
+    return base_path
+
+
+def _infer_ssd_model_family(model_ref: str) -> str:
+    model_ref_lower = model_ref.lower()
+    if "llama" in model_ref_lower:
+        return "llama"
+    if "qwen" in model_ref_lower:
+        return "qwen"
+    return "unknown"
+
+
+def _resolve_ssd_draft_model_ref(
+    target_model_ref: str,
+    requested_draft_ref: Optional[str],
+) -> Optional[str]:
+    """Resolve SSD draft selection using the same defaults as SSD's native benchmark."""
+    target_family = _infer_ssd_model_family(target_model_ref)
+
+    draft_aliases = {
+        "llama": {
+            "1": "meta-llama/Llama-3.2-1B-Instruct",
+            "3": "meta-llama/Llama-3.2-3B-Instruct",
+            "8": "meta-llama/Llama-3.1-8B-Instruct",
+            "70": "meta-llama/Llama-3.1-70B-Instruct",
+        },
+        "qwen": {
+            "0.6": "Qwen/Qwen3-0.6B",
+            "1": "meta-llama/Llama-3.2-1B-Instruct",
+        },
+    }
+    default_drafts = {
+        "llama": "meta-llama/Llama-3.2-1B-Instruct",
+        "qwen": "Qwen/Qwen3-0.6B",
+    }
+
+    if requested_draft_ref:
+        if (
+            requested_draft_ref in draft_aliases.get(target_family, {})
+            and "/" not in requested_draft_ref
+            and not os.path.exists(requested_draft_ref)
+        ):
+            return draft_aliases[target_family][requested_draft_ref]
+        return requested_draft_ref
+
+    if target_family not in default_drafts:
+        raise ValueError(
+            "SSD speculative decoding needs a draft model, but the benchmark could not "
+            f"infer a default draft for target model '{target_model_ref}'. "
+            "Please pass --ssd-draft-model explicitly."
+        )
+
+    default_draft_ref = default_drafts[target_family]
+    logging.info(
+        "Using default SSD draft model '%s' for target model '%s'",
+        default_draft_ref,
+        target_model_ref,
+    )
+    return default_draft_ref
+
+
+def _validate_ssd_args(bench_args: BenchArgs):
+    if bench_args.ssd_draft_async and not bench_args.ssd_speculate:
+        raise ValueError("--ssd-draft-async requires --ssd-speculate")
+    if bench_args.ssd_sampler_x is not None and not bench_args.ssd_draft_async:
+        raise ValueError("--ssd-sampler-x requires --ssd-draft-async")
+    if bench_args.ssd_fan_out_list is not None and not bench_args.ssd_draft_async:
+        raise ValueError("--ssd-fan-out-list requires --ssd-draft-async")
+    if bench_args.ssd_fan_out_list_miss is not None and not bench_args.ssd_draft_async:
+        raise ValueError("--ssd-fan-out-list-miss requires --ssd-draft-async")
+    expected_fan_out_len = bench_args.ssd_speculate_k + 1
+    if (
+        bench_args.ssd_fan_out_list is not None
+        and len(bench_args.ssd_fan_out_list) != expected_fan_out_len
+    ):
+        raise ValueError(
+            f"--ssd-fan-out-list must have length {expected_fan_out_len} "
+            f"(ssd_speculate_k + 1), got {len(bench_args.ssd_fan_out_list)}"
+        )
+    if (
+        bench_args.ssd_fan_out_list_miss is not None
+        and len(bench_args.ssd_fan_out_list_miss) != expected_fan_out_len
+    ):
+        raise ValueError(
+            f"--ssd-fan-out-list-miss must have length {expected_fan_out_len} "
+            f"(ssd_speculate_k + 1), got {len(bench_args.ssd_fan_out_list_miss)}"
+        )
 
 
 def _create_ray_engine_backend(server_args: ServerArgs):
@@ -426,6 +794,10 @@ def throughput_test(
     if bench_args.profile:
         os.environ.setdefault("SGLANG_PROFILE_V2", "1")
 
+    ssd_model_path = None
+    ssd_draft_model = None
+    ssd_tokenizer_path = None
+
     if bench_args.backend == "engine":
         if server_args.use_ray:
             backend = _create_ray_engine_backend(server_args)
@@ -435,10 +807,53 @@ def throughput_test(
             raise ValueError("Please provide valid engine arguments")
     elif bench_args.backend == "runtime":
         backend = Runtime(**dataclasses.asdict(server_args))
-    else:
-        raise ValueError('Please set backend to either "engine" or "runtime"')
+    elif bench_args.backend == "ssd":
+        _validate_ssd_args(bench_args)
+        SSDLLM, _ = _import_ssd_backend()
+        ssd_model_path = _resolve_ssd_artifact_path(
+            server_args.model_path,
+            "target model",
+            require_config=True,
+        )
+        if bench_args.ssd_speculate:
+            ssd_draft_model_ref = _resolve_ssd_draft_model_ref(
+                ssd_model_path or server_args.model_path,
+                bench_args.ssd_draft_model,
+            )
+            ssd_draft_model = _resolve_ssd_artifact_path(
+                ssd_draft_model_ref,
+                "draft model",
+                require_config=True,
+            )
+        ssd_tokenizer_path = _resolve_ssd_artifact_path(
+            server_args.tokenizer_path, "tokenizer"
+        )
 
-    tokenizer_id = server_args.tokenizer_path or server_args.model_path
+        backend = SSDLLM(
+            ssd_model_path,
+            num_gpus=bench_args.ssd_num_gpus,
+            speculate=bench_args.ssd_speculate,
+            speculate_k=bench_args.ssd_speculate_k,
+            draft=ssd_draft_model,
+            draft_async=bench_args.ssd_draft_async,
+            async_fan_out=bench_args.ssd_async_fan_out,
+            fan_out_list=bench_args.ssd_fan_out_list,
+            fan_out_list_miss=bench_args.ssd_fan_out_list_miss,
+            sampler_x=bench_args.ssd_sampler_x,
+            jit_speculate=(bench_args.ssd_backup == "jit"),
+            kvcache_block_size=bench_args.ssd_kvcache_block_size,
+            max_num_seqs=bench_args.ssd_max_num_seqs,
+            max_model_len=bench_args.ssd_max_model_len,
+            enforce_eager=bench_args.ssd_enforce_eager,
+            tokenizer_path=ssd_tokenizer_path,
+        )
+    else:
+        raise ValueError('Please set backend to "engine", "runtime", or "ssd"')
+
+    if bench_args.backend == "ssd":
+        tokenizer_id = ssd_tokenizer_path or ssd_model_path
+    else:
+        tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
     # Set global environments
@@ -449,7 +864,17 @@ def throughput_test(
     # Parse args
     extra_request_body = {}
     if bench_args.extra_request_body:
-        extra_request_body = json.loads(args.extra_request_body)
+        extra_request_body = json.loads(bench_args.extra_request_body)
+    if bench_args.backend == "ssd":
+        extra_request_body = {
+            "temperature": bench_args.ssd_temperature,
+            **(
+                {"draft_temperature": bench_args.ssd_draft_temperature}
+                if bench_args.ssd_draft_temperature is not None
+                else {}
+            ),
+            **extra_request_body,
+        }
 
     # Read dataset
     input_requests = get_dataset(bench_args, tokenizer)
@@ -491,7 +916,10 @@ def throughput_test(
         return_logprob=bench_args.return_logprob,
         logprob_start_len=bench_args.logprob_start_len,
     )
-    backend.shutdown()
+    if bench_args.backend == "ssd":
+        backend.exit(hard=False)
+    else:
+        backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:

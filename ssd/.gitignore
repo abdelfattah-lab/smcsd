@@ -1,0 +1,46 @@
+# Python bytecode / extensions
+__pycache__/
+*.py[cod]
+*.so
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and local runtime outputs
+logs/
+*.log
+*.out
+*.err
+
+# Project runtime artifacts
+wandb/
+wandb_runs/
+bench/tmp*/
+bench/results/
+plots/
+profile/
+summaries/
+
+# Temporary / scratch
+tmp/
+tmp*/
