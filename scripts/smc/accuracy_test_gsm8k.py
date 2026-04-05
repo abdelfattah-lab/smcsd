@@ -414,6 +414,8 @@ def run_engine_eval(args, prompts, labels):
         engine_kwargs["page_size"] = 1
         engine_kwargs["attention_backend"] = args.attention_backend
         engine_kwargs["smc_resampling_overlap"] = True
+        if args.resample_threshold is not None:
+            engine_kwargs["smc_resample_threshold"] = args.resample_threshold
         if args.pingpong:
             engine_kwargs["smc_pingpong_overlap"] = True
     if args.mem_fraction_static is not None:
@@ -600,6 +602,10 @@ if __name__ == "__main__":
     )
     smc_grp.add_argument(
         "--seed", type=int, default=None, help="numpy seed for reproducibility"
+    )
+    smc_grp.add_argument(
+        "--resample-threshold", type=float, default=None,
+        help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
     )
     smc_grp.add_argument(
         "--pingpong", action="store_true",
