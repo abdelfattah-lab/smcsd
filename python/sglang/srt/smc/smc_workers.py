@@ -257,16 +257,15 @@ class SMCWorker(BaseSpecWorker):
             logits = draft_out.logits_output.next_token_logits  # (bs, vocab)
 
             # Sample next token
+            scaled_logits = logits / self.smc_draft_temperature
+            log_probs = torch.log_softmax(scaled_logits, dim=-1)
             if self.smc_draft_temperature > 0:
-                probs = torch.softmax(logits / self.smc_draft_temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                next_token = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
             else:
-                probs = torch.softmax(logits, dim=-1)
                 next_token = torch.argmax(logits, dim=-1)
 
             # Collect logprob (only first gamma steps)
             if step < gamma:
-                log_probs = torch.log(probs + 1e-8)
                 token_logprob = log_probs.gather(1, next_token.unsqueeze(1)).squeeze(1)
                 draft_logprobs.append(token_logprob)
 
