@@ -383,9 +383,9 @@ class SMCResampler:
             )
             src_indices = resample_t[ancestors_t.long()]
             mask = resample_t != src_indices
-            if not mask.any().item():
-                continue
             dst_list = resample_t[mask].tolist()
+            if not dst_list:
+                continue
             src_list = src_indices[mask].tolist()
             evictions = list(zip(dst_list, src_list))
 
@@ -557,12 +557,8 @@ class SMCResampler:
     def _sample_ancestors(self, normalized_weights: torch.Tensor) -> torch.Tensor:
         """Returns ancestor indices as a GPU tensor."""
         if self.smc_manager.server_args.smc_resample_method == "multinomial":
-            result = multinomial_resample(normalized_weights, device=self.device)
-        else:
-            result = systematic_resample(normalized_weights, device=self.device)
-        if not isinstance(result, torch.Tensor):
-            return torch.tensor(result, dtype=torch.int64, device=self.device)
-        return result
+            return multinomial_resample(normalized_weights, device=self.device)
+        return systematic_resample(normalized_weights, device=self.device)
 
     def _stall_group_reqs(
         self,
