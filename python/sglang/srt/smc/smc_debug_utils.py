@@ -7,6 +7,9 @@ import time
 _SMC_DIAG_PATH_ENV = "SGLANG_SMC_DIAG_PATH"
 _SMC_PROBE_RECORD_PATH_ENV = "SGLANG_SMC_PROBE_RECORD_PATH"
 
+smc_diag_enabled = bool(os.environ.get(_SMC_DIAG_PATH_ENV))
+smc_probe_enabled = bool(os.environ.get(_SMC_PROBE_RECORD_PATH_ENV))
+
 
 def _append_jsonl_record(env_var_name: str, record: dict) -> None:
     record_path = os.environ.get(env_var_name)

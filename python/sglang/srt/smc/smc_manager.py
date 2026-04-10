@@ -14,7 +14,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.smc.smc_debug_utils import append_smc_diag_record
+from sglang.srt.smc.smc_debug_utils import append_smc_diag_record, smc_diag_enabled
 from sglang.srt.smc.smc_info import SMCDraftInput
 from sglang.srt.smc.smc_utils import (
     _release_internal_req,
@@ -363,23 +363,24 @@ class SMCManager:
                 best_finish_reason = finish_reason
                 best_finished_len = finished_len
 
-        append_smc_diag_record(
-            {
-                "type": "finalize_group",
-                "group_id": group_id,
-                "log_weights": [float(x) for x in group.log_weights.tolist()],
-                "best_idx": best_idx,
-                "particle_output_ids": {
-                    str(particle_idx): (
-                        list(group.finished_particles[particle_idx].output_ids)
-                        if particle_idx in group.finished_particles
-                        else list(req.output_ids)
-                    )
-                    for particle_idx, req in group.particle_reqs.items()
-                },
-                "best_output_ids": list(best_output_ids),
-            }
-        )
+        if smc_diag_enabled:
+            append_smc_diag_record(
+                {
+                    "type": "finalize_group",
+                    "group_id": group_id,
+                    "log_weights": [float(x) for x in group.log_weights.tolist()],
+                    "best_idx": best_idx,
+                    "particle_output_ids": {
+                        str(particle_idx): (
+                            list(group.finished_particles[particle_idx].output_ids)
+                            if particle_idx in group.finished_particles
+                            else list(req.output_ids)
+                        )
+                        for particle_idx, req in group.particle_reqs.items()
+                    },
+                    "best_output_ids": list(best_output_ids),
+                }
+            )
 
         # Release KV cache and req_pool entries for all particle requests.
         # Particles that were already released during decode (finished early)

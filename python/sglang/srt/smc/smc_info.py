@@ -332,7 +332,7 @@ class SMCDraftInput(SpecInput):
         # seq_lens = PREFIX ONLY (KV already in target model cache).
         # Draft tokens are handled via EXTEND-style causal self-attention.
         orig_seq_lens = self._orig_seq_lens
-        orig_seq_lens_cpu = orig_seq_lens.cpu()
+        orig_seq_lens_cpu = self._orig_seq_lens_cpu  # cached from prepare_for_decode
 
         # Positions: [seq_len, seq_len+1, ..., seq_len+gamma] per request
         step_offsets = torch.arange(draft_token_num, device=device)
@@ -343,7 +343,7 @@ class SMCDraftInput(SpecInput):
             draft_token_num=draft_token_num,
             positions=positions,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            seq_lens_sum=orig_seq_lens.sum().item(),
+            seq_lens_sum=self._orig_seq_lens_sum,  # cached from prepare_for_decode
             seq_lens_cpu=orig_seq_lens_cpu,
             num_tokens_per_req=draft_token_num,
         )

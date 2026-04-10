@@ -423,8 +423,8 @@ def run_engine_eval(args, prompts, labels):
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
     elif args.mode == "smc":
-        # max_running_requests must be >= particles to avoid deadlock
-        engine_kwargs["max_running_requests"] = max(args.particles, 8)
+        # Need headroom above particle count for scheduling overlap
+        engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
 
     sampling_params = {"max_new_tokens": args.max_new_tokens}
 

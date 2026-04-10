@@ -194,31 +194,50 @@ def effective_sample_size(
     return float(1.0 / torch.sum(weights_t * weights_t).item())
 
 
+def should_resample(
+    normalized_weights: torch.Tensor,
+    n_particles: int,
+    threshold: float,
+    device: Optional[torch.device | str] = None,
+) -> bool:
+    """Fused ESS threshold check — does comparison on GPU, syncs only the boolean."""
+    weights_t = torch.as_tensor(normalized_weights, dtype=torch.float64, device=device)
+    if weights_t.numel() == 0:
+        return False
+    # ESS = 1 / sum(w^2).  Resample when ESS < n * threshold.
+    # Equivalent: sum(w^2) > 1 / (n * threshold)
+    sum_sq = torch.sum(weights_t * weights_t)
+    return bool((sum_sq > 1.0 / (n_particles * threshold)).item())
+
+
 def systematic_resample(
     weights: Sequence[float] | torch.Tensor,
     device: Optional[torch.device | str] = None,
-) -> List[int]:
+) -> torch.Tensor:
+    """Returns ancestor indices as a GPU tensor (no GPU→CPU sync)."""
     weights_t = torch.as_tensor(weights, dtype=torch.float64, device=device)
     if weights_t.numel() == 0:
-        return []
+        return torch.empty(0, dtype=torch.int64, device=device)
     cdf = torch.cumsum(weights_t, dim=0)
-    step = 1.0 / weights_t.numel()
-    start = torch.rand((), dtype=torch.float64).item() * step
+    n = weights_t.numel()
+    step = 1.0 / n
+    start = torch.rand((), dtype=torch.float64, device=weights_t.device) * step
     positions = start + step * torch.arange(
-        weights_t.numel(),
+        n,
         dtype=torch.float64,
         device=weights_t.device,
     )
-    return torch.searchsorted(cdf, positions, right=False).tolist()
+    return torch.searchsorted(cdf, positions, right=False)
 
 
 def multinomial_resample(
     weights: Sequence[float] | torch.Tensor,
     device: Optional[torch.device | str] = None,
-) -> List[int]:
+) -> torch.Tensor:
+    """Returns ancestor indices as a GPU tensor (no GPU→CPU sync)."""
     weights_t = torch.as_tensor(weights, dtype=torch.float64, device=device)
     if weights_t.numel() == 0:
-        return []
+        return torch.empty(0, dtype=torch.int64, device=device)
     return torch.multinomial(
         weights_t, num_samples=weights_t.numel(), replacement=True
-    ).tolist()
+    )

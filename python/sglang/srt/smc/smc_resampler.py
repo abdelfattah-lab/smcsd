@@ -11,12 +11,15 @@ from sglang.srt.managers.schedule_batch import Req, SMCGroupSpan, ScheduleBatch
 from sglang.srt.smc.smc_debug_utils import (
     append_smc_diag_record,
     append_smc_probe_record,
+    smc_diag_enabled,
+    smc_probe_enabled,
 )
 from sglang.srt.smc.smc_manager import SMCFinishedParticleSnapshot
 from sglang.srt.smc.smc_utils import (
     effective_sample_size,
     multinomial_resample,
     normalize_log_weights,
+    should_resample,
     systematic_resample,
 )
 
@@ -288,15 +291,16 @@ class SMCResampler:
             for p in pidxs:
                 group.step_counts[p] += 1
 
-        append_smc_diag_record(
-            {
-                "type": "group_update",
-                "group_id": group.group_id,
-                "particle_indices": [req.smc_particle_idx for req in reqs],
-                "logprob_diffs": [float(x) for x in logprob_diffs.tolist()],
-                "step_counts": list(group.step_counts),
-            }
-        )
+        if smc_diag_enabled:
+            append_smc_diag_record(
+                {
+                    "type": "group_update",
+                    "group_id": group.group_id,
+                    "particle_indices": [req.smc_particle_idx for req in reqs],
+                    "logprob_diffs": [float(x) for x in logprob_diffs.tolist()],
+                    "step_counts": list(group.step_counts),
+                }
+            )
 
         if not group.all_active_aligned():
             return None
@@ -337,51 +341,55 @@ class SMCResampler:
             normalized_weights = normalize_log_weights(
                 group_log_weights, device=self.device
             )
-            ess = effective_sample_size(normalized_weights, device=self.device)
-            append_smc_diag_record(
-                {
-                    "type": "resample_check",
-                    "group_id": group.group_id,
-                    "resample_indices": list(resample_indices),
-                    "active_indices": list(active_indices),
-                    "log_weights": [float(x) for x in group_log_weights.tolist()],
-                    "normalized_weights": [
-                        float(x) for x in normalized_weights.tolist()
-                    ],
-                    "ess": float(ess),
-                }
+            threshold = self.smc_manager.server_args.smc_resample_threshold
+            needs_resample = should_resample(
+                normalized_weights, len(resample_indices), threshold, device=self.device
             )
-            if (
-                ess
-                >= len(resample_indices)
-                * self.smc_manager.server_args.smc_resample_threshold
-            ):
+            if smc_diag_enabled:
+                ess = effective_sample_size(normalized_weights, device=self.device)
+                append_smc_diag_record(
+                    {
+                        "type": "resample_check",
+                        "group_id": group.group_id,
+                        "resample_indices": list(resample_indices),
+                        "active_indices": list(active_indices),
+                        "log_weights": [float(x) for x in group_log_weights.tolist()],
+                        "normalized_weights": [
+                            float(x) for x in normalized_weights.tolist()
+                        ],
+                        "ess": float(ess),
+                    }
+                )
+            if not needs_resample:
                 continue
 
-            ancestors = self._sample_ancestors(normalized_weights)
-            append_smc_diag_record(
-                {
-                    "type": "resample_choice",
-                    "group_id": group.group_id,
-                    "resample_indices": list(resample_indices),
-                    "active_indices": list(active_indices),
-                    "ancestors": list(ancestors),
-                }
-            )
-            evictions = [
-                (dst_idx, resample_indices[src_pos])
-                for dst_idx, src_pos in zip(resample_indices, ancestors, strict=True)
-                if dst_idx != resample_indices[src_pos]
-            ]
-            if not evictions:
-                continue
+            ancestors_t = self._sample_ancestors(normalized_weights)
+            if smc_diag_enabled:
+                append_smc_diag_record(
+                    {
+                        "type": "resample_choice",
+                        "group_id": group.group_id,
+                        "resample_indices": list(resample_indices),
+                        "active_indices": list(active_indices),
+                        "ancestors": ancestors_t.tolist(),
+                    }
+                )
 
-            active_tensor = torch.tensor(
+            # Compute evictions on GPU, sync once
+            resample_t = torch.tensor(
                 resample_indices,
                 dtype=torch.int64,
-                device=group.log_weights.device,
+                device=self.device,
             )
-            group.log_weights[active_tensor] = 0.0
+            src_indices = resample_t[ancestors_t.long()]
+            mask = resample_t != src_indices
+            if not mask.any().item():
+                continue
+            dst_list = resample_t[mask].tolist()
+            src_list = src_indices[mask].tolist()
+            evictions = list(zip(dst_list, src_list))
+
+            group.log_weights[resample_t] = 0.0
 
             stalled_reqs = [group.particle_reqs[idx] for idx in active_indices]
             self._stall_group_reqs(group_id, stalled_reqs, scheduler)
@@ -546,10 +554,15 @@ class SMCResampler:
         result_queue = getattr(scheduler, "result_queue", None)
         return result_queue is not None and len(result_queue) > 0
 
-    def _sample_ancestors(self, normalized_weights: torch.Tensor) -> List[int]:
+    def _sample_ancestors(self, normalized_weights: torch.Tensor) -> torch.Tensor:
+        """Returns ancestor indices as a GPU tensor."""
         if self.smc_manager.server_args.smc_resample_method == "multinomial":
-            return multinomial_resample(normalized_weights, device=self.device)
-        return systematic_resample(normalized_weights, device=self.device)
+            result = multinomial_resample(normalized_weights, device=self.device)
+        else:
+            result = systematic_resample(normalized_weights, device=self.device)
+        if not isinstance(result, torch.Tensor):
+            return torch.tensor(result, dtype=torch.int64, device=self.device)
+        return result
 
     def _stall_group_reqs(
         self,
@@ -602,14 +615,15 @@ class SMCResampler:
         scheduler,
         pending: PendingResample,
     ) -> None:
-        append_smc_probe_record(
-            {
-                "type": "resample_launch",
-                "group_id": group.group_id,
-                "active_particles": len(group.active_particle_indices()),
-                "num_evictions": len(evictions),
-            }
-        )
+        if smc_probe_enabled:
+            append_smc_probe_record(
+                {
+                    "type": "resample_launch",
+                    "group_id": group.group_id,
+                    "active_particles": len(group.active_particle_indices()),
+                    "num_evictions": len(evictions),
+                }
+            )
         req_to_token = scheduler.req_to_token_pool.req_to_token
         staged_snapshots: Dict[int, dict] = {}
         staged_copies: Dict[int, torch.Tensor] = {}
