@@ -416,14 +416,15 @@ def run_engine_eval(args, prompts, labels):
         engine_kwargs["smc_resampling_overlap"] = True
         if args.resample_threshold is not None:
             engine_kwargs["smc_resample_threshold"] = args.resample_threshold
-        if args.pingpong:
-            engine_kwargs["smc_pingpong_overlap"] = True
     if args.mem_fraction_static is not None:
         engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
     if args.cuda_graph_max_bs is not None:
         engine_kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
+    elif args.mode == "smc":
+        # max_running_requests must be >= particles to avoid deadlock
+        engine_kwargs["max_running_requests"] = max(args.particles, 8)
 
     sampling_params = {"max_new_tokens": args.max_new_tokens}
 
@@ -607,11 +608,6 @@ if __name__ == "__main__":
         "--resample-threshold", type=float, default=None,
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
     )
-    smc_grp.add_argument(
-        "--pingpong", action="store_true",
-        help="use ping-pong double-buffer scheduler (multi-group overlap)",
-    )
-
     # Benchmark
     bench = parser.add_argument_group("benchmark")
     bench.add_argument("--num-questions", type=int, default=20)
@@ -625,7 +621,7 @@ if __name__ == "__main__":
                       help="attention backend for SMC mode (default: triton)")
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=16)
-    eng.add_argument("--max-running-requests", type=int, default=8)
+    eng.add_argument("--max-running-requests", type=int, default=None)
 
     # Native mode memory splits
     nat = parser.add_argument_group("native mode memory")

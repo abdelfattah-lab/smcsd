@@ -76,12 +76,6 @@ def parse_args() -> argparse.Namespace:
         help="Use the experimental SMC overlap scheduler instead of the baseline normal SMC scheduler.",
     )
     parser.add_argument(
-        "--pingpong",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use the experimental pingpong scheduling instead of the baseline normal SMC scheduler.",
-    )
-    parser.add_argument(
         "--prompt",
         action="append",
         dest="prompts",
@@ -199,7 +193,6 @@ def main() -> None:
         smc_draft_temperature=0.8,
         smc_target_temperature=0.8,
         smc_resampling_overlap=args.smc_resampling_overlap,
-        smc_pingpong_overlap=args.pingpong
     ) as engine:
         server_info = engine.get_server_info()
         write_json(run_dir / "server_info.json", server_info)

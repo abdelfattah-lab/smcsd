@@ -506,7 +506,6 @@ class ServerArgs:
     smc_resample_threshold: float = 0.5
     smc_resample_method: Literal["systematic", "multinomial"] = "systematic"
     smc_resampling_overlap: bool = False
-    smc_pingpong_overlap: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -3008,8 +3007,6 @@ class ServerArgs:
             # Normal SMC uses the v1 (non-overlap) worker contract —
             # no result_queue, no forward_stream, synchronous resampling.
             # Overlap SMC uses the v2 contract for CPU/GPU pipelining.
-            if self.smc_pingpong_overlap:
-                self.smc_resampling_overlap = True
             self.disable_overlap_schedule = not self.smc_resampling_overlap
             if self.smc_resampling_overlap:
                 logger.warning(
@@ -4874,15 +4871,6 @@ class ServerArgs:
             default=ServerArgs.smc_resampling_overlap,
             help="Enable the experimental SMC overlap scheduler. By default "
             "SMC uses the baseline normal scheduler policy.",
-        )
-
-        parser.add_argument(
-            "--smc-pingpong-overlap",
-            action="store_true",
-            default=ServerArgs.smc_pingpong_overlap,
-            help="Enable ping-pong double-buffer SMC overlap scheduler. "
-            "Targets multi-group workloads where groups forward/resample "
-            "in alternating slots. Implies --smc-resampling-overlap.",
         )
 
         # Speculative decoding (ngram)
