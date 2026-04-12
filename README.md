@@ -4,6 +4,8 @@ This repository implements **Sequential Monte Carlo Speculative Decoding (SMC-SD
 
 Paper: *Accelerating LLM Inference with Sequential Monte Carlo*
 
+<img width="772" height="424" alt="image" src="https://github.com/user-attachments/assets/3cda3320-e257-4079-99b3-93e3a7bec627" />
+
 ## Installation
 
 ```bash
