@@ -448,6 +448,28 @@ def throughput_test_once(
             o["meta_info"]["completion_tokens"] for o in gen_out
         )
 
+    # Aggregate speculative decoding acceptance metrics
+    accept_lengths = [
+        o["meta_info"]["spec_accept_length"]
+        for o in gen_out
+        if isinstance(o.get("meta_info"), dict)
+        and "spec_accept_length" in o["meta_info"]
+    ]
+    if accept_lengths:
+        measurement_results["avg_spec_accept_length"] = sum(accept_lengths) / len(
+            accept_lengths
+        )
+    accept_rates = [
+        o["meta_info"]["spec_accept_rate"]
+        for o in gen_out
+        if isinstance(o.get("meta_info"), dict)
+        and "spec_accept_rate" in o["meta_info"]
+    ]
+    if accept_rates:
+        measurement_results["avg_spec_accept_rate"] = sum(accept_rates) / len(
+            accept_rates
+        )
+
     measurement_results["request_throughput"] = (
         measurement_results["successful_requests"] / latency
     )
@@ -960,6 +982,19 @@ def throughput_test(
             "Total token throughput (tok/s):", result["total_throughput"]
         )
     )
+    if "avg_spec_accept_length" in result:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Avg spec accept length (E[L_acc]+1):",
+                result["avg_spec_accept_length"],
+            )
+        )
+    if "avg_spec_accept_rate" in result:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Avg spec accept rate:", result["avg_spec_accept_rate"]
+            )
+        )
     print("=" * 50)
 
     return result
