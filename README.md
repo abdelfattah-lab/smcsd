@@ -1,5 +1,7 @@
 # SMC Speculative Decoding
 
+> **Warning:** This repository is under active development. APIs, configuration flags, and internal interfaces may go through breaking changes.
+
 This repository implements **Sequential Monte Carlo Speculative Decoding (SMC-SD)** on top of [SGLang](https://github.com/sgl-project/sglang). SMC-SD is a population-based alternative to rejection-based speculative decoding: N particles maintain parallel generation paths, weighted by target/draft likelihood ratios, and resampled when effective sample size drops. All drafted tokens are accepted (no rejection), and throughput scales with batch size by increasing arithmetic intensity toward the GPU compute bound.
 
 Paper: *Accelerating LLM Inference with Sequential Monte Carlo*
