@@ -20,19 +20,6 @@ uv pip install -e "python"
 
 ## Quick Start
 
-```bash
-# SMC-SD accuracy on GSM8K (N=12 particles, gamma=8)
-python scripts/smc/accuracy_test_gsm8k.py \
-  --mode smc \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --draft-model meta-llama/Llama-3.2-1B-Instruct \
-  --particles 12 --gamma 8 \
-  --temperature 0.7 \
-  --attention-backend fa3 \
-  --num-questions 400
-```
-
-### ShareGPT Throughput
 
 ```bash
 # SMC-SD throughput on ShareGPT (batch size 1)
@@ -44,10 +31,22 @@ python -O -m sglang.bench_offline_throughput \
   --smc-draft-temperature 0.7 --smc-target-temperature 0.7 \
   --attention-backend fa3 \
   --mem-fraction-static 0.60 \
-  --max-running-requests 8 \
-  --cuda-graph-max-bs 8 \
+  --max-running-requests 16 \
+  --cuda-graph-max-bs 16 \
   --dataset-name sharegpt \
   --num-prompts 200
+```
+
+```bash
+# SMC-SD accuracy on GSM8K (N=12 particles, gamma=8)
+python scripts/smc/accuracy_test_gsm8k.py \
+  --mode smc \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --particles 12 --gamma 8 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 400
 ```
 
 ## SMC-SD Parameters

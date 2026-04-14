@@ -28,8 +28,8 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-14B-Instruct"
-DEFAULT_DRAFT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
 
 # ---------------------------------------------------------------------------

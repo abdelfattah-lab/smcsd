@@ -11,8 +11,8 @@ import argparse
 import os
 import sglang as sgl
 
-TARGET_MODEL = "Qwen/Qwen2.5-14B-Instruct"
-DRAFT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+TARGET_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 PROMPTS = [
     "The capital of France is",
     "Write one sentence about why speculative decoding matters for inference systems.",

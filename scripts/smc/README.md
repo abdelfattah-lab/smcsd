@@ -38,8 +38,8 @@ Key flags for `accuracy_test_gsm8k.py`:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--mode` | `smc` | `smc` (engine-level) or `baseline` |
-| `--model` | `Qwen/Qwen2.5-14B-Instruct` | Target model |
-| `--draft-model` | `Qwen/Qwen2.5-3B-Instruct` | Draft model for SMC mode |
+| `--model` | `meta-llama/Llama-3.1-8B-Instruct` | Target model |
+| `--draft-model` | `meta-llama/Llama-3.2-1B-Instruct` | Draft model for SMC mode |
 | `-N` / `--particles` | `4` | Number of SMC particles |
 | `-g` / `--gamma` | `4` | Draft tokens per step |
 | `--temperature` | `0.7` | Draft temperature |
