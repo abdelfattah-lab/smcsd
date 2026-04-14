@@ -4,7 +4,7 @@ This directory contains ad hoc entrypoints for SMC (Sequential Monte Carlo) spec
 
 ## Scripts
 
-- **`accuracy_test_gsm8k.py`** — GSM8K accuracy benchmark comparing engine-level SMC, native (Python-level) SMC, and vanilla baseline generation.
+- **`accuracy_test_gsm8k.py`** — GSM8K accuracy benchmark comparing engine-level SMC and vanilla baseline generation.
 - **`quick_quality_check.py`** — Quick output quality sanity check (vanilla vs SMC) on a handful of hardcoded prompts.
 - **`smc_profile_engine.py`** — Offline `sgl.Engine(...)` profiler harness for SMC scheduler variants. Emits Chrome-compatible traces.
 - **`bench_tputs_smc.sh`** — Single-config SMC throughput benchmark (quick one-off runs).
@@ -23,9 +23,6 @@ python scripts/smc/accuracy_test_gsm8k.py --mode smc -N 8 -g 32 --num-questions 
 # Baseline (no speculative decoding) for comparison
 python scripts/smc/accuracy_test_gsm8k.py --mode baseline --num-questions 200
 
-# Native/external SMC (Python-level reference, slower but inspectable)
-python scripts/smc/accuracy_test_gsm8k.py --mode native -N 8 -g 32 --num-questions 200
-
 # Full test set (1319 questions)
 python scripts/smc/accuracy_test_gsm8k.py --mode smc -N 8 -g 32 --num-questions 1319
 
@@ -40,9 +37,9 @@ python scripts/smc/accuracy_test_gsm8k.py --mode smc \
 Key flags for `accuracy_test_gsm8k.py`:
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--mode` | `smc` | `smc` (engine-level), `native` (Python-level), or `baseline` |
-| `--model` | `Qwen/Qwen2.5-0.5B-Instruct` | Target model |
-| `--draft-model` | same as `--model` | Draft model for SMC modes |
+| `--mode` | `smc` | `smc` (engine-level) or `baseline` |
+| `--model` | `Qwen/Qwen2.5-14B-Instruct` | Target model |
+| `--draft-model` | `Qwen/Qwen2.5-3B-Instruct` | Draft model for SMC mode |
 | `-N` / `--particles` | `4` | Number of SMC particles |
 | `-g` / `--gamma` | `4` | Draft tokens per step |
 | `--temperature` | `0.7` | Draft temperature |

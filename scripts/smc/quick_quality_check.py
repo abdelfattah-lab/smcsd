@@ -12,7 +12,8 @@ import argparse
 import os
 import sglang as sgl
 
-MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+TARGET_MODEL = "Qwen/Qwen2.5-14B-Instruct"
+DRAFT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 PROMPTS = [
     "The capital of France is",
     "Write one sentence about why overlap scheduling matters for inference systems.",
@@ -27,7 +28,7 @@ def run_vanilla(prompts, sampling_params):
     print("VANILLA (no spec decode)")
     print("=" * 60)
     engine = sgl.Engine(
-        model_path=MODEL,
+        model_path=TARGET_MODEL,
         mem_fraction_static=0.45,
         attention_backend="triton",
     )
@@ -45,9 +46,9 @@ def run_smc(prompts, sampling_params, args):
     )
     print("=" * 60)
     engine = sgl.Engine(
-        model_path=MODEL,
+        model_path=TARGET_MODEL,
         speculative_algorithm="SMC",
-        speculative_draft_model_path=MODEL,
+        speculative_draft_model_path=DRAFT_MODEL,
         smc_n_particles=args.particles,
         smc_gamma=args.gamma,
         smc_draft_temperature=max(args.temperature, 0.01),
@@ -71,11 +72,6 @@ def main():
     parser.add_argument("--mode", choices=["vanilla", "smc", "both"], default="both")
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--gamma", type=int, default=4)
-    parser.add_argument(
-        "--smc-resampling-overlap",
-        action="store_true",
-        help="Use the experimental SMC overlap scheduler instead of the baseline normal SMC scheduler.",
-    )
     args = parser.parse_args()
 
     sampling_params = {
