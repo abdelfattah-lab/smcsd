@@ -5,7 +5,6 @@ Examples:
   source .venv/bin/activate
   python scripts/smc/smc_profile_engine.py --output-dir /tmp/sglang-smc-profile
   python scripts/smc/smc_profile_engine.py --profile-v2 --decode-only
-  python scripts/smc/smc_profile_engine.py --smc-resampling-overlap
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ DEFAULT_MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_PATH = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_PROMPTS = [
     "The capital of France is",
-    "Write one sentence about why overlap scheduling matters for inference systems.",
+    "Write one sentence about why speculative decoding matters for inference systems.",
     "List two prime numbers and one composite number.",
     "In one short paragraph, explain speculative decoding.",
 ]
@@ -69,12 +68,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--smc-n-particles", type=int, default=8)
     parser.add_argument("--smc-gamma", type=int, default=8)
-    parser.add_argument(
-        "--smc-resampling-overlap",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use the experimental SMC overlap scheduler instead of the baseline normal SMC scheduler.",
-    )
     parser.add_argument(
         "--prompt",
         action="append",
@@ -126,7 +119,6 @@ def summarize_server_info(server_info: dict[str, Any]) -> dict[str, Any]:
     return {
         "model_path": server_info.get("model_path"),
         "speculative_algorithm": server_info.get("speculative_algorithm"),
-        "disable_overlap_schedule": server_info.get("disable_overlap_schedule"),
         "smc_n_particles": server_info.get("smc_n_particles"),
         "smc_gamma": server_info.get("smc_gamma"),
         "avg_spec_accept_length": first_state.get("avg_spec_accept_length"),

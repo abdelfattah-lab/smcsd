@@ -5,7 +5,6 @@ Usage:
   python scripts/smc/quick_quality_check.py --temperature 0.8
   python scripts/smc/quick_quality_check.py --temperature 0.0 --mode smc
   python scripts/smc/quick_quality_check.py --mode both
-  python scripts/smc/quick_quality_check.py --mode smc --smc-resampling-overlap
 """
 
 import argparse
@@ -16,7 +15,7 @@ TARGET_MODEL = "Qwen/Qwen2.5-14B-Instruct"
 DRAFT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 PROMPTS = [
     "The capital of France is",
-    "Write one sentence about why overlap scheduling matters for inference systems.",
+    "Write one sentence about why speculative decoding matters for inference systems.",
     "List two prime numbers and one composite number.",
     "In one short paragraph, explain speculative decoding.",
     "What is 1+1?",
