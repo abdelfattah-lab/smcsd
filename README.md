@@ -89,3 +89,11 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for a detailed design o
 }
 ```
 
+## Roadmap
+
+- [ ] EAGLE support
+- [ ] Async/Delayed resampling (CPU/GPU overlap for KV cache rewrites)
+- [ ] Disaggregation (draft/target separation)
+
+PRs welcome!
+
