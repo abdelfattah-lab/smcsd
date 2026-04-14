@@ -413,7 +413,6 @@ def run_engine_eval(args, prompts, labels):
         engine_kwargs["smc_target_temperature"] = args.temperature
         engine_kwargs["page_size"] = 1
         engine_kwargs["attention_backend"] = args.attention_backend
-        engine_kwargs["smc_resampling_overlap"] = True
         if args.resample_threshold is not None:
             engine_kwargs["smc_resample_threshold"] = args.resample_threshold
     if args.mem_fraction_static is not None:

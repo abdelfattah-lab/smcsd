@@ -505,7 +505,6 @@ class ServerArgs:
     smc_target_temperature: float = 1.0
     smc_resample_threshold: float = 0.5
     smc_resample_method: Literal["systematic", "multinomial"] = "systematic"
-    smc_resampling_overlap: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -3004,20 +3003,7 @@ class ServerArgs:
             self.speculative_eagle_topk = 1
             self.speculative_num_steps = self.smc_gamma
             self.speculative_num_draft_tokens = self.smc_gamma + 1
-            # Normal SMC uses the v1 (non-overlap) worker contract —
-            # no result_queue, no forward_stream, synchronous resampling.
-            # Overlap SMC uses the v2 contract for CPU/GPU pipelining.
-            self.disable_overlap_schedule = not self.smc_resampling_overlap
-            if self.smc_resampling_overlap:
-                logger.warning(
-                    "SMC resampling-overlap scheduler is enabled."
-                )
-            else:
-                logger.warning(
-                    "SMC uses the normal scheduler policy by default. Set "
-                    "--smc-resampling-overlap to enable the experimental SMC "
-                    "overlap scheduler."
-                )
+            self.disable_overlap_schedule = True
             if self.speculative_draft_model_path is None:
                 raise ValueError(
                     "SMC speculative decoding requires --speculative-draft-model-path."
@@ -4865,14 +4851,6 @@ class ServerArgs:
             default=ServerArgs.smc_resample_method,
             help="Resampling method for SMC speculative decoding.",
         )
-        parser.add_argument(
-            "--smc-resampling-overlap",
-            action="store_true",
-            default=ServerArgs.smc_resampling_overlap,
-            help="Enable the experimental SMC overlap scheduler. By default "
-            "SMC uses the baseline normal scheduler policy.",
-        )
-
         # Speculative decoding (ngram)
         parser.add_argument(
             "--speculative-ngram-min-match-window-size",

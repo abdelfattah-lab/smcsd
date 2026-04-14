@@ -1,7 +1,6 @@
 """Unit tests for SMC helper state and resampling utilities."""
 
 from collections import deque
-from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest import TestCase
@@ -33,7 +32,7 @@ from sglang.srt.smc.smc_utils import (
     systematic_resample,
     validate_smc_parent_req,
 )
-from sglang.srt.smc.smc_resampler import PendingResample, SMCResampler
+from sglang.srt.smc.smc_resampler import SMCResampler
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-cpu-only")
@@ -349,397 +348,6 @@ class TestSMCResampler(TestCase):
 
         self.assertIsNone(build_smc_group_spans([req0, req1, req2]))
 
-    def test_should_delay_admission_is_disabled_without_stalled_bucket(self):
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-
-        self.assertFalse(scheduler.should_delay_admission(running_req_count=0, group_size=4))
-        self.assertFalse(scheduler.should_delay_admission(running_req_count=8, group_size=4))
-
-    def test_should_delay_admission_when_it_worsens_bucket_balance(self):
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-        scheduler.resampling_reqs["g1"] = [
-            SimpleNamespace(),
-            SimpleNamespace(),
-            SimpleNamespace(),
-            SimpleNamespace(),
-        ]
-
-        self.assertFalse(scheduler.should_delay_admission(running_req_count=0, group_size=4))
-        self.assertFalse(scheduler.should_delay_admission(running_req_count=4, group_size=0))
-        self.assertTrue(scheduler.should_delay_admission(running_req_count=4, group_size=4))
-        self.assertTrue(scheduler.should_delay_admission(running_req_count=8, group_size=4))
-
-    def test_complete_resample_waits_for_done_event_and_enqueues_group_for_running(self):
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-
-        req0 = _make_scheduler_req(
-            group_id="g1",
-            particle_idx=0,
-            req_pool_idx=0,
-            output_ids=[10],
-            kv_indices=[101],
-        )
-        req1 = _make_scheduler_req(
-            group_id="g1",
-            particle_idx=1,
-            req_pool_idx=1,
-            output_ids=[20],
-            kv_indices=[201],
-        )
-        manager.groups["g1"] = SMCGroupState(
-            group_id="g1",
-            parent_req=SimpleNamespace(),
-            particle_reqs={0: req0, 1: req1},
-            log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts=[0, 0],
-        )
-
-        order = []
-        done_event = object()
-        allocator = SimpleNamespace(
-            inc_ref=lambda indices: order.append(("inc", indices.clone())),
-            dec_ref_and_free=lambda indices: order.append(("dec", indices.clone())),
-        )
-        other_req = SimpleNamespace(rid="other")
-        live_scheduler = SimpleNamespace(
-            schedule_stream=SimpleNamespace(
-                wait_event=lambda event: order.append(("wait", event))
-            ),
-            running_batch=_FakeRunningBatch([other_req]),
-            token_to_kv_pool_allocator=allocator,
-        )
-        scheduler.resampling_reqs["g1"] = [req0, req1]
-
-        pending = PendingResample(
-            group_id="g1",
-            dst_reqs=[req1],
-            src_snapshots=[
-                {
-                    "indices": torch.tensor([101], dtype=torch.int64),
-                    "output_ids": [10],
-                    "finished_reason": None,
-                    "finished_len": None,
-                    "finished_output": None,
-                    "to_finish": None,
-                    "kv_committed_len": 1,
-                    "cache_protected_len": 1,
-                    "logprob_start_len": 0,
-                }
-            ],
-            inc_ref=[torch.tensor([101], dtype=torch.int64)],
-            dec_ref=[torch.tensor([201], dtype=torch.int64)],
-            done_event=done_event,
-        )
-        scheduler.pending_resamples["g1"] = pending
-
-        scheduler._complete_resample("g1", pending, live_scheduler)
-
-        self.assertEqual(order[0], ("wait", done_event))
-        self.assertEqual([op for op, _ in order[1:3]], ["inc", "dec"])
-        self.assertEqual(live_scheduler.running_batch.reqs, [other_req])
-        self.assertEqual(list(scheduler.wait_for_running), ["g1"])
-        self.assertEqual(scheduler._wait_for_running_members, {"g1"})
-        self.assertNotIn("g1", scheduler.resampling_reqs)
-
-    def test_finish_pending_before_idle_blocks_until_resamples_complete(self):
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-
-        done_event = MagicMock()
-        pending = PendingResample(group_id="g1", done_event=done_event)
-        scheduler.pending_resamples["g1"] = pending
-        scheduler._launch_pending_resamples = MagicMock()
-        scheduler._complete_resample = MagicMock(
-            side_effect=lambda group_id, *_args: scheduler.pending_resamples.pop(
-                group_id, None
-            )
-        )
-        scheduler._drain_wait_for_running = MagicMock()
-        live_scheduler = SimpleNamespace()
-
-        self.assertTrue(scheduler.finish_pending_before_idle(live_scheduler))
-        scheduler._launch_pending_resamples.assert_called_once_with(live_scheduler)
-        done_event.synchronize.assert_called_once_with()
-        scheduler._complete_resample.assert_called_once_with(
-            "g1", pending, live_scheduler
-        )
-        scheduler._drain_wait_for_running.assert_called_once_with(live_scheduler)
-
-    def test_event_loop_overlap_clears_last_batch_before_idle_continue(self):
-        class _StopLoop(Exception):
-            pass
-
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-
-        copied_batch = SimpleNamespace(tag="copied-batch")
-        decode_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(
-                is_decode=lambda: True,
-                is_extend=lambda: False,
-            ),
-            spec_algorithm=SimpleNamespace(is_smc=lambda: True),
-            copy=lambda: copied_batch,
-        )
-        smc_resampler = SimpleNamespace()
-        smc_resampler.step_before_forward = MagicMock()
-        smc_resampler.step_after_forward = MagicMock()
-        smc_resampler.finish_pending_before_idle = MagicMock(
-            side_effect=[False, True, False]
-        )
-
-        recv_count = 0
-
-        def _recv_requests():
-            nonlocal recv_count
-            recv_count += 1
-            if recv_count >= 4:
-                raise _StopLoop()
-            return []
-
-        next_batches = deque([decode_batch, None, None])
-        processed = []
-        live_scheduler = SimpleNamespace(
-            _engine_paused=False,
-            last_batch=None,
-            cur_batch=None,
-            is_generation=False,
-            smc_resampler=smc_resampler,
-            recv_requests=_recv_requests,
-            process_input_requests=lambda _reqs: None,
-            get_next_batch_to_run=lambda: next_batches.popleft(),
-            is_disable_overlap_for_batch=lambda _batch: False,
-            run_batch=lambda _batch: "batch-result",
-            cancel_bubble_timer=lambda: None,
-            process_batch_result=lambda batch, result: processed.append((batch, result)),
-            launch_batch_sample_if_needed=lambda _batch_result: None,
-            self_check_during_idle=lambda: None,
-            result_queue=deque(),
-        )
-
-        with self.assertRaises(_StopLoop):
-            Scheduler.event_loop_overlap(live_scheduler)
-
-        self.assertEqual(processed, [(copied_batch, "batch-result")])
-        self.assertIsNone(live_scheduler.last_batch)
-
-    def test_drain_wait_for_running_drops_stale_head_and_admits_next_group(self):
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-
-        req0 = _make_scheduler_req(
-            group_id="g2",
-            particle_idx=0,
-            req_pool_idx=0,
-            output_ids=[10],
-            kv_indices=[101],
-        )
-        req1 = _make_scheduler_req(
-            group_id="g2",
-            particle_idx=1,
-            req_pool_idx=1,
-            output_ids=[20],
-            kv_indices=[201],
-        )
-        manager.groups["g2"] = SMCGroupState(
-            group_id="g2",
-            parent_req=SimpleNamespace(),
-            particle_reqs={0: req0, 1: req1},
-            log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts=[0, 0],
-        )
-
-        scheduler.enqueue_group_for_running("stale")
-        scheduler.enqueue_group_for_running("g2")
-        live_scheduler = SimpleNamespace(
-            running_batch=_FakeRunningBatch([]),
-            server_args=SimpleNamespace(pp_max_micro_batch_size=8),
-        )
-        rebuilt_batch = SimpleNamespace(reqs=[req0, req1], is_empty=lambda: False)
-        manager._build_particle_batch = MagicMock(return_value=rebuilt_batch)
-
-        scheduler._drain_wait_for_running(live_scheduler)
-
-        self.assertIs(live_scheduler.running_batch, rebuilt_batch)
-        self.assertFalse(scheduler.wait_for_running)
-        self.assertFalse(scheduler._wait_for_running_members)
-        manager._build_particle_batch.assert_called_once_with(
-            [req0, req1],
-            live_scheduler,
-            use_future_map=False,
-        )
-
-    def test_drain_wait_for_running_respects_fifo_when_balance_blocks_head(self):
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-
-        blocked_req0 = _make_scheduler_req(
-            group_id="g1",
-            particle_idx=0,
-            req_pool_idx=0,
-            output_ids=[10],
-            kv_indices=[101],
-        )
-        blocked_req1 = _make_scheduler_req(
-            group_id="g1",
-            particle_idx=1,
-            req_pool_idx=1,
-            output_ids=[20],
-            kv_indices=[201],
-        )
-        trailing_req0 = _make_scheduler_req(
-            group_id="g2",
-            particle_idx=0,
-            req_pool_idx=2,
-            output_ids=[30],
-            kv_indices=[301],
-        )
-        trailing_req1 = _make_scheduler_req(
-            group_id="g2",
-            particle_idx=1,
-            req_pool_idx=3,
-            output_ids=[40],
-            kv_indices=[401],
-        )
-        manager.groups["g1"] = SMCGroupState(
-            group_id="g1",
-            parent_req=SimpleNamespace(),
-            particle_reqs={0: blocked_req0, 1: blocked_req1},
-            log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts=[0, 0],
-        )
-        manager.groups["g2"] = SMCGroupState(
-            group_id="g2",
-            parent_req=SimpleNamespace(),
-            particle_reqs={0: trailing_req0, 1: trailing_req1},
-            log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts=[0, 0],
-        )
-
-        scheduler.resampling_reqs["stalled"] = [SimpleNamespace(), SimpleNamespace()]
-        scheduler.enqueue_group_for_running("g1")
-        scheduler.enqueue_group_for_running("g2")
-        live_scheduler = SimpleNamespace(
-            running_batch=_FakeRunningBatch(
-                [
-                    _make_scheduler_req(
-                        group_id="running",
-                        particle_idx=0,
-                        req_pool_idx=4,
-                        output_ids=[50],
-                        kv_indices=[501],
-                    ),
-                    _make_scheduler_req(
-                        group_id="running",
-                        particle_idx=1,
-                        req_pool_idx=5,
-                        output_ids=[60],
-                        kv_indices=[601],
-                    ),
-                ]
-            ),
-            server_args=SimpleNamespace(pp_max_micro_batch_size=8),
-        )
-        manager._build_particle_batch = MagicMock()
-
-        scheduler._drain_wait_for_running(live_scheduler)
-
-        self.assertEqual([req.smc_group_id for req in live_scheduler.running_batch.reqs], ["running", "running"])
-        self.assertEqual(list(scheduler.wait_for_running), ["g1", "g2"])
-        manager._build_particle_batch.assert_not_called()
-
-    def test_running_smc_req_count_ignores_processed_last_batch_without_overlap_queue(self):
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-        live_scheduler = SimpleNamespace(
-            running_batch=_FakeRunningBatch(
-                [
-                    _make_scheduler_req(
-                        group_id="running",
-                        particle_idx=0,
-                        req_pool_idx=0,
-                        output_ids=[10],
-                        kv_indices=[101],
-                    )
-                ]
-            ),
-            last_batch=SimpleNamespace(
-                reqs=[
-                    _make_scheduler_req(
-                        group_id="last",
-                        particle_idx=0,
-                        req_pool_idx=1,
-                        output_ids=[20],
-                        kv_indices=[201],
-                    )
-                ],
-                forward_mode=SimpleNamespace(is_extend=lambda: True),
-                spec_algorithm=SimpleNamespace(is_smc=lambda: True),
-                count_smc_particle_reqs=lambda: 1,
-            ),
-            result_queue=[],
-        )
-
-        self.assertEqual(scheduler._running_smc_req_count(live_scheduler), 1)
-        self.assertEqual(scheduler._remaining_req_capacity(live_scheduler), 1 << 30)
-
-    def test_running_smc_req_count_includes_pending_overlap_last_batch(self):
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-        live_scheduler = SimpleNamespace(
-            running_batch=_FakeRunningBatch(
-                [
-                    _make_scheduler_req(
-                        group_id="running",
-                        particle_idx=0,
-                        req_pool_idx=0,
-                        output_ids=[10],
-                        kv_indices=[101],
-                    )
-                ]
-            ),
-            last_batch=SimpleNamespace(
-                reqs=[
-                    _make_scheduler_req(
-                        group_id="last",
-                        particle_idx=0,
-                        req_pool_idx=1,
-                        output_ids=[20],
-                        kv_indices=[201],
-                    )
-                ],
-                forward_mode=SimpleNamespace(is_extend=lambda: True),
-                spec_algorithm=SimpleNamespace(is_smc=lambda: True),
-                count_smc_particle_reqs=lambda: 1,
-                batch_size=lambda: 1,
-            ),
-            result_queue=[object()],
-            server_args=SimpleNamespace(pp_max_micro_batch_size=3),
-        )
-
-        self.assertEqual(scheduler._running_smc_req_count(live_scheduler), 2)
-        self.assertEqual(scheduler._remaining_req_capacity(live_scheduler), 1)
-
     def test_on_batch_done_uses_atomic_group_fast_path_for_contiguous_groups(self):
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=0.0, smc_resample_method="systematic")
@@ -801,7 +409,6 @@ class TestSMCResampler(TestCase):
 
         self.assertEqual(finalized, [])
         mock_grouped.assert_not_called()
-        # log_weight updates are deferred; flush to verify correctness
         manager.groups["g1"].flush_pending_diffs()
         manager.groups["g2"].flush_pending_diffs()
         self.assertTrue(
@@ -818,130 +425,19 @@ class TestSMCResampler(TestCase):
         )
         self.assertEqual(manager.groups["g1"].step_counts, [1, 1])
         self.assertEqual(manager.groups["g2"].step_counts, [1, 1])
-        # Always-resample: aligned groups with >1 active particle are marked
         self.assertEqual(scheduler._groups_needing_resample, {"g1", "g2"})
 
     @patch("sglang.srt.smc.smc_resampler.systematic_resample")
-    def test_step_resamples_and_reinserts_group_with_matching_future_mode(
+    def test_step_before_forward_resamples_inline_and_resumes(
         self,
         mock_systematic_resample,
     ):
-        mock_systematic_resample.return_value = [0, 0]
+        mock_systematic_resample.return_value = torch.tensor([0, 0])
 
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
         )
         scheduler = SMCResampler(manager, device="cpu")
-        scheduler.init_streams(enable_overlap=False)
-
-        req0 = _make_scheduler_req(
-            group_id="g1",
-            particle_idx=0,
-            req_pool_idx=0,
-            output_ids=[10, 11],
-            kv_indices=[101, 102],
-        )
-        req1 = _make_scheduler_req(
-            group_id="g1",
-            particle_idx=1,
-            req_pool_idx=1,
-            output_ids=[20],
-            kv_indices=[201],
-        )
-        manager.groups["g1"] = SMCGroupState(
-            group_id="g1",
-            parent_req=SimpleNamespace(),
-            particle_reqs={0: req0, 1: req1},
-            log_weights=torch.zeros(2, dtype=torch.float64),
-            step_counts=[0, 0],
-        )
-
-        req_to_token = torch.tensor(
-            [
-                [101, 102, 0, 0],
-                [201, 0, 0, 0],
-                [301, 0, 0, 0],
-            ],
-            dtype=torch.int32,
-        )
-        allocator = _FakeAllocator()
-        live_scheduler = SimpleNamespace(
-            running_batch=_FakeRunningBatch(
-                [req0, req1, SimpleNamespace(rid="other")],
-                future_indices=SimpleNamespace(indices=torch.tensor([1])),
-                batch_is_full=True,
-            ),
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=req_to_token,
-                write=lambda indices, values: req_to_token.__setitem__(indices, values),
-            ),
-            token_to_kv_pool_allocator=allocator,
-        )
-        manager.req_to_token_pool = live_scheduler.req_to_token_pool
-        rebuilt_batch = SimpleNamespace(reqs=[req0, req1])
-        manager._build_particle_batch = MagicMock(return_value=rebuilt_batch)
-
-        finalized = scheduler.on_batch_done(
-            [req0, req1],
-            torch.tensor([9.0, 0.0], dtype=torch.float32),
-        )
-        self.assertEqual(finalized, [])
-
-        scheduler.step(live_scheduler)
-
-        self.assertEqual(live_scheduler.running_batch.reqs[0].rid, "other")
-        self.assertEqual(live_scheduler.running_batch.reqs[1:], [req0, req1])
-        self.assertEqual(req1.output_ids, req0.output_ids)
-        self.assertTrue(
-            torch.equal(
-                req_to_token[req1.req_pool_idx, : req0.kv_committed_len],
-                req_to_token[req0.req_pool_idx, : req0.kv_committed_len],
-            )
-        )
-        self.assertEqual(len(allocator.dec_calls), 1)
-        self.assertEqual(len(allocator.inc_calls), 1)
-        self.assertTrue(
-            torch.equal(allocator.dec_calls[0], torch.tensor([201], dtype=torch.int64))
-        )
-        self.assertTrue(
-            torch.equal(allocator.inc_calls[0], torch.tensor([101, 102], dtype=torch.int64))
-        )
-        self.assertTrue(
-            torch.equal(
-                manager.groups["g1"].log_weights,
-                torch.zeros(2, dtype=torch.float64),
-            )
-        )
-        manager._build_particle_batch.assert_called_once_with(
-            [req0, req1],
-            live_scheduler,
-            use_future_map=True,
-        )
-
-    @patch("sglang.srt.smc.smc_resampler.systematic_resample")
-    def test_step_before_forward_stalls_group_before_next_launch(
-        self,
-        mock_systematic_resample,
-    ):
-        mock_systematic_resample.return_value = [0, 0]
-
-        manager = SMCManager(
-            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
-        )
-        scheduler = SMCResampler(manager, device="cpu")
-
-        class _FakePendingEvent:
-            def record(self):
-                return None
-
-            def query(self):
-                return False
-
-        scheduler.resample_stream = object()
-        scheduler.device_module = SimpleNamespace(
-            stream=lambda _stream: nullcontext(),
-            Event=lambda: _FakePendingEvent(),
-        )
 
         req0 = _make_scheduler_req(
             group_id="g1",
@@ -971,6 +467,7 @@ class TestSMCResampler(TestCase):
             dtype=torch.int32,
         )
         allocator = _FakeAllocator()
+        resumed_batch = SimpleNamespace(reqs=[req0, req1], is_empty=lambda: False)
         live_scheduler = SimpleNamespace(
             running_batch=_FakeRunningBatch([req0, req1, other_req], batch_is_full=True),
             req_to_token_pool=SimpleNamespace(
@@ -980,7 +477,7 @@ class TestSMCResampler(TestCase):
             token_to_kv_pool_allocator=allocator,
         )
         manager.req_to_token_pool = live_scheduler.req_to_token_pool
-        manager._build_particle_batch = MagicMock()
+        manager._build_particle_batch = MagicMock(return_value=resumed_batch)
 
         scheduler.on_batch_done(
             [req0, req1],
@@ -988,23 +485,20 @@ class TestSMCResampler(TestCase):
         )
         scheduler.step_before_forward(live_scheduler)
 
-        self.assertEqual(live_scheduler.running_batch.reqs, [other_req])
-        self.assertEqual(scheduler.resampling_reqs["g1"], [req0, req1])
-        self.assertIn("g1", scheduler.pending_resamples)
-        manager._build_particle_batch.assert_not_called()
+        manager._build_particle_batch.assert_called_once()
+        self.assertIn(other_req, live_scheduler.running_batch.reqs)
 
     @patch("sglang.srt.smc.smc_resampler.systematic_resample")
     def test_step_skips_stall_when_resample_has_no_evictions(
         self,
         mock_systematic_resample,
     ):
-        mock_systematic_resample.return_value = [0, 1]
+        mock_systematic_resample.return_value = torch.tensor([0, 1])
 
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
         )
         scheduler = SMCResampler(manager, device="cpu")
-        scheduler.init_streams(enable_overlap=False)
 
         req0 = _make_scheduler_req(
             group_id="g1",
@@ -1046,11 +540,9 @@ class TestSMCResampler(TestCase):
             [req0, req1],
             torch.tensor([9.0, 0.0], dtype=torch.float32),
         )
-        scheduler.step(live_scheduler)
+        scheduler.step_before_forward(live_scheduler)
 
         self.assertEqual(live_scheduler.running_batch.reqs, [req0, req1])
-        self.assertFalse(scheduler.resampling_reqs)
-        self.assertFalse(scheduler.pending_resamples)
         manager._build_particle_batch.assert_not_called()
         self.assertTrue(
             torch.equal(
@@ -1068,7 +560,6 @@ class TestSMCResampler(TestCase):
             SimpleNamespace(smc_resample_threshold=0.1, smc_resample_method="systematic")
         )
         scheduler = SMCResampler(manager, device="cpu")
-        scheduler.init_streams(enable_overlap=False)
 
         req0 = _make_scheduler_req(
             group_id="g1",
@@ -1109,12 +600,10 @@ class TestSMCResampler(TestCase):
             [req0, req1],
             torch.tensor([9.0, 0.0], dtype=torch.float32),
         )
-        scheduler.step(live_scheduler)
+        scheduler.step_before_forward(live_scheduler)
 
         mock_systematic_resample.assert_not_called()
         self.assertEqual(live_scheduler.running_batch.reqs, [req0, req1])
-        self.assertFalse(scheduler.resampling_reqs)
-        self.assertFalse(scheduler.pending_resamples)
         self.assertTrue(
             torch.equal(
                 manager.groups["g1"].log_weights,
@@ -1127,13 +616,12 @@ class TestSMCResampler(TestCase):
         self,
         mock_systematic_resample,
     ):
-        mock_systematic_resample.return_value = [0, 0]
+        mock_systematic_resample.return_value = torch.tensor([0, 0])
 
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
         )
         scheduler = SMCResampler(manager, device="cpu")
-        scheduler.init_streams(enable_overlap=False)
 
         req0 = _make_scheduler_req(
             group_id="g1",
@@ -1174,7 +662,7 @@ class TestSMCResampler(TestCase):
             [req0, req1],
             torch.tensor([9.0, 0.0], dtype=torch.float32),
         )
-        scheduler.step(live_scheduler)
+        scheduler.step_before_forward(live_scheduler)
 
         self.assertIs(live_scheduler.running_batch, rebuilt_batch)
         manager._build_particle_batch.assert_called_once_with(
@@ -1188,13 +676,12 @@ class TestSMCResampler(TestCase):
         self,
         mock_systematic_resample,
     ):
-        mock_systematic_resample.return_value = [1, 0]
+        mock_systematic_resample.return_value = torch.tensor([1, 0])
 
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
         )
         scheduler = SMCResampler(manager, device="cpu")
-        scheduler.init_streams(enable_overlap=False)
 
         req0 = _make_scheduler_req(
             group_id="g1",
@@ -1250,7 +737,7 @@ class TestSMCResampler(TestCase):
             [req0, req1],
             torch.tensor([9.0, 0.0], dtype=torch.float32),
         )
-        scheduler.step(live_scheduler)
+        scheduler.step_before_forward(live_scheduler)
 
         self.assertEqual(req0.output_ids, [20, 21])
         self.assertEqual(req1.output_ids, [10, 11])
@@ -1285,13 +772,12 @@ class TestSMCResampler(TestCase):
         self,
         mock_systematic_resample,
     ):
-        mock_systematic_resample.return_value = [1, 1]
+        mock_systematic_resample.return_value = torch.tensor([1, 1])
 
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
         )
         scheduler = SMCResampler(manager, device="cpu")
-        scheduler.init_streams(enable_overlap=False)
 
         req0 = _make_scheduler_req(
             group_id="g1",
@@ -1347,7 +833,6 @@ class TestSMCResampler(TestCase):
             running_batch=_FakeRunningBatch([req0]),
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
-            schedule_stream=SimpleNamespace(wait_event=lambda _event: None),
             stream_output=MagicMock(),
         )
         manager.req_to_token_pool = req_to_token_pool
@@ -1357,27 +842,25 @@ class TestSMCResampler(TestCase):
             [req0],
             torch.tensor([0.0], dtype=torch.float32),
         )
-        scheduler.step(live_scheduler)
+        scheduler.step_before_forward(live_scheduler)
 
         self.assertIsNone(manager.get_group("g1"))
         self.assertEqual(parent_req.output_ids, [20])
         self.assertEqual(parent_req.finished_reason.type, finish_reason.type)
         parent_req.time_stats.set_completion_time.assert_called_once_with()
         live_scheduler.stream_output.assert_called_once_with([parent_req], False)
-        self.assertFalse(scheduler.wait_for_running)
 
     @patch("sglang.srt.smc.smc_resampler.systematic_resample")
     def test_step_trims_stale_overalloc_before_reinsert(
         self,
         mock_systematic_resample,
     ):
-        mock_systematic_resample.return_value = [0, 0]
+        mock_systematic_resample.return_value = torch.tensor([0, 0])
 
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
         )
         scheduler = SMCResampler(manager, device="cpu")
-        scheduler.init_streams(enable_overlap=False)
 
         req0 = _make_scheduler_req(
             group_id="g1",
@@ -1420,7 +903,7 @@ class TestSMCResampler(TestCase):
             [req0, req1],
             torch.tensor([9.0, 0.0], dtype=torch.float32),
         )
-        scheduler.step(live_scheduler)
+        scheduler.step_before_forward(live_scheduler)
 
         self.assertEqual(req0.kv_allocated_len, req0.kv_committed_len)
         self.assertEqual(req1.kv_allocated_len, req1.kv_committed_len)
@@ -1440,13 +923,12 @@ class TestSMCResampler(TestCase):
         self,
         mock_systematic_resample,
     ):
-        mock_systematic_resample.return_value = [0, 0]
+        mock_systematic_resample.return_value = torch.tensor([0, 0])
 
         manager = SMCManager(
             SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
         )
         scheduler = SMCResampler(manager, device="cpu")
-        scheduler.init_streams(enable_overlap=False)
 
         req0 = _make_scheduler_req(
             group_id="g1",
@@ -1489,7 +971,7 @@ class TestSMCResampler(TestCase):
             [req0, req1],
             torch.tensor([9.0, 0.0], dtype=torch.float32),
         )
-        scheduler.step(live_scheduler)
+        scheduler.step_before_forward(live_scheduler)
 
         self.assertEqual(req0.kv_allocated_len, req0.kv_committed_len)
         self.assertEqual(req1.kv_allocated_len, req1.kv_committed_len)
@@ -1503,6 +985,61 @@ class TestSMCResampler(TestCase):
         self.assertTrue(
             torch.equal(allocator.dec_calls[2], torch.tensor([201], dtype=torch.int64))
         )
+
+    def test_event_loop_overlap_clears_last_batch_before_idle_continue(self):
+        class _StopLoop(Exception):
+            pass
+
+        manager = SMCManager(
+            SimpleNamespace(smc_resample_threshold=1.0, smc_resample_method="systematic")
+        )
+
+        copied_batch = SimpleNamespace(tag="copied-batch")
+        decode_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: True,
+                is_extend=lambda: False,
+            ),
+            spec_algorithm=SimpleNamespace(is_smc=lambda: True),
+            copy=lambda: copied_batch,
+        )
+        smc_resampler = SimpleNamespace()
+        smc_resampler.step_before_forward = MagicMock()
+
+        recv_count = 0
+
+        def _recv_requests():
+            nonlocal recv_count
+            recv_count += 1
+            if recv_count >= 4:
+                raise _StopLoop()
+            return []
+
+        next_batches = deque([decode_batch, None, None])
+        processed = []
+        live_scheduler = SimpleNamespace(
+            _engine_paused=False,
+            last_batch=None,
+            cur_batch=None,
+            is_generation=False,
+            smc_resampler=smc_resampler,
+            recv_requests=_recv_requests,
+            process_input_requests=lambda _reqs: None,
+            get_next_batch_to_run=lambda: next_batches.popleft(),
+            is_disable_overlap_for_batch=lambda _batch: False,
+            run_batch=lambda _batch: "batch-result",
+            cancel_bubble_timer=lambda: None,
+            process_batch_result=lambda batch, result: processed.append((batch, result)),
+            launch_batch_sample_if_needed=lambda _batch_result: None,
+            self_check_during_idle=lambda: None,
+            result_queue=deque(),
+        )
+
+        with self.assertRaises(_StopLoop):
+            Scheduler.event_loop_overlap(live_scheduler)
+
+        self.assertEqual(processed, [(copied_batch, "batch-result")])
+        self.assertIsNone(live_scheduler.last_batch)
 
 
 class TestValidateSMCParentReq(TestCase):
@@ -1519,6 +1056,8 @@ class TestValidateSMCParentReq(TestCase):
         req.return_hidden_states = False
         req.sampling_params.stop_strs = ["stop"]
         self.assertIn("stop strings", validate_smc_parent_req(req))
+
+
 class TestGenerationBatchResult(TestCase):
     def test_copy_to_cpu_moves_logprob_diff(self):
         copied_diffs = object()

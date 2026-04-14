@@ -51,7 +51,7 @@ class SMCGroupState:
     def flush_pending_diffs(self) -> None:
         """Apply all deferred log_weight updates to the GPU tensor.
 
-        Called from _launch_pending_resamples (overlapped) or _finalize_group.
+        Called from _launch_pending_resamples (synchronous) or _finalize_group.
         This is the only place GPU log_weight kernels fire.
         """
         if not self.pending_diffs:

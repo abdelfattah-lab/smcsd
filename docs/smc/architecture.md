@@ -84,8 +84,6 @@ For each eviction `(dst, src)` where dst is being overwritten by src:
 
 After resampling, dst and src share the same physical KV slots (like prefix sharing).
 
-In **overlap mode**, KV copies run on a separate `resample_stream` while the forward pass continues on other groups -- a `done_event` synchronizes completion.
-
 ---
 
 ## seq_lens Lifecycle
@@ -153,7 +151,7 @@ After (weights reset to 0):
   P3: "The answer is 42..."     w=0  (cloned from P0)
 ```
 
-During resampling, stalled particles are removed from `running_batch` and held in `resampling_reqs`. After KV row copies and state restore, they re-enter the batch.
+During resampling, all group particles are removed from `running_batch`. After KV row copies and state restore, active particles re-enter the batch.
 
 ---
 

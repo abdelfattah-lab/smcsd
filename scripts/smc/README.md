@@ -76,7 +76,6 @@ source .venv/bin/activate
 
 python scripts/smc/quick_quality_check.py                              # both vanilla and SMC
 python scripts/smc/quick_quality_check.py --mode smc                   # SMC only
-python scripts/smc/quick_quality_check.py --mode smc --smc-resampling-overlap  # overlap scheduler
 python scripts/smc/quick_quality_check.py --temperature 0.8            # custom temperature
 ```
 
@@ -87,10 +86,8 @@ source .venv/bin/activate
 
 python scripts/smc/smc_profile_engine.py --output-dir /tmp/sglang-smc-profile
 python scripts/smc/smc_profile_engine.py --profile-v2 --decode-only
-python scripts/smc/smc_profile_engine.py --smc-resampling-overlap
 ```
 
 ## Notes
 
-- `SGLANG_ENABLE_SPEC_V2=1` is the intended default for overlap-SMC experiments.
 - `FLASHINFER_WORKSPACE_BASE=/tmp/cc2869-flashinfer` is often needed on this machine when running GPU-backed experiments.

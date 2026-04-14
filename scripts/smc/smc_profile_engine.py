@@ -127,7 +127,6 @@ def summarize_server_info(server_info: dict[str, Any]) -> dict[str, Any]:
         "model_path": server_info.get("model_path"),
         "speculative_algorithm": server_info.get("speculative_algorithm"),
         "disable_overlap_schedule": server_info.get("disable_overlap_schedule"),
-        "smc_resampling_overlap": server_info.get("smc_resampling_overlap"),
         "smc_n_particles": server_info.get("smc_n_particles"),
         "smc_gamma": server_info.get("smc_gamma"),
         "avg_spec_accept_length": first_state.get("avg_spec_accept_length"),
@@ -172,7 +171,6 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "smc_n_particles": args.smc_n_particles,
             "smc_gamma": args.smc_gamma,
-            "smc_resampling_overlap": args.smc_resampling_overlap,
             "prompts": prompts,
         },
     )
@@ -192,7 +190,6 @@ def main() -> None:
         attention_backend="fa3",
         smc_draft_temperature=0.8,
         smc_target_temperature=0.8,
-        smc_resampling_overlap=args.smc_resampling_overlap,
     ) as engine:
         server_info = engine.get_server_info()
         write_json(run_dir / "server_info.json", server_info)

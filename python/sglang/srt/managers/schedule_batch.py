@@ -1979,10 +1979,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # SMC NOTE: This block ensures all particles of a group are retracted
         # together (no partial group in running batch). However, it does NOT
         # pause the SMC group state or reset log_weights/step_counts, so re-
-        # admission will encounter stale group bookkeeping. Additionally,
-        # particles currently stalled in the resample bucket
-        # (SMCResampler.resampling_reqs) are NOT handled here and may be left
-        # dangling.
+        # admission will encounter stale group bookkeeping.
         retracted_group_ids = {
             req.smc_group_id for req in retracted_reqs if req.smc_group_id is not None
         }

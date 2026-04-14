@@ -40,9 +40,8 @@ def run_vanilla(prompts, sampling_params):
 
 def run_smc(prompts, sampling_params, args):
     print("=" * 60)
-    scheduler_mode = "resampling-overlap" if args.smc_resampling_overlap else "normal"
     print(
-        f"SMC (particles={args.particles}, gamma={args.gamma}, scheduler={scheduler_mode})"
+        f"SMC (particles={args.particles}, gamma={args.gamma})"
     )
     print("=" * 60)
     engine = sgl.Engine(
@@ -57,7 +56,6 @@ def run_smc(prompts, sampling_params, args):
         disable_piecewise_cuda_graph=False,
         cuda_graph_max_bs=16,
         attention_backend="triton",
-        smc_resampling_overlap=args.smc_resampling_overlap,
     )
     results = engine.generate(prompts, sampling_params)
     for i, r in enumerate(results):

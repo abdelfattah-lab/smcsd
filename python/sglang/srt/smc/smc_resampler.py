@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 from collections import deque
-from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Set
 
 import torch
@@ -23,131 +22,28 @@ from sglang.srt.smc.smc_utils import (
     systematic_resample,
 )
 
-# Lazy imports resolved at first use
-_SamplingBatchInfo = None
-_build_smc_group_spans = None
-_SMCDraftInput = None
-
-
-def _ensure_lazy_imports():
-    global _SamplingBatchInfo, _build_smc_group_spans, _SMCDraftInput
-    if _SamplingBatchInfo is None:
-        from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo as _SBI
-        from sglang.srt.managers.schedule_batch import (
-            build_smc_group_spans as _build,
-        )
-        from sglang.srt.smc.smc_info import SMCDraftInput as _SDI
-        _SamplingBatchInfo = _SBI
-        _build_smc_group_spans = _build
-        _SMCDraftInput = _SDI
-
-
-@dataclass
-class PendingResample:
-    group_id: str
-    dst_reqs: List[Req] = field(default_factory=list)
-    src_snapshots: List[dict] = field(default_factory=list)
-    inc_ref: List[torch.Tensor] = field(default_factory=list)
-    dec_ref: List[torch.Tensor] = field(default_factory=list)
-    done_event: Optional[torch.cuda.Event] = None
-
 
 class SMCResampler:
     def __init__(self, smc_manager, device):
         self.smc_manager = smc_manager
         self.device = device
-        self.device_module = None
-        self.resample_stream = None
-        self.wait_for_running: Deque[str] = deque()
-        self._wait_for_running_members: Set[str] = set()
-        self.resampling_reqs: Dict[str, List[Req]] = {}
-        self.pending_resamples: Dict[str, PendingResample] = {}
         self._groups_needing_resample: Set[str] = set()
-
-    def init_streams(self, enable_overlap: bool) -> None:
-        self.device_module = torch.get_device_module(self.device)
-        if not enable_overlap or str(self.device) == "cpu":
-            self.resample_stream = None
-            return
-        self.resample_stream = self.device_module.Stream(priority=0)
+        self._pending_new_groups: Deque[str] = deque()
+        self._pending_new_groups_set: Set[str] = set()
 
     def clear(self) -> None:
-        self.wait_for_running.clear()
-        self._wait_for_running_members.clear()
-        self.resampling_reqs.clear()
-        self.pending_resamples.clear()
         self._groups_needing_resample.clear()
-
-    def enqueue_group_for_running(self, group_id: Optional[str]) -> None:
-        if group_id is None:
-            return
-        if group_id not in self._wait_for_running_members:
-            self.wait_for_running.append(group_id)
-            self._wait_for_running_members.add(group_id)
-
-    def get_stalled_req_count(self) -> int:
-        return sum(len(reqs) for reqs in self.resampling_reqs.values())
-
-    def should_delay_admission(
-        self,
-        running_req_count: int,
-        group_size: int,
-    ) -> bool:
-        stalled_req_count = self.get_stalled_req_count()
-        if stalled_req_count <= 0:
-            return False
-        current_gap = abs(running_req_count - stalled_req_count)
-        next_gap = abs((running_req_count + group_size) - stalled_req_count)
-        return next_gap > current_gap
-
-    def step(self, scheduler) -> None:
-        self._sync_completed_resamples(scheduler)
-        self._launch_pending_resamples(scheduler)
-        self._drain_wait_for_running(scheduler)
+        self._pending_new_groups.clear()
+        self._pending_new_groups_set.clear()
 
     def step_before_forward(self, scheduler) -> None:
-        """Sync completed resamples and merge groups back into running_batch.
-
-        Must run BEFORE get_next_batch_to_run() so that resumed particles
-        are visible to batch selection.
-        """
-        self._sync_completed_resamples(scheduler)
-        # Stall and launch resamples before selecting the next batch. The
-        # resample path trims overallocated tails and rewrites req_to_token
-        # entries, so doing it after the next decode launch can mutate KV
-        # reservations that the in-flight forward is still consuming.
+        """Run pending resamples, then admit new groups into running_batch."""
         self._launch_pending_resamples(scheduler)
-        self._drain_wait_for_running(scheduler)
+        self._drain_pending_new_groups(scheduler)
 
-    def step_after_forward(self, scheduler) -> None:
-        """Resample launches happen in step_before_forward.
-
-        Keeping the launch there guarantees stalled groups are removed from
-        running_batch before batch selection, while the queued resample-stream
-        work still overlaps with the forward that follows.
-        """
-
-    def finish_pending_before_idle(self, scheduler) -> bool:
-        """Drain pending resamples before the scheduler declares itself idle.
-
-        Pending resamples temporarily rewrite req_to_token rows before
-        _complete_resample() applies the matching allocator refcount updates.
-        If the overlap loop runs its idle memory check in that window, the KV
-        pool looks artificially short. When there is no forward to overlap
-        against, block here, complete the pending work, and let the next loop
-        iteration observe the resumed requests.
-        """
-        had_pending_work = bool(self.pending_resamples or self._groups_needing_resample)
-        if not had_pending_work:
-            return False
-
-        self._launch_pending_resamples(scheduler)
-        for group_id, pending in list(self.pending_resamples.items()):
-            if pending.done_event is not None:
-                pending.done_event.synchronize()
-            self._complete_resample(group_id, pending, scheduler)
-        self._drain_wait_for_running(scheduler)
-        return True
+    # ------------------------------------------------------------------
+    # Weight tracking (called from process_batch_result via on_batch_done)
+    # ------------------------------------------------------------------
 
     def on_batch_done(
         self,
@@ -274,12 +170,7 @@ class SMCResampler:
         reqs: List[Req],
         logprob_diffs: torch.Tensor,
     ) -> Optional[Req]:
-        """100% CPU — stash log_weight diffs, update step_counts, mark resample.
-
-        The GPU log_weight add is deferred to ``_launch_pending_resamples``
-        (overlapped with the next forward) or ``_finalize_group``.
-        """
-        # Stash diffs for deferred GPU application (pure Python, no torch ops)
+        """CPU-only: stash log_weight diffs, update step_counts, mark resample."""
         n = len(reqs)
         if n == 1:
             idx = reqs[0].smc_particle_idx
@@ -310,21 +201,20 @@ class SMCResampler:
             return self.smc_manager._finalize_group(group.group_id)
 
         group.resampled_at_step = group.step_counts[active_indices[0]]
-        # Always mark aligned multi-particle groups for resampling. Finished
-        # particles keep participating in the SMC population, so a group with
-        # one live particle and finished siblings can still need resampling.
         if len(group.particle_reqs) > 1:
             self._groups_needing_resample.add(group.group_id)
         return None
 
+    # ------------------------------------------------------------------
+    # Resampling (synchronous, inline)
+    # ------------------------------------------------------------------
+
     def _launch_pending_resamples(self, scheduler) -> None:
+        """Resample marked groups: stall, rewrite KV, resume — all inline."""
         group_ids = list(self._groups_needing_resample)
         self._groups_needing_resample.clear()
 
         for group_id in group_ids:
-            if group_id in self.pending_resamples:
-                continue
-
             group = self.smc_manager.get_group(group_id)
             if group is None:
                 continue
@@ -335,7 +225,6 @@ class SMCResampler:
                 group.flush_pending_diffs()
                 continue
 
-            # Apply deferred log_weight updates before sampling ancestors
             group.flush_pending_diffs()
             group_log_weights = group.log_weights[resample_indices]
             normalized_weights = normalize_log_weights(
@@ -375,7 +264,6 @@ class SMCResampler:
                     }
                 )
 
-            # Compute evictions on GPU, sync once
             resample_t = torch.tensor(
                 resample_indices,
                 dtype=torch.int64,
@@ -391,66 +279,22 @@ class SMCResampler:
 
             group.log_weights[resample_t] = 0.0
 
-            stalled_reqs = [group.particle_reqs[idx] for idx in active_indices]
-            self._stall_group_reqs(group_id, stalled_reqs, scheduler)
+            all_group_reqs = [group.particle_reqs[idx] for idx in sorted(group.particle_reqs)]
+            self._stall_group_reqs(group_id, all_group_reqs, scheduler)
 
-            pending = PendingResample(group_id=group_id)
-            if self.resample_stream is None:
-                self._prepare_pending_resample(group, evictions, scheduler, pending)
-                self.pending_resamples[group_id] = pending
-                self._complete_resample(group_id, pending, scheduler)
-                continue
+            inc_refs, dec_refs, dst_reqs, src_snapshots = (
+                self._execute_kv_resample(group, evictions, scheduler)
+            )
 
-            with self.device_module.stream(self.resample_stream):
-                self._prepare_pending_resample(group, evictions, scheduler, pending)
-                pending.done_event = self.device_module.Event()
-                pending.done_event.record()
+            for indices in inc_refs:
+                scheduler.token_to_kv_pool_allocator.inc_ref(indices)
+            for indices in dec_refs:
+                scheduler.token_to_kv_pool_allocator.dec_ref_and_free(indices)
 
-            self.pending_resamples[group_id] = pending
+            for dst_req, snapshot in zip(dst_reqs, src_snapshots, strict=True):
+                self._restore_req_state(dst_req, snapshot)
 
-    def _sync_completed_resamples(self, scheduler) -> None:
-        for group_id, pending in list(self.pending_resamples.items()):
-            if pending.done_event is not None and not pending.done_event.query():
-                continue
-            self._complete_resample(group_id, pending, scheduler)
-
-    def _complete_resample(self, group_id: str, pending: PendingResample, scheduler) -> None:
-        if pending.done_event is not None:
-            scheduler.schedule_stream.wait_event(pending.done_event)
-
-        for indices in pending.inc_ref:
-            scheduler.token_to_kv_pool_allocator.inc_ref(indices)
-        for indices in pending.dec_ref:
-            scheduler.token_to_kv_pool_allocator.dec_ref_and_free(indices)
-
-        for dst_req, snapshot in zip(
-            pending.dst_reqs,
-            pending.src_snapshots,
-            strict=True,
-        ):
-            self._restore_req_state(dst_req, snapshot)
-
-        self.resampling_reqs.pop(group_id, None)
-        del self.pending_resamples[group_id]
-
-        group = self.smc_manager.get_group(group_id)
-        if group is not None:
-            for dst_req, snapshot in zip(
-                pending.dst_reqs,
-                pending.src_snapshots,
-                strict=True,
-            ):
-                particle_idx = dst_req.smc_particle_idx
-                if snapshot["finished_reason"] is None:
-                    group.finished_particles.pop(particle_idx, None)
-                else:
-                    group.finished_particles[particle_idx] = (
-                        SMCFinishedParticleSnapshot(
-                            output_ids=list(snapshot["output_ids"]),
-                            finished_reason=copy.copy(snapshot["finished_reason"]),
-                            finished_len=snapshot["finished_len"],
-                        )
-                    )
+            self._update_finished_particles(group, dst_reqs, src_snapshots)
 
             if not group.active_particle_indices():
                 finalized_req = self.smc_manager._finalize_group(group_id)
@@ -459,33 +303,58 @@ class SMCResampler:
                     if time_stats is not None:
                         time_stats.set_completion_time()
                     scheduler.stream_output([finalized_req], False)
-                return
+                continue
 
-        self.enqueue_group_for_running(group_id)
+            self._resume_group(group_id, scheduler)
 
-    def _drain_wait_for_running(self, scheduler) -> None:
-        while self.wait_for_running:
-            group_id = self.wait_for_running[0]
+    def _resume_group(self, group_id: str, scheduler) -> None:
+        """Merge a resampled group's particles back into running_batch."""
+        active_reqs = self.smc_manager.get_active_particle_reqs(group_id)
+        if not active_reqs:
+            return
+
+        resumed_batch = self.smc_manager._build_particle_batch(
+            active_reqs,
+            scheduler,
+            use_future_map=self._running_batch_uses_future_indices(
+                scheduler.running_batch
+            ),
+        )
+
+        if scheduler.running_batch is None or scheduler.running_batch.is_empty():
+            scheduler.running_batch = resumed_batch
+        else:
+            scheduler.running_batch.merge_batch(resumed_batch)
+
+    def enqueue_group_for_running(self, group_id: Optional[str]) -> None:
+        """Queue a newly-created group for admission into running_batch.
+
+        Called from the output processor after prefill creates an SMC group.
+        The actual merge into running_batch happens in step_before_forward
+        via _drain_pending_new_groups, ensuring it runs at a safe point in
+        the scheduler loop (before batch selection).
+        """
+        if group_id is None:
+            return
+        if group_id not in self._pending_new_groups_set:
+            self._pending_new_groups.append(group_id)
+            self._pending_new_groups_set.add(group_id)
+
+    def _drain_pending_new_groups(self, scheduler) -> None:
+        """Merge queued new groups into running_batch."""
+        while self._pending_new_groups:
+            group_id = self._pending_new_groups[0]
             group = self.smc_manager.get_group(group_id)
             if group is None:
-                self._pop_wait_for_running_head()
+                self._pending_new_groups.popleft()
+                self._pending_new_groups_set.discard(group_id)
                 continue
 
             active_reqs = self.smc_manager.get_active_particle_reqs(group_id)
             if not active_reqs:
-                self._pop_wait_for_running_head()
+                self._pending_new_groups.popleft()
+                self._pending_new_groups_set.discard(group_id)
                 continue
-
-            group_size = len(active_reqs)
-            if self._remaining_req_capacity(scheduler) < group_size:
-                break
-
-            running_smc_req_count = self._running_smc_req_count(scheduler)
-            if self.should_delay_admission(
-                running_req_count=running_smc_req_count,
-                group_size=group_size,
-            ):
-                break
 
             resumed_batch = self.smc_manager._build_particle_batch(
                 active_reqs,
@@ -494,103 +363,37 @@ class SMCResampler:
                     scheduler.running_batch
                 ),
             )
-            self._pop_wait_for_running_head()
 
-            if scheduler.running_batch.is_empty():
+            self._pending_new_groups.popleft()
+            self._pending_new_groups_set.discard(group_id)
+
+            if scheduler.running_batch is None or scheduler.running_batch.is_empty():
                 scheduler.running_batch = resumed_batch
             else:
                 scheduler.running_batch.merge_batch(resumed_batch)
 
-    def _pop_wait_for_running_head(self) -> Optional[str]:
-        if not self.wait_for_running:
-            return None
-        group_id = self.wait_for_running.popleft()
-        self._wait_for_running_members.discard(group_id)
-        return group_id
-
-    def _remaining_req_capacity(self, scheduler) -> int:
-        max_req_count = getattr(
-            getattr(scheduler, "server_args", None),
-            "pp_max_micro_batch_size",
-            None,
-        )
-        if max_req_count is None:
-            max_req_count = getattr(scheduler, "max_running_requests", None)
-        if max_req_count is None:
-            return 1 << 30
-
-        pending_prefill_reqs = 0
-        last_batch = getattr(scheduler, "last_batch", None)
-        if self._has_pending_last_batch(scheduler) and last_batch is not None and last_batch.forward_mode.is_extend():
-            if hasattr(last_batch, "batch_size"):
-                pending_prefill_reqs = last_batch.batch_size()
-            else:
-                pending_prefill_reqs = len(last_batch.reqs)
-
-        return max(
-            max_req_count - len(scheduler.running_batch.reqs) - pending_prefill_reqs,
-            0,
-        )
-
-    def _running_smc_req_count(self, scheduler) -> int:
-        running_smc_req_count = scheduler.running_batch.count_smc_particle_reqs()
-        last_batch = getattr(scheduler, "last_batch", None)
-        if (
-            self._has_pending_last_batch(scheduler)
-            and last_batch is not None
-            and last_batch.forward_mode.is_extend()
-            and getattr(last_batch, "spec_algorithm", None) is not None
-            and last_batch.spec_algorithm.is_smc()
-        ):
-            if hasattr(last_batch, "count_smc_particle_reqs"):
-                running_smc_req_count += last_batch.count_smc_particle_reqs()
-            else:
-                running_smc_req_count += sum(
-                    1 for req in last_batch.reqs if req.smc_group_id is not None
-                )
-        return running_smc_req_count
-
-    def _has_pending_last_batch(self, scheduler) -> bool:
-        result_queue = getattr(scheduler, "result_queue", None)
-        return result_queue is not None and len(result_queue) > 0
-
-    def _sample_ancestors(self, normalized_weights: torch.Tensor) -> torch.Tensor:
-        """Returns ancestor indices as a GPU tensor."""
-        if self.smc_manager.server_args.smc_resample_method == "multinomial":
-            return multinomial_resample(normalized_weights, device=self.device)
-        return systematic_resample(normalized_weights, device=self.device)
+    # ------------------------------------------------------------------
+    # KV cache manipulation
+    # ------------------------------------------------------------------
 
     def _stall_group_reqs(
         self,
         group_id: str,
-        stalled_reqs: List[Req],
+        all_group_reqs: List[Req],
         scheduler,
     ) -> None:
-        self._trim_stale_overalloc(stalled_reqs, scheduler)
+        self._trim_stale_overalloc(all_group_reqs, scheduler)
 
-        group_span = scheduler.running_batch.get_smc_group_span(group_id)
-        if group_span is not None and group_span.size == len(stalled_reqs):
-            keep_indices = list(range(group_span.start)) + list(
-                range(group_span.end, len(scheduler.running_batch.reqs))
-            )
-        else:
-            stalled_req_ids = {id(req) for req in stalled_reqs}
-            keep_indices = [
-                idx
-                for idx, req in enumerate(scheduler.running_batch.reqs)
-                if id(req) not in stalled_req_ids
-            ]
-            if len(keep_indices) + len(stalled_reqs) != len(scheduler.running_batch.reqs):
-                raise RuntimeError(
-                    f"SMC group {group_id} could not be isolated from running_batch for resampling."
-                )
+        keep_indices = [
+            idx
+            for idx, req in enumerate(scheduler.running_batch.reqs)
+            if getattr(req, "smc_group_id", None) != group_id
+        ]
 
         scheduler.running_batch.filter_batch(keep_indices=keep_indices)
         scheduler.running_batch.batch_is_full = False
         if not keep_indices:
             scheduler.running_batch = ScheduleBatch(reqs=[])
-
-        self.resampling_reqs[group_id] = stalled_reqs
 
     def _trim_stale_overalloc(self, reqs: List[Req], scheduler) -> None:
         for req in reqs:
@@ -604,13 +407,13 @@ class SMCResampler:
             scheduler.token_to_kv_pool_allocator.dec_ref_and_free(indices_to_free)
             req.kv_allocated_len = req.kv_committed_len
 
-    def _prepare_pending_resample(
+    def _execute_kv_resample(
         self,
         group,
         evictions: List[tuple[int, int]],
         scheduler,
-        pending: PendingResample,
-    ) -> None:
+    ) -> tuple[List[torch.Tensor], List[torch.Tensor], List[Req], List[dict]]:
+        """Rewrite KV rows for each eviction. Returns (inc_refs, dec_refs, dst_reqs, snapshots)."""
         if smc_probe_enabled:
             append_smc_probe_record(
                 {
@@ -621,6 +424,12 @@ class SMCResampler:
                 }
             )
         req_to_token = scheduler.req_to_token_pool.req_to_token
+
+        inc_refs: List[torch.Tensor] = []
+        dec_refs: List[torch.Tensor] = []
+        dst_reqs: List[Req] = []
+        src_snapshots: List[dict] = []
+
         staged_snapshots: Dict[int, dict] = {}
         staged_copies: Dict[int, torch.Tensor] = {}
         staged_actions: List[tuple[Req, int, int]] = []
@@ -632,7 +441,7 @@ class SMCResampler:
 
             dst_allocated_len = int(dst_req.kv_allocated_len)
             if dst_allocated_len > 0:
-                pending.dec_ref.append(
+                dec_refs.append(
                     req_to_token[
                         dst_req.req_pool_idx, :dst_allocated_len
                     ].to(dtype=torch.int64, copy=True)
@@ -660,10 +469,40 @@ class SMCResampler:
                     (dst_req.req_pool_idx, slice(0, src_len)),
                     copied_indices.to(dtype=torch.int32),
                 )
-                pending.inc_ref.append(copied_indices)
+                inc_refs.append(copied_indices)
 
-            pending.dst_reqs.append(dst_req)
-            pending.src_snapshots.append(staged_snapshots[src_idx])
+            dst_reqs.append(dst_req)
+            src_snapshots.append(staged_snapshots[src_idx])
+
+        return inc_refs, dec_refs, dst_reqs, src_snapshots
+
+    def _update_finished_particles(
+        self,
+        group,
+        dst_reqs: List[Req],
+        src_snapshots: List[dict],
+    ) -> None:
+        for dst_req, snapshot in zip(dst_reqs, src_snapshots, strict=True):
+            particle_idx = dst_req.smc_particle_idx
+            if snapshot["finished_reason"] is None:
+                group.finished_particles.pop(particle_idx, None)
+            else:
+                group.finished_particles[particle_idx] = (
+                    SMCFinishedParticleSnapshot(
+                        output_ids=list(snapshot["output_ids"]),
+                        finished_reason=copy.copy(snapshot["finished_reason"]),
+                        finished_len=snapshot["finished_len"],
+                    )
+                )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _sample_ancestors(self, normalized_weights: torch.Tensor) -> torch.Tensor:
+        if self.smc_manager.server_args.smc_resample_method == "multinomial":
+            return multinomial_resample(normalized_weights, device=self.device)
+        return systematic_resample(normalized_weights, device=self.device)
 
     def _snapshot_req_state(self, req: Req) -> dict:
         seq_len = req.kv_committed_len
@@ -734,4 +573,3 @@ class SMCResampler:
             return False
         spec_info = getattr(running_batch, "spec_info", None)
         return getattr(spec_info, "future_indices", None) is not None
-

@@ -322,9 +322,10 @@ class SchedulerRuntimeCheckerMixin:
                 msg += "SMC_GROUPS:\n" + "\n".join(group_msgs) + "\n"
             if smc_resampler is not None:
                 msg += (
-                    f"SMC_BUCKETS: stalled={list(smc_resampler.resampling_reqs.keys())}, "
-                    f"pending={list(smc_resampler.pending_resamples.keys())}, "
-                    f"wait_for_running={list(smc_resampler.wait_for_running)}\n"
+                    f"SMC_RESAMPLER: groups_needing_resample="
+                    f"{list(smc_resampler._groups_needing_resample)}, "
+                    f"pending_new_groups="
+                    f"{list(smc_resampler._pending_new_groups)}\n"
                 )
             tracked_req_msgs = []
             tracked_rows = set()
