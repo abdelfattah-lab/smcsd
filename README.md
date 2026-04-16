@@ -12,8 +12,8 @@ Paper: *Accelerating LLM Inference with Sequential Monte Carlo*
 
 ```bash
 # Clone and install
-git clone https://github.com/abdelfattah-lab/smc_sglang.git
-cd smc_sglang
+git clone https://github.com/abdelfattah-lab/smcsd.git
+cd smcsd
 uv venv --python 3.12
 uv pip install -e "python"
 ```
@@ -52,14 +52,14 @@ python scripts/smc/accuracy_test_gsm8k.py \
 ## SMC-SD Parameters
 
 
-| Parameter          | Flag                       | Description                                     |
-| ------------------ | -------------------------- | ----------------------------------------------- |
-| Particles          | `--smc-n-particles`        | Number of parallel generation paths per request |
-| Gamma              | `--smc-gamma`              | Draft tokens per speculative step               |
-| Draft temp         | `--smc-draft-temperature`  | Sampling temperature for draft model            |
-| Target temp        | `--smc-target-temperature` | Scoring temperature for target model            |
-| Resample threshold | `--smc-resample-threshold` | Resample when ESS < N * threshold (0 = disable) |
-| Resample method    | `--smc-resample-method`    | `systematic` or `multinomial`                   |
+| Parameter | Flag | Description |
+| --- | --- | --- |
+| Particles (N) | `--smc-n-particles` | Number of parallel generation paths per request |
+| Gamma (K) | `--smc-gamma` | Draft tokens per speculative step |
+| Draft temp | `--smc-draft-temperature` | Sampling temperature for draft model |
+| Target temp | `--smc-target-temperature` | Scoring temperature for target model |
+| Resample threshold | `--smc-resample-threshold` | Resample when ESS < N × threshold (0 = disable) |
+| Resample method | `--smc-resample-method` | `systematic` or `multinomial` |
 
 
 ## Architecture
