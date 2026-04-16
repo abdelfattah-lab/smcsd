@@ -85,7 +85,7 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for a detailed design o
 ```bibtex
 @inproceedings{smcsd2026,
   title={Faster LLM Inference via Sequential Monte Carlo},
-  author={},
+  author={Yahya Emara, Mauricio Barba da Costa, Chi-Chih Chang, Cameron Freer, Tim Vieira, Ryan Cotterell, Mohamed Abdelfattah},
   year={2026}
 }
 ```
@@ -97,4 +97,3 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for a detailed design o
 - [ ] Disaggregation (draft/target separation)
 
 PRs welcome!
-
