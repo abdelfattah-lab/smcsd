@@ -46,6 +46,8 @@ python scripts/smc/accuracy_test_gsm8k.py \
   --particles 12 --gamma 8 \
   --temperature 0.7 \
   --attention-backend fa3 \
+  --max-running-requests 24\
+    --cuda-graph-max-bs 16 \
   --num-questions 400
 ```
 
