@@ -4,7 +4,7 @@
 
 This repository implements **Sequential Monte Carlo Speculative Decoding (SMC-SD)** on top of [SGLang](https://github.com/sgl-project/sglang). SMC-SD is a population-based alternative to rejection-based speculative decoding: N particles maintain parallel generation paths, weighted by target/draft likelihood ratios, and resampled when effective sample size drops. All drafted tokens are accepted (no rejection), and throughput scales with batch size by increasing arithmetic intensity toward the GPU compute bound.
 
-Paper: *Accelerating LLM Inference with Sequential Monte Carlo*
+Paper: *Faster LLM Inference via Sequential Monte Carlo*
 
 <img width="772" height="424" alt="image" src="https://github.com/user-attachments/assets/3cda3320-e257-4079-99b3-93e3a7bec627" />
 
@@ -82,7 +82,7 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for a detailed design o
 
 ```bibtex
 @inproceedings{smcsd2026,
-  title={Accelerating LLM Inference with Sequential Monte Carlo},
+  title={Faster LLM Inference via Sequential Monte Carlo},
   author={},
   year={2026}
 }
