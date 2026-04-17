@@ -6,9 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "smcsd"
 version = "0.1.0"
 description = "SMC (Sequential Monte Carlo) speculative decoding engine built on SGLang."
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 # sglang is not listed here: install it editable from 3rdparty/sglang/python
-# before (or together with) this package. See Makefile `install` target.
+# before (or together with) this package.
 dependencies = []
 
 [tool.setuptools.packages.find]
