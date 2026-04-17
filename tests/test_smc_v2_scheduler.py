@@ -23,6 +23,7 @@ import torch
 
 from smcsd.v2 import scheduler as v2_scheduler_mod
 from smcsd.v2.req_state import ScheduleBatchSMC
+from smcsd.v2.info import SMCDecodeContext, SMCEagleDraftInputV2, SMCDraftInputV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -125,6 +126,38 @@ class _FakeAllocator:
         self.free_calls.append(indices.clone())
 
 
+class _FakeTreeTokenAllocator:
+    def __init__(self, size=4096):
+        self.page_size = 1
+        self._free = torch.arange(size, dtype=torch.int64)
+        self._cursor = 0
+
+    def available_size(self):
+        return len(self._free) - self._cursor
+
+    def alloc(self, num_tokens):
+        start = self._cursor
+        end = start + num_tokens
+        if end > len(self._free):
+            return None
+        self._cursor = end
+        return self._free[start:end].clone()
+
+
+class _FakeTreeCache:
+    def __init__(self, size=4096):
+        self.token_to_kv_pool_allocator = _FakeTreeTokenAllocator(size=size)
+
+    def is_chunk_cache(self):
+        return False
+
+    def evict(self, params):
+        return None
+
+    def pretty_print(self):
+        return None
+
+
 def _make_runtime_group(group_id, n_particles, *, pool_idx_base=0):
     reqs = {
         i: _FakeRuntimeReq(
@@ -143,7 +176,9 @@ def _make_runtime_group(group_id, n_particles, *, pool_idx_base=0):
     )
 
 
-def _build_slot_state(*, max_num_reqs, rows, allocator_size=256):
+def _build_slot_state(
+    *, max_num_reqs, rows, allocator_size=256, smc_draft_kind="lm", smc_eagle_topk=4
+):
     return ScheduleBatchSMC(
         max_num_reqs=max_num_reqs,
         device="cpu",
@@ -152,8 +187,10 @@ def _build_slot_state(*, max_num_reqs, rows, allocator_size=256):
         max_output_len=8,
         req_to_token_pool=_FakeReqToTokenPool(rows),
         token_to_kv_pool_allocator=_FakeAllocator(size=allocator_size),
-        tree_cache=SimpleNamespace(),
+        tree_cache=_FakeTreeCache(),
         model_config=SimpleNamespace(),
+        smc_draft_kind=smc_draft_kind,
+        smc_eagle_topk=smc_eagle_topk,
     )
 
 
@@ -219,6 +256,68 @@ class TestSMCSchedulerAdmission(CustomTestCase):
         self.assertEqual(len(scheduler.waiting_groups), 0)
         self.assertEqual(len(aborted), 1)
         self.assertEqual(aborted[0][0], "g0")
+
+
+class TestSMCDraftCarrierSelection(CustomTestCase):
+    def test_prepare_for_decode_returns_lm_carrier_by_default(self):
+        slot_state = _build_slot_state(max_num_reqs=2, rows=[[0, 0, 0], [0, 0, 0]])
+        slot_state.active_slots = torch.tensor([0], dtype=torch.int64)
+        slot_state.num_active = 1
+        slot_state.req_pool_indices[0] = 0
+        slot_state.seq_lens[0] = 1
+        slot_state.kv_allocated_lens[0] = 1
+        slot_state.verified_ids[0] = 42
+
+        fake_ctx = SMCDecodeContext(
+            orig_seq_lens=torch.tensor([1], dtype=torch.int64),
+            orig_seq_lens_cpu=torch.tensor([1], dtype=torch.int64),
+            orig_seq_lens_sum=1,
+            new_seq_lens=torch.tensor([3], dtype=torch.int64),
+            gamma=1,
+        )
+        with patch(
+            "smcsd.v2.req_state.SMCDecodeContext.from_slot_gather",
+            return_value=(fake_ctx, torch.tensor([3], dtype=torch.int64)),
+        ):
+            draft_input = slot_state.prepare_for_decode()
+
+        self.assertIsInstance(draft_input, SMCDraftInputV2)
+        self.assertEqual(draft_input.verified_id.tolist(), [42])
+        self.assertIs(draft_input.decode_ctx, fake_ctx)
+
+    def test_prepare_for_decode_returns_eagle_carrier_when_requested(self):
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[0, 0, 0], [0, 0, 0]],
+            smc_draft_kind="eagle",
+            smc_eagle_topk=4,
+        )
+        slot_state.active_slots = torch.tensor([0], dtype=torch.int64)
+        slot_state.num_active = 1
+        slot_state.req_pool_indices[0] = 0
+        slot_state.seq_lens[0] = 1
+        slot_state.kv_allocated_lens[0] = 1
+        slot_state.verified_ids[0] = 77
+
+        fake_ctx = SMCDecodeContext(
+            orig_seq_lens=torch.tensor([1], dtype=torch.int64),
+            orig_seq_lens_cpu=torch.tensor([1], dtype=torch.int64),
+            orig_seq_lens_sum=1,
+            new_seq_lens=torch.tensor([3], dtype=torch.int64),
+            gamma=1,
+        )
+        with patch(
+            "smcsd.v2.req_state.SMCDecodeContext.from_slot_gather",
+            return_value=(fake_ctx, torch.tensor([3], dtype=torch.int64)),
+        ):
+            draft_input = slot_state.prepare_for_decode()
+
+        self.assertIsInstance(draft_input, SMCEagleDraftInputV2)
+        self.assertEqual(draft_input.verified_id.tolist(), [77])
+        self.assertIs(draft_input.decode_ctx, fake_ctx)
+        self.assertIsNone(draft_input.hidden_states)
+        self.assertIsNone(draft_input.topk_p)
+        self.assertIsNone(draft_input.topk_index)
 
 
 class TestSMCResampleSlowPath(CustomTestCase):

@@ -4,7 +4,9 @@
   Owns prepare_for_draft / prepare_for_verify (moved from SMCDraftInput).
   Factory method from_slot_gather does vectorized KV allocation.
 
-- SMCDraftInputV2: pure data carrier on batch.spec_info (no prepare methods).
+- SMCDraftInputV2 / SMCEagleDraftInputV2: pure data carriers on batch.spec_info
+  (no prepare methods). The first is the existing LM-draft carrier; the second
+  is the Checkpoint 3 placeholder for the future SMC + EAGLE proposal path.
 
 - SMCVerifyInput: reused from smc_info.py (unchanged).
 
@@ -15,7 +17,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
+from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple, TypeAlias
 
 import torch
 
@@ -279,3 +281,56 @@ class SMCDraftInputV2(SpecInput):
             verified_id=torch.empty((0,), dtype=torch.int32, device=device),
             num_tokens_per_req=1,
         )
+
+
+@dataclass
+class SMCEagleDraftInputV2(SpecInput):
+    """SMC-side carrier for the future EAGLE draft path.
+
+    This intentionally carries only state. It does not implement any EAGLE
+    drafting yet; that comes in later checkpoints. The goal here is to let the
+    scheduler and worker pass a distinct EAGLE-shaped draft state through the
+    same SMC boundaries without changing behavior in the existing LM path.
+    """
+
+    verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token
+    hidden_states: Optional[torch.Tensor] = None  # draft hidden state cache
+    topk_p: Optional[torch.Tensor] = None  # (bs, topk) retained candidate masses
+    topk_index: Optional[torch.Tensor] = None  # (bs, topk) retained candidate ids
+    logprob_diff: Optional[torch.Tensor] = None  # (bs,) from last step
+    num_tokens_per_req: int = -1  # gamma + 1
+    decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
+
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = 1
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.EAGLE_DRAFT)
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return (self.num_tokens_per_req, self.num_tokens_per_req)
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        *,
+        topk: int,
+    ) -> "SMCEagleDraftInputV2":
+        return cls(
+            verified_id=torch.empty((0,), dtype=torch.int32, device=device),
+            hidden_states=None,
+            topk_p=torch.empty((0, topk), dtype=torch.float32, device=device),
+            topk_index=torch.empty((0, topk), dtype=torch.int64, device=device),
+            num_tokens_per_req=1,
+        )
+
+
+SMCDraftInputLike: TypeAlias = SMCDraftInputV2 | SMCEagleDraftInputV2
+
+
+def get_smc_draft_input_cls(draft_kind: str) -> type[SMCDraftInputLike]:
+    if draft_kind == "lm":
+        return SMCDraftInputV2
+    if draft_kind == "eagle":
+        return SMCEagleDraftInputV2
+    raise ValueError(f"Unknown SMC draft kind: {draft_kind}")

@@ -23,14 +23,20 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import ServerArgs
-from smcsd.v2.info import SMCDecodeContext, SMCDraftInputV2
+from smcsd.v2.info import (
+    SMCDecodeContext,
+    SMCDraftInputLike,
+    SMCEagleDraftInputV2,
+    SMCDraftInputV2,
+    get_smc_draft_input_cls,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 
 logger = logging.getLogger(__name__)
 
 
 class SMCWorkerV2(BaseSpecWorker):
-    """Standalone SMC worker using v2 API (SMCDecodeContext + SMCDraftInputV2)."""
+    """Standalone SMC worker using v2 API draft carriers."""
 
     def __init__(
         self,
@@ -56,6 +62,8 @@ class SMCWorkerV2(BaseSpecWorker):
         self.smc_target_temperature = max(
             float(server_args.smc_target_temperature), 1e-5
         )
+        self.smc_draft_kind = server_args.smc_draft_kind
+        self._draft_input_cls = get_smc_draft_input_cls(self.smc_draft_kind)
 
         # Share req_to_token_pool, separate KV caches
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -64,6 +72,7 @@ class SMCWorkerV2(BaseSpecWorker):
 
         # Set class-level constant for KV allocation
         SMCDraftInputV2.ALLOC_LEN_PER_DECODE = self.speculative_num_draft_tokens
+        SMCEagleDraftInputV2.ALLOC_LEN_PER_DECODE = self.speculative_num_draft_tokens
 
         # Override context length of draft model to match score model
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -161,7 +170,7 @@ class SMCWorkerV2(BaseSpecWorker):
         score_result.next_token_ids = draft_result.next_token_ids
 
         # x0 KV is NOT written during prefill — first decode writes it.
-        score_result.next_draft_input = SMCDraftInputV2(
+        score_result.next_draft_input = self._draft_input_cls(
             verified_id=draft_result.next_token_ids,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
@@ -180,7 +189,7 @@ class SMCWorkerV2(BaseSpecWorker):
         if batch.req_pool_indices is not None:
             batch.req_pool_indices.record_stream(current_stream)
 
-        draft_input: SMCDraftInputV2 = batch.spec_info
+        draft_input: SMCDraftInputLike = batch.spec_info
         ctx: SMCDecodeContext = draft_input.decode_ctx
 
         if draft_input.verified_id is not None:
@@ -309,7 +318,7 @@ class SMCWorkerV2(BaseSpecWorker):
         next_verified_id.record_stream(current_stream)
         logprob_diff.record_stream(current_stream)
 
-        next_draft_input = SMCDraftInputV2(
+        next_draft_input = self._draft_input_cls(
             verified_id=next_verified_id,
             logprob_diff=logprob_diff,
             num_tokens_per_req=self.speculative_num_draft_tokens,
@@ -329,8 +338,15 @@ class SMCWorkerV2(BaseSpecWorker):
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=torch.empty(0, dtype=torch.int64, device=self.device),
             accept_lens=torch.empty(0, dtype=torch.int32, device=self.device),
-            next_draft_input=SMCDraftInputV2.create_idle_input(self.device),
+            next_draft_input=self._make_idle_draft_input(),
         )
+
+    def _make_idle_draft_input(self) -> SMCDraftInputLike:
+        if self._draft_input_cls is SMCEagleDraftInputV2:
+            return self._draft_input_cls.create_idle_input(
+                self.device, topk=self.server_args.smc_eagle_topk,
+            )
+        return self._draft_input_cls.create_idle_input(self.device)
 
     def _make_clean_batch(self, batch: ModelWorkerBatch) -> ModelWorkerBatch:
         """Copy batch with no spec_info (for draft model)."""

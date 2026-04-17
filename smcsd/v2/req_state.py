@@ -20,7 +20,13 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from smcsd.v2.info import SMCDecodeContext, SMCDraftInputV2
+from smcsd.v2.info import (
+    SMCDecodeContext,
+    SMCDraftInputLike,
+    SMCEagleDraftInputV2,
+    SMCDraftInputV2,
+    get_smc_draft_input_cls,
+)
 from smcsd.v2.stacked_state import StackedGroupState
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -55,6 +61,8 @@ class ScheduleBatchSMC:
         model_config: "ModelConfig",
         enable_overlap: bool = False,
         n_particles: int = 1,
+        smc_draft_kind: str = "lm",
+        smc_eagle_topk: int = 4,
     ):
         self.max_slots = max_num_reqs
         self.device = device
@@ -65,6 +73,8 @@ class ScheduleBatchSMC:
         self.model_config = model_config
         self.enable_overlap = enable_overlap
         self.n_particles = n_particles
+        self.smc_draft_kind = smc_draft_kind
+        self.smc_eagle_topk = smc_eagle_topk
 
         # Pool references (shared with scheduler)
         self.req_to_token_pool = req_to_token_pool
@@ -298,13 +308,18 @@ class ScheduleBatchSMC:
     #  Decode Preparation (sparse → vectorized KV alloc → sparse)
     # ────────────────────────────────────────────────────────
 
-    def prepare_for_decode(self) -> SMCDraftInputV2:
+    def prepare_for_decode(self) -> SMCDraftInputLike:
         """Gather slot tensors → vectorized KV alloc → scatter back.
 
-        Returns an SMCDraftInputV2 with decode_ctx for the worker.
+        Returns an SMC draft carrier with decode_ctx for the worker.
         """
+        draft_input_cls = get_smc_draft_input_cls(self.smc_draft_kind)
         if self.num_active == 0:
-            return SMCDraftInputV2(
+            if draft_input_cls is SMCEagleDraftInputV2:
+                return draft_input_cls.create_idle_input(
+                    self.device, topk=self.smc_eagle_topk,
+                )
+            return draft_input_cls(
                 verified_id=torch.empty(0, dtype=torch.int32, device=self.device),
                 num_tokens_per_req=self.gamma_plus_1,
             )
@@ -331,7 +346,7 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
 
-        return SMCDraftInputV2(
+        return draft_input_cls(
             verified_id=verified_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
@@ -355,7 +370,7 @@ class ScheduleBatchSMC:
 
     def build_model_worker_batch(
         self,
-        draft_input: SMCDraftInputV2,
+        draft_input: SMCDraftInputLike,
     ) -> ModelWorkerBatch:
         """Gather sparse slot state into a contiguous ModelWorkerBatch."""
         active = self.active_slots

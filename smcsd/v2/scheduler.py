@@ -425,6 +425,8 @@ class SMCSchedulerV2(Scheduler):
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             n_particles=server_args.smc_n_particles,
+            smc_draft_kind=server_args.smc_draft_kind,
+            smc_eagle_topk=server_args.smc_eagle_topk,
         )
         self.coordinator = SMCCoordinatorV2(
             device=self.device,

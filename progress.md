@@ -17,6 +17,10 @@ test it in small steps.
   - `smc_draft_kind = {lm, eagle}`
   - `smc_eagle_topk`
   - clear validation for unsupported / invalid EAGLE-SMC configurations
+- Checkpoint 3 draft-state plumbing is implemented:
+  - `SMCEagleDraftInputV2` exists as a distinct SMC-side carrier
+  - `ScheduleBatchSMC` can now construct either LM or EAGLE draft carriers
+  - `SMCWorkerV2` accepts either carrier type without changing LM behavior
 - We are **not** implementing full tree-aware SMC in v1.
 - We are targeting an MVP that keeps the current SMC contract:
   - draft `gamma` proposal-scored tokens,
@@ -390,6 +394,13 @@ Status:
 
 Add an SMC-side EAGLE draft-state carrier that can survive prefill/decode
 boundaries.
+
+Status:
+
+- implemented
+- no real EAGLE drafting yet
+- LM path remains unchanged
+- EAGLE mode now has a concrete internal carrier type for later checkpoints
 
 ### Checkpoint 4
 
