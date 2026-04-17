@@ -1,0 +1,4 @@
+[submodule "3rdparty/sglang"]
+	path = 3rdparty/sglang
+	url = git@github.com:abdelfattah-lab/sglang.git
+	branch = smc_v2_clean
