@@ -16,6 +16,7 @@ Pure CPU — no Triton, no GPU.  Mocks `req_to_token_pool` and
 
 import unittest
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,6 +25,11 @@ import torch
 from smcsd.v2 import scheduler as v2_scheduler_mod
 from smcsd.v2.req_state import ScheduleBatchSMC
 from smcsd.v2.info import SMCDecodeContext, SMCEagleDraftInputV2, SMCDraftInputV2
+from smcsd.v2.worker import SMCWorkerV2
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -194,6 +200,58 @@ def _build_slot_state(
     )
 
 
+def _make_model_worker_batch():
+    return ModelWorkerBatch(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=torch.tensor([11, 12, 13, 21, 22], dtype=torch.int64),
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+        seq_lens=torch.tensor([3, 2], dtype=torch.int64),
+        out_cache_loc=None,
+        seq_lens_cpu=torch.tensor([3, 2], dtype=torch.int64),
+        seq_lens_sum=5,
+        return_logprob=False,
+        top_logprobs_nums=[0, 0],
+        token_ids_logprobs=None,
+        global_num_tokens=None,
+        global_num_tokens_for_logprob=None,
+        is_extend_in_batch=False,
+        all_extend_in_batch=False,
+        can_run_dp_cuda_graph=False,
+        tbo_split_seq_index=None,
+        global_forward_mode=None,
+        extend_num_tokens=5,
+        extend_seq_lens=[3, 2],
+        extend_prefix_lens=[0, 0],
+        extend_logprob_start_lens=[0, 0],
+        extend_input_logprob_token_ids=None,
+        multimodal_inputs=None,
+        encoder_cached=None,
+        encoder_lens=None,
+        encoder_lens_cpu=None,
+        encoder_out_cache_loc=None,
+        lora_ids=None,
+        sampling_info=SimpleNamespace(),
+        orig_seq_lens=None,
+        input_embeds=None,
+        ne_token_table=None,
+        token_type_ids=None,
+        spec_algorithm=None,
+        spec_info=None,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        hicache_consumer_index=-1,
+        dimensions=None,
+        is_prefill_only=False,
+        dllm_block_offsets=None,
+        dllm_config=None,
+        reqs=[],
+        has_grammar=False,
+        return_hidden_states_before_norm=False,
+        mamba_track_indices=None,
+        mamba_track_mask=None,
+        mamba_track_seqlens=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -318,6 +376,68 @@ class TestSMCDraftCarrierSelection(CustomTestCase):
         self.assertIsNone(draft_input.hidden_states)
         self.assertIsNone(draft_input.topk_p)
         self.assertIsNone(draft_input.topk_index)
+
+
+class TestSMCEaglePrefill(CustomTestCase):
+    def test_forward_extend_initializes_eagle_prefill_state(self):
+        worker = object.__new__(SMCWorkerV2)
+        worker.device = "cpu"
+        worker.server_args = SimpleNamespace(smc_eagle_topk=3)
+        worker.speculative_num_draft_tokens = 5
+        worker._draft_input_cls = SMCEagleDraftInputV2
+        worker.smc_draft_kind = "eagle"
+
+        target_hidden = torch.tensor(
+            [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=torch.float32
+        )
+        target_result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=torch.tensor(
+                    [[1.0, 0.5, -0.3], [0.2, -0.7, 0.9]], dtype=torch.float32
+                ),
+                hidden_states=target_hidden,
+            ),
+            next_token_ids=torch.tensor([7, 8], dtype=torch.int64),
+        )
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=lambda batch: target_result
+        )
+
+        draft_logits_output = LogitsProcessorOutput(
+            next_token_logits=torch.tensor(
+                [
+                    [1.0, 3.0, 2.0, -1.0],
+                    [0.5, 0.2, 0.1, 0.9],
+                ],
+                dtype=torch.float32,
+            ),
+            hidden_states=torch.tensor(
+                [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32
+            ),
+        )
+        worker._run_eagle_prefill_forward = (
+            lambda *args, **kwargs: draft_logits_output
+        )
+
+        batch = _make_model_worker_batch()
+        result = worker._forward_extend(batch)
+
+        self.assertEqual(result.next_token_ids.tolist(), [7, 8])
+        self.assertEqual(result.accept_lens.tolist(), [0, 0])
+        self.assertIsInstance(result.next_draft_input, SMCEagleDraftInputV2)
+        self.assertEqual(result.next_draft_input.verified_id.tolist(), [7, 8])
+        self.assertEqual(result.next_draft_input.topk_index.tolist(), [[1, 2, 0], [3, 0, 1]])
+        self.assertEqual(result.next_draft_input.topk_p.shape, (2, 3))
+        self.assertEqual(result.next_draft_input.hidden_states.shape, (2, 3))
+
+    def test_forward_decode_rejects_eagle_until_decode_checkpoint(self):
+        worker = object.__new__(SMCWorkerV2)
+        worker._draft_input_cls = SMCEagleDraftInputV2
+
+        batch = replace(_make_model_worker_batch(), forward_mode=ForwardMode.DECODE)
+
+        with self.assertRaisesRegex(NotImplementedError, "prefill"):
+            worker._forward_decode(batch)
 
 
 class TestSMCResampleSlowPath(CustomTestCase):

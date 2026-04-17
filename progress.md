@@ -1,7 +1,7 @@
 # SMCSD EAGLE Draft Integration Progress
 
 Date: 2026-04-17
-Branch: `new_release`
+Branch: `eagle`
 
 ## Goal
 
@@ -21,6 +21,12 @@ test it in small steps.
   - `SMCEagleDraftInputV2` exists as a distinct SMC-side carrier
   - `ScheduleBatchSMC` can now construct either LM or EAGLE draft carriers
   - `SMCWorkerV2` accepts either carrier type without changing LM behavior
+- Checkpoint 4 prefill-only EAGLE initialization is implemented:
+  - EAGLE mode now captures target hidden states during prefill
+  - the draft model runs one EAGLE-style prefill step to initialize
+    `hidden_states`, `topk_p`, and `topk_index`
+  - decode is still intentionally blocked in EAGLE mode until the next
+    checkpoint
 - We are **not** implementing full tree-aware SMC in v1.
 - We are targeting an MVP that keeps the current SMC contract:
   - draft `gamma` proposal-scored tokens,
@@ -179,6 +185,41 @@ This is the main simplification that keeps the first implementation small:
 - no tree-aware resampling,
 - no need to redefine the current SMC decode contract,
 - no need to invent a new structured importance-weight formula in v1.
+
+## Checkpoint 4
+
+### Scope
+
+Checkpoint 4 makes EAGLE mode real only in the prefill path.
+
+That means:
+
+- target prefill now runs with hidden-state capture enabled
+- EAGLE mode uses those target hidden states plus the target-sampled
+  `verified_id` to run one draft-model prefill step
+- the SMC-side `SMCEagleDraftInputV2` returned from prefill is now populated
+  with:
+  - `verified_id`
+  - `hidden_states`
+  - `topk_p`
+  - `topk_index`
+- the decode path still raises an explicit "not implemented yet" error in
+  EAGLE mode so failures stay local and understandable
+
+### What Changed Conceptually
+
+Before Checkpoint 4, `smc_draft_kind=eagle` only changed configuration and
+carrier types.
+
+After Checkpoint 4:
+
+1. The target prefill generates the first real token as usual.
+2. That token becomes the carried `verified_id` for EAGLE state init.
+3. The draft model computes the first retained EAGLE candidate distribution.
+4. We store that state in `SMCEagleDraftInputV2` for the next checkpoint.
+
+So EAGLE mode now has a real prefill boundary, but still no decode-time
+sampling logic yet.
 
 ### Side-By-Side Diagram
 

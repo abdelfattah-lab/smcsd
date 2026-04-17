@@ -21,8 +21,12 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+)
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from smcsd.v2.info import (
     SMCDecodeContext,
     SMCDraftInputLike,
@@ -158,6 +162,9 @@ class SMCWorkerV2(BaseSpecWorker):
     # ── EXTEND (prefill) ──
 
     def _forward_extend(self, batch: ModelWorkerBatch):
+        if self._draft_input_cls is SMCEagleDraftInputV2:
+            return self._forward_extend_eagle(batch)
+
         # Score model prefill
         score_result = self._target_worker.forward_batch_generation(batch)
 
@@ -179,11 +186,45 @@ class SMCWorkerV2(BaseSpecWorker):
         )
         return score_result
 
+    def _forward_extend_eagle(self, batch: ModelWorkerBatch):
+        target_batch = dataclasses.replace(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        score_result = self._target_worker.forward_batch_generation(target_batch)
+
+        target_hidden_states = score_result.logits_output.hidden_states
+        if target_hidden_states is None:
+            raise RuntimeError(
+                "SMC EAGLE prefill requires target hidden states, but the target "
+                "prefill result did not return any."
+            )
+
+        eagle_logits_output = self._run_eagle_prefill_forward(
+            batch,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=score_result.next_token_ids,
+            mm_input_embeds=score_result.logits_output.mm_input_embeds,
+        )
+        score_result.next_draft_input = self._build_eagle_prefill_next_draft_input(
+            verified_id=score_result.next_token_ids,
+            logits_output=eagle_logits_output,
+        )
+        score_result.accept_lens = torch.zeros(
+            len(batch.seq_lens), dtype=torch.int32, device=self.device
+        )
+        return score_result
+
     # ── DECODE ──
 
     def _forward_decode(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_idle():
             return self._forward_idle(batch)
+
+        if self._draft_input_cls is SMCEagleDraftInputV2:
+            raise NotImplementedError(
+                "SMC EAGLE decode is not implemented yet. Checkpoint 4 only "
+                "initializes EAGLE draft state during prefill."
+            )
 
         current_stream = torch.get_device_module(self.device).current_stream()
         if batch.req_pool_indices is not None:
@@ -352,4 +393,74 @@ class SMCWorkerV2(BaseSpecWorker):
         """Copy batch with no spec_info (for draft model)."""
         return dataclasses.replace(
             batch, spec_info=None, capture_hidden_mode=CaptureHiddenMode.NULL
+        )
+
+    def _run_eagle_prefill_forward(
+        self,
+        batch: ModelWorkerBatch,
+        *,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        mm_input_embeds: Optional[torch.Tensor],
+    ) -> LogitsProcessorOutput:
+        draft_batch = self._make_eagle_prefill_batch(
+            batch,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+        )
+        forward_batch = ForwardBatch.init_new(draft_batch, self.draft_runner)
+        if mm_input_embeds is not None:
+            forward_batch.mm_input_embeds = mm_input_embeds
+        return self.draft_runner.forward(forward_batch).logits_output
+
+    def _make_eagle_prefill_batch(
+        self,
+        batch: ModelWorkerBatch,
+        *,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> ModelWorkerBatch:
+        eagle_input = EagleDraftInput(
+            hidden_states=target_hidden_states,
+            verified_id=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+        return dataclasses.replace(
+            batch,
+            input_ids=batch.input_ids.clone(),
+            spec_info=eagle_input,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+
+    def _build_eagle_prefill_next_draft_input(
+        self,
+        *,
+        verified_id: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
+    ) -> SMCEagleDraftInputV2:
+        if logits_output.hidden_states is None:
+            raise RuntimeError(
+                "SMC EAGLE prefill requires draft hidden states, but the draft "
+                "prefill result did not return any."
+            )
+        if logits_output.next_token_logits is None:
+            raise RuntimeError(
+                "SMC EAGLE prefill requires draft logits, but the draft prefill "
+                "result did not return any."
+            )
+
+        topk = min(self.server_args.smc_eagle_topk, logits_output.next_token_logits.shape[-1])
+        topk_logits, topk_index = torch.topk(
+            logits_output.next_token_logits,
+            k=topk,
+            dim=-1,
+        )
+        topk_p = torch.softmax(topk_logits, dim=-1)
+        return SMCEagleDraftInputV2(
+            verified_id=verified_id,
+            hidden_states=logits_output.hidden_states,
+            topk_p=topk_p,
+            topk_index=topk_index,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
         )
