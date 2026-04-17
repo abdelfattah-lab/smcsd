@@ -116,6 +116,30 @@ class SMCWorkerV2(BaseSpecWorker):
         self.draft_runner = self._draft_worker.model_runner
         self.score_runner = self._target_worker.model_runner
 
+        # EAGLE v1 checkpoints ship no lm_head (and often not input_layernorm /
+        # final norm); they are expected to share the target's lm_head and
+        # embed_tokens at runtime. sglang's EAGLEWorker does this via
+        # init_lm_head(). TpModelWorker does not, so without this the draft's
+        # lm_head stays at init (zeros) and every top-k comes out uniform.
+        if self.smc_draft_kind == "eagle":
+            try:
+                embed, head = (
+                    self._target_worker.model_runner.model.get_embed_and_head()
+                )
+                self.draft_runner.model.set_embed_and_head(embed, head)
+                logger.warning(
+                    "SMC EAGLE: shared target embed_tokens/lm_head into the "
+                    "draft runner (required for EAGLE-v1 heads that ship no "
+                    "lm_head weights)."
+                )
+            except AttributeError as exc:
+                logger.warning(
+                    "SMC EAGLE: target or draft model does not expose "
+                    "get_embed_and_head/set_embed_and_head — draft lm_head "
+                    "may be uninitialized. %s",
+                    exc,
+                )
+
         # Multi-step draft attention backend
         from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
