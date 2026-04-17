@@ -10,16 +10,33 @@ Paper: *Faster LLM Inference via Sequential Monte Carlo*
 
 ## Installation
 
+This repo vendors a patched SGLang as a git submodule at `3rdparty/sglang` (branch `smc_v2_clean`). Install both in editable mode.
+
 ```bash
-# Clone and install
-git clone https://github.com/abdelfattah-lab/smcsd.git
+# 1. Clone with submodules
+git clone --recurse-submodules https://github.com/abdelfattah-lab/smcsd.git
 cd smcsd
+
+# If you already cloned without --recurse-submodules, initialise now:
+# git submodule update --init --recursive
+
+# 2. Create a Python 3.12 environment
 uv venv --python 3.12
-uv pip install -e "python"
+source .venv/bin/activate
+
+# 3. Install the patched SGLang (from the submodule), then this package
+uv pip install -e 3rdparty/sglang/python
+uv pip install -e .
+```
+
+Updating the vendored SGLang later:
+
+```bash
+git submodule update --remote 3rdparty/sglang    # pull latest smc_v2_clean
+# then commit the bumped submodule pointer
 ```
 
 ## Quick Start
-
 
 ```bash
 # SMC-SD throughput on ShareGPT (batch size 1)
@@ -38,21 +55,22 @@ python -O -m sglang.bench_offline_throughput \
 ```
 
 ```bash
-# SMC-SD accuracy on GSM8K (N=12 particles, gamma=8)
-python scripts/smc/accuracy_test_gsm8k.py \
-  --mode smc \
+# SMC-SD accuracy on GSM8K via the dedicated SMCEngine (N=12 particles, gamma=8)
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --draft-model meta-llama/Llama-3.2-1B-Instruct \
   --particles 12 --gamma 8 \
   --temperature 0.7 \
   --attention-backend fa3 \
-  --max-running-requests 24\
-    --cuda-graph-max-bs 24 \
+  --max-running-requests 24 \
+  --cuda-graph-max-bs 24 \
   --num-questions 400
 ```
 
-## SMC-SD Parameters
+See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
+## SMC-SD Parameters
 
 | Parameter | Flag | Description |
 | --- | --- | --- |
@@ -63,22 +81,27 @@ python scripts/smc/accuracy_test_gsm8k.py \
 | Resample threshold | `--smc-resample-threshold` | Resample when ESS < N × threshold (0 = disable) |
 | Resample method | `--smc-resample-method` | `systematic` or `multinomial` |
 
-
 ## Architecture
 
-The SMC implementation lives in `python/sglang/srt/smc/`:
+SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via a handful of extension points (`ModelRunner._init_pools`, `ModelRunner._build_dummy_run_spec_info`, `ModelRunner._get_graph_runner_class`, `CudaGraphRunner.get_spec_info`, `Scheduler.init_tp_model_worker`, `TpModelWorker._init_model_runner`).
 
+| Path | Description |
+| --- | --- |
+| `smcsd/engine.py` | `SMCEngine` — standalone offline engine (bypasses Tokenizer/Detokenizer managers) |
+| `smcsd/v2/scheduler.py` | `SMCSchedulerV2` + `SMCCoordinatorV2` — slot-based decode loop and resampler |
+| `smcsd/v2/worker.py` | `SMCWorkerV2` — draft AR loop + target scoring + importance weights |
+| `smcsd/v2/req_state.py` | `ScheduleBatchSMC` — per-slot decode state |
+| `smcsd/v2/stacked_state.py` | `StackedGroupState` — GPU-resident per-group tensors for the fast path |
+| `smcsd/v2/info.py` | `SMCDraftInputV2`, `SMCDecodeContext` — spec-info wiring |
+| `smcsd/v2/kernels/` | Fused Triton kernels (`fused_collect`, `fused_resample_kv`) |
+| `smcsd/managers/smc_tp_worker.py` | `SMCTpModelWorker` — wires `SMCModelRunner` into the target TP worker |
+| `smcsd/model_executor/smc_model_runner.py` | `SMCModelRunner` — installs refcounted allocator + SMC warmup spec-info |
+| `smcsd/model_executor/smc_cuda_graph_runner.py` | `SMCCudaGraphRunner` — `SMCVerifyInput` during CUDA graph capture |
+| `smcsd/mem_cache/allocator.py` | `SMCRefCountedTokenAllocator` + `copy_block_table` |
+| `smcsd/common/verify.py` | `SMCVerifyInput` + Triton cache-assignment kernel |
+| `smcsd/common/utils.py` | Particle cloning, weight normalization, ESS / resample helpers |
 
-| File               | Description                                                               |
-| ------------------ | ------------------------------------------------------------------------- |
-| `smc_workers.py`   | Draft AR loop + target scoring + importance weight computation            |
-| `smc_resampler.py` | ESS check, systematic resampling, KV cache copy via refcounting           |
-| `smc_manager.py`   | Group lifecycle, particle creation, deferred weight updates, finalization |
-| `smc_info.py`      | KV allocation, Triton cache assignment kernel, verify input preparation   |
-| `smc_utils.py`     | Particle cloning, weight normalization, ESS computation                   |
-
-
-See [docs/smc/architecture.md](docs/smc/architecture.md) for a detailed design overview.
+See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design overview.
 
 ## Citation
 
