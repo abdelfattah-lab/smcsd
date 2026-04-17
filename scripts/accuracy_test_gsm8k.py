@@ -94,6 +94,8 @@ def run_smc_engine_eval(args, prompts, labels):
         draft_model_path=draft_model,
         n_particles=args.particles,
         gamma=args.gamma,
+        draft_kind=args.smc_draft_kind,
+        eagle_topk=args.smc_eagle_topk,
         draft_temperature=args.temperature,
         target_temperature=args.temperature,
         trust_remote_code=True,
@@ -169,6 +171,9 @@ def run_baseline_eval(args, prompts, labels):
         engine_kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
+    if args.disable_cuda_graph:
+        engine_kwargs["disable_cuda_graph"] = True
+        engine_kwargs["disable_piecewise_cuda_graph"] = True
 
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
@@ -224,7 +229,8 @@ def main(args):
         draft = args.draft_model or DEFAULT_DRAFT_MODEL
         print(
             f"  particles={args.particles}, gamma={args.gamma}, "
-            f"temperature={args.temperature}, draft={draft}"
+            f"temperature={args.temperature}, draft={draft}, "
+            f"draft_kind={args.smc_draft_kind}, eagle_topk={args.smc_eagle_topk}"
         )
     print(
         f"  num_questions={args.num_questions}, max_new_tokens={args.max_new_tokens}, "
@@ -294,6 +300,25 @@ if __name__ == "__main__":
     smc_grp.add_argument("--particles", "-N", type=int, default=4)
     smc_grp.add_argument("--gamma", "-g", type=int, default=4)
     smc_grp.add_argument(
+        "--smc-draft-kind",
+        choices=["lm", "eagle"],
+        default="lm",
+        help=(
+            "SMC draft backend: 'lm' is the current runnable path; "
+            "'eagle' wires the upcoming EAGLE proposal config and currently "
+            "fails fast with a clear not-implemented message."
+        ),
+    )
+    smc_grp.add_argument(
+        "--smc-eagle-topk",
+        type=int,
+        default=4,
+        help=(
+            "Top-k retained EAGLE candidates per draft step when "
+            "--smc-draft-kind=eagle. Intended to be > 1."
+        ),
+    )
+    smc_grp.add_argument(
         "--temperature",
         type=float,
         default=0.7,
@@ -338,6 +363,7 @@ if __name__ == "__main__":
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=128)
+    eng.add_argument("--disable-cuda-graph", action="store_true", default=False)
 
     args = parser.parse_args()
     main(args)

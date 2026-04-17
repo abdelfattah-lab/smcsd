@@ -64,6 +64,8 @@ class SMCEngine:
         # SMC hyper-parameters
         n_particles: int = 4,
         gamma: int = 4,
+        draft_kind: str = "lm",
+        eagle_topk: int = 4,
         draft_temperature: float = 0.7,
         target_temperature: float = 1.0,
         resample_threshold: float = 0.5,
@@ -84,6 +86,8 @@ class SMCEngine:
             disable_radix_cache=True,
             smc_n_particles=n_particles,
             smc_gamma=gamma,
+            smc_draft_kind=draft_kind,
+            smc_eagle_topk=eagle_topk,
             smc_draft_temperature=draft_temperature,
             smc_target_temperature=target_temperature,
             smc_resample_threshold=resample_threshold,
