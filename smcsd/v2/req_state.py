@@ -75,6 +75,8 @@ class ScheduleBatchSMC:
         self.n_particles = n_particles
         self.smc_draft_kind = smc_draft_kind
         self.smc_eagle_topk = smc_eagle_topk
+        self.eagle_hidden_size = int(getattr(model_config, "hidden_size", 0) or 0)
+        self.eagle_hidden_dtype = getattr(model_config, "dtype", torch.float32)
 
         # Pool references (shared with scheduler)
         self.req_to_token_pool = req_to_token_pool
@@ -135,6 +137,23 @@ class ScheduleBatchSMC:
             (self.max_slots,), -1, dtype=torch.int32, device=device
         )
         self.min_ps = torch.zeros(self.max_slots, dtype=torch.float32, device=device)
+        self.eagle_hidden_states = torch.empty(
+            (self.max_slots, self.eagle_hidden_size),
+            dtype=self.eagle_hidden_dtype,
+            device=device,
+        )
+        self.eagle_topk_p = torch.zeros(
+            (self.max_slots, smc_eagle_topk), dtype=torch.float32, device=device
+        )
+        self.eagle_topk_index = torch.zeros(
+            (self.max_slots, smc_eagle_topk), dtype=torch.int64, device=device
+        )
+        self.eagle_state_valid = torch.zeros(
+            self.max_slots, dtype=torch.bool, device=device
+        )
+        self.eagle_topk_ready = torch.zeros(
+            self.max_slots, dtype=torch.bool, device=device
+        )
 
         # ── Active batch index ──
         self.active_slots = torch.empty(0, dtype=torch.int64, device=device)
@@ -171,6 +190,7 @@ class ScheduleBatchSMC:
         group_idx: int,
         particle_reqs: List[Req],
         shared_seq_len: int,
+        initial_draft_input: Optional[SMCEagleDraftInputV2] = None,
     ) -> List[int]:
         """Claim slots for newly materialized particles, fill from Reqs."""
         n = len(particle_reqs)
@@ -226,6 +246,9 @@ class ScheduleBatchSMC:
             self.top_ks[slot] = req.sampling_params.top_k
             self.min_ps[slot] = req.sampling_params.min_p
 
+            if self.smc_draft_kind == "eagle":
+                self._initialize_eagle_slot(slot, initial_draft_input)
+
         self.group_slot_lists[group_id] = slots
         # Register this group in the stacked storage and bind the legacy
         # dict entries to views into its row.  Writes to
@@ -243,36 +266,25 @@ class ScheduleBatchSMC:
         """Free all slots for a finalized group."""
         slots = self.group_slot_lists.pop(group_id, [])
         for slot in slots:
-            pool_idx = int(self.req_pool_indices[slot].item())
-            alloc_len = int(self.kv_allocated_lens[slot].item())
-
-            if pool_idx != EMPTY_SLOT and alloc_len > 0:
-                indices = self.req_to_token_pool.req_to_token[
-                    pool_idx, :alloc_len
-                ].to(dtype=torch.int64, copy=True)
-                self.token_to_kv_pool_allocator.dec_ref_and_free(indices)
-                req = self.slot_to_req.get(slot)
-                if req is not None:
-                    self.req_to_token_pool.free(req)
-
-            self.req_pool_indices[slot] = EMPTY_SLOT
-            self.seq_lens[slot] = 0
-            self.kv_allocated_lens[slot] = 0
-            self.verified_ids[slot] = 0
-            self.token_counts[slot] = 0
-            self.group_indices[slot] = EMPTY_SLOT
-            self.particle_indices[slot] = EMPTY_SLOT
-            self.finished_mask[slot] = False
-            self.ignore_eos_t[slot] = False
-
-            self.slot_to_req.pop(slot, None)
-            self.slot_to_group_id.pop(slot, None)
-            self.free_slots.append(slot)
+            self._free_slot(slot)
 
         self.group_log_weights.pop(group_id, None)
         self.group_interval_weights.pop(group_id, None)
         self.group_n_particles.pop(group_id, None)
         self.stacked.unregister_group(group_id)
+        self.rebuild_active_slots()
+
+    def force_free_all_slots(self) -> None:
+        """Emergency cleanup for orphaned slot-state with no owning groups."""
+        for slot in list(self.slot_to_req.keys()):
+            self._free_slot(slot)
+
+        self.group_slot_lists.clear()
+        self.group_log_weights.clear()
+        self.group_interval_weights.clear()
+        self.group_n_particles.clear()
+        for group_id in list(self.stacked.group_id_to_row.keys()):
+            self.stacked.unregister_group(group_id)
         self.rebuild_active_slots()
 
     def rebuild_active_slots(self) -> None:
@@ -345,6 +357,23 @@ class ScheduleBatchSMC:
         # Scatter back to sparse slots
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
+        if draft_input_cls is SMCEagleDraftInputV2:
+            hidden_states = None
+            if self.eagle_state_valid[active].all().item() and self.eagle_hidden_size > 0:
+                hidden_states = self.eagle_hidden_states[active]
+            topk_p = None
+            topk_index = None
+            if self.eagle_topk_ready[active].all().item():
+                topk_p = self.eagle_topk_p[active]
+                topk_index = self.eagle_topk_index[active]
+            return draft_input_cls(
+                verified_id=verified_g,
+                hidden_states=hidden_states,
+                topk_p=topk_p,
+                topk_index=topk_index,
+                num_tokens_per_req=self.gamma_plus_1,
+                decode_ctx=ctx,
+            )
 
         return draft_input_cls(
             verified_id=verified_g,
@@ -444,6 +473,7 @@ class ScheduleBatchSMC:
         accept_lens: torch.Tensor,
         logprob_diff: torch.Tensor,
         bonus_ids: torch.Tensor,
+        next_draft_input: Optional[SMCDraftInputLike] = None,
         *,
         rebuild_active: bool = True,
     ) -> List[int]:
@@ -473,6 +503,8 @@ class ScheduleBatchSMC:
 
         # b. Update verified_ids
         self.verified_ids[active] = bonus_ids.to(dtype=torch.int32)
+        if self.smc_draft_kind == "eagle":
+            self._store_eagle_decode_state(active, next_draft_input)
 
         # c. Batched finish check
         newly_finished: List[int] = []
@@ -560,6 +592,110 @@ class ScheduleBatchSMC:
             self.rebuild_active_slots()
 
         return newly_finished
+
+    def _free_slot(self, slot: int) -> None:
+        pool_idx = int(self.req_pool_indices[slot].item())
+        alloc_len = int(self.kv_allocated_lens[slot].item())
+
+        if pool_idx != EMPTY_SLOT and alloc_len > 0:
+            indices = self.req_to_token_pool.req_to_token[
+                pool_idx, :alloc_len
+            ].to(dtype=torch.int64, copy=True)
+            self.token_to_kv_pool_allocator.dec_ref_and_free(indices)
+            req = self.slot_to_req.get(slot)
+            if req is not None and req.req_pool_idx is not None:
+                self.req_to_token_pool.free(req)
+
+        self.req_pool_indices[slot] = EMPTY_SLOT
+        self.seq_lens[slot] = 0
+        self.kv_allocated_lens[slot] = 0
+        self.verified_ids[slot] = 0
+        self.token_counts[slot] = 0
+        self.group_indices[slot] = EMPTY_SLOT
+        self.particle_indices[slot] = EMPTY_SLOT
+        self.finished_mask[slot] = False
+        self.ignore_eos_t[slot] = False
+        if self.smc_draft_kind == "eagle":
+            self.eagle_state_valid[slot] = False
+            self.eagle_topk_ready[slot] = False
+            if self.eagle_hidden_size > 0:
+                self.eagle_hidden_states[slot].zero_()
+            self.eagle_topk_p[slot].zero_()
+            self.eagle_topk_index[slot].zero_()
+
+        self.slot_to_req.pop(slot, None)
+        self.slot_to_group_id.pop(slot, None)
+        self.free_slots.append(slot)
+
+    def _initialize_eagle_slot(
+        self,
+        slot: int,
+        initial_draft_input: Optional[SMCEagleDraftInputV2],
+    ) -> None:
+        if initial_draft_input is None:
+            self.eagle_state_valid[slot] = False
+            self.eagle_topk_ready[slot] = False
+            return
+
+        hidden_states = initial_draft_input.hidden_states
+        self.eagle_state_valid[slot] = hidden_states is not None
+        self.eagle_topk_ready[slot] = initial_draft_input.topk_p is not None
+
+        if (
+            hidden_states is not None
+            and self.eagle_hidden_size > 0
+            and hidden_states.numel() > 0
+        ):
+            self.eagle_hidden_states[slot] = hidden_states[0].to(
+                dtype=self.eagle_hidden_dtype,
+                device=self.device,
+            )
+        if initial_draft_input.topk_p is not None:
+            self.eagle_topk_p[slot] = initial_draft_input.topk_p[0].to(
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if initial_draft_input.topk_index is not None:
+            self.eagle_topk_index[slot] = initial_draft_input.topk_index[0].to(
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+    def _store_eagle_decode_state(
+        self,
+        active: torch.Tensor,
+        next_draft_input: Optional[SMCDraftInputLike],
+    ) -> None:
+        if not isinstance(next_draft_input, SMCEagleDraftInputV2):
+            raise RuntimeError(
+                "SMC EAGLE decode requires SMCEagleDraftInputV2 in next_draft_input."
+            )
+        if next_draft_input.hidden_states is None:
+            raise RuntimeError(
+                "SMC EAGLE decode requires hidden_states in next_draft_input."
+            )
+
+        self.eagle_state_valid[active] = True
+        if self.eagle_hidden_size > 0 and next_draft_input.hidden_states.numel() > 0:
+            self.eagle_hidden_states[active] = next_draft_input.hidden_states.to(
+                dtype=self.eagle_hidden_dtype,
+                device=self.device,
+            )
+
+        has_topk = (
+            next_draft_input.topk_p is not None
+            and next_draft_input.topk_index is not None
+        )
+        self.eagle_topk_ready[active] = has_topk
+        if has_topk:
+            self.eagle_topk_p[active] = next_draft_input.topk_p.to(
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.eagle_topk_index[active] = next_draft_input.topk_index.to(
+                dtype=torch.int64,
+                device=self.device,
+            )
 
     # ────────────────────────────────────────────────────────
     #  Resampling

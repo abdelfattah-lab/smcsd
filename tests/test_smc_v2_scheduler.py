@@ -356,6 +356,10 @@ class TestSMCDraftCarrierSelection(CustomTestCase):
         slot_state.seq_lens[0] = 1
         slot_state.kv_allocated_lens[0] = 1
         slot_state.verified_ids[0] = 77
+        slot_state.eagle_state_valid[0] = True
+        slot_state.eagle_topk_ready[0] = True
+        slot_state.eagle_topk_p[0] = torch.tensor([0.75, 0.25, 0.0, 0.0])
+        slot_state.eagle_topk_index[0] = torch.tensor([5, 6, 0, 0])
 
         fake_ctx = SMCDecodeContext(
             orig_seq_lens=torch.tensor([1], dtype=torch.int64),
@@ -364,6 +368,11 @@ class TestSMCDraftCarrierSelection(CustomTestCase):
             new_seq_lens=torch.tensor([3], dtype=torch.int64),
             gamma=1,
         )
+        if slot_state.eagle_hidden_size > 0:
+            slot_state.eagle_hidden_states[0] = torch.tensor(
+                [1.0] * slot_state.eagle_hidden_size,
+                dtype=slot_state.eagle_hidden_dtype,
+            )
         with patch(
             "smcsd.v2.req_state.SMCDecodeContext.from_slot_gather",
             return_value=(fake_ctx, torch.tensor([3], dtype=torch.int64)),
@@ -373,9 +382,13 @@ class TestSMCDraftCarrierSelection(CustomTestCase):
         self.assertIsInstance(draft_input, SMCEagleDraftInputV2)
         self.assertEqual(draft_input.verified_id.tolist(), [77])
         self.assertIs(draft_input.decode_ctx, fake_ctx)
-        self.assertIsNone(draft_input.hidden_states)
-        self.assertIsNone(draft_input.topk_p)
-        self.assertIsNone(draft_input.topk_index)
+        self.assertEqual(draft_input.topk_index.tolist(), [[5, 6, 0, 0]])
+        self.assertEqual(draft_input.topk_p.shape, (1, 4))
+        if slot_state.eagle_hidden_size > 0:
+            self.assertEqual(
+                draft_input.hidden_states.shape,
+                (1, slot_state.eagle_hidden_size),
+            )
 
 
 class TestSMCEaglePrefill(CustomTestCase):
@@ -430,14 +443,109 @@ class TestSMCEaglePrefill(CustomTestCase):
         self.assertEqual(result.next_draft_input.topk_p.shape, (2, 3))
         self.assertEqual(result.next_draft_input.hidden_states.shape, (2, 3))
 
-    def test_forward_decode_rejects_eagle_until_decode_checkpoint(self):
+    def test_forward_decode_runs_flat_chain_eagle_path(self):
         worker = object.__new__(SMCWorkerV2)
+        worker.device = "cpu"
+        worker.gamma = 2
+        worker.smc_draft_temperature = 0.0
+        worker.smc_target_temperature = 1.0
+        worker.speculative_num_draft_tokens = 3
         worker._draft_input_cls = SMCEagleDraftInputV2
+        worker.server_args = SimpleNamespace(smc_eagle_topk=2)
+        worker.req_to_token_pool = SimpleNamespace()
+        worker.draft_runner = SimpleNamespace()
 
-        batch = replace(_make_model_worker_batch(), forward_mode=ForwardMode.DECODE)
+        fake_ctx = SimpleNamespace(
+            orig_seq_lens=torch.tensor([5], dtype=torch.int64),
+            orig_seq_lens_cpu=torch.tensor([5], dtype=torch.int64),
+            orig_seq_lens_sum=5,
+            prepare_for_draft=lambda *args, **kwargs: (
+                None,
+                False,
+                torch.tensor([[101, 102, 103]], dtype=torch.int64),
+                torch.tensor([[5, 6, 7]], dtype=torch.int64),
+                torch.tensor([[6, 7, 8]], dtype=torch.int64),
+            ),
+            prepare_for_verify=lambda *args, **kwargs: ("verify_fb", False),
+        )
 
-        with self.assertRaisesRegex(NotImplementedError, "prefill"):
-            worker._forward_decode(batch)
+        batch = replace(
+            _make_model_worker_batch(),
+            forward_mode=ForwardMode.DECODE,
+            spec_info=SMCEagleDraftInputV2(
+                verified_id=torch.tensor([9], dtype=torch.int64),
+                hidden_states=torch.tensor([[0.3, 0.7]], dtype=torch.float32),
+                topk_p=torch.tensor([[0.9, 0.1]], dtype=torch.float32),
+                topk_index=torch.tensor([[11, 12]], dtype=torch.int64),
+                decode_ctx=fake_ctx,
+            ),
+        )
+
+        draft_steps = iter(
+            [
+                LogitsProcessorOutput(
+                    next_token_logits=torch.tensor(
+                        [[0.1, 0.2, 4.0]], dtype=torch.float32
+                    ),
+                    hidden_states=torch.tensor([[1.0, 1.5]], dtype=torch.float32),
+                ),
+                LogitsProcessorOutput(
+                    next_token_logits=torch.tensor(
+                        [[0.3, 0.4, 0.5]], dtype=torch.float32
+                    ),
+                    hidden_states=torch.tensor([[2.0, 2.5]], dtype=torch.float32),
+                ),
+            ]
+        )
+        worker._run_eagle_decode_step = lambda *args, **kwargs: next(draft_steps)
+
+        score_logits = torch.full((3, 13), -6.0, dtype=torch.float32)
+        score_logits[0, 11] = 6.0
+        score_logits[1, 2] = 5.0
+        score_logits[2, 4] = 4.0
+        score_hidden = torch.tensor(
+            [[10.0, 10.5], [11.0, 11.5], [12.0, 12.5]], dtype=torch.float32
+        )
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=lambda **kwargs: GenerationBatchResult(
+                logits_output=LogitsProcessorOutput(
+                    next_token_logits=score_logits,
+                    hidden_states=score_hidden,
+                ),
+            )
+        )
+        worker._build_eagle_next_draft_input_from_decode = (
+            lambda **kwargs: SMCEagleDraftInputV2(
+                verified_id=torch.tensor([4], dtype=torch.int64),
+                hidden_states=torch.tensor([[21.0, 22.0]], dtype=torch.float32),
+                topk_p=torch.tensor([[0.6, 0.4]], dtype=torch.float32),
+                topk_index=torch.tensor([[5, 6]], dtype=torch.int64),
+                logprob_diff=kwargs["logprob_diff"],
+                num_tokens_per_req=worker.speculative_num_draft_tokens,
+            )
+        )
+
+        with patch.object(torch.Tensor, "record_stream", lambda self, stream: None):
+            with patch(
+                "torch.get_device_module",
+                return_value=SimpleNamespace(current_stream=lambda: object()),
+            ):
+                result = worker._forward_decode(batch)
+
+        self.assertEqual(result.next_token_ids.tolist(), [11, 2, 4])
+        expected = torch.log_softmax(score_logits[:2], dim=-1)[
+            torch.arange(2), torch.tensor([11, 2])
+        ].sum()
+        self.assertTrue(torch.allclose(result.logprob_diff, expected.reshape(1)))
+        self.assertIsInstance(result.next_draft_input, SMCEagleDraftInputV2)
+        self.assertEqual(result.next_draft_input.verified_id.tolist(), [4])
+        self.assertEqual(result.next_draft_input.topk_index.tolist(), [[5, 6]])
+        self.assertTrue(
+            torch.equal(
+                result.next_draft_input.hidden_states,
+                torch.tensor([[21.0, 22.0]], dtype=torch.float32),
+            )
+        )
 
 
 class TestSMCResampleSlowPath(CustomTestCase):

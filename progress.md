@@ -27,12 +27,272 @@ test it in small steps.
     `hidden_states`, `topk_p`, and `topk_index`
   - decode is still intentionally blocked in EAGLE mode until the next
     checkpoint
+- Checkpoint 5 flat-chain EAGLE decode is implemented at the worker/state level:
+  - SMC EAGLE decode now samples one linear chain per particle from retained
+    top-k EAGLE proposals
+  - `log q` is accumulated from the renormalized retained top-k proposal
+  - decode now writes a real next-cycle `SMCEagleDraftInputV2` back into
+    slot-state instead of dropping EAGLE state after prefill
+  - focused CPU/unit tests pass
+  - end-to-end cleanup was fixed after adding orphan slot cleanup in the
+    scheduler / slot-state layer
 - We are **not** implementing full tree-aware SMC in v1.
 - We are targeting an MVP that keeps the current SMC contract:
   - draft `gamma` proposal-scored tokens,
   - target-score those same `gamma` tokens,
   - then sample one target-side bonus token,
   - carry that bonus token into the next decode cycle as `verified_id`.
+
+## Handoff Summary
+
+This section is meant to let another agent pick the work up without chat
+history.
+
+### What Is Working Today
+
+- `smc_draft_kind=lm` still runs normally.
+- `smc_draft_kind=eagle` now runs end to end without crashing the scheduler.
+- The worker executes a flat-chain EAGLE proposal:
+  - start from `verified_id`
+  - sample `gamma` draft tokens from retained EAGLE top-k proposals
+  - accumulate `log q`
+  - verify the drafted chain under the target
+  - compute `logprob_diff = sum(log p - log q)`
+  - sample a target bonus token
+  - build a next-cycle `SMCEagleDraftInputV2`
+- The scheduler/slot-state now persists EAGLE state across cycles rather than
+  dropping it after prefill.
+- The one-question GPU smoke exits cleanly and prints the evaluation summary.
+
+### What Is Still Wrong
+
+The current problem is no longer plumbing or cleanup. The current problem is
+generation quality / behavioral correctness.
+
+Observed runtime result on the real smoke test:
+
+- command:
+  - `PYTHONPATH=/home/yahya/smcsd:/home/yahya/smcsd/3rdparty/sglang/python CUDA_VISIBLE_DEVICES=3 .venv/bin/python scripts/accuracy_test_gsm8k.py --mode smc_engine --model meta-llama/Llama-3.1-8B-Instruct --draft-model meta-llama/Llama-3.2-1B-Instruct --particles 4 --gamma 4 --temperature 0.7 --attention-backend fa3 --num-questions 1 --max-running-requests 8 --cuda-graph-max-bs 8 --smc-draft-kind eagle --smc-eagle-topk 4`
+- result:
+  - generation completed and the process exited cleanly
+  - output was only one token: `To`
+  - accuracy was `0/1`
+  - output marked invalid
+
+So the project has crossed the "make it run" boundary, but it has not crossed
+the "make it generate sensible continuations" boundary.
+
+### Most Likely Remaining Problem Area
+
+The likely remaining bug is in proposal-state semantics rather than raw
+scheduler plumbing.
+
+The most suspicious areas are:
+
+- what exactly the carried `hidden_states` represent from one cycle to the next
+- whether the next-cycle EAGLE state should be bootstrapped from target hidden
+  states, draft hidden states, or a draft-extend pass over the accepted path
+- whether `verified_id` and the carried hidden state are aligned to the same
+  history
+- whether the decode-time draft step is writing / reading KV locations with the
+  correct timing relative to the sampled chain
+- whether the retained `topk_p` / `topk_index` correspond to the same token
+  history as the carried hidden state
+
+This means the next work should be correctness debugging, not more scheduler
+infrastructure.
+
+## Files Changed So Far
+
+### Top-level repo
+
+- `progress.md`
+- `scripts/accuracy_test_gsm8k.py`
+- `smcsd/engine.py`
+- `smcsd/v2/info.py`
+- `smcsd/v2/req_state.py`
+- `smcsd/v2/scheduler.py`
+- `smcsd/v2/worker.py`
+- `tests/test_smc_v2_scheduler.py`
+
+### Vendored submodule
+
+- `3rdparty/sglang/python/sglang/srt/server_args.py`
+
+## Detailed Checkpoint Notes
+
+### Checkpoint 2: Config Plumbing
+
+Implemented:
+
+- `smc_draft_kind = {lm, eagle}`
+- `smc_eagle_topk`
+- validation that `smc_eagle_topk > 1` for EAGLE mode
+- engine/script wiring so the new args reach `ServerArgs`
+
+Important detail:
+
+- the original hard failure for all `smc_draft_kind=eagle` runs was later
+  removed once Checkpoint 4/5 were implemented, so EAGLE mode now passes
+  initialization.
+
+### Checkpoint 3: Draft Carrier
+
+Implemented:
+
+- `SMCEagleDraftInputV2` in `smcsd/v2/info.py`
+- `ScheduleBatchSMC.prepare_for_decode()` can now return either:
+  - `SMCDraftInputV2`
+  - `SMCEagleDraftInputV2`
+- worker and tests accept both carrier shapes
+
+Purpose:
+
+- create a stable SMC-side state object before adding real EAGLE logic
+
+### Checkpoint 4: Prefill-Only EAGLE Initialization
+
+Implemented:
+
+- target prefill captures hidden states
+- EAGLE draft prefill runs once to initialize:
+  - `verified_id`
+  - `hidden_states`
+  - `topk_p`
+  - `topk_index`
+- EAGLE decode was intentionally blocked at this stage
+
+Important detail:
+
+- this checkpoint was used to validate that EAGLE state could be created
+  correctly at the prefill/decode boundary without touching the SMC resampler
+
+### Checkpoint 5: Flat-Chain EAGLE Decode
+
+Implemented:
+
+- EAGLE decode path in `smcsd/v2/worker.py`
+- per-step sampling from renormalized retained top-k probabilities
+- `log q` accumulation
+- target verify reuse from the existing SMC path
+- next-cycle `SMCEagleDraftInputV2` construction after decode
+
+Also implemented to support this:
+
+- per-slot EAGLE state persistence in `smcsd/v2/req_state.py`
+  - hidden states
+  - retained top-k probabilities
+  - retained top-k indices
+  - validity flags
+- prefill seeding of slot-state from `result.next_draft_input`
+- decode write-back of next-cycle EAGLE state into slot-state
+
+### Cleanup Work Done After Checkpoint 5
+
+The first runtime version of Checkpoint 5 still crashed after generation due to
+idle-time memory checks.
+
+Observed failures that were fixed:
+
+1. First decode cycle had no persisted EAGLE state in slot-state.
+   Fix:
+   - seed slot-state with prefill-produced `SMCEagleDraftInputV2`
+   - persist next-cycle EAGLE state after each decode result
+
+2. Scheduler could reach idle with orphaned slot-held tokens/reqs.
+   Fix:
+   - add idle-time orphan cleanup hook in `SMCSchedulerV2`
+   - add lower-level `force_free_all_slots()` support in `ScheduleBatchSMC`
+
+3. Forced orphan cleanup hit partially-freed req objects.
+   Fix:
+   - make slot freeing tolerate reqs whose `req_pool_idx` is already `None`
+
+Result:
+
+- the one-question EAGLE smoke now exits cleanly
+
+## Current Verification State
+
+### Unit / CPU checks
+
+Passing:
+
+- `python3 -m py_compile` on the edited Python files
+- focused test suite:
+  - `tests/test_smc_v2_scheduler.py`
+  - current result: `10 tests, OK`
+
+These tests currently cover:
+
+- decode-carrier selection
+- EAGLE prefill carrier initialization
+- mocked flat-chain EAGLE decode flow
+- scheduler admission
+- finalize-group behavior
+- slow-path resampling behavior
+
+### Runtime checks
+
+Confirmed working:
+
+- LM SMC path still runs
+- EAGLE SMC path now runs end to end and exits cleanly
+
+Confirmed still bad:
+
+- EAGLE generation quality is currently poor / degenerate on the smoke test
+
+## Recommended Next Steps
+
+If another agent picks this up, the best next move is to debug correctness of
+the EAGLE state transition, not to add more features.
+
+Recommended order:
+
+1. Add temporary instrumentation around one decode cycle in `smcsd/v2/worker.py`
+   to log:
+   - incoming `verified_id`
+   - whether `topk_p/topk_index` are present
+   - sampled draft tokens
+   - per-step `log q`
+   - verified tokens under the target
+   - outgoing `verified_id`
+2. Check that the carried `hidden_states` and `verified_id` correspond to the
+   same history.
+3. Check whether the next-cycle state should come from:
+   - the current draft-extend path over `next_token_ids`
+   - or a different bootstrap source
+4. Compare one-cycle behavior against upstream EAGLE worker logic for the same
+   accepted path.
+5. Only after generations look sane should we run larger GSM8K tests or touch
+   performance.
+
+## Commands Used For Verification
+
+Focused unit suite:
+
+```bash
+.venv/bin/python -c "import sys, unittest; sys.path[:0]=['/home/yahya/smcsd','/home/yahya/smcsd/3rdparty/sglang/python']; suite=unittest.defaultTestLoader.discover('/home/yahya/smcsd/tests', pattern='test_smc_v2_scheduler.py'); result=unittest.TextTestRunner(verbosity=2).run(suite); raise SystemExit(0 if result.wasSuccessful() else 1)"
+```
+
+Main EAGLE runtime smoke:
+
+```bash
+PYTHONPATH=/home/yahya/smcsd:/home/yahya/smcsd/3rdparty/sglang/python \
+CUDA_VISIBLE_DEVICES=3 .venv/bin/python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --particles 4 --gamma 4 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 1 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs 8 \
+  --smc-draft-kind eagle \
+  --smc-eagle-topk 4
+```
 
 ## Checkpoint 1
 

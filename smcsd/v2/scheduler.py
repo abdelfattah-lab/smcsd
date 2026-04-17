@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import signal
 import time
+
+_SMC_EAGLE_DEBUG = os.environ.get("SMC_EAGLE_DEBUG", "0") == "1"
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
@@ -30,6 +33,7 @@ from smcsd.common.utils import (
     validate_smc_parent_req,
 )
 from smcsd.mem_cache.allocator import copy_block_table
+from smcsd.v2.info import SMCEagleDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode, kill_itself_when_parent_died
 from sglang.utils import get_exception_traceback
@@ -568,6 +572,29 @@ class SMCSchedulerV2(Scheduler):
                 msg,
             )
 
+    def _cleanup_orphaned_slot_state(self) -> None:
+        if self.running_groups or self.prefill_groups:
+            return
+        if self.slot_state.held_req_count() == 0:
+            return
+        logger.warning(
+            "SMCSchedulerV2: force-cleaning orphaned slot-state during idle "
+            "(active=%s, held_reqs=%s, groups=%s)",
+            self.slot_state.num_active,
+            self.slot_state.held_req_count(),
+            self.slot_state.sorted_group_ids(),
+        )
+        self.slot_state.force_free_all_slots()
+
+    def self_check_during_idle(self):
+        self._drain_finished_groups()
+        self._cleanup_orphaned_slot_state()
+        if self.running_groups or self.prefill_groups:
+            self.new_token_ratio = self.init_new_token_ratio
+            self.maybe_sleep_on_idle()
+            return
+        return super().self_check_during_idle()
+
     # ── Request Admission ──
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -709,26 +736,91 @@ class SMCSchedulerV2(Scheduler):
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
-        for group, req, next_token_id in zip(groups, batch.reqs, next_token_ids):
+        next_draft = result.next_draft_input
+
+        for idx, (group, req, next_token_id) in enumerate(zip(groups, batch.reqs, next_token_ids)):
             assert req is group.parent_req
 
             req.output_ids.append(next_token_id)
             req.check_finished()
 
+            if _SMC_EAGLE_DEBUG:
+                print(
+                    f"[SMC_EAGLE_SCHED] _process_prefill_result idx={idx} "
+                    f"next_token_id={next_token_id} "
+                    f"req.finished={req.finished()} "
+                    f"finished_reason={req.finished_reason}",
+                    flush=True,
+                )
+
             if req.finished():
                 release_kv_cache(req, self.tree_cache)
                 req.time_stats.set_completion_time()
                 self.stream_output([req], False)
+                if _SMC_EAGLE_DEBUG:
+                    print(
+                        f"[SMC_EAGLE_SCHED] EARLY FINALIZE via req.finished() "
+                        f"idx={idx} reason={req.finished_reason}",
+                        flush=True,
+                    )
                 continue
 
-            error_msg = self._materialize_group(group)
+            group_draft_input = self._slice_prefill_draft_input(next_draft, idx)
+            if _SMC_EAGLE_DEBUG:
+                print(
+                    f"[SMC_EAGLE_SCHED] sliced_draft_input type="
+                    f"{type(group_draft_input).__name__ if group_draft_input is not None else 'None'}",
+                    flush=True,
+                )
+            error_msg = self._materialize_group(
+                group, initial_draft_input=group_draft_input,
+            )
             if error_msg is not None:
+                if _SMC_EAGLE_DEBUG:
+                    print(
+                        f"[SMC_EAGLE_SCHED] MATERIALIZE FAILED idx={idx} "
+                        f"error={error_msg!r}",
+                        flush=True,
+                    )
                 self._abort_group(group, error_msg)
                 continue
 
+            if _SMC_EAGLE_DEBUG:
+                print(
+                    f"[SMC_EAGLE_SCHED] group admitted to running_groups idx={idx} "
+                    f"group_id={group.group_id}",
+                    flush=True,
+                )
             self.running_groups.append(group)
 
-    def _materialize_group(self, group: SequenceGroup) -> Optional[str]:
+    def _slice_prefill_draft_input(
+        self,
+        draft_input,
+        batch_index: int,
+    ) -> Optional[SMCEagleDraftInputV2]:
+        if not isinstance(draft_input, SMCEagleDraftInputV2):
+            return None
+
+        def _slice_tensor(x):
+            if x is None:
+                return None
+            return x[batch_index : batch_index + 1]
+
+        return SMCEagleDraftInputV2(
+            verified_id=_slice_tensor(draft_input.verified_id),
+            hidden_states=_slice_tensor(draft_input.hidden_states),
+            topk_p=_slice_tensor(draft_input.topk_p),
+            topk_index=_slice_tensor(draft_input.topk_index),
+            logprob_diff=_slice_tensor(draft_input.logprob_diff),
+            num_tokens_per_req=draft_input.num_tokens_per_req,
+        )
+
+    def _materialize_group(
+        self,
+        group: SequenceGroup,
+        *,
+        initial_draft_input: Optional[SMCEagleDraftInputV2] = None,
+    ) -> Optional[str]:
         parent_req = group.parent_req
         try:
             self.model_worker.materialize_smc_parent_draft_prefix(parent_req)
@@ -784,6 +876,7 @@ class SMCSchedulerV2(Scheduler):
                 group_idx=group_idx,
                 particle_reqs=particle_reqs,
                 shared_seq_len=shared_seq_len,
+                initial_draft_input=initial_draft_input,
             )
         except Exception as exc:
             for particle_req in particle_reqs:
@@ -818,6 +911,14 @@ class SMCSchedulerV2(Scheduler):
     def _prepare_decode_batch(self):
         """Prepare decode via slot state. Returns ModelWorkerBatch or None."""
         draft_input = self.slot_state.prepare_for_decode()
+        if _SMC_EAGLE_DEBUG:
+            print(
+                f"[SMC_EAGLE_SCHED] _prepare_decode_batch "
+                f"running_groups={len(self.running_groups)} "
+                f"draft_input.type={type(draft_input).__name__} "
+                f"decode_ctx_present={draft_input.decode_ctx is not None}",
+                flush=True,
+            )
         if draft_input.decode_ctx is None:
             return None
         return self.slot_state.build_model_worker_batch(draft_input)
@@ -849,6 +950,7 @@ class SMCSchedulerV2(Scheduler):
             accept_lens=result.accept_lens,
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
+            next_draft_input=next_draft,
             rebuild_active=False,
         )
 

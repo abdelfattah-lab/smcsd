@@ -116,6 +116,8 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_running_requests"] = args.max_running_requests
     else:
         engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
+    if args.dtype is not None:
+        engine_kwargs["dtype"] = args.dtype
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
@@ -364,6 +366,8 @@ if __name__ == "__main__":
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=128)
     eng.add_argument("--disable-cuda-graph", action="store_true", default=False)
+    eng.add_argument("--dtype", type=str, default=None,
+                      help="model dtype (auto/float16/bfloat16/float32). Forces both target and draft into the same dtype.")
 
     args = parser.parse_args()
     main(args)
