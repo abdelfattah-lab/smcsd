@@ -410,11 +410,16 @@ class SMCSchedulerV2(Scheduler):
 
         from smcsd.v2.req_state import ScheduleBatchSMC
 
+        # SMCEngine (or core auto-resolution) has sized the req_to_token_pool
+        # for G * (N+1) Reqs; back out G = max concurrent user groups.
+        n_particles = server_args.smc_n_particles
+        self.max_user_groups = self.max_running_requests // (n_particles + 1)
+
         self.waiting_groups: Deque[SequenceGroup] = deque()
         self.prefill_groups: List[SequenceGroup] = []
         self.running_groups: List[SequenceGroup] = []
         self.slot_state = ScheduleBatchSMC(
-            max_num_reqs=server_args.max_running_requests or 256,
+            max_num_reqs=self.max_user_groups * n_particles,
             device=self.device,
             gamma_plus_1=server_args.speculative_num_draft_tokens,
             vocab_size=self.model_config.vocab_size,
@@ -424,7 +429,7 @@ class SMCSchedulerV2(Scheduler):
             tree_cache=self.tree_cache,
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
-            n_particles=server_args.smc_n_particles,
+            n_particles=n_particles,
         )
         self.coordinator = SMCCoordinatorV2(
             device=self.device,
@@ -451,7 +456,24 @@ class SMCSchedulerV2(Scheduler):
             batch_is_full=False,
         )
 
-    # ── Worker override: use SMCWorkerV2 ──
+    # ── Worker overrides: use SMC variants ──
+
+    def init_tp_model_worker(self):
+        # Construct SMCTpModelWorker so the target model_runner uses
+        # SMCRefCountedTokenAllocator instead of TokenToKVPoolAllocator.
+        from smcsd.managers.smc_tp_worker import SMCTpModelWorker
+
+        self.tp_worker = SMCTpModelWorker(
+            server_args=self.server_args,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+            pp_rank=self.pp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_dp_rank=self.moe_dp_rank,
+            dp_rank=self.dp_rank,
+            nccl_port=self.nccl_port,
+        )
 
     def maybe_init_draft_worker(self):
         from smcsd.v2.worker import SMCWorkerV2
@@ -636,30 +658,17 @@ class SMCSchedulerV2(Scheduler):
 
     def _admit_prefill_groups(self) -> List[SequenceGroup]:
         admitted: List[SequenceGroup] = []
-        remaining_capacity = None
-        if self.max_running_requests is not None:
-            remaining_capacity = self.slot_state.available_slot_count()
+        remaining_capacity = self.slot_state.available_slot_count()
 
         while self.waiting_groups:
             group = self.waiting_groups[0]
             group_size = group.n_particles
-            if (
-                self.max_running_requests is not None
-                and group_size > self.max_running_requests
-            ):
-                self.waiting_groups.popleft()
-                self._emit_abort(
-                    group.parent_req,
-                    "SMC particle count exceeds max_running_requests.",
-                )
-                continue
-            if remaining_capacity is not None and group_size > remaining_capacity:
+            if group_size > remaining_capacity:
                 break
             admitted.append(self.waiting_groups.popleft())
-            if remaining_capacity is not None:
-                remaining_capacity -= group_size
-                if remaining_capacity <= 0:
-                    break
+            remaining_capacity -= group_size
+            if remaining_capacity <= 0:
+                break
         return admitted
 
     # ── Prefill (uses ScheduleBatch) ──

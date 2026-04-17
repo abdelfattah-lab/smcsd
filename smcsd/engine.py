@@ -75,6 +75,21 @@ class SMCEngine:
         **kwargs,
     ):
         # -- 1. Build ServerArgs --
+        # Each SMC group needs N+1 Req slots (1 parent + N particles co-exist
+        # briefly during materialize).  Expand max_running_requests upfront so
+        # the core req_to_token_pool is sized correctly; SMCSchedulerV2 backs
+        # out the user-facing concurrency from the expanded value.
+        user_max = kwargs.pop("max_running_requests", None)
+        if user_max is not None:
+            expanded = user_max * (n_particles + 1)
+            logger.info(
+                "SMCEngine: scaling max_running_requests %d -> %d "
+                "(= %d * (N+1=%d)) for per-particle Reqs.",
+                user_max, expanded, user_max, n_particles + 1,
+            )
+        else:
+            expanded = None
+
         forced = dict(
             model_path=model_path,
             speculative_algorithm="SMC",
@@ -91,6 +106,8 @@ class SMCEngine:
             tp_size=tp_size,
             base_gpu_id=base_gpu_id,
         )
+        if expanded is not None:
+            forced["max_running_requests"] = expanded
         # User kwargs can override anything not in `forced`
         merged = {**kwargs, **forced}
         if "log_level" not in merged:
