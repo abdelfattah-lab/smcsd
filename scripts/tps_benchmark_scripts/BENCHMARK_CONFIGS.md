@@ -46,8 +46,8 @@
 |-----------|-------|
 | Draft Temperature | 0.7 |
 | Target Temperature | 0.7 |
-| `--max-running-requests` | `b * n` (computed) |
-| `--cuda-graph-max-bs` | `b * n` (computed) |
+| `--max-running-requests` | `b` (concurrent user groups; SMCEngine expands internally to `G * (N+1)` for the req pool) |
+| `--cuda-graph-max-bs` | `b * n` (peak decode batch = groups × particles) |
 
 ## SMC (gamma, n) Sweep Pairs
 

@@ -45,8 +45,11 @@ for b in "${NUM_PROMPTS_LIST[@]}"; do
     sleep 5
     read -r gamma n <<< "$pair"
 
-    max_rr=$((b * n))
-    cuda_bs=$((max_rr))
+    # --max-running-requests = concurrent user groups (SMCEngine expands
+    # to G*(N+1) internally for the req pool).  --cuda-graph-max-bs is
+    # the peak decode batch = groups * particles.
+    max_rr=$b
+    cuda_bs=$((b * n))
 
     echo "=== b=$b  gamma=$gamma  n=$n  max_rr=$max_rr  cuda_bs=$cuda_bs ==="
 
