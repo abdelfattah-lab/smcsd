@@ -719,3 +719,377 @@ Plug that proposal into the current SMC verify / weight / resample flow.
 ### Checkpoint 7
 
 Run small end-to-end GSM8K smoke tests before any performance tuning.
+
+---
+
+# Session 2 — 2026-04-18 — End-to-end debugging & quality push
+
+This session picked up from the state above (Checkpoint 5 "looks implemented"
+but produces only 1 token `To` on the smoke) and drove it to a pipeline that
+actually generates coherent text end to end. Along the way we discovered that
+the previous "Checkpoint 5 is implemented" claim was misleading — at runtime
+the group was being aborted silently before decode ever ran. Below is the full
+diagnostic chain and what each fix actually did.
+
+## Starting picture
+
+- Smoke run: 1 token output (`To`), marked invalid, accuracy 0/1.
+- Earlier hypothesis in this file ("carried hidden_states semantics / KV
+  timing") was only partly right — the real chain of bugs was more plumbing
+  than semantics.
+
+## Step 1 — Instrument one decode cycle
+
+Added env-gated debug prints (`SMC_EAGLE_DEBUG=1`, with optional
+`SMC_EAGLE_DEBUG_MAX_CYCLES`, default 2) to
+[smcsd/v2/worker.py](smcsd/v2/worker.py) inside `_forward_decode_eagle` and
+covering the dispatch (`forward_batch_generation`), extend entry/exit, and
+decode entry. Also added scheduler-side prints in
+[smcsd/v2/scheduler.py](smcsd/v2/scheduler.py) (`_process_prefill_result`,
+`_prepare_decode_batch`) behind the same env var.
+
+These prints were the cheapest way to find out that `_forward_decode_eagle`
+was **never actually being called** — the group was being aborted at
+`_materialize_group` with a tensor-size error the earlier `try/except`
+swallowed as a soft abort.
+
+## Bug cascade (in the order we uncovered it)
+
+For each, the symptom, cause, and fix.
+
+### 1. Slot-buffer hidden_size used target's, not draft's
+
+- Symptom: `SMC slot allocation failed: The expanded size of the tensor
+  (4096) must match the existing size (2048) at non-singleton dimension 0`.
+- Cause: [smcsd/v2/req_state.py](smcsd/v2/req_state.py)'s `eagle_hidden_size`
+  was read from the (target) `model_config.hidden_size`. The draft in the
+  smoke command was vanilla Llama-3.2-1B (hidden=2048), so writing
+  `hidden_states[0]` (2048) into the slot buffer (4096) raised and the group
+  was aborted. Nothing downstream ever ran.
+- Fix path taken: sidestep by using a **real EAGLE head** whose `hidden_size`
+  matches the target (4096). We did not add a draft-hidden_size plumbing
+  path, because later analysis showed a vanilla 1B was the wrong thing to
+  plug in to EAGLE semantics anyway.
+
+### 2. EAGLE head `max_position_embeddings=2048` < target 131072
+
+- Cause: EAGLE head configs ship short RoPE ranges; the draft worker's
+  `ModelConfig._derive_context_length` refuses to stretch the draft past its
+  config without an override.
+- Fix: set `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`.
+
+### 3. EAGLE head `torch_dtype=float16` ≠ target `bfloat16`
+
+- Symptom: `AssertionError: Buffer input_embeds has different dtype than
+  before.` during CUDA-graph input-buffer sharing.
+- Cause: target loaded as bf16, EAGLE head config declares fp16; the shared
+  CUDA-graph input buffers detect the dtype clash on capture.
+- Fix: added `--dtype` flag to
+  [scripts/accuracy_test_gsm8k.py](scripts/accuracy_test_gsm8k.py) that
+  threads through `SMCEngine(**kwargs)` to `ServerArgs.dtype`. Use
+  `--dtype bfloat16` to force both models into the same dtype.
+
+### 4. Draft CUDA-graph capture with no `spec_info`
+
+- Symptom: `AttributeError: 'NoneType' object has no attribute
+  'hidden_states'` inside `LlamaForCausalLMEagle.forward` at
+  `forward_batch.spec_info.hidden_states`.
+- Cause: `TpModelWorker`'s CUDA-graph capture runs a dummy forward without
+  setting spec_info. Standard `EAGLEWorker` injects a dummy
+  `EagleDraftInput` at capture time. `SMCWorkerV2` does not.
+- Fix: force-disable draft CUDA-graph capture in EAGLE mode (set
+  `backup_disable_cuda_graph = True` before the conditional capture call in
+  [smcsd/v2/worker.py](smcsd/v2/worker.py)). Acceptable — target graphs are
+  also disabled in EAGLE mode (see bug 6).
+
+### Bug Y — draft FA backend pushed into tree branch (topk > 1)
+
+- Symptom: `RuntimeError: shape '[-1, 0]' is invalid for input of size 4` at
+  [flashattention_backend.py:477](3rdparty/sglang/python/sglang/srt/layers/attention/flashattention_backend.py#L477),
+  in `cache_loc.view(-1, self.speculative_num_steps)`.
+- Cause: SMC sets `server_args.speculative_eagle_topk = smc_eagle_topk = 4`.
+  The FA backend reads `self.topk = server_args.speculative_eagle_topk` and
+  enters the EAGLE-tree decode branch, which divides `out_cache_loc` by
+  `speculative_num_steps` — left at its default 0 on the draft runner's
+  standalone FA backend (it's only set on the multi-step draft backend
+  `SMCWorkerV2` constructs separately and never actually uses in the
+  per-step decode).
+- Realization: SMC's "top-k" (number of retained candidates for the
+  renormalized proposal) is a different concept from the attention
+  backend's "topk" (tree width). SMC draws **one** token per step — the
+  correct attention path is `topk<=1`.
+- Fix: override `self.draft_runner.attn_backend.topk = 1` after draft init
+  for EAGLE mode (in [smcsd/v2/worker.py](smcsd/v2/worker.py)). This routes
+  per-step decode into the clean single-chain branch.
+
+### Bug Z — target verify expected a tree `custom_mask`
+
+- Symptom: `TypeError: 'NoneType' object is not subscriptable` at
+  [flashattention_backend.py:2161](3rdparty/sglang/python/sglang/srt/layers/attention/flashattention_backend.py#L2161),
+  `spec_info.custom_mask[mask_extraction_indices]`, during CUDA-graph replay
+  for target verify.
+- Cause: same `speculative_eagle_topk > 1` pushes target into tree-verify
+  mode expecting a `custom_mask` that SMC's flat-chain verify never
+  constructs.
+- Fix (two parts):
+  1. Set `self.score_runner.attn_backend.topk = 1` so the target-verify
+     eager path takes the single-chain branch that needs no custom_mask.
+  2. Force `server_args.disable_cuda_graph = True` in
+     [3rdparty/sglang/python/sglang/srt/server_args.py](3rdparty/sglang/python/sglang/srt/server_args.py)
+     when `smc_draft_kind == "eagle"`. The target's CUDA graphs were
+     captured during `super().__init__()` (before `SMCWorkerV2` can touch
+     topk), so the graph-replay path is baked for tree mode; easier to skip
+     capture entirely for EAGLE mode. Eager path + topk=1 works.
+
+### Missing hidden states from target verify
+
+- Symptom: `RuntimeError: SMC EAGLE decode requires target hidden states to
+  initialize the next draft state.` inside
+  `_build_eagle_next_draft_input_from_decode`.
+- Cause: `SMCDecodeContext.prepare_for_verify` hardcoded
+  `capture_hidden_mode=CaptureHiddenMode.NULL`. EAGLE's cycle transition
+  needs the target's hidden state at the last verify position.
+- Fix: added a `capture_hidden_mode` kwarg to
+  [smcsd/v2/info.py](smcsd/v2/info.py) `prepare_for_verify` (default NULL
+  for LM), and the EAGLE caller in worker.py passes
+  `CaptureHiddenMode.FULL`.
+
+### `prepare_for_extend_to_fill_draft_kvcache` crash
+
+- Symptom: `TypeError: Mismatched type on argument #4 when calling
+  store_cache ... Expected DLTensor* but got None` during the
+  end-of-cycle draft-extend forward.
+- Cause: the extend's `out_cache_loc` was inherited from the decode batch
+  and didn't match the KV-pool layout the draft-extend path expects; the
+  machinery assumes a standard EAGLE worker's KV-pool plumbing that
+  `SMCWorkerV2` doesn't fully provide.
+- Fix (pragmatic): replaced the draft-extend with the simplest thing that
+  works — carry target's last-verify hidden directly, set
+  `topk_p=topk_index=None`, let the next cycle's bootstrap step regenerate
+  top-k from `_run_eagle_decode_step` on the bonus token. The bootstrap
+  case (kv_step_offset=1) fills all gamma+1 slots, so there is **no KV gap
+  across cycles** — the perceived "bonus position missing draft KV" worry
+  in the original progress notes is moot under this simplification.
+
+### Fix X — shared embed_tokens / lm_head for the draft
+
+This was the quality-breaking bug.
+
+- Observation from Step-1 instrumentation once the pipeline started running:
+  top-k was **exactly** `[0.25, 0.25, 0.25, 0.25]` with indices `[1, 0, 2,
+  3]` at every step across cycles — classic all-zero-logits signature.
+- Inspected the EAGLE-v1 checkpoint (`lmsys/sglang-EAGLE-LLaMA3-Instruct-8B`)
+  and found it ships 10 tensors: `embed_tokens`, `fc`, 1 transformer layer's
+  weights, `post_attention_layernorm`. No `lm_head.weight`. Config says
+  `tie_word_embeddings: false`. The checkpoint expects the **target's
+  lm_head and embed to be wired in at runtime** — which sglang's real
+  `EAGLEWorker.init_lm_head()` does via `set_embed_and_head(embed, head)`.
+  `SMCWorkerV2` used plain `TpModelWorker`, so the draft's `lm_head` stayed
+  at init (all-zero rows) → uniform-over-vocab logits → top-k returned the
+  lowest 4 ids.
+- Fix: after creating the draft runner in
+  [smcsd/v2/worker.py](smcsd/v2/worker.py), for `smc_draft_kind == "eagle"`
+  call `target_model.get_embed_and_head()` and `draft_model.set_embed_and_head(embed, head)`.
+
+Post-fix, top-k is real, hidden states evolve meaningfully across steps, and
+a 1-question smoke emits:
+
+```
+ToStep 1: Calculate the number of eggs Janet is the total number of each day
+minus daily consumption ...
+```
+
+## Where we stood after the plumbing fixes
+
+**Gold signal: pipeline runs end to end, producing real English.**
+
+Single-question smoke at `gamma=4, N=4, topk=4, temperature=0.7`:
+| | before Step 1 | after X fix |
+|---|---|---|
+| Output | `"To"` (1 token) | 128 real tokens |
+| TPS | 5 | 111 |
+| GSM8K @ 1 question | 0/1 (format invalid) | 0/1 (format valid, wrong answer) |
+
+50-question GSM8K eval against the LM-draft baseline (Llama-3.2-1B):
+
+| | **LM SMC** | **EAGLE v1** |
+|---|---|---|
+| Accuracy | **32/50 (64%)** | 0/50 (0%) |
+| Invalid | 1/50 (2%) | 39/50 (78%) |
+| Throughput | 251 tps | 185 tps |
+| Wall time | 37s | 125s |
+
+Output text was **partially coherent but garbled** — recurring repetitions
+("Total daily Total daily ..."), disjointed clauses, never hitting the
+`#### <answer>` pattern. Hypothesized root cause: EAGLE-v1 head was trained
+on Llama-3, not Llama-3.1; combined with SMC's accept-all-drafts rule (4 of
+every 5 output tokens come from the draft), small draft biases compound
+into incoherent output.
+
+## B1 — Fix the cycle-transition draft-extend properly
+
+Attempted to replace the simplified "carry target-last hidden with
+`topk_p=None`" path with a one-step draft forward at the bonus position to
+fill draft KV there and carry fresh top-k.
+
+**Result: no accuracy improvement.** 0/50 stayed 0/50; invalid rate moved
+78% → 84%. Output character changed (from rambling to looping:
+`"ToStep 1: First, Janet calculates\nTotal daily eggs eggs\n..." → "Total
+daily\nTotal daily\nTotal daily"`), but quality was not rescued. B1
+confirmed my prior analysis was wrong about where the ceiling came from:
+the missing piece isn't the cycle-transition math, it's draft quality +
+accept-all. The B1 code is still in
+`_build_eagle_next_draft_input_from_decode` — it's a correctness
+improvement in its own right, just not a quality lever.
+
+## B2 — EAGLE3 support
+
+The cached `lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B` head is actually
+trained for Llama-3.1 (vs v1's Llama-3). EAGLE3 is a different architecture:
+
+- Reduced draft vocab (`draft_vocab_size=32000`) with a `d2t` map that
+  carries per-draft-id offsets to the full 128256-token target vocab.
+- `fc` takes 3× target hidden (`hidden_size * 3 = 12288`) — aux hidden
+  states from three target layers, not just the last.
+- Ships its own `lm_head` (over 32000 draft tokens) and needs only
+  `embed_tokens` shared from target.
+
+Changes made in [smcsd/v2/worker.py](smcsd/v2/worker.py):
+- Detect EAGLE3 by presence of `draft_model.hot_token_id` (populated by
+  `LlamaForCausalLMEagle3.load_weights` from `d2t`).
+- For EAGLE3: call `draft_model.set_embed(embed)` (embed-only) and
+  `target_model.set_eagle3_layers_to_capture()` (spec_algorithm is "SMC"
+  not "EAGLE3", so target's runner does not auto-enable aux capture).
+- Cache `hot_token_id` on the worker and remap `topk_index` at the end of
+  `_extract_eagle_state` and `_build_eagle_prefill_next_draft_input` —
+  every target-vocab-facing consumer (verify, bonus, next input, carrier)
+  sees target-vocab ids.
+
+**Result (EAGLE3 @ gamma=4, N=4):**
+
+| | LM SMC | EAGLE v1 | **EAGLE3** |
+|---|---|---|---|
+| Accuracy | 64% | 0% | **0%** |
+| Invalid | 2% | 78% | **58%** |
+| Throughput | 251 tps | 185 | 179 |
+
+EAGLE3 **measurably improves draft quality** (invalid rate 78% → 58%,
+first sentences grammatical, real prompt words appear) but still 0%
+accuracy. Same failure mode as v1 at larger scale: decent start, then
+degenerate word-salad / repetition collapse.
+
+## C3 — `gamma` ablation, and the breakthrough
+
+The accept-all-draft hypothesis predicts that **reducing gamma** (thus the
+draft:target token ratio) should monotonically lift accuracy.
+
+EAGLE3 with N=4, topk=4, temp=0.7, 50 questions:
+
+| gamma | Accuracy | Invalid | TPS | Wall |
+|---|---|---|---|---|
+| 4 (prev default) | 0/50 (0%) | 58% | 179 | 127 s |
+| 2 | 0/50 (0%) | 28% | 122 | 203 s |
+| **1** | **12/50 (24%)** | **0/50 (0%)** | 87 | 205 s |
+| 2, N=8 | 0/50 (0%) | 38% | 118 | 197 s |
+
+**`gamma=1` jumps from 0% → 24% accuracy.** Invalid rate drops to zero —
+every output hits the GSM8K format. At gamma=1 the chain is 1 draft + 1
+bonus = 50% target tokens (vs 20% at gamma=4), and the accept-all
+contamination essentially disappears.
+
+This is a decisive empirical confirmation that the architectural ceiling
+seen earlier is **gamma × draft-quality**, not plumbing.
+
+## What worked vs. what didn't
+
+### Worked
+- Env-gated instrumentation as the first diagnostic move (cheap, decisive).
+- Treating the original "KV chain" hypothesis as a theory to falsify rather
+  than implement. The actual plumbing bugs had nothing to do with it.
+- Using sglang's own `set_embed_and_head` / `set_embed` +
+  `set_eagle3_layers_to_capture` primitives rather than re-implementing.
+- Running LM SMC as a live control during diagnosis (confirmed "prefill →
+  N-particle decode" was working for LM, so the aborting group was
+  EAGLE-specific).
+- Asking the user which draft model they intended — using a vanilla 1B as
+  "EAGLE draft" was the root of cascading shape errors.
+- Aggressively force-disabling target/draft CUDA graphs for EAGLE mode.
+  Graph capture for target is baked in before `SMCWorkerV2` can adjust
+  config, so retrofits are fragile. Eager is fine for now.
+- Confirming B1 didn't help before doubling down on harder versions.
+
+### Didn't work / misleading
+- Progress.md's pre-session "most likely remaining problem area" list put
+  carried-hidden-states semantics and KV-timing at the top. Real blockers
+  were all plumbing: slot-buffer shape, attention backend topk branch,
+  custom_mask, CUDA-graph / spec_info interaction, and an uninitialized
+  lm_head. Takeaway: reason from traces, not from design intuition.
+- The "one-question EAGLE smoke exits cleanly" note in the original
+  progress.md was **misleading**. It exited cleanly only because
+  `_materialize_group` swallowed the slot-alloc error as a soft abort,
+  emitting 1 token (the prefill bonus) and finalizing. No decode had ever
+  run.
+- Proper draft-extend at cycle transition (B1) gave zero accuracy uplift.
+  At this setup the quality lever is gamma, not cycle-transition fidelity.
+- Passing `--disable-cuda-graph` via the CLI did not propagate to the
+  scheduler subprocess (observed `disable_cuda_graph=False` at worker
+  init); forcing it inside `ServerArgs.__post_init__` for EAGLE-SMC was
+  the reliable path.
+
+## Current knob defaults recommendation
+
+For EAGLE-SMC against Llama-3.1-8B:
+- `--draft-model lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B`
+- `--dtype bfloat16`
+- `--gamma 1 --smc-eagle-topk 4 --particles 4 --temperature 0.7`
+- `--attention-backend fa3` (LM path; EAGLE force-disables CUDA graphs)
+- env: `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`
+
+Larger gamma is currently unsafe at any quality bar. `--max-running-requests
+16` is a comfortable setting for the 50-question eval.
+
+## Remaining debug instrumentation
+
+Gated behind `SMC_EAGLE_DEBUG=1` + `SMC_EAGLE_DEBUG_MAX_CYCLES` (default 2).
+Still present in [smcsd/v2/worker.py](smcsd/v2/worker.py) and
+[smcsd/v2/scheduler.py](smcsd/v2/scheduler.py). Zero cost when env var is
+unset. Worth leaving until the next wave of correctness work settles.
+
+## Files touched this session
+
+- [smcsd/v2/worker.py](smcsd/v2/worker.py) — instrumentation; force-disable
+  draft CUDA graphs for EAGLE; override draft+target `attn_backend.topk=1`
+  for EAGLE; share `embed_tokens` + (v1) `lm_head` or (v3) `embed` only; cache
+  `hot_token_id` and remap `topk_index` through it for EAGLE3; cycle
+  transition rewritten to skip the failing draft-extend and carry
+  target-last hidden (then later upgraded in B1 to a one-step bonus draft
+  forward that fills the bonus-position KV and carries fresh top-k).
+- [smcsd/v2/info.py](smcsd/v2/info.py) — `prepare_for_verify` accepts a
+  `capture_hidden_mode` kwarg (default NULL), EAGLE caller passes
+  `CaptureHiddenMode.FULL`.
+- [smcsd/v2/scheduler.py](smcsd/v2/scheduler.py) — scheduler-side debug
+  prints around `_process_prefill_result` and `_prepare_decode_batch`.
+- [3rdparty/sglang/python/sglang/srt/server_args.py](3rdparty/sglang/python/sglang/srt/server_args.py)
+  — for `smc_draft_kind == "eagle"`, force `disable_cuda_graph = True` with
+  an explanatory warning.
+- [scripts/accuracy_test_gsm8k.py](scripts/accuracy_test_gsm8k.py) —
+  `--dtype` flag threaded through to `SMCEngine` kwargs.
+
+## Open questions / next work
+
+- **D1**: does `gamma=1, N=8` or `N=16` push past 24%? Untested.
+- **D2**: does `gamma=1` with wider `--smc-eagle-topk` (8, 16) change
+  resampling behavior? Untested.
+- **D3**: does `--smc-resample-threshold` below default 0.5 (more
+  aggressive resampling) help at `gamma=1`? Untested.
+- **D5**: apples-to-apples LM baseline at `gamma=1` — unknown whether the
+  EAGLE3-vs-LM gap persists at the same cycle shape. Untested.
+- Alternative: introduce a per-token rejection at the worker level (breaks
+  the SMC "accept all drafts" spec but may be necessary to make EAGLE-class
+  drafts usable at higher gamma).
+- The B1 bonus draft-step writes into the same KV slot target used at the
+  bonus position. Different KV-pool layers → no collision, but this relies
+  on sglang's shared-pool conventions; worth an explicit assertion if the
+  memory-pool config changes.
+- The debug prints should eventually be removed or moved behind a proper
+  logging level once the shape of "correct" is settled.

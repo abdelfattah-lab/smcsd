@@ -116,27 +116,54 @@ class SMCWorkerV2(BaseSpecWorker):
         self.draft_runner = self._draft_worker.model_runner
         self.score_runner = self._target_worker.model_runner
 
-        # EAGLE v1 checkpoints ship no lm_head (and often not input_layernorm /
-        # final norm); they are expected to share the target's lm_head and
-        # embed_tokens at runtime. sglang's EAGLEWorker does this via
-        # init_lm_head(). TpModelWorker does not, so without this the draft's
-        # lm_head stays at init (zeros) and every top-k comes out uniform.
+        # EAGLE heads ship no embed_tokens (and often no lm_head); they are
+        # expected to share the target's at runtime. sglang's EAGLEWorker does
+        # this via init_lm_head(). TpModelWorker does not.
+        # EAGLE v1: share both embed_tokens and lm_head (draft predicts in
+        #   full target-vocab space).
+        # EAGLE3:  share only embed_tokens — the draft ships its own lm_head
+        #   over a reduced draft-vocab (e.g. 32000). d2t remapping is applied
+        #   at top-k extraction time via hot_token_id.
+        self._is_eagle3 = False
+        self._hot_token_id: Optional[torch.Tensor] = None
         if self.smc_draft_kind == "eagle":
+            draft_model = self.draft_runner.model
+            target_model = self._target_worker.model_runner.model
+            # Distinguish EAGLE3 by presence of hot_token_id attribute that the
+            # LlamaForCausalLMEagle3 load_weights populates from d2t.
+            self._is_eagle3 = getattr(draft_model, "hot_token_id", None) is not None
             try:
-                embed, head = (
-                    self._target_worker.model_runner.model.get_embed_and_head()
-                )
-                self.draft_runner.model.set_embed_and_head(embed, head)
-                logger.warning(
-                    "SMC EAGLE: shared target embed_tokens/lm_head into the "
-                    "draft runner (required for EAGLE-v1 heads that ship no "
-                    "lm_head weights)."
-                )
+                embed, head = target_model.get_embed_and_head()
+                if self._is_eagle3:
+                    # EAGLE3: share only embed; draft keeps its own lm_head.
+                    draft_model.set_embed(embed)
+                    hot = draft_model.hot_token_id
+                    if hot is not None:
+                        self._hot_token_id = hot.to(self.device, dtype=torch.int64)
+                    logger.warning(
+                        "SMC EAGLE3: shared target embed_tokens (draft keeps "
+                        "own lm_head + d2t); hot_token_id shape=%s",
+                        tuple(self._hot_token_id.shape)
+                        if self._hot_token_id is not None
+                        else None,
+                    )
+                    # Target must capture aux hidden states at the 3 layers
+                    # EAGLE3 was trained on. For spec_algorithm=SMC the target
+                    # runner does not auto-enable this, so trigger it here.
+                    if hasattr(target_model, "set_eagle3_layers_to_capture"):
+                        target_model.set_eagle3_layers_to_capture()
+                        logger.warning(
+                            "SMC EAGLE3: enabled target aux hidden capture."
+                        )
+                else:
+                    draft_model.set_embed_and_head(embed, head)
+                    logger.warning(
+                        "SMC EAGLE v1: shared target embed_tokens/lm_head."
+                    )
             except AttributeError as exc:
                 logger.warning(
-                    "SMC EAGLE: target or draft model does not expose "
-                    "get_embed_and_head/set_embed_and_head — draft lm_head "
-                    "may be uninitialized. %s",
+                    "SMC EAGLE: target or draft model does not expose embed/"
+                    "head accessors; draft may be uninitialized. %s",
                     exc,
                 )
 
@@ -706,6 +733,10 @@ class SMCWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             bonus_ids=bonus,
             logprob_diff=logprob_diff,
+            all_seq_lens=all_seq_lens,
+            all_positions=all_positions,
+            cache_locs=cache_locs,
+            current_hidden_states=current_hidden_states,
         )
 
         return GenerationBatchResult(
@@ -783,6 +814,11 @@ class SMCWorkerV2(BaseSpecWorker):
             dim=-1,
         )
         topk_p = F.softmax(topk_logits, dim=-1)
+        # EAGLE3: draft logits are over a reduced draft-vocab; remap the
+        # retained top-k ids into target-vocab space so downstream verify,
+        # sampling, and token emission all use target vocab ids.
+        if self._is_eagle3 and self._hot_token_id is not None:
+            topk_index = self._hot_token_id[topk_index]
         return topk_p, topk_index, logits_output.hidden_states
 
     def _run_eagle_decode_step(
@@ -827,6 +863,10 @@ class SMCWorkerV2(BaseSpecWorker):
         accept_lens: torch.Tensor,
         bonus_ids: torch.Tensor,
         logprob_diff: torch.Tensor,
+        all_seq_lens: torch.Tensor,
+        all_positions: torch.Tensor,
+        cache_locs: torch.Tensor,
+        current_hidden_states: torch.Tensor,
     ) -> SMCEagleDraftInputV2:
         if score_result.logits_output.hidden_states is None:
             raise RuntimeError(
@@ -834,25 +874,44 @@ class SMCWorkerV2(BaseSpecWorker):
                 "next draft state."
             )
 
-        # Target verify returned FULL hidden states for
+        # Target verify captured FULL hidden states for
         #   bs * (gamma + 1) positions in row-major (particle, step) order.
-        # For the next cycle we carry the target hidden at each particle's
-        # last-verify position (= seq_len + gamma), which the EAGLE head will
-        # concat with embed(bonus) at the next cycle's bootstrap draft step.
+        # Take each particle's last-verify hidden (= target state after x_gamma).
         bs = len(ctx.orig_seq_lens)
+        gamma = self.gamma
         last_index = (
             torch.arange(bs, device=self.device, dtype=torch.int64)
             * self.speculative_num_draft_tokens
             + self.speculative_num_draft_tokens
             - 1
         )
-        last_hidden = score_result.logits_output.hidden_states[last_index]
+        last_target_hidden = score_result.logits_output.hidden_states[last_index]
+
+        # Run ONE extra draft forward at slot cache_locs[:, gamma] with input=bonus,
+        # spec_info.hidden=last_target_hidden. This fills the draft KV for the
+        # bonus position (EAGLE shifted-by-one: slot for position orig+gamma holds
+        # the representation of the token arriving after x_gamma, i.e. bonus) and
+        # produces a fresh top-k / draft hidden for the next cycle so its first
+        # decode step can skip the bootstrap.
+        post_bonus_out = self._run_eagle_decode_step(
+            batch,
+            token_ids=bonus_ids,
+            hidden_states=last_target_hidden,
+            seq_lens=all_seq_lens[:, gamma].contiguous(),
+            seq_lens_cpu=ctx.orig_seq_lens_cpu + (gamma + 1),
+            seq_lens_sum=ctx.orig_seq_lens_sum + bs * (gamma + 1),
+            out_cache_loc=cache_locs[:, gamma].contiguous(),
+            position=all_positions[:, gamma].contiguous(),
+        )
+        next_topk_p, next_topk_index, next_draft_hidden = self._extract_eagle_state(
+            post_bonus_out
+        )
 
         return SMCEagleDraftInputV2(
             verified_id=bonus_ids,
-            hidden_states=last_hidden,
-            topk_p=None,
-            topk_index=None,
+            hidden_states=next_draft_hidden,
+            topk_p=next_topk_p,
+            topk_index=next_topk_index,
             logprob_diff=logprob_diff,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
@@ -919,6 +978,8 @@ class SMCWorkerV2(BaseSpecWorker):
             dim=-1,
         )
         topk_p = torch.softmax(topk_logits, dim=-1)
+        if self._is_eagle3 and self._hot_token_id is not None:
+            topk_index = self._hot_token_id[topk_index]
         return SMCEagleDraftInputV2(
             verified_id=verified_id,
             hidden_states=logits_output.hidden_states,
