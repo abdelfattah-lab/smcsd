@@ -276,4 +276,9 @@ sgl-kernel/csrc/**/*_musa/
 
 CLAUDE.md
 AGENTS.md
+smc_native_draft_plan.md
 tasks/
+# SMC-native draft training artifacts
+training/data_cache/
+training/checkpoints/
+training/eval_results/

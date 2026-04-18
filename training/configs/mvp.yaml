@@ -1,0 +1,44 @@
+# MVP: small proposal trained by KL distillation from Llama-3.2-1B.
+# hidden_size must match target for warm-start of the embedding table.
+
+target:
+  model_path: meta-llama/Llama-3.2-1B-Instruct
+  dtype: bfloat16
+
+proposal:
+  hidden_size: 2048
+  num_hidden_layers: 4
+  num_attention_heads: 32
+  num_key_value_heads: 8
+  intermediate_size: 4096
+  vocab_size: 128256
+  max_position_embeddings: 2048
+  tie_word_embeddings: true
+  rope_theta: 500000.0
+  warm_start_embeddings: true
+  freeze_embeddings: true
+
+data:
+  prompt_set: gsm8k_train
+  samples_per_prompt: 4
+  continuation_len: 256
+  temperature: 0.7
+  top_k_cache: 50
+  output_dir: data_cache/target_traces
+
+training_stage1:
+  total_tokens: 1_000_000_000
+  batch_size: 32
+  seq_len: 256
+  lr_peak: 3.0e-4
+  lr_schedule: cosine
+  warmup_frac: 0.02
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  dtype: bfloat16
+  checkpoint_every_tokens: 100_000_000
+
+eval:
+  k_values: [1, 2, 4, 8]
+  n_particles: 8
+  held_out_split: gsm8k_test
