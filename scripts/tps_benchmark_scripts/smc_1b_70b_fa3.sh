@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # SMC v2 throughput sweep — Llama 3.1-70B target + Llama 3.2-1B draft, fa3, TP=4.
-# Wraps SMCEngine via bench_smc_engine_throughput.py (the engine-level
-# --speculative-algorithm SMC path was removed with v1 retirement).
+# Uses bench_offline_throughput.py with --backend smc_engine, which routes
+# through SMCEngine (the engine-level --speculative-algorithm SMC path was
+# removed with v1 retirement).
 
 # --- Sweep parameters ---
 NUM_PROMPTS_LIST=(1 4 8 16)
@@ -31,7 +32,7 @@ TP=4
 METHOD_LABEL="smc_fa3"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HARNESS="${SCRIPT_DIR}/bench_smc_engine_throughput.py"
+HARNESS="${SCRIPT_DIR}/bench_offline_throughput.py"
 
 # --- Output CSV ---
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -51,8 +52,9 @@ for b in "${NUM_PROMPTS_LIST[@]}"; do
 
     LOGFILE=$(mktemp /tmp/bench_smc_XXXXXX.log)
     if python -O "$HARNESS" \
+        --backend smc_engine \
         --model-path "$MODEL" \
-        --draft-model-path "$DRAFT_MODEL" \
+        --speculative-draft-model-path "$DRAFT_MODEL" \
         --smc-n-particles "$n" \
         --smc-gamma "$gamma" \
         --smc-draft-temperature "$DRAFT_TEMP" \
@@ -61,13 +63,15 @@ for b in "${NUM_PROMPTS_LIST[@]}"; do
         --mem-fraction-static "$MEM_FRACTION" \
         --max-running-requests "$max_rr" \
         --cuda-graph-max-bs "$cuda_bs" \
+        --dataset-name random \
         --random-input-len "$INPUT_LEN" \
         --random-output-len "$OUTPUT_LEN" \
+        --extra-request-body "{\"temperature\": $TARGET_TEMP}" \
         --num-prompts "$b" \
-        --tp "$TP" \
+        --tp-size "$TP" \
         2>&1 | tee "$LOGFILE"; then
 
-      tps=$(grep "Output token throughput" "$LOGFILE" | awk '{print $(NF-1)}')
+      tps=$(grep "Output token throughput" "$LOGFILE" | awk '{print $NF}')
       if [[ -z "$tps" ]]; then
         echo "ERROR: no throughput in output (b=$b gamma=$gamma n=$n)"
         echo "${METHOD_LABEL},$gamma,$n,ERROR,$b" >> "$OUTFILE"

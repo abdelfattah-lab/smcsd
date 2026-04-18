@@ -65,6 +65,7 @@ python scripts/accuracy_test_gsm8k.py \
   --attention-backend fa3 \
   --max-running-requests 24 \
   --cuda-graph-max-bs 24 \
+  --smc-fast-resample \
   --num-questions 400
 ```
 
