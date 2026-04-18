@@ -96,13 +96,26 @@ def score_with_target(
     return log_probs.gather(-1, gen_tokens.unsqueeze(-1)).squeeze(-1)
 
 
+def _ess_regime(ess_over_n_mean: float) -> str:
+    if ess_over_n_mean < 0.1:
+        return "degenerate"
+    if ess_over_n_mean < 0.7:
+        return "mixing"
+    return "converged"
+
+
 def compute_metrics(
     log_w_per_step: torch.Tensor,   # [M, N, K_max]
     k_values: list[int],
-) -> dict:
-    """Aggregate per-step log weights into block-chi^2 / ESS / diagnostics for each K."""
+) -> tuple[dict, dict]:
+    """Aggregate per-step log weights into block-chi^2 / ESS / diagnostics for each K.
+
+    Returns (summary, per_prefix). The per_prefix dict stores ess_over_n arrays
+    per K (1 float per held-out prefix) for downstream prefix-difficulty analysis.
+    """
     M, N, K_max = log_w_per_step.shape
-    results = {}
+    summary = {}
+    per_prefix = {}
     for k in k_values:
         log_w = log_w_per_step[:, :, :k].sum(dim=-1)   # [M, N]
         flat = log_w.flatten().float()                  # [M*N]
@@ -111,17 +124,20 @@ def compute_metrics(
         chi2 = math.expm1(log_1p_chi2)
 
         log_ess = 2.0 * torch.logsumexp(log_w.float(), dim=1) - torch.logsumexp(2.0 * log_w.float(), dim=1)
-        ess_over_n = (log_ess - math.log(N)).exp()
+        ess_over_n = (log_ess - math.log(N)).exp()     # [M]
 
         q = torch.quantile(flat, torch.tensor([0.05, 0.5, 0.95], device=flat.device))
-        results[k] = {
+        ess_mean = ess_over_n.mean().item()
+        summary[k] = {
             "log_1p_chi2": log_1p_chi2,
             "chi2": chi2,
-            "ess_over_n_mean": ess_over_n.mean().item(),
+            "ess_over_n_mean": ess_mean,
             "ess_over_n_median": ess_over_n.median().item(),
+            "ess_regime": _ess_regime(ess_mean),
             "mean_log_w": flat.mean().item(),
             "median_log_w": q[1].item(),
             "log_w_q05": q[0].item(),
             "log_w_q95": q[2].item(),
         }
-    return results
+        per_prefix[k] = {"ess_over_n": ess_over_n.tolist()}
+    return summary, per_prefix

@@ -51,7 +51,9 @@ def load_proposal(checkpoint: str | None, target_model, device):
             target_model.get_input_embeddings().weight.data
         )
     if checkpoint is not None:
-        state = torch.load(checkpoint, map_location=device, weights_only=True)
+        # weights_only=False: trusted checkpoints from our own trainer; full dict
+        # carries optimizer + numpy RNG state which the safe loader rejects.
+        state = torch.load(checkpoint, map_location=device, weights_only=False)
         if "model" in state:
             state = state["model"]
         missing, unexpected = proposal.load_state_dict(state, strict=False)
@@ -114,22 +116,26 @@ def main():
         log_p_all[s : s + B] = log_p.view(B, N, args.k_max).cpu()
 
     log_w_per_step = log_p_all - log_q_all
-    metrics = compute_metrics(log_w_per_step, k_values)
+    summary, per_prefix = compute_metrics(log_w_per_step, k_values)
 
     print()
-    header = f"{'K':>3}  {'log(1+chi2)':>11}  {'chi2':>12}  {'ESS/N mean':>11}  {'ESS/N med':>10}  {'mean log_w':>11}  {'log_w [5% 50% 95%]':>25}"
+    header = f"{'K':>3}  {'log(1+chi2)':>11}  {'chi2':>12}  {'ESS/N mean':>11}  {'ESS/N med':>10}  {'regime':>11}  {'mean log_w':>11}  {'log_w [5% 50% 95%]':>25}"
     print(header)
     print("-" * len(header))
     for k in k_values:
-        m = metrics[k]
+        m = summary[k]
         chi2_str = f"{m['chi2']:.3e}" if abs(m["chi2"]) >= 100 else f"{m['chi2']:.3f}"
         q_str = f"[{m['log_w_q05']:.2f} {m['median_log_w']:.2f} {m['log_w_q95']:.2f}]"
-        print(f"{k:>3}  {m['log_1p_chi2']:>11.3f}  {chi2_str:>12}  {m['ess_over_n_mean']:>11.4f}  {m['ess_over_n_median']:>10.4f}  {m['mean_log_w']:>11.3f}  {q_str:>25}")
+        print(f"{k:>3}  {m['log_1p_chi2']:>11.3f}  {chi2_str:>12}  {m['ess_over_n_mean']:>11.4f}  {m['ess_over_n_median']:>10.4f}  {m['ess_regime']:>11}  {m['mean_log_w']:>11.3f}  {q_str:>25}")
 
     if args.output_json:
         Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
         with open(args.output_json, "w") as f:
-            json.dump({"config": vars(args), "metrics": metrics}, f, indent=2)
+            json.dump({
+                "config": vars(args),
+                "summary": summary,
+                "per_prefix": per_prefix,
+            }, f, indent=2)
         print(f"\nsaved: {args.output_json}")
 
 
