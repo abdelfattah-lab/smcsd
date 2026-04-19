@@ -1,46 +1,14 @@
 """Offline throughput benchmark with SMC support.
 
-Fork of ``sglang.bench_offline_throughput`` that adds a ``smc_engine``
-backend routing through :class:`smcsd.engine.SMCEngine`.  Intended as the
-single driver for all sweeps under ``scripts/tps_benchmark_scripts/``:
+Fork of ``sglang.bench_offline_throughput`` adding a ``smc_engine`` backend
+routed through :class:`smcsd.engine.SMCEngine`. Drives two sweep modes:
 
-  * STANDALONE speculative decoding (upstream ``sgl.Engine``):
-        ``--backend engine --speculative-algorithm STANDALONE ...``
-  * SMC (via dedicated ``SMCEngine``):
-        ``--backend smc_engine --smc-n-particles N --smc-gamma K ...``
+  * ``--backend engine`` — upstream ``sgl.Engine`` (e.g. STANDALONE spec).
+  * ``--backend smc_engine`` — ``SMCEngine`` with ``--smc-*`` options.
 
-Scope is narrower than upstream — only what the sweep shell scripts use:
-the ``random`` dataset, warmup, and the ``Output token throughput (tok/s):``
-result line that the ``awk '{print $NF}'`` extraction depends on.  If you
-need sharegpt / profile / chat-template / Ray, run upstream instead.
-
-Usage examples (mirrors ``scripts/tps_benchmark_scripts/*.sh``):
-
-    # SMC sweep entry
-    python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \\
-        --backend smc_engine \\
-        --model-path meta-llama/Llama-3.1-8B-Instruct \\
-        --speculative-draft-model-path meta-llama/Llama-3.2-1B-Instruct \\
-        --smc-n-particles 8 --smc-gamma 8 \\
-        --smc-draft-temperature 0.7 --smc-target-temperature 0.7 \\
-        --attention-backend triton --mem-fraction-static 0.60 \\
-        --max-running-requests 64 --cuda-graph-max-bs 64 \\
-        --dataset-name random --random-input-len 256 --random-output-len 512 \\
-        --num-prompts 8
-
-    # STANDALONE spec sweep entry
-    SGLANG_ENABLE_SPEC_V2=True \\
-    python scripts/tps_benchmark_scripts/bench_offline_throughput.py \\
-        --backend engine \\
-        --model-path meta-llama/Llama-3.1-8B-Instruct \\
-        --speculative-algorithm STANDALONE \\
-        --speculative-draft-model-path meta-llama/Llama-3.2-1B-Instruct \\
-        --speculative-eagle-topk 1 --speculative-num-steps 4 \\
-        --speculative-num-draft-tokens 5 \\
-        --attention-backend fa3 --mem-fraction-static 0.60 \\
-        --dataset-name random --random-input-len 256 --random-output-len 512 \\
-        --extra-request-body '{"temperature": 0.7}' \\
-        --num-prompts 8
+Preserves the ``Output token throughput (tok/s):`` result line that sweep
+scripts extract via ``awk '{print $NF}'``. See
+``scripts/tps_benchmark_scripts/*.sh`` for invocation examples.
 """
 
 import argparse
@@ -56,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from sglang.benchmark.datasets import DatasetRow
+from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, set_ulimit
 from sglang.srt.entrypoints.engine import Engine
@@ -178,12 +146,21 @@ class BenchArgs:
     dataset_name: str = "random"
     dataset_path: str = ""
     num_prompts: int = 1000
+    sharegpt_output_len: Optional[int] = None
+    sharegpt_context_len: Optional[int] = None
     random_input_len: int = 1024
     random_output_len: int = 1024
     random_range_ratio: float = 0.0
+    gsp_num_groups: int = 64
+    gsp_prompts_per_group: int = 16
+    gsp_system_prompt_len: int = 2048
+    gsp_question_len: int = 128
+    gsp_output_len: int = 256
     seed: int = 1
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
+    apply_chat_template: bool = False
+    prompt_suffix: str = ""
     skip_warmup: bool = False
 
     @staticmethod
@@ -202,15 +179,29 @@ class BenchArgs:
             "--dataset-name",
             type=str,
             default="random",
-            choices=["random"],
-            help="Only the random dataset is supported by this fork.",
+            choices=["sharegpt", "random", "generated-shared-prefix"],
+            help="Name of the dataset to benchmark on.",
         )
-        parser.add_argument("--dataset-path", type=str, default="")
+        parser.add_argument(
+            "--dataset-path", type=str, default="", help="Path to the dataset."
+        )
         parser.add_argument(
             "--num-prompts",
             type=int,
             default=BenchArgs.num_prompts,
             help="Number of prompts to process.",
+        )
+        parser.add_argument(
+            "--sharegpt-output-len",
+            type=int,
+            default=BenchArgs.sharegpt_output_len,
+            help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
+        )
+        parser.add_argument(
+            "--sharegpt-context-len",
+            type=int,
+            default=BenchArgs.sharegpt_context_len,
+            help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
         )
         parser.add_argument(
             "--random-input-len",
@@ -230,6 +221,41 @@ class BenchArgs:
             default=BenchArgs.random_range_ratio,
             help="Range of sampled ratio of input/output length.",
         )
+        parser.add_argument(
+            "--gsp-num-groups",
+            type=int,
+            default=BenchArgs.gsp_num_groups,
+            help="Number of groups with shared prefix "
+            "(generated-shared-prefix dataset only).",
+        )
+        parser.add_argument(
+            "--gsp-prompts-per-group",
+            type=int,
+            default=BenchArgs.gsp_prompts_per_group,
+            help="Number of prompts per shared-prefix group "
+            "(generated-shared-prefix dataset only).",
+        )
+        parser.add_argument(
+            "--gsp-system-prompt-len",
+            type=int,
+            default=BenchArgs.gsp_system_prompt_len,
+            help="System prompt length "
+            "(generated-shared-prefix dataset only).",
+        )
+        parser.add_argument(
+            "--gsp-question-len",
+            type=int,
+            default=BenchArgs.gsp_question_len,
+            help="Question length "
+            "(generated-shared-prefix dataset only).",
+        )
+        parser.add_argument(
+            "--gsp-output-len",
+            type=int,
+            default=BenchArgs.gsp_output_len,
+            help="Target length in tokens for outputs "
+            "(generated-shared-prefix dataset only).",
+        )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
         parser.add_argument(
             "--disable-ignore-eos",
@@ -243,6 +269,18 @@ class BenchArgs:
             default=BenchArgs.extra_request_body,
             help="Append given JSON object to the request payload "
             "(e.g. sampling params).",
+        )
+        parser.add_argument(
+            "--apply-chat-template",
+            action="store_true",
+            help="Apply chat template to dataset prompts (sharegpt).",
+        )
+        parser.add_argument(
+            "--prompt-suffix",
+            type=str,
+            default="",
+            help="Suffix applied to the end of all user prompts "
+            "(followed by assistant prompt suffix).",
         )
         parser.add_argument(
             "--skip-warmup",
@@ -347,14 +385,7 @@ def throughput_test(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.extra_request_body:
         extra_request_body = json.loads(bench_args.extra_request_body)
 
-    input_requests = sample_random_requests(
-        input_len=bench_args.random_input_len,
-        output_len=bench_args.random_output_len,
-        num_prompts=bench_args.num_prompts,
-        range_ratio=bench_args.random_range_ratio,
-        tokenizer=tokenizer,
-        dataset_path=bench_args.dataset_path,
-    )
+    input_requests = get_dataset(bench_args, tokenizer)
 
     warmup_requests = sample_random_requests(
         input_len=256,

@@ -29,30 +29,7 @@ uv pip install -e 3rdparty/sglang/python
 uv pip install -e .
 ```
 
-Updating the vendored SGLang later:
-
-```bash
-git submodule update --remote 3rdparty/sglang    # pull latest smc_v2_clean
-# then commit the bumped submodule pointer
-```
-
 ## Quick Start
-
-```bash
-# SMC-SD throughput on ShareGPT (batch size 1)
-python -O -m sglang.bench_offline_throughput \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --speculative-algorithm SMC \
-  --speculative-draft-model-path meta-llama/Llama-3.2-1B-Instruct \
-  --smc-n-particles 8 --smc-gamma 8 \
-  --smc-draft-temperature 0.7 --smc-target-temperature 0.7 \
-  --attention-backend fa3 \
-  --mem-fraction-static 0.60 \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs 16 \
-  --dataset-name sharegpt \
-  --num-prompts 200
-```
 
 ```bash
 # SMC-SD accuracy on GSM8K via the dedicated SMCEngine (N=12 particles, gamma=8)
@@ -63,10 +40,26 @@ python scripts/accuracy_test_gsm8k.py \
   --particles 12 --gamma 8 \
   --temperature 0.7 \
   --attention-backend fa3 \
-  --max-running-requests 24 \
-  --cuda-graph-max-bs 24 \
   --smc-fast-resample \
-  --num-questions 400
+  --smc-fast-resample \
+  --num-questions 400 
+```
+
+```bash
+# SMC-SD throughput on ShareGPT (1 concurrent group, 200 prompts, N=8, gamma=8)
+python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
+  --backend smc_engine \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --speculative-draft-model-path meta-llama/Llama-3.2-1B-Instruct \
+  --smc-n-particles 8 --smc-gamma 8 \
+  --smc-draft-temperature 0.7 --smc-target-temperature 0.7 \
+  --attention-backend fa3 \
+  --mem-fraction-static 0.60 \
+  --max-running-requests 1 \
+  --smc-fast-resample \
+  --cuda-graph-max-bs 8 \
+  --dataset-name sharegpt \
+  --num-prompts 200
 ```
 
 See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
