@@ -30,7 +30,6 @@ uv pip install -e .
 ```
 
 ## Quick Start
-
 ```bash
 # SMC-SD accuracy on GSM8K via the dedicated SMCEngine (N=12 particles, gamma=8)
 python scripts/accuracy_test_gsm8k.py \
@@ -61,6 +60,9 @@ python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
   --dataset-name sharegpt \
   --num-prompts 200
 ```
+
+> [!NOTE] 
+> When using non-Hopper GPU (such as A100, A6000), specify `--attention-backend` to be `triton`
 
 See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
