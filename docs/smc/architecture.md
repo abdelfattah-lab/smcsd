@@ -1,117 +1,247 @@
-# SMC v2 Architecture
+# SMC Speculative Decoding — Architecture Overview
 
-## Workflow
+Entry point for the Sequential-Monte-Carlo speculative-decoding implementation.
+This doc is the map; two companions go deeper:
 
-```
-PREFILL (ScheduleBatch) -> parent prefill on score + draft
-     |
-     v
-MATERIALIZE GROUP
-  clone parent -> N particle Reqs
-  copy_block_table (parent prefix -> particles, inc_ref)
-  release parent (dec_ref)
-  StackedGroupState.register_group (claim row)
-  ScheduleBatchSMC.allocate_slots (fill [max_slots] tensors)
-     |
-     v
-DECODE LOOP (ScheduleBatchSMC, slot-based) ------+
-  prepare_for_decode: gather[active] -> ctx      |
-    SMCDecodeContext.from_slot_gather            |
-      vectorised alloc gamma+1 KV                 |
-      seq_lens += gamma+1                         |
-    scatter back                                  |
-  build_model_worker_batch (sparse -> dense)     |
-  SMCWorkerV2._forward_decode                    |
-    ctx.prepare_for_draft  -> AR gamma+1 steps   |
-    ctx.prepare_for_verify -> TARGET_VERIFY      |
-    sample bonus                                 |
-  process_batch_result (dense -> sparse scatter) |
-    accumulate log/interval weights on stacked   |
-  SMCCoordinatorV2                               |
-    slow: per-group Python (golden truth)        |
-    fast: one fused Triton kernel over stacked   |
-  dispatch: batched_resample_kv + slot copies    |
-  rebuild_active_slots (at most once / cycle)    |
-  --------(until group has no active slot)-------+
-     |
-     v
-FINALIZE (argmax log_weight -> parent Req, free_group_slots)
-```
+- [`state.md`](./state.md) — data structures: `SequenceGroup`,
+  `ScheduleBatchSMC`, `StackedGroupState`, the refcounted KV allocator.
+- [`pipeline.md`](./pipeline.md) — the end-to-end flow: admit → prefill →
+  materialize → decode cycle → resample → finalize.
 
-## Key Files (`smcsd/`)
+All code lives under the `smcsd/` package. There is no legacy variant; this
+is the implementation.
 
-| File | Role |
-|------|------|
-| `v2/scheduler.py` | `SMCSchedulerV2`, `SMCCoordinatorV2`, `SequenceGroup` |
-| `v2/req_state.py` | `ScheduleBatchSMC` — persistent slot-based GPU state |
-| `v2/stacked_state.py` | `StackedGroupState` — `(max_G, N)` primary storage |
-| `v2/info.py` | `SMCDecodeContext`, `SMCDraftInputV2` |
-| `v2/worker.py` | `SMCWorkerV2` (standalone, not inheriting v1) |
-| `v2/kernels/fused_collect.py` | Fused normalize+ESS+resample+compaction |
-| `v2/kernels/fused_resample_kv.py` | Fused block-table copy + refcount |
-| `mem_cache/allocator.py` | `SMCRefCountedTokenAllocator` |
+---
 
-## Two-Tier State
+## 1. What SMC does
+
+For every user request (a **parent** `Req`), SMC materializes **N particle
+`Req`s** that share the prompt prefix. Every decode step advances each
+particle by `γ+1` tokens:
 
 ```
-ScheduleBatchSMC — slot-major [max_slots] (sparse)
-  req_pool_indices, seq_lens, kv_allocated_lens, verified_ids,
-  token_counts, finished_mask, group_indices, particle_indices,
-  all_token_ids [max_slots, max_output_len]
-
-  active_slots: idx_mapping (batch_idx -> slot_idx),
-                sorted by group, rebuilt only on membership change
-
-StackedGroupState — group-major (max_G, N) (dense)
-  log_weights, interval_weights  (float64)
-  particle_to_slot, active_cell_mask, n_active, row_in_use
-  persistent scratch (dst/src/row flat, atomic counter, mask)
-
-  legacy group_log_weights[gid] is a VIEW into log_weights[row, :n]
-  -> stacked tensors are single source of truth for fused kernel
+        ┌────────── draft model ──────────┐      ┌── target model ──┐
+x₀ ───► x₁ ───► x₂ ───► … ───► x_γ ───► x_{γ+1}    verify x₁…x_γ
+   (autoregressive γ+1 steps)             (bonus)  in one batched pass
 ```
 
-## Resampling: Slow vs Fast
+Then the target model is run once (`TARGET_VERIFY`) over the drafted tokens.
+Per particle we compute a log-weight update `Σ (score_logprob − draft_logprob)`.
+Every cycle we test each group's ESS; if it dips below threshold we
+**resample** — low-weight particles are overwritten by copies of high-weight
+siblings, both KV and metadata. At the end, the highest-weighted particle's
+output is copied onto the parent `Req`.
 
-**Slow path (`fast_resample=False`)** — per-group Python: normalize → ESS → systematic → `Counter` pair → per-pair `resample_copy_slot`. Golden truth.
+No rejection loop. All `γ+1` drafted tokens are always accepted; divergence
+from the target is absorbed into the log-weight.
 
-**Fast path (`fast_resample=True`, systematic + CUDA)** — one kernel per group row:
+---
+
+## 2. System hierarchy
+
+Top-down: one scheduler process drives two models and a stack of fused
+kernels. The scheduler owns all SMC-specific orchestration; workers are
+thin forward-pass executors.
 
 ```
-_fused_collect_kernel (one program per row of stacked state)
-  mask inactive -> -inf
-  lse-normalize -> weights
-  ess = 1/Σw²; resample if ess < threshold * n_active
-  cdf = cumsum(weights)
-  seed = tl.rand(step_counter, row)   # Philox, no host sync
-  systematic draws -> counts[ancestor] via scalar searchsorted
-  dead_flag = (counts==0) & active
-  excess    = max(counts-1, 0)
-  offset = atomic_add(global_counter, n_copies)
-  scatter flat dst/src/row; zero weights
-  -> BatchedResampleResult (only .item() sync at n_jobs)
-
-batched_resample_kv (one program per (dst,src) pair)
-  Phase 1: capture req_to_token[dst, :dst_alloc] + dec_ref
-  Phase 2: copy req_to_token[src, :src_len] -> dst + inc_ref
-  -> to_free for allocator
-
-vectorised slot-tensor copies: seq_lens, kv_allocated_lens,
-  verified_ids, finished_mask, token_counts, all_token_ids [dst]=[src]
-
-per-pair Python: Req-side metadata (output_ids, finished_reason,
-  offsets) — the only unavoidable host cost
+┌──────────────────────────────────────────────────────────────────────┐
+│  SMCEngine  (in-process)                                             │
+│    • tokenizer + offline generate() API                              │
+│    • forks the scheduler subprocess                                  │
+│    • ZMQ IPC ◄─────────────────────────────────────────┐             │
+└────────────────────────────────────────────────────────┼─────────────┘
+                                                         │
+                                                         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  Scheduler subprocess                                                │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  SMCSchedulerV2                                                │  │
+│  │    waiting_groups  ┐                                           │  │
+│  │    prefill_groups  ├─ List[SequenceGroup]                      │  │
+│  │    running_groups  ┘                                           │  │
+│  │                                                                │  │
+│  │    slot_state : ScheduleBatchSMC        ← slot-major GPU state │  │
+│  │       └── stacked : StackedGroupState   ← group-major GPU state│  │
+│  │    coordinator : SMCCoordinatorV2       ← ESS + resample       │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│             │                                   │                    │
+│             ▼                                   ▼                    │
+│  ┌────────────────────────┐    ┌───────────────────────────────────┐ │
+│  │  SMCTpModelWorker      │    │  SMCWorkerV2  (BaseSpecWorker)    │ │
+│  │   target / score model │    │    owns a plain TpModelWorker     │ │
+│  │    → SMCModelRunner    │    │    for the draft model and a ref  │ │
+│  │    → SMCRefCounted-    │    │    to the target worker.          │ │
+│  │       TokenAllocator   │    │                                   │ │
+│  │    → SMCCudaGraph-     │    │    _forward_decode:               │ │
+│  │       Runner (emits    │    │      draft AR × (γ+1)             │ │
+│  │       SMCVerifyInput   │    │      → TARGET_VERIFY              │ │
+│  │       during capture)  │    │      → logprob_diff + bonus       │ │
+│  └────────────────────────┘    └───────────────────────────────────┘ │
+│                     │                             │                  │
+│                     └────────┬────────────────────┘                  │
+│                              ▼                                       │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  Fused Triton kernels  (v2/kernels/)                           │  │
+│  │    fused_collect      — mask/normalize/ESS/systematic/compact  │  │
+│  │    fused_resample_kv  — batched block-table dec / copy / inc   │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-## v2 vs v1: What Changed
+Two models live in one process. The **score (target)** model owns the
+refcounted KV pool; the **draft** model shares that pool via its own
+`TpModelWorker` attached to `SMCWorkerV2`.
 
-| | v1 | v2 |
-|---|---|---|
-| Decode batch | `ScheduleGroupBatch`, rebuilt each iter via `sync_from_groups` | `ScheduleBatchSMC`, persistent slots + `active_slots` gather |
-| Per-group state | Python dicts (`group_log_weights`, etc.) | `StackedGroupState` `(max_G, N)` tensors; dicts are views |
-| KV alloc/decode | Per-req Python loop | One vectorised `assign_req_to_token_pool_func` |
-| Spec carrier | `SMCDraftInput` holds prepare methods + hidden `_orig_seq_lens` | `SMCDraftInputV2` = pure data; prep on `SMCDecodeContext` |
-| Worker | `SMCWorker` | `SMCWorkerV2` standalone |
-| Resample collect | Per-group Python | One fused Triton launch over whole stacked state |
-| Resample dispatch | Per-pair `resample_copy_slot` | Fused `batched_resample_kv` + vectorised slot copies |
-| `rebuild_active` | Implicit via rebuild | Deferred, at most once per cycle |
+---
+
+## 3. Module map
+
+| Area            | Module                                | Role                                                              |
+|-----------------|---------------------------------------|-------------------------------------------------------------------|
+| Entry           | `engine`                              | `SMCEngine` — tokenization, ZMQ, fork scheduler.                  |
+| Scheduler       | `v2/scheduler`                        | `SMCSchedulerV2`, `SequenceGroup`, `SMCCoordinatorV2`.            |
+| Slot state      | `v2/req_state`                        | `ScheduleBatchSMC` — slot-major persistent decode batch.          |
+| Group state     | `v2/stacked_state`                    | `StackedGroupState` — group-major `(max_G, N)` tensors.           |
+| Spec IO         | `v2/info`                             | `SMCDecodeContext` (cycle) + `SMCDraftInputV2` (batch.spec_info). |
+| Worker          | `v2/worker`                           | `SMCWorkerV2` — draft AR, verify, logprob diff, bonus.            |
+| Kernels         | `v2/kernels/fused_collect`            | Fused normalize + ESS + systematic resample + compaction.         |
+| Kernels         | `v2/kernels/fused_resample_kv`        | Fused block-table dec_ref / copy / inc_ref over many jobs.        |
+| KV memory       | `mem_cache/allocator`                 | `SMCRefCountedTokenAllocator`, `copy_block_table`.                |
+| TP worker       | `managers/smc_tp_worker`              | Installs refcounted allocator on the target runner.               |
+| Target runner   | `model_executor/smc_model_runner`     | Allocator swap, spec-info shape for warmup.                       |
+| Graph runner    | `model_executor/smc_cuda_graph_runner`| Emits `SMCVerifyInput` during graph capture.                      |
+| Common          | `common/utils`                        | Particle clone, shared-prefix, normalize / ESS / systematic.      |
+| Common          | `common/verify`                       | `SMCVerifyInput`, per-particle cache-loc kernel.                  |
+
+---
+
+## 4. Lifecycle of a user request
+
+Five stages. Each step in the cycle is unpacked in
+[`pipeline.md`](./pipeline.md); the state it touches is cataloged in
+[`state.md`](./state.md).
+
+```
+  request ──► [ ADMIT ] ──► [ PREFILL ] ──► [ MATERIALIZE ] ──► [ DECODE CYCLE ] ╶╮
+                                                                                 │
+                                              ◄───────── repeat until drained ◄──╯
+                                                                │
+                                                                ▼
+                                                         [ FINALIZE ]
+                                                                │
+                                                                ▼
+                                                           response
+```
+
+**ADMIT.** A `SequenceGroup(parent_req, n_particles)` is wrapped and pushed
+onto `waiting_groups`. Validation rejects parents that request logprobs,
+grammar, multimodal, etc. — these don't compose with N-particle decoding.
+
+**PREFILL.** Admitted parents are extended through a standard `ScheduleBatch`
+pass on the score model. This samples `x₀` and leaves the committed KV prefix
+on the parent.
+
+**MATERIALIZE.** The one-shot fan-out from 1 parent to N particles:
+
+```
+                parent Req
+             kv_committed_len = L
+                    │
+                    │  clone_req_for_smc_particle × N
+                    ▼
+          ┌──────────┬──────────┬─────┬──────────┐
+          │ part₀    │ part₁    │ …   │ part_{N−1}
+          │ pidx = 0 │ pidx = 1 │     │ pidx = N−1
+          └──────────┴──────────┴─────┴──────────┘
+                    │
+                    │  copy_block_table(parent → part_i, L)
+                    │     (inc_ref on each of the L shared KV slots)
+                    │  _release_smc_parent_req(parent)
+                    │     (dec_ref_and_free the parent's block table)
+                    │
+                    ▼
+         slot_state.allocate_slots(...)
+             • N free slots claimed
+             • StackedGroupState.register_group → a row of (max_G, N)
+             • views: group_log_weights[gid]  →  log_weights[row, :N]
+                      group_interval_weights  →  interval_weights[row, :N]
+```
+
+After this, the group is in `running_groups` and its N particles live at
+fixed slots for the rest of the group's life.
+
+**DECODE CYCLE.** Runs as long as any group has at least one active particle.
+Each cycle does:
+
+```
+  prepare_for_decode       sparse slots → gather(active) → vectorised KV alloc
+       │                   for γ+1 tokens → scatter new lens back to slots
+       ▼
+  build_model_worker_batch gather active slot tensors → dense ModelWorkerBatch
+       │
+       ▼
+  SMCWorkerV2              draft AR × (γ+1) → TARGET_VERIFY → logprob_diff + bonus
+       │
+       ▼
+  process_batch_result     scatter accepted tokens back into per-slot
+       │                   all_token_ids, accumulate weights into the
+       │                   stacked row, mark newly finished slots.
+       ▼
+  coordinator.collect      ESS check per group; either a per-group Python
+       │                   pass (slow) or one fused kernel over every
+       │                   stacked row (fast).
+       ▼
+  coordinator.dispatch     copy KV block table + slot tensors + Req
+       │                   metadata from src → dst for every resample pair.
+       ▼
+  rebuild_active_slots     at most once per cycle, only if membership moved.
+```
+
+See [`pipeline.md`](./pipeline.md) for each substage in detail.
+
+**FINALIZE.** When a group runs out of active slots, the best particle is
+picked by `argmax(log_weight, output_length)`, its `output_ids` /
+`finished_reason` are copied onto the parent `Req`, the group's slots are
+freed (allocator refcounts drop), the stacked row is released, and the
+parent is streamed out.
+
+---
+
+## 5. Core invariants
+
+These thread through every piece of code in this package. The rest of the
+docs lean on them.
+
+1. **Slots are for life.** A particle's slot index is chosen at materialize
+   and freed at finalize. Between those, the only thing that changes from
+   cycle to cycle is which slots are *active* — expressed by the
+   `active_slots` gather vector, not by rebuilding the batch.
+
+2. **Rows are for life.** Each `SequenceGroup` owns one row of
+   `StackedGroupState` from materialize to finalize. The dict-style
+   `group_log_weights[gid]` and `group_interval_weights[gid]` are thin
+   slices into that row — writes land in the stacked tensors, which are
+   the ground truth consumed by the fused collect kernel.
+
+3. **`smc_particle_idx` is the column.** The particle index a clone gets
+   at `clone_req_for_smc_particle` time *is* its column in the stacked
+   row, stable forever.
+
+4. **`active_cell_mask` is about allocation, not finish.** It flips True
+   at `register_group`, False at `unregister_group`. Finished particles
+   remain in the candidate set for resampling; the `finished_mask` bit
+   is then copy-propagated through `resample_copy_slot` / the fused KV
+   kernel — so a particle that finishes with high weight can still act
+   as a resample ancestor for a dying sibling.
+
+5. **KV is multi-owner via refcount.** Both `copy_block_table` (parent
+   fan-out) and the fused KV kernel (resample) `inc_ref` on slots they
+   duplicate. `dec_ref_and_free` only returns a slot to the free pool
+   when the last owner releases it. This is the *only* mechanism that
+   lets N particles safely share a prefix.
+
+6. **Rebuild is deferred.** `process_batch_result` and
+   `dispatch_resample_batch` both run with `rebuild_active=False`; the
+   scheduler rebuilds `active_slots` once, at the end of the cycle,
+   and only if membership changed.
