@@ -337,7 +337,7 @@ if __name__ == "__main__":
                       help="attention backend for smc_engine mode (default: triton)")
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
-    eng.add_argument("--max-running-requests", type=int, default=128)
+    eng.add_argument("--max-running-requests", type=int, default=16)
 
     args = parser.parse_args()
     main(args)
