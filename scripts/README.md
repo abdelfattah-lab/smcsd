@@ -1,13 +1,13 @@
 # SMC Experiment Scripts
 
 Ad hoc entrypoints for SMC (Sequential Monte Carlo) speculative decoding
-experiments on top of the standalone `python/sglang/srt/smc/` implementation.
+experiments on top of the standalone `smcsd/` implementation.
 
 ## Scripts
 
 - **`accuracy_test_gsm8k.py`** — GSM8K accuracy benchmark. Supports
-  `smc_engine` (dedicated offline SMCEngine), `native` (Python-level
-  reference), and `baseline` (no speculative decoding).
+  `smc_engine` (dedicated offline SMCEngine) and `baseline`
+  (no speculative decoding).
 - **`quick_quality_check.py`** — Quick output quality sanity check
   (vanilla vs SMC) on a handful of hardcoded prompts.
 - **`smc_profile_engine.py`** — Offline profiler harness for SMC. Use
@@ -23,16 +23,13 @@ experiments on top of the standalone `python/sglang/srt/smc/` implementation.
 source .venv/bin/activate
 
 # Dedicated SMCEngine (recommended) — 8 particles, gamma=8 draft tokens
-python scripts/smc/accuracy_test_gsm8k.py --mode smc_engine -N 8 -g 8 --num-questions 200
+python scripts/accuracy_test_gsm8k.py --mode smc_engine -N 12 -g 8 --num-questions 400
 
 # Baseline (no speculative decoding) for comparison
-python scripts/smc/accuracy_test_gsm8k.py --mode baseline --num-questions 200
-
-# Native/external SMC (Python-level reference, slower but inspectable)
-python scripts/smc/accuracy_test_gsm8k.py --mode native -N 8 -g 8 --num-questions 200
+python scripts/accuracy_test_gsm8k.py --mode baseline --num-questions 400
 
 # Custom models (Llama 3.1-8B target + Llama 3.2-1B draft)
-python scripts/smc/accuracy_test_gsm8k.py --mode smc_engine \
+python scripts/accuracy_test_gsm8k.py --mode smc_engine \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --draft-model meta-llama/Llama-3.2-1B-Instruct \
     -N 8 -g 8 --num-questions 200
@@ -42,7 +39,7 @@ Key flags for `accuracy_test_gsm8k.py`:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--mode` | `smc_engine` | `smc_engine` (dedicated SMCEngine), `native` (Python-level), or `baseline` |
+| `--mode` | `smc_engine` | `smc_engine` (dedicated SMCEngine) or `baseline` |
 | `--model` | `meta-llama/Llama-3.1-8B-Instruct` | Target model |
 | `--draft-model` | `meta-llama/Llama-3.2-1B-Instruct` | Draft model for SMC modes |
 | `-N` / `--particles` | `4` | Number of SMC particles |
@@ -65,7 +62,7 @@ columns `method,gamma,n,tps,b`.
 ```bash
 source .venv/bin/activate
 
-python scripts/smc/quick_quality_check.py --model-path meta-llama/Llama-3.1-8B-Instruct \
+python scripts/quick_quality_check.py --model-path meta-llama/Llama-3.1-8B-Instruct \
   --draft-model-path meta-llama/Llama-3.2-1B-Instruct --mode smc
 ```
 
@@ -74,7 +71,7 @@ python scripts/smc/quick_quality_check.py --model-path meta-llama/Llama-3.1-8B-I
 ```bash
 source .venv/bin/activate
 
-python scripts/smc/smc_profile_engine.py --engine-kind smc_engine \
+python scripts/smc_profile_engine.py --engine-kind smc_engine \
     --output-dir /tmp/sglang-smc-profile
 ```
 

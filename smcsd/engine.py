@@ -16,22 +16,37 @@ from typing import Deque, Dict, List, Optional, Type, TypeVar, Union
 import zmq
 from transformers import AutoTokenizer
 
-from sglang.srt.entrypoints.engine import Engine, _set_envs_and_config
-from sglang.srt.managers.io_struct import (
-    AbortReq,
-    BatchTokenIDOutput,
-    ProfileReq,
-    ProfileReqOutput,
-    ProfileReqType,
-    RpcReqInput,
-    RpcReqOutput,
-    TokenizedGenerateReqInput,
+_SGLANG_IMPORT_HELP = (
+    "smcsd requires the patched SGLang checkout in `3rdparty/sglang`.\n"
+    "If you cloned without submodules or have not installed it yet, run:\n"
+    "  git submodule update --init --recursive\n"
+    "  uv pip install -e 3rdparty/sglang/python\n"
+    "Then reinstall this package if needed:\n"
+    "  uv pip install -e ."
 )
-from smcsd.v2.scheduler import run_smc_scheduler_v2_process
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, get_bool_env_var, kill_process_tree
-from sglang.srt.utils.network import get_zmq_socket
+
+try:
+    from sglang.srt.entrypoints.engine import Engine, _set_envs_and_config
+    from sglang.srt.managers.io_struct import (
+        AbortReq,
+        BatchTokenIDOutput,
+        ProfileReq,
+        ProfileReqOutput,
+        ProfileReqType,
+        RpcReqInput,
+        RpcReqOutput,
+        TokenizedGenerateReqInput,
+    )
+    from smcsd.v2.scheduler import run_smc_scheduler_v2_process
+    from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.server_args import PortArgs, ServerArgs
+    from sglang.srt.utils import configure_logger, get_bool_env_var, kill_process_tree
+    from sglang.srt.utils.network import get_zmq_socket
+except ModuleNotFoundError as exc:
+    missing_root = (exc.name or "").split(".")[0]
+    if missing_root == "sglang":
+        raise ModuleNotFoundError(_SGLANG_IMPORT_HELP) from exc
+    raise
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
