@@ -31,8 +31,8 @@ python -O -m sglang.bench_offline_throughput \
   --smc-draft-temperature 0.7 --smc-target-temperature 0.7 \
   --attention-backend fa3 \
   --mem-fraction-static 0.60 \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs 16 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs 128 \
   --dataset-name sharegpt \
   --num-prompts 200
 ```
@@ -46,8 +46,8 @@ python scripts/smc/accuracy_test_gsm8k.py \
   --particles 12 --gamma 8 \
   --temperature 0.7 \
   --attention-backend fa3 \
-  --max-running-requests 24\
-    --cuda-graph-max-bs 24 \
+  --max-running-requests 128\
+    --cuda-graph-max-bs 128 \
   --num-questions 400
 ```
 
