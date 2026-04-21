@@ -38,10 +38,15 @@ class SMCModelRunner(ModelRunner):
         if self.spec_algorithm.is_smc() and not self.is_draft_worker:
             from smcsd.common.verify import SMCVerifyInput
 
+            chm = (
+                CaptureHiddenMode.FULL
+                if getattr(self.server_args, "smc_draft_mode", "dense") == "eagle3"
+                else CaptureHiddenMode.NULL
+            )
             return SMCVerifyInput(
                 draft_token_num=num_tokens_per_bs,
                 positions=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=chm,
                 num_tokens_per_req=num_tokens_per_bs,
             )
         return super()._build_dummy_run_spec_info(buffers, num_tokens_per_bs)

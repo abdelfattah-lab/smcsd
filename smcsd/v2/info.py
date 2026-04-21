@@ -178,6 +178,7 @@ class SMCDecodeContext:
         target_worker: "TpModelWorker",
         all_tokens: list,
         cache_locs: torch.Tensor,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
     ) -> Tuple[ForwardBatch, bool]:
         """Prepare batch and create ForwardBatch for score model verification.
 
@@ -202,7 +203,7 @@ class SMCDecodeContext:
         verify_spec_info = SMCVerifyInput(
             draft_token_num=draft_token_num,
             positions=positions,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=capture_hidden_mode,
             seq_lens_sum=self.orig_seq_lens_sum,
             seq_lens_cpu=orig_seq_lens_cpu,
             num_tokens_per_req=draft_token_num,
@@ -215,7 +216,7 @@ class SMCDecodeContext:
         verify_batch.seq_lens_cpu = orig_seq_lens_cpu
         verify_batch.seq_lens_sum = verify_spec_info.seq_lens_sum
         verify_batch.spec_info = verify_spec_info
-        verify_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        verify_batch.capture_hidden_mode = capture_hidden_mode
         batch = verify_batch
 
         is_idle = batch.forward_mode.is_idle()
@@ -263,6 +264,23 @@ class SMCDraftInputV2(SpecInput):
     logprob_diff: Optional[torch.Tensor] = None  # (bs,) from last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
+
+    # EAGLE3 mode: target hidden states carried across decode cycles.
+    # Shape (bs, 3*hidden_dim) when use_aux_hidden_state=True (low+mid+high concat),
+    # or (bs, hidden_dim) for plain EAGLE3 without aux.
+    # Always None in dense draft mode.
+    target_hidden_state: Optional[torch.Tensor] = None
+
+    # EAGLE3 mode: the pre-sampled first draft token for the NEXT decode cycle.
+    # This is sampled from the draft's last-position logits (prefill or rewrite).
+    # At the start of each EAGLE3 decode cycle, this becomes x1 (first proposed
+    # token), fed into draft step 0 alongside target_hidden_state.
+    # Storing this avoids re-consuming `verified_id` (which the draft already
+    # saw during prefill / rewrite) and matches the official EAGLE3 flow.
+    first_draft_token_id: Optional[torch.Tensor] = None  # (bs,) target-vocab
+    # Draft log-prob of first_draft_token_id (in draft vocab), used for SMC
+    # weighting alongside per-step draft log-probs.
+    first_draft_logprob: Optional[torch.Tensor] = None  # (bs,)
 
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1

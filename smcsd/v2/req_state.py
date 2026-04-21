@@ -116,6 +116,20 @@ class ScheduleBatchSMC:
             (self.max_slots, max_output_len), dtype=torch.int32, device=device
         )
 
+        # ── EAGLE3: per-slot target hidden states [max_slots, aux_hidden_dim] ──
+        # Allocated lazily on first eagle3 use to avoid memory cost in dense mode.
+        # aux_hidden_dim = 3*hidden_dim (use_aux_hidden_state=True) or hidden_dim.
+        self.target_hidden_states: Optional[torch.Tensor] = None
+
+        # ── EAGLE3: per-slot carry of the pre-sampled "first draft token" ──
+        # Allocated lazily. These are the draft's own prediction of the next
+        # token (in target-vocab space) sampled from the previous cycle's
+        # last-position logits (prefill or rewrite). At decode step 0, this
+        # is the token fed into the draft (NOT the verified_id, which was
+        # already consumed by the draft during prefill / rewrite).
+        self.first_draft_token_ids: Optional[torch.Tensor] = None  # (max_slots,) int64
+        self.first_draft_logprobs: Optional[torch.Tensor] = None  # (max_slots,) float32
+
         # ── Sampling params [max_slots], static after allocation ──
         self.temperatures = torch.ones(
             self.max_slots, 1, dtype=torch.float32, device=device
@@ -229,6 +243,53 @@ class ScheduleBatchSMC:
         self.rebuild_active_slots()
         return slots
 
+    def set_prefill_hidden(
+        self,
+        slots: List[int],
+        prefill_hidden: torch.Tensor,
+        first_draft_token_id: Optional[torch.Tensor] = None,
+        first_draft_logprob: Optional[torch.Tensor] = None,
+    ) -> None:
+        """EAGLE3: scatter a single parent's prefill hidden state (and the
+        pre-sampled first draft token / logprob) across its fanned-out
+        particle slots. Called after allocate_slots."""
+        if not slots:
+            return
+        slot_idx = torch.tensor(slots, dtype=torch.long, device=self.device)
+
+        if prefill_hidden is not None:
+            new_dim = prefill_hidden.shape[-1]
+            if (
+                self.target_hidden_states is None
+                or self.target_hidden_states.shape[-1] != new_dim
+            ):
+                self.target_hidden_states = torch.zeros(
+                    (self.max_slots, new_dim),
+                    dtype=prefill_hidden.dtype,
+                    device=self.device,
+                )
+            self.target_hidden_states[slot_idx] = prefill_hidden.unsqueeze(0).expand(
+                len(slots), -1
+            )
+
+        if first_draft_token_id is not None:
+            if self.first_draft_token_ids is None:
+                self.first_draft_token_ids = torch.zeros(
+                    self.max_slots, dtype=torch.int64, device=self.device,
+                )
+            self.first_draft_token_ids[slot_idx] = first_draft_token_id.to(
+                dtype=torch.int64
+            ).expand(len(slots))
+
+        if first_draft_logprob is not None:
+            if self.first_draft_logprobs is None:
+                self.first_draft_logprobs = torch.zeros(
+                    self.max_slots, dtype=torch.float32, device=self.device,
+                )
+            self.first_draft_logprobs[slot_idx] = first_draft_logprob.to(
+                dtype=torch.float32
+            ).expand(len(slots))
+
     def free_group_slots(self, group_id: str) -> None:
         """Free all slots for a finalized group."""
         slots = self.group_slot_lists.pop(group_id, [])
@@ -331,10 +392,29 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
 
+        hidden_g = (
+            self.target_hidden_states[active].clone()
+            if self.target_hidden_states is not None
+            else None
+        )
+        fd_ids_g = (
+            self.first_draft_token_ids[active].clone()
+            if self.first_draft_token_ids is not None
+            else None
+        )
+        fd_logp_g = (
+            self.first_draft_logprobs[active].clone()
+            if self.first_draft_logprobs is not None
+            else None
+        )
+
         return SMCDraftInputV2(
             verified_id=verified_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
+            target_hidden_state=hidden_g,
+            first_draft_token_id=fd_ids_g,
+            first_draft_logprob=fd_logp_g,
         )
 
     # ────────────────────────────────────────────────────────
@@ -430,6 +510,9 @@ class ScheduleBatchSMC:
         logprob_diff: torch.Tensor,
         bonus_ids: torch.Tensor,
         *,
+        next_hidden_state: Optional[torch.Tensor] = None,
+        next_first_draft_token_id: Optional[torch.Tensor] = None,
+        next_first_draft_logprob: Optional[torch.Tensor] = None,
         rebuild_active: bool = True,
     ) -> List[int]:
         """Write forward results back to slot state. Returns newly finished slots.
@@ -458,6 +541,40 @@ class ScheduleBatchSMC:
 
         # b. Update verified_ids
         self.verified_ids[active] = bonus_ids.to(dtype=torch.int32)
+
+        # b2. EAGLE3: scatter new target hidden states back to slot storage.
+        # Dim can change across cycles (hidden_dim seed at prefill vs
+        # 3*hidden_dim aux after verify) — reallocate on mismatch.
+        if next_hidden_state is not None:
+            new_dim = next_hidden_state.shape[-1]
+            if (
+                self.target_hidden_states is None
+                or self.target_hidden_states.shape[-1] != new_dim
+            ):
+                self.target_hidden_states = torch.zeros(
+                    (self.max_slots, new_dim),
+                    dtype=next_hidden_state.dtype,
+                    device=self.device,
+                )
+            self.target_hidden_states[active] = next_hidden_state
+
+        # b3. EAGLE3: write back the next-cycle first-draft token / logprob.
+        if next_first_draft_token_id is not None:
+            if self.first_draft_token_ids is None:
+                self.first_draft_token_ids = torch.zeros(
+                    self.max_slots, dtype=torch.int64, device=self.device,
+                )
+            self.first_draft_token_ids[active] = next_first_draft_token_id.to(
+                dtype=torch.int64
+            )
+        if next_first_draft_logprob is not None:
+            if self.first_draft_logprobs is None:
+                self.first_draft_logprobs = torch.zeros(
+                    self.max_slots, dtype=torch.float32, device=self.device,
+                )
+            self.first_draft_logprobs[active] = next_first_draft_logprob.to(
+                dtype=torch.float32
+            )
 
         # c. Batched finish check
         newly_finished: List[int] = []
@@ -559,6 +676,12 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[dst_slot] = self.kv_allocated_lens[src_slot]
         self.verified_ids[dst_slot] = self.verified_ids[src_slot]
         self.finished_mask[dst_slot] = self.finished_mask[src_slot]
+        if self.target_hidden_states is not None:
+            self.target_hidden_states[dst_slot] = self.target_hidden_states[src_slot]
+        if self.first_draft_token_ids is not None:
+            self.first_draft_token_ids[dst_slot] = self.first_draft_token_ids[src_slot]
+        if self.first_draft_logprobs is not None:
+            self.first_draft_logprobs[dst_slot] = self.first_draft_logprobs[src_slot]
 
         src_count = int(self.token_counts[src_slot].item())
         self.token_counts[dst_slot] = src_count

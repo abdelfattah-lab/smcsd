@@ -68,6 +68,8 @@ class SMCEngine:
         target_temperature: float = 1.0,
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
+        # Draft mode
+        smc_draft_mode: str = "dense",  # "dense" or "eagle3"
         # Hardware
         tp_size: int = 1,
         base_gpu_id: int = 0,
@@ -103,6 +105,7 @@ class SMCEngine:
             smc_target_temperature=target_temperature,
             smc_resample_threshold=resample_threshold,
             smc_resample_method=resample_method,
+            smc_draft_mode=smc_draft_mode,
             tp_size=tp_size,
             base_gpu_id=base_gpu_id,
         )

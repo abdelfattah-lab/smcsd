@@ -376,6 +376,18 @@ class SMCCoordinatorV2:
         slot_state.finished_mask[dst_idx] = slot_state.finished_mask[src_idx]
         slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
         slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
+        if slot_state.target_hidden_states is not None:
+            slot_state.target_hidden_states[dst_idx] = slot_state.target_hidden_states[
+                src_idx
+            ]
+        if slot_state.first_draft_token_ids is not None:
+            slot_state.first_draft_token_ids[dst_idx] = (
+                slot_state.first_draft_token_ids[src_idx]
+            )
+        if slot_state.first_draft_logprobs is not None:
+            slot_state.first_draft_logprobs[dst_idx] = (
+                slot_state.first_draft_logprobs[src_idx]
+            )
 
         # Req metadata loop — accepted unavoidable Python-side cost.
         for dst_slot, src_slot in zip(
@@ -716,7 +728,25 @@ class SMCSchedulerV2(Scheduler):
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
-        for group, req, next_token_id in zip(groups, batch.reqs, next_token_ids):
+        # EAGLE3: per-parent prefill hidden state (num_parents, aux_dim) — same
+        # order as batch.reqs. None in dense mode.
+        prefill_hidden = None
+        prefill_first_draft_ids = None
+        prefill_first_draft_logprobs = None
+        if result.next_draft_input is not None:
+            prefill_hidden = getattr(
+                result.next_draft_input, "target_hidden_state", None
+            )
+            prefill_first_draft_ids = getattr(
+                result.next_draft_input, "first_draft_token_id", None
+            )
+            prefill_first_draft_logprobs = getattr(
+                result.next_draft_input, "first_draft_logprob", None
+            )
+
+        for i, (group, req, next_token_id) in enumerate(
+            zip(groups, batch.reqs, next_token_ids)
+        ):
             assert req is group.parent_req
 
             req.output_ids.append(next_token_id)
@@ -728,14 +758,36 @@ class SMCSchedulerV2(Scheduler):
                 self.stream_output([req], False)
                 continue
 
-            error_msg = self._materialize_group(group)
+            h_i = prefill_hidden[i] if prefill_hidden is not None else None
+            fd_id_i = (
+                prefill_first_draft_ids[i : i + 1]
+                if prefill_first_draft_ids is not None
+                else None
+            )
+            fd_lp_i = (
+                prefill_first_draft_logprobs[i : i + 1]
+                if prefill_first_draft_logprobs is not None
+                else None
+            )
+            error_msg = self._materialize_group(
+                group,
+                prefill_hidden=h_i,
+                first_draft_token_id=fd_id_i,
+                first_draft_logprob=fd_lp_i,
+            )
             if error_msg is not None:
                 self._abort_group(group, error_msg)
                 continue
 
             self.running_groups.append(group)
 
-    def _materialize_group(self, group: SequenceGroup) -> Optional[str]:
+    def _materialize_group(
+        self,
+        group: SequenceGroup,
+        prefill_hidden: Optional[torch.Tensor] = None,
+        first_draft_token_id: Optional[torch.Tensor] = None,
+        first_draft_logprob: Optional[torch.Tensor] = None,
+    ) -> Optional[str]:
         parent_req = group.parent_req
         try:
             self.model_worker.materialize_smc_parent_draft_prefix(parent_req)
@@ -786,12 +838,26 @@ class SMCSchedulerV2(Scheduler):
         group_idx = self._group_idx_counter
         self._group_idx_counter += 1
         try:
-            self.slot_state.allocate_slots(
+            slots = self.slot_state.allocate_slots(
                 group_id=group.group_id,
                 group_idx=group_idx,
                 particle_reqs=particle_reqs,
                 shared_seq_len=shared_seq_len,
             )
+            # EAGLE3: seed particle slots with the parent's prefill hidden state
+            # and pre-sampled first-draft token (both come from the draft's
+            # prefill of the bootstrap prefix).
+            if (
+                prefill_hidden is not None
+                or first_draft_token_id is not None
+                or first_draft_logprob is not None
+            ):
+                self.slot_state.set_prefill_hidden(
+                    slots,
+                    prefill_hidden,
+                    first_draft_token_id=first_draft_token_id,
+                    first_draft_logprob=first_draft_logprob,
+                )
         except Exception as exc:
             for particle_req in particle_reqs:
                 _release_internal_req(
@@ -851,11 +917,29 @@ class SMCSchedulerV2(Scheduler):
             raise RuntimeError("SMCSchedulerV2: result missing next_draft_input.verified_id")
 
         # Write results back to slot state (defer rebuild to end of cycle)
+        next_hidden = (
+            next_draft.target_hidden_state
+            if next_draft is not None
+            else None
+        )
+        next_first_draft_id = (
+            next_draft.first_draft_token_id
+            if next_draft is not None
+            else None
+        )
+        next_first_draft_lp = (
+            next_draft.first_draft_logprob
+            if next_draft is not None
+            else None
+        )
         newly_finished = self.slot_state.process_batch_result(
             next_token_ids=result.next_token_ids,
             accept_lens=result.accept_lens,
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
+            next_hidden_state=next_hidden,
+            next_first_draft_token_id=next_first_draft_id,
+            next_first_draft_logprob=next_first_draft_lp,
             rebuild_active=False,
         )
 

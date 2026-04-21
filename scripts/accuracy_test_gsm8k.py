@@ -96,6 +96,7 @@ def run_smc_engine_eval(args, prompts, labels):
         gamma=args.gamma,
         draft_temperature=args.temperature,
         target_temperature=args.temperature,
+        smc_draft_mode=args.smc_draft_mode,
         trust_remote_code=True,
         page_size=1,
         attention_backend=args.attention_backend,
@@ -114,6 +115,8 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_running_requests"] = args.max_running_requests
     else:
         engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
+    if getattr(args, "dtype", None):
+        engine_kwargs["dtype"] = args.dtype
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
@@ -224,7 +227,8 @@ def main(args):
         draft = args.draft_model or DEFAULT_DRAFT_MODEL
         print(
             f"  particles={args.particles}, gamma={args.gamma}, "
-            f"temperature={args.temperature}, draft={draft}"
+            f"temperature={args.temperature}, draft={draft}, "
+            f"smc_draft_mode={args.smc_draft_mode}"
         )
     print(
         f"  num_questions={args.num_questions}, max_new_tokens={args.max_new_tokens}, "
@@ -318,6 +322,19 @@ if __name__ == "__main__":
             "Default (off) is the slow per-group Python path (golden truth)."
         ),
     )
+    smc_grp.add_argument(
+        "--smc-draft-mode",
+        type=str,
+        choices=["dense", "eagle3"],
+        default="dense",
+        help=(
+            "SMC draft mode. 'dense' (default) = separate draft model "
+            "(e.g. Llama-3.2-1B). 'eagle3' = EAGLE3 head that uses the "
+            "target model's hidden states; --draft-model should be the "
+            "matching EAGLE3 checkpoint "
+            "(e.g. lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B)."
+        ),
+    )
     # Benchmark
     bench = parser.add_argument_group("benchmark")
     bench.add_argument("--num-questions", type=int, default=80)
@@ -332,6 +349,8 @@ if __name__ == "__main__":
 
     # Engine overrides (smc_engine / baseline modes)
     eng = parser.add_argument_group("engine overrides (smc_engine/baseline)")
+    eng.add_argument("--dtype", type=str, default=None,
+                     help="model dtype override (e.g. bfloat16, float16)")
     eng.add_argument("--attention-backend", type=str, default="triton",
                       choices=["triton", "fa3"],
                       help="attention backend for smc_engine mode (default: triton)")
