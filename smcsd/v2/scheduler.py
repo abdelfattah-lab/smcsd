@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import copy
 import logging
 import signal
-import time
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -23,27 +21,13 @@ from smcsd.common.utils import (
     _release_smc_parent_req,
     clone_req_for_smc_particle,
     compute_smc_shared_prefix_len,
-    multinomial_resample,
-    normalize_log_weights,
-    should_resample,
-    systematic_resample,
     validate_smc_parent_req,
 )
 from smcsd.mem_cache.allocator import copy_block_table
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode, kill_itself_when_parent_died
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ResampleJobSet:
-    """Per-group dst/src pairs produced by the slow path."""
-
-    group_id: str
-    dst_slots: List[int]
-    src_slots: List[int]
 
 
 def _prepare_req_for_private_prefill(req: Req) -> None:
@@ -60,12 +44,18 @@ def _prepare_req_for_private_prefill(req: Req) -> None:
 
 @dataclass
 class SequenceGroup:
+    """Scheduler-side handle for one SMC group before/during decoding.
+
+    Owns the parent ``Req`` (the user-visible request), the materialised
+    particle ``Req`` objects, and basic metadata.  Cumulative weights live
+    slot-indexed on ``ScheduleBatchSMC`` (not here) once the group is
+    materialised.
+    """
+
     parent_req: Req
     n_particles: int
     particle_temperature: float
     particle_reqs: Dict[int, Req] = field(default_factory=dict)
-    log_weights: Optional[torch.Tensor] = None
-    interval_log_weights: Optional[torch.Tensor] = None
 
     @property
     def group_id(self) -> str:
@@ -90,11 +80,12 @@ class SequenceGroup:
     def all_particle_indices(self) -> List[int]:
         return sorted(self.particle_reqs)
 
-    def materialize_particles(
-        self,
-        *,
-        device: torch.device | str,
-    ) -> None:
+    def materialize_particles(self) -> None:
+        """Clone ``n_particles`` Reqs off the parent Req and register them.
+
+        Weight tensors are allocated slot-indexed on ``ScheduleBatchSMC`` at
+        ``allocate_slots`` time — not on the SequenceGroup.
+        """
         if self.particle_reqs:
             return
         parent_req = self.parent_req
@@ -109,17 +100,9 @@ class SequenceGroup:
             particle_reqs.append(particle_req)
 
         self.particle_reqs = {req.smc_particle_idx: req for req in particle_reqs}
-        self.log_weights = torch.zeros(
-            self.n_particles,
-            dtype=torch.float64,
-            device=device,
-        )
-        self.interval_log_weights = torch.zeros_like(self.log_weights)
 
     def clear_particles(self) -> None:
         self.particle_reqs = {}
-        self.log_weights = None
-        self.interval_log_weights = None
 
 
 ### V1b dedicated scheduler classes (ScheduleGroupBatch, SMCCoordinator, SMCScheduler,
@@ -127,17 +110,20 @@ class SequenceGroup:
 ### The V1a path (Engine() with SMCManager in scheduler.py) is unchanged.
 
 class SMCCoordinatorV2:
-    """SMC resample coordinator with two paths:
+    """SMC resample coordinator.
 
-    1. **slow path** (`fast_resample=False`, default): per-group Python
-       normalize + ESS + systematic/multinomial resample + Counter-based
-       dst/src pairing + per-slot `resample_copy_slot`.  Zero fusion — the
-       reference against which the fast path is validated.
-    2. **fast path** (`fast_resample=True`): one fused Triton kernel (see
-       `fused_collect_kernel.py`) emits flat `dst/src/row_of_job` tensors
-       consumed directly by `batched_resample_kv` (fused KV copy) plus a
-       per-pair `copy_req_metadata` Python loop (inherent unavoidable cost).
-       Requires systematic resampling + CUDA.
+    One fused Triton kernel per decode step:
+
+    1. ``collect`` — for every in-use group row, normalise interval weights,
+       check ESS against ``threshold * N``, and (if below threshold) run
+       systematic resampling, emitting flat ``dst_slots`` / ``src_slots`` /
+       ``row_of_job`` tensors.  Zeros the resampled rows' weights in place.
+
+    2. ``dispatch`` — hand those flat tensors to ``batched_resample_kv`` for
+       a fused KV block-table copy + refcount update, then vector-copy the
+       per-slot state tensors (seq_lens, finished_mask, token_counts,
+       all_token_ids, …).  Python-side ``copy_req_metadata`` loops over the
+       at-most-``max_slots`` copies — accepted unavoidable cost.
     """
 
     def __init__(
@@ -145,43 +131,42 @@ class SMCCoordinatorV2:
         *,
         device: torch.device | str,
         resample_threshold: float,
-        resample_method: str,
-        fast_resample: bool = False,
     ) -> None:
+        if torch.device(device).type != "cuda":
+            raise ValueError("SMCCoordinatorV2 requires CUDA")
         self.device = device
         self.resample_threshold = resample_threshold
-        self.resample_method = resample_method
-        self.fast_resample = fast_resample
-        self._fast_step_counter = 0
-        if self.fast_resample:
-            if resample_method != "systematic":
-                raise ValueError(
-                    "fast_resample requires --smc-resample-method=systematic"
-                )
-            if torch.device(device).type != "cuda":
-                raise ValueError("fast_resample requires CUDA")
-        logger.warning(
-            "SMCCoordinatorV2: resample_method=%s fast_resample=%s",
-            resample_method,
-            fast_resample,
+        self._step_counter = 0
+        logger.info(
+            "SMCCoordinatorV2: resample_threshold=%s (fused systematic kernel)",
+            resample_threshold,
         )
 
     # ── Public API ──────────────────────────────────────────
 
-    def collect_resample_jobs_batch(
-        self,
-        group_ids: List[str],
-        slot_state: "ScheduleBatchSMC",
-    ):
-        """Collect resample jobs for all active groups.
+    def collect_resample_jobs_batch(self, slot_state: "ScheduleBatchSMC"):
+        """Run the fused collect kernel over all in-use group rows.
 
-        Returns a `BatchedResampleResult` (fast path) or a plain
-        `List[ResampleJobSet]` (slow path).  `dispatch_resample_batch`
-        accepts both.
+        Returns a ``BatchedResampleResult``.  The ``step_counter`` increments
+        on every call so ``tl.rand(step_counter, row)`` draws independent
+        stratified uniforms across steps.
         """
-        if self.fast_resample:
-            return self._collect_fast(slot_state)
-        return self._collect_slow(group_ids, slot_state)
+        from smcsd.v2.kernels.fused_collect import batched_collect_fused
+
+        self._step_counter += 1
+        return batched_collect_fused(
+            slot_state.log_weights,
+            slot_state.interval_weights,
+            slot_state.group_to_slots,
+            slot_state.row_in_use,
+            self.resample_threshold,
+            step_counter=self._step_counter,
+            scratch_dst=slot_state.scratch_dst_flat,
+            scratch_src=slot_state.scratch_src_flat,
+            scratch_row=slot_state.scratch_row_of_job,
+            scratch_counter=slot_state.scratch_counter,
+            scratch_mask=slot_state.scratch_resample_mask,
+        )
 
     def dispatch_resample_batch(
         self,
@@ -190,159 +175,15 @@ class SMCCoordinatorV2:
         *,
         rebuild_active: bool = True,
     ) -> None:
-        """Dispatch a collect plan.  Fast path → fused KV copy; slow path →
-        per-slot `resample_copy_slot`.  No-op on empty plans.
+        """Apply a ``BatchedResampleResult`` plan.
+
+        Fused KV copy + per-slot state copies + Req-metadata loop.  No-op on
+        an empty plan.  ``rebuild_active`` may be deferred by the caller if
+        other membership changes are about to happen in the same cycle.
         """
-        if isinstance(plan, list):
-            if not plan:
-                return
-            self._dispatch_slow(plan, slot_state)
-        else:
-            # BatchedResampleResult
-            if plan.n_jobs == 0:
-                return
-            self._dispatch_fast(plan, slot_state)
+        if plan.n_jobs == 0:
+            return
 
-        # Resampling can copy finished ancestors into previously active slots.
-        # Caller may defer rebuild to batch with other membership changes.
-        if rebuild_active:
-            slot_state.rebuild_active_slots()
-
-    # ── Slow path (golden truth) ────────────────────────────
-
-    def _collect_slow(
-        self,
-        group_ids: List[str],
-        slot_state: "ScheduleBatchSMC",
-    ) -> List[ResampleJobSet]:
-        """Per-group Python collection.  Preserves legacy semantics
-        (includes all particles, relies on finished_mask propagation via
-        `resample_copy_slot`).
-        """
-        jobs: List[ResampleJobSet] = []
-        for group_id in group_ids:
-            job = self._collect_one(group_id, slot_state)
-            if job is not None:
-                jobs.append(job)
-        return jobs
-
-    def _collect_one(
-        self,
-        group_id: str,
-        slot_state: "ScheduleBatchSMC",
-    ) -> Optional[ResampleJobSet]:
-        """Single-group Python collect.  Preserves legacy behaviour: all
-        particles (including finished) participate; `finished_mask` is
-        propagated downstream via `resample_copy_slot`.
-        """
-        iw = slot_state.group_interval_weights.get(group_id)
-        if iw is None:
-            return None
-        slots = slot_state.group_slot_lists.get(group_id, [])
-        if len(slots) <= 1:
-            return None
-
-        pidx_gpu = slot_state.particle_indices[slots]
-        resample_pidxs = pidx_gpu.tolist()
-        pidx_to_slot = dict(zip(resample_pidxs, slots))
-
-        normalized_weights = normalize_log_weights(
-            iw[resample_pidxs], device=self.device,
-        )
-        if not should_resample(
-            normalized_weights,
-            len(resample_pidxs),
-            self.resample_threshold,
-            device=self.device,
-        ):
-            return None
-
-        if self.resample_method == "multinomial":
-            ancestors_t = multinomial_resample(normalized_weights, device=self.device)
-        else:
-            ancestors_t = systematic_resample(normalized_weights, device=self.device)
-
-        # Reset cumulative weights (writes through the group_log_weights view
-        # into the stacked storage).
-        pidx_t = pidx_gpu.to(torch.int64)
-        slot_state.group_log_weights[group_id][pidx_t] = 0.0
-        iw[pidx_t] = 0.0
-
-        ancestor_pidxs = [resample_pidxs[idx] for idx in ancestors_t.tolist()]
-
-        keep_counts: Counter[int] = Counter()
-        target_counts = Counter(ancestor_pidxs)
-        dst_pidxs: List[int] = []
-        src_pidxs: List[int] = []
-        for pidx in resample_pidxs:
-            if keep_counts[pidx] < target_counts[pidx]:
-                keep_counts[pidx] += 1
-                continue
-            dst_pidxs.append(pidx)
-        for pidx in resample_pidxs:
-            remaining = target_counts[pidx] - keep_counts[pidx]
-            if remaining > 0:
-                src_pidxs.extend([pidx] * remaining)
-        if not dst_pidxs:
-            return None
-
-        dst_slots = [pidx_to_slot[p] for p in dst_pidxs]
-        src_slots = [pidx_to_slot[p] for p in src_pidxs]
-        return ResampleJobSet(
-            group_id=group_id, dst_slots=dst_slots, src_slots=src_slots,
-        )
-
-    def _dispatch_slow(
-        self,
-        jobs: List[ResampleJobSet],
-        slot_state: "ScheduleBatchSMC",
-    ) -> None:
-        """No-fusion dispatch: per-slot `resample_copy_slot` inside one
-        free_group_begin/end wrapper."""
-        if __debug__:
-            all_dst: set = set()
-            all_src: set = set()
-            for job in jobs:
-                all_dst.update(job.dst_slots)
-                all_src.update(job.src_slots)
-            assert all_dst.isdisjoint(all_src), (
-                "Cross-group dst/src slot overlap detected (slow path)"
-            )
-        slot_state.token_to_kv_pool_allocator.free_group_begin()
-        try:
-            for job in jobs:
-                for dst_slot, src_slot in zip(job.dst_slots, job.src_slots):
-                    slot_state.resample_copy_slot(dst_slot, src_slot)
-        finally:
-            slot_state.token_to_kv_pool_allocator.free_group_end()
-
-    # ── Fast path ───────────────────────────────────────────
-
-    def _collect_fast(self, slot_state: "ScheduleBatchSMC"):
-        """One fused kernel launch.  Returns `BatchedResampleResult`.
-
-        Seeds are drawn inside the kernel via Philox (`tl.rand`), keyed by a
-        monotonic host-side step counter so consecutive calls produce
-        independent stratified u ~ U[0,1/n_active) values without any
-        per-step host allocation or device sync.
-        """
-        from smcsd.v2.kernels.fused_collect import batched_collect_fused
-
-        stacked = slot_state.stacked
-        self._fast_step_counter += 1
-        return batched_collect_fused(
-            stacked,
-            self.resample_threshold,
-            step_counter=self._fast_step_counter,
-            scratch_dst=stacked.scratch_dst_flat,
-            scratch_src=stacked.scratch_src_flat,
-            scratch_row=stacked.scratch_row_of_job,
-            scratch_counter=stacked.scratch_counter,
-            scratch_mask=stacked.scratch_resample_mask,
-        )
-
-    def _dispatch_fast(self, plan, slot_state: "ScheduleBatchSMC") -> None:
-        """Fused KV copy + vectorised slot-tensor copies + req metadata loop."""
         from smcsd.v2.kernels.fused_resample_kv import batched_resample_kv
 
         dst_idx = plan.dst_slots.to(torch.int64)
@@ -350,7 +191,7 @@ class SMCCoordinatorV2:
 
         if __debug__:
             assert not torch.isin(dst_idx, src_idx).any().item(), (
-                "Cross-group dst/src slot overlap detected (fast path)"
+                "Cross-group dst/src slot overlap detected"
             )
 
         dst_pool_indices = slot_state.req_pool_indices[dst_idx].to(torch.int32)
@@ -369,7 +210,7 @@ class SMCCoordinatorV2:
         if to_free.numel() > 0:
             slot_state.token_to_kv_pool_allocator.free(to_free)
 
-        # Batch-copy slot tensors on device.
+        # Vector-copy the per-slot tensors dst ← src.
         slot_state.seq_lens[dst_idx] = slot_state.seq_lens[src_idx]
         slot_state.kv_allocated_lens[dst_idx] = slot_state.kv_allocated_lens[src_idx]
         slot_state.verified_ids[dst_idx] = slot_state.verified_ids[src_idx]
@@ -377,11 +218,17 @@ class SMCCoordinatorV2:
         slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
         slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
 
-        # Req metadata loop — accepted unavoidable Python-side cost.
+        # Req-level metadata is Python-only (output_ids list, finished_reason
+        # object, etc.) — unavoidable per-copy loop.
         for dst_slot, src_slot in zip(
             dst_idx.tolist(), src_idx.tolist(), strict=True
         ):
             slot_state.copy_req_metadata(dst_slot, src_slot)
+
+        # Resampling can copy finished ancestors into previously active
+        # slots, flipping the live set.
+        if rebuild_active:
+            slot_state.rebuild_active_slots()
 
 
 class SMCSchedulerV2(Scheduler):
@@ -434,8 +281,6 @@ class SMCSchedulerV2(Scheduler):
         self.coordinator = SMCCoordinatorV2(
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
-            resample_method=server_args.smc_resample_method,
-            fast_resample=server_args.smc_fast_resample,
         )
         self._group_idx_counter = 0
 
@@ -742,7 +587,7 @@ class SMCSchedulerV2(Scheduler):
         except Exception as exc:
             return f"SMC parent draft prefill failed: {exc}"
 
-        group.materialize_particles(device=self.device)
+        group.materialize_particles()
         particle_reqs = list(group.particle_reqs.values())
         if self.req_to_token_pool.alloc(particle_reqs) is None:
             group.clear_particles()
@@ -859,26 +704,17 @@ class SMCSchedulerV2(Scheduler):
             rebuild_active=False,
         )
 
-        # Resample all groups.  Either the slow path (List[ResampleJobSet],
-        # golden truth) or the fast path (BatchedResampleResult, one fused
-        # kernel) depending on `server_args.smc_fast_resample`.
-        active_group_ids = [
-            group.group_id
-            for group in self.running_groups
-            if self.slot_state.group_has_active(group.group_id)
-        ]
-        plan = self.coordinator.collect_resample_jobs_batch(
-            active_group_ids, self.slot_state
-        )
-        did_resample = (
-            bool(plan) if isinstance(plan, list) else plan.n_jobs > 0
-        )
+        # One fused collect over every in-use group row, then dispatch the
+        # resulting dst/src plan.  The kernel gates on row_in_use, so we
+        # don't need to filter the group list on the Python side.
+        plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
+        did_resample = plan.n_jobs > 0
         if did_resample:
             self.coordinator.dispatch_resample_batch(
                 plan, self.slot_state, rebuild_active=False,
             )
 
-        # Single rebuild per decode cycle if membership changed
+        # Single rebuild per decode cycle if membership changed.
         if newly_finished or did_resample:
             self.slot_state.rebuild_active_slots()
 

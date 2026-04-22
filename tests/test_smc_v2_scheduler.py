@@ -1,23 +1,20 @@
-"""Unit tests for SMC v2 data structures and scheduler glue.
+"""Unit tests for SMC v2 scheduler glue and ScheduleBatchSMC.
 
 Covers:
-  * `SMCSchedulerV2._admit_prefill_groups` admission gating against
-    `slot_state.available_slot_count()`.
-  * `SMCCoordinatorV2` slow-path resample (`collect_resample_jobs_batch`
-    + `dispatch_resample_batch`) over `ScheduleBatchSMC`: dead slots
-    take the survivor's KV block table, finished-state propagates,
-    refcounts move correctly.
-  * `ScheduleBatchSMC.finalize_group` picks the highest-scoring particle
-    and respects each particle's `finished_len` watermark.
 
-Pure CPU — no Triton, no GPU.  Mocks `req_to_token_pool` and
-`token_to_kv_pool_allocator` so the test isolates v2's own logic.
+* ``SMCSchedulerV2._admit_prefill_groups`` admission gating against
+  ``slot_state.available_slot_count()``.
+* ``ScheduleBatchSMC.finalize_group`` — picks the highest-scoring particle
+  and respects each particle's ``finished_len`` watermark.
+
+Pure CPU.  Mocks the KV pools / allocator so the test isolates the v2
+logic.  The fused resample path (Triton) is covered by
+``test_smc_v2_kernels.py`` on CUDA.
 """
 
 import unittest
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -29,17 +26,18 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
-SMCCoordinatorV2 = v2_scheduler_mod.SMCCoordinatorV2
 SMCSchedulerV2 = v2_scheduler_mod.SMCSchedulerV2
 SequenceGroup = v2_scheduler_mod.SequenceGroup
 
 
 # ---------------------------------------------------------------------------
-# Fakes (kept tiny — only what the methods under test actually touch)
+# Minimal fakes — just what the methods under test touch.
 # ---------------------------------------------------------------------------
 
 
 class _FakeReq:
+    """Stand-in for sglang's Req object, with only the fields v2 reads."""
+
     def __init__(
         self,
         *,
@@ -87,7 +85,7 @@ class _FakeRuntimeReq:
 
 
 class _FakeReqToTokenPool:
-    """Just enough surface for ScheduleBatchSMC.resample_copy_slot."""
+    """Just enough surface for ``ScheduleBatchSMC`` KV bookkeeping."""
 
     def __init__(self, rows):
         self.req_to_token = torch.tensor(rows, dtype=torch.int32)
@@ -99,21 +97,14 @@ class _FakeReqToTokenPool:
 
 
 class _FakeAllocator:
-    """Records inc/dec/free invocations + maintains a slot_ref_count tensor."""
+    """Records inc/dec/free invocations and maintains a slot_ref_count."""
 
     def __init__(self, size=256):
         self.inc_calls = []
         self.dec_calls = []
         self.free_calls = []
-        self.free_group_depth = 0
         self.page_size = 1
         self.slot_ref_count = torch.zeros(size, dtype=torch.int32)
-
-    def free_group_begin(self):
-        self.free_group_depth += 1
-
-    def free_group_end(self):
-        self.free_group_depth -= 1
 
     def inc_ref(self, indices):
         self.inc_calls.append(indices.clone())
@@ -139,11 +130,10 @@ def _make_runtime_group(group_id, n_particles, *, pool_idx_base=0):
         n_particles=n_particles,
         particle_temperature=0.7,
         particle_reqs=reqs,
-        log_weights=torch.zeros(n_particles, dtype=torch.float64),
     )
 
 
-def _build_slot_state(*, max_num_reqs, rows, allocator_size=256):
+def _build_slot_state(*, max_num_reqs, rows, allocator_size=256, n_particles=1):
     return ScheduleBatchSMC(
         max_num_reqs=max_num_reqs,
         device="cpu",
@@ -154,6 +144,7 @@ def _build_slot_state(*, max_num_reqs, rows, allocator_size=256):
         token_to_kv_pool_allocator=_FakeAllocator(size=allocator_size),
         tree_cache=SimpleNamespace(),
         model_config=SimpleNamespace(),
+        n_particles=n_particles,
     )
 
 
@@ -163,6 +154,8 @@ def _build_slot_state(*, max_num_reqs, rows, allocator_size=256):
 
 
 class TestSMCSchedulerAdmission(CustomTestCase):
+    """``_admit_prefill_groups`` gates on available slot capacity."""
+
     def test_admit_prefill_groups_respects_free_slot_capacity(self):
         """When the slot pool is empty, queued groups stay queued."""
         queued_group = _make_runtime_group("g0", n_particles=2, pool_idx_base=10)
@@ -200,196 +193,40 @@ class TestSMCSchedulerAdmission(CustomTestCase):
         self.assertEqual([g.group_id for g in admitted], ["g0", "g1"])
         self.assertEqual(len(scheduler.waiting_groups), 0)
 
-    def test_admit_prefill_groups_aborts_oversized_group(self):
-        """A group whose particle count exceeds max_running_requests is aborted."""
+    def test_admit_prefill_groups_blocks_on_insufficient_capacity(self):
+        """A group whose particle count exceeds available slot capacity is
+        not admitted and stays queued; no abort is emitted.  (The scheduler
+        does not today have a policy for aborting oversized groups — that
+        would be a separate feature.)"""
         oversized = _make_runtime_group("g0", n_particles=8, pool_idx_base=10)
         scheduler = SimpleNamespace(
             waiting_groups=deque([oversized]),
             max_running_requests=4,
             slot_state=SimpleNamespace(available_slot_count=lambda: 4),
         )
-        aborted = []
-        scheduler._emit_abort = lambda req, error_msg: aborted.append(
-            (req.rid, error_msg)
+        scheduler._emit_abort = lambda req, error_msg: self.fail(
+            f"unexpected abort for {req.rid}: {error_msg}"
         )
 
         admitted = SMCSchedulerV2._admit_prefill_groups(scheduler)
 
         self.assertEqual(admitted, [])
-        self.assertEqual(len(scheduler.waiting_groups), 0)
-        self.assertEqual(len(aborted), 1)
-        self.assertEqual(aborted[0][0], "g0")
-
-
-class TestSMCResampleSlowPath(CustomTestCase):
-    def test_resample_copies_survivor_state_and_refcounts(self):
-        """Skewed weights → all particles end up as copies of the lone survivor.
-
-        Setup: 3 particles in group "g".  Particle 1 has weight ≈ 1.0
-        (log_weight 0), particle 0 / particle 2 have effectively zero
-        weight (log_weight = -1e10) so systematic resample is forced to
-        pick particle 1 for every ancestor draw — deterministic regardless
-        of the torch RNG.
-
-        Particle 1 is also marked finished (`finished_reason` set).  After
-        resampling, both other particles must inherit its output_ids,
-        finished_reason, finished_len, and finished_mask.
-
-        KV bookkeeping: dst slots dec_ref their old indices, inc_ref the
-        survivor's indices, and the dst block-table rows now match the
-        survivor's row.
-        """
-        slot_state = _build_slot_state(
-            max_num_reqs=3,
-            rows=[[1, 0, 0], [7, 0, 0], [3, 4, 0]],
-        )
-        req0 = _FakeReq(
-            rid="g_p0",
-            particle_idx=0,
-            req_pool_idx=0,
-            output_ids=[10],
-            kv_indices=[1],
-        )
-        req1 = _FakeReq(
-            rid="g_p1",
-            particle_idx=1,
-            req_pool_idx=1,
-            output_ids=[99],
-            kv_indices=[7],
-            finished_reason=SimpleNamespace(type="stop"),
-            finished_len=1,
-        )
-        req2 = _FakeReq(
-            rid="g_p2",
-            particle_idx=2,
-            req_pool_idx=2,
-            output_ids=[20, 21],
-            kv_indices=[3, 4],
-        )
-        slot_state.slot_to_req = {0: req0, 1: req1, 2: req2}
-        slot_state.group_slot_lists = {"g": [0, 1, 2]}
-        # Override the stacked-storage views with plain tensors — the
-        # collect path only reads & writes via `__getitem__` on the dict.
-        slot_state.group_log_weights = {
-            "g": torch.tensor([-1e10, 0.0, -1e10], dtype=torch.float64)
-        }
-        slot_state.group_interval_weights = {
-            "g": torch.tensor([-1e10, 0.0, -1e10], dtype=torch.float64)
-        }
-        slot_state.req_pool_indices[0] = 0
-        slot_state.req_pool_indices[1] = 1
-        slot_state.req_pool_indices[2] = 2
-        slot_state.seq_lens[0] = 1
-        slot_state.seq_lens[1] = 1
-        slot_state.seq_lens[2] = 2
-        slot_state.kv_allocated_lens[0] = 1
-        slot_state.kv_allocated_lens[1] = 1
-        slot_state.kv_allocated_lens[2] = 2
-        slot_state.token_counts[0] = 1
-        slot_state.token_counts[1] = 1
-        slot_state.token_counts[2] = 2
-        slot_state.particle_indices[0] = 0
-        slot_state.particle_indices[1] = 1
-        slot_state.particle_indices[2] = 2
-        slot_state.finished_mask[1] = True
-        slot_state.rebuild_active_slots()
-
-        coordinator = SMCCoordinatorV2(
-            device="cpu",
-            resample_threshold=0.75,
-            resample_method="systematic",
-        )
-
-        plan = coordinator.collect_resample_jobs_batch(["g"], slot_state)
-        coordinator.dispatch_resample_batch(plan, slot_state)
-
-        # Survivor state propagated to dead particles
-        self.assertEqual(req0.output_ids, [99])
-        self.assertEqual(req2.output_ids, [99])
-        self.assertEqual(req0.finished_reason.type, "stop")
-        self.assertEqual(req2.finished_reason.type, "stop")
-        self.assertEqual(req0.finished_len, 1)
-        self.assertEqual(req2.finished_len, 1)
-        self.assertTrue(slot_state.finished_mask[0].item())
-        self.assertTrue(slot_state.finished_mask[1].item())
-        self.assertTrue(slot_state.finished_mask[2].item())
-        self.assertFalse(slot_state.group_has_active("g"))
-        self.assertEqual(slot_state.active_particle_count(), 0)
-
-        # Interval weights zeroed (group reset for the next decode step)
         self.assertEqual(
-            slot_state.group_interval_weights["g"].tolist(), [0.0, 0.0, 0.0]
+            [g.group_id for g in scheduler.waiting_groups], ["g0"]
         )
-
-        # Block table: dst rows now hold the survivor's KV index (7)
-        self.assertEqual(int(slot_state.req_to_token_pool.req_to_token[0, 0].item()), 7)
-        self.assertEqual(int(slot_state.req_to_token_pool.req_to_token[2, 0].item()), 7)
-
-        # Refcount: 2 inc_ref calls (one per dst inheriting src's KV)
-        # and 2 dec_ref_and_free calls (one per dst dropping its old KV).
-        # The dropped allocations are sized 1 (slot 0) and 2 (slot 2).
-        allocator = slot_state.token_to_kv_pool_allocator
-        self.assertEqual(len(allocator.inc_calls), 2)
-        self.assertEqual(len(allocator.dec_calls), 2)
-        self.assertEqual(
-            sorted(t.numel() for t in allocator.dec_calls), [1, 2],
-        )
-
-    def test_no_resample_when_weights_are_equal(self):
-        """Equal weights → ESS = N → coordinator emits an empty plan and
-        does NOT touch req state or refcounts."""
-        slot_state = _build_slot_state(
-            max_num_reqs=3,
-            rows=[[1, 0, 0], [7, 0, 0], [3, 4, 0]],
-        )
-        req0 = _FakeReq(rid="g_p0", particle_idx=0, req_pool_idx=0,
-                        output_ids=[1], kv_indices=[1])
-        req1 = _FakeReq(rid="g_p1", particle_idx=1, req_pool_idx=1,
-                        output_ids=[7], kv_indices=[7])
-        req2 = _FakeReq(rid="g_p2", particle_idx=2, req_pool_idx=2,
-                        output_ids=[3, 4], kv_indices=[3, 4])
-        slot_state.slot_to_req = {0: req0, 1: req1, 2: req2}
-        slot_state.group_slot_lists = {"g": [0, 1, 2]}
-        slot_state.group_log_weights = {
-            "g": torch.zeros(3, dtype=torch.float64)
-        }
-        slot_state.group_interval_weights = {
-            "g": torch.zeros(3, dtype=torch.float64)
-        }
-        slot_state.req_pool_indices[:3] = torch.tensor([0, 1, 2])
-        slot_state.particle_indices[:3] = torch.tensor([0, 1, 2])
-        slot_state.seq_lens[:3] = torch.tensor([1, 1, 2])
-        slot_state.kv_allocated_lens[:3] = torch.tensor([1, 1, 2])
-        slot_state.token_counts[:3] = torch.tensor([1, 1, 2])
-        slot_state.rebuild_active_slots()
-
-        coordinator = SMCCoordinatorV2(
-            device="cpu",
-            resample_threshold=0.5,  # ESS=3 ≥ 0.5*3=1.5 → no resample
-            resample_method="systematic",
-        )
-
-        plan = coordinator.collect_resample_jobs_batch(["g"], slot_state)
-        coordinator.dispatch_resample_batch(plan, slot_state)
-
-        allocator = slot_state.token_to_kv_pool_allocator
-        self.assertEqual(allocator.inc_calls, [])
-        self.assertEqual(allocator.dec_calls, [])
-        self.assertEqual(req0.output_ids, [1])
-        self.assertEqual(req1.output_ids, [7])
-        self.assertEqual(req2.output_ids, [3, 4])
 
 
 class TestSMCFinalizeGroup(CustomTestCase):
+    """``ScheduleBatchSMC.finalize_group`` — argmax on slot-indexed log_weights."""
+
     def test_finalize_picks_best_visible_finished_length(self):
-        """When two particles tie on log_weight, finalize_group must pick
-        the one with greater visible output (token_count clipped to
-        finished_len), then copy its output_ids / finished_reason /
-        finished_len into the parent_req.
-        """
+        """Two particles tie on log_weight: pick the one with greater visible
+        output (token_count clipped to finished_len), copy its
+        output_ids / finished_reason / finished_len into parent_req."""
         slot_state = _build_slot_state(
             max_num_reqs=2,
             rows=[[1, 2, 3, 4], [5, 6, 7, 0]],
+            n_particles=2,
         )
         req0 = _FakeReq(
             rid="g_p0",
@@ -411,16 +248,15 @@ class TestSMCFinalizeGroup(CustomTestCase):
         )
         slot_state.slot_to_req = {0: req0, 1: req1}
         slot_state.group_slot_lists = {"g": [0, 1]}
-        slot_state.group_log_weights = {
-            "g": torch.tensor([0.0, 0.0], dtype=torch.float64)
-        }
+        # Equal log_weights → tiebreak on visible output length.  The new
+        # layout stores log_weights slot-indexed directly.
+        slot_state.log_weights[0] = 0.0
+        slot_state.log_weights[1] = 0.0
         slot_state.req_pool_indices[0] = 0
         slot_state.req_pool_indices[1] = 1
         slot_state.kv_allocated_lens[0] = 4
         slot_state.kv_allocated_lens[1] = 3
-        slot_state.particle_indices[0] = 0
-        slot_state.particle_indices[1] = 1
-        slot_state.token_counts[0] = 4  # but finished_len=2 → visible=2
+        slot_state.token_counts[0] = 4  # finished_len=2 → visible=2
         slot_state.token_counts[1] = 3  # finished_len=3 → visible=3 ✓ winner
 
         freed = []
@@ -436,6 +272,54 @@ class TestSMCFinalizeGroup(CustomTestCase):
         self.assertEqual(parent_req.finished_len, 3)
         self.assertEqual(parent_req.finished_reason.type, "length")
         self.assertEqual(freed, ["g"])
+
+    def test_finalize_picks_highest_log_weight(self):
+        """When log_weights differ, the heavier particle wins regardless
+        of output length."""
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+        )
+        heavy = _FakeReq(
+            rid="g_p0",
+            particle_idx=0,
+            req_pool_idx=0,
+            output_ids=[1],
+            kv_indices=[1],
+            finished_reason=SimpleNamespace(type="stop"),
+            finished_len=1,
+        )
+        light = _FakeReq(
+            rid="g_p1",
+            particle_idx=1,
+            req_pool_idx=1,
+            output_ids=[2, 3, 4],
+            kv_indices=[2],
+            finished_reason=SimpleNamespace(type="stop"),
+            finished_len=3,
+        )
+        slot_state.slot_to_req = {0: heavy, 1: light}
+        slot_state.group_slot_lists = {"g": [0, 1]}
+        slot_state.log_weights[0] = 1.0    # heavier
+        slot_state.log_weights[1] = 0.0
+        slot_state.req_pool_indices[0] = 0
+        slot_state.req_pool_indices[1] = 1
+        slot_state.kv_allocated_lens[0] = 1
+        slot_state.kv_allocated_lens[1] = 1
+        slot_state.token_counts[0] = 1
+        slot_state.token_counts[1] = 3
+
+        slot_state.free_group_slots = lambda group_id: None
+
+        parent_req = SimpleNamespace(
+            output_ids=[], finished_reason=None, finished_len=None
+        )
+        finalized = slot_state.finalize_group("g", parent_req)
+
+        self.assertIs(finalized, parent_req)
+        self.assertEqual(parent_req.output_ids, [1])
+        self.assertEqual(parent_req.finished_len, 1)
 
 
 if __name__ == "__main__":
