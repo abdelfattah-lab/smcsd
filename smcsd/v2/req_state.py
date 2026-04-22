@@ -187,23 +187,9 @@ class ScheduleBatchSMC:
         self.row_to_group_id: Dict[int, str] = {}
         self._free_rows: List[int] = list(range(self.max_groups))
 
-        # ── Persistent scratch for the fused collect kernel ──
-        # Worst case: every allocated particle emits a dst and a src copy
-        # simultaneously, i.e. `max_groups * n_particles == max_slots`.
-        flat_cap = self.max_slots
-        self.scratch_dst_flat = torch.empty(
-            flat_cap, dtype=torch.int32, device=device,
-        )
-        self.scratch_src_flat = torch.empty(
-            flat_cap, dtype=torch.int32, device=device,
-        )
-        self.scratch_row_of_job = torch.empty(
-            flat_cap, dtype=torch.int32, device=device,
-        )
-        self.scratch_counter = torch.zeros(1, dtype=torch.int32, device=device)
-        self.scratch_resample_mask = torch.zeros(
-            self.max_groups, dtype=torch.int32, device=device,
-        )
+        # Fused-collect kernel output buffers are allocated per call
+        # inside `batched_collect_fused` — they are transient to one
+        # kernel launch, not persistent batch state.
 
     # ────────────────────────────────────────────────────────
     #  Slot Allocation / Deallocation

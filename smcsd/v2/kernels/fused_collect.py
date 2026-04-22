@@ -203,11 +203,6 @@ def batched_collect_fused(
     threshold: float,
     *,
     step_counter: int,
-    scratch_dst: torch.Tensor,
-    scratch_src: torch.Tensor,
-    scratch_row: torch.Tensor,
-    scratch_counter: torch.Tensor,
-    scratch_mask: torch.Tensor,
 ) -> BatchedResampleResult:
     """Launch the fused collect kernel against slot-major weights.
 
@@ -228,30 +223,32 @@ def batched_collect_fused(
         Monotonic host counter.  Must strictly increase across calls to
         avoid re-using the same Philox sequence.  Combined with the row
         id via ``tl.rand(step_counter, row)`` to seed each row.
-    scratch_* : persistent device buffers
-        Reused across calls to avoid per-step allocation.  Sized at the
-        worst case of ``max_groups * N == max_slots``.
 
     Returns
     -------
     BatchedResampleResult
+        Encodes the resample plan for ``dispatch_resample_batch``: for
+        each of the ``n_jobs`` jobs, copy ``src_slots[i] → dst_slots[i]``
+        (tagged with its source row in ``row_of_job[i]``).
+        ``resample_mask[r]`` flags rows that actually resampled this step.
+
+    Notes
+    -----
+    The kernel's output buffers are allocated locally on each call.
+    ``5 × torch.empty((max_slots,), int32)`` is microseconds against a
+    ~10 ms decode step — not worth pre-allocating.  The buffers outlive
+    the call only via the slice views carried by the returned
+    ``BatchedResampleResult``.
     """
     device = log_weights.device
     max_groups, N = group_to_slots.shape
     flat_cap = max_groups * N
 
-    if (
-        scratch_dst.numel() < flat_cap
-        or scratch_src.numel() < flat_cap
-        or scratch_row.numel() < flat_cap
-    ):
-        raise ValueError(
-            f"fused_collect scratch buffers too small: need {flat_cap}, got "
-            f"dst={scratch_dst.numel()}, src={scratch_src.numel()}, "
-            f"row={scratch_row.numel()}"
-        )
-    scratch_counter.zero_()
-    scratch_mask.zero_()
+    plan_dst = torch.empty(flat_cap, dtype=torch.int32, device=device)
+    plan_src = torch.empty(flat_cap, dtype=torch.int32, device=device)
+    plan_rows = torch.empty(flat_cap, dtype=torch.int32, device=device)
+    plan_counter = torch.zeros(1, dtype=torch.int32, device=device)
+    plan_mask = torch.zeros(max_groups, dtype=torch.int32, device=device)
 
     BLOCK = max(triton.next_power_of_2(N), 16)
     _fused_collect_kernel[(max_groups,)](
@@ -260,21 +257,21 @@ def batched_collect_fused(
         group_to_slots,
         row_in_use,
         int(step_counter),
-        scratch_dst,
-        scratch_src,
-        scratch_row,
-        scratch_counter,
-        scratch_mask,
+        plan_dst,
+        plan_src,
+        plan_rows,
+        plan_counter,
+        plan_mask,
         float(threshold),
         N=N,
         BLOCK=BLOCK,
     )
 
-    n_jobs = int(scratch_counter.item())   # the one boundary sync
+    n_jobs = int(plan_counter.item())   # the one boundary sync
     return BatchedResampleResult(
-        dst_slots=scratch_dst[:n_jobs],
-        src_slots=scratch_src[:n_jobs],
-        row_of_job=scratch_row[:n_jobs],
-        resample_mask=scratch_mask.to(torch.bool),
+        dst_slots=plan_dst[:n_jobs],
+        src_slots=plan_src[:n_jobs],
+        row_of_job=plan_rows[:n_jobs],
+        resample_mask=plan_mask.to(torch.bool),
         n_jobs=n_jobs,
     )

@@ -161,11 +161,6 @@ class SMCCoordinatorV2:
             slot_state.row_in_use,
             self.resample_threshold,
             step_counter=self._step_counter,
-            scratch_dst=slot_state.scratch_dst_flat,
-            scratch_src=slot_state.scratch_src_flat,
-            scratch_row=slot_state.scratch_row_of_job,
-            scratch_counter=slot_state.scratch_counter,
-            scratch_mask=slot_state.scratch_resample_mask,
         )
 
     def dispatch_resample_batch(

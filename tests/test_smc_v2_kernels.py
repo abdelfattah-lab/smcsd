@@ -43,11 +43,6 @@ class CollectFixture:
     interval_weights: torch.Tensor    # (max_slots,) float64
     group_to_slots: torch.Tensor      # (max_groups, N) int32
     row_in_use: torch.Tensor          # (max_groups,) bool
-    scratch_dst: torch.Tensor
-    scratch_src: torch.Tensor
-    scratch_row: torch.Tensor
-    scratch_counter: torch.Tensor
-    scratch_mask: torch.Tensor
     slots_by_row: List[Optional[List[int]]]
 
     @classmethod
@@ -60,7 +55,6 @@ class CollectFixture:
         device: torch.device | str,
     ) -> "CollectFixture":
         dev = torch.device(device)
-        flat_cap = max_groups * n_particles
         return cls(
             log_weights=torch.zeros(max_slots, dtype=torch.float64, device=dev),
             interval_weights=torch.zeros(max_slots, dtype=torch.float64, device=dev),
@@ -68,11 +62,6 @@ class CollectFixture:
                 (max_groups, n_particles), -1, dtype=torch.int32, device=dev
             ),
             row_in_use=torch.zeros(max_groups, dtype=torch.bool, device=dev),
-            scratch_dst=torch.empty(flat_cap, dtype=torch.int32, device=dev),
-            scratch_src=torch.empty(flat_cap, dtype=torch.int32, device=dev),
-            scratch_row=torch.empty(flat_cap, dtype=torch.int32, device=dev),
-            scratch_counter=torch.zeros(1, dtype=torch.int32, device=dev),
-            scratch_mask=torch.zeros(max_groups, dtype=torch.int32, device=dev),
             slots_by_row=[None] * max_groups,
         )
 
@@ -126,11 +115,6 @@ class CollectFixture:
             self.row_in_use,
             threshold,
             step_counter=step_counter,
-            scratch_dst=self.scratch_dst,
-            scratch_src=self.scratch_src,
-            scratch_row=self.scratch_row,
-            scratch_counter=self.scratch_counter,
-            scratch_mask=self.scratch_mask,
         )
 
 
