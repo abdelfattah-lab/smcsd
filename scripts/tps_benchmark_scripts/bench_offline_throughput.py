@@ -69,7 +69,7 @@ class _SMCEngineBackend:
     ``get_server_info`` (SMCEngine doesn't surface ``last_gen_throughput``).
     """
 
-    def __init__(self, server_args: ServerArgs):
+    def __init__(self, server_args: ServerArgs, smc_draft_mode: str = "dense"):
         from smcsd.engine import SMCEngine
 
         all_fields = dataclasses.asdict(server_args)
@@ -89,6 +89,7 @@ class _SMCEngineBackend:
             resample_method=server_args.smc_resample_method,
             tp_size=server_args.tp_size,
             base_gpu_id=server_args.base_gpu_id,
+            smc_draft_mode=smc_draft_mode,
             **extras,
         )
 
@@ -162,6 +163,7 @@ class BenchArgs:
     apply_chat_template: bool = False
     prompt_suffix: str = ""
     skip_warmup: bool = False
+    smc_draft_mode: str = "dense"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -171,6 +173,14 @@ class BenchArgs:
             default=BenchArgs.backend,
             choices=["engine", "smc_engine"],
             help="engine = upstream sgl.Engine; smc_engine = smcsd SMCEngine",
+        )
+        parser.add_argument(
+            "--smc-draft-mode",
+            type=str,
+            default=BenchArgs.smc_draft_mode,
+            choices=["dense", "eagle3"],
+            help="smc_engine draft mode (dense = separate 1B draft; "
+                 "eagle3 = EAGLE3 head on target hidden states).",
         )
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
@@ -370,7 +380,9 @@ def throughput_test(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.backend == "engine":
         backend = Engine(**dataclasses.asdict(server_args))
     elif bench_args.backend == "smc_engine":
-        backend = _SMCEngineBackend(server_args)
+        backend = _SMCEngineBackend(
+            server_args, smc_draft_mode=bench_args.smc_draft_mode
+        )
     else:
         raise ValueError(f'Unknown backend: {bench_args.backend!r}')
 

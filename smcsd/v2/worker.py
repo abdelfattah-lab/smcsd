@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -21,7 +22,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from smcsd.v2.info import SMCDecodeContext, SMCDraftInputV2
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -171,11 +176,6 @@ class SMCWorkerV2(BaseSpecWorker):
             if self.hot_token_id is not None:
                 self.hot_token_id = self.hot_token_id.to(embed.device)
 
-            # EAGLE3 head runs eagerly — disable its CUDA graph.
-            # (set_eagle3_layers_to_capture on the TARGET is called inside
-            # SMCCudaGraphRunner.__init__, before the target graph is captured.)
-            backup_disable_cuda_graph = True
-
         # Multi-step draft attention backend
         from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
@@ -187,11 +187,25 @@ class SMCWorkerV2(BaseSpecWorker):
         )
         self.draft_attn_backend = factory.create_decode_backend()
 
-        # Restore cuda graph and capture for draft model
+        # Restore cuda graph and capture for draft model.
+        # For EAGLE3 we use a dedicated runner (below) instead of the
+        # standard one because the base CudaGraphRunner does not bake
+        # EagleDraftInput.hidden_states into its captured input set.
         server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        self._draft_cg_runner = None
         if not backup_disable_cuda_graph:
-            self.draft_runner.init_device_graphs()
+            if self.is_eagle3:
+                # EAGLE3: skip init_device_graphs() (which would try to
+                # capture without hidden_states) and install our custom
+                # lazy-capture runner. Gate via env var for easy A/B.
+                if os.environ.get("SMC_EAGLE3_CG", "1") != "0":
+                    from smcsd.model_executor.smc_eagle3_draft_cuda_graph_runner import (
+                        SMCEagle3DraftCudaGraphRunner,
+                    )
+                    self._draft_cg_runner = SMCEagle3DraftCudaGraphRunner(self)
+            else:
+                self.draft_runner.init_device_graphs()
 
     # ── Properties (required by BaseSpecWorker / scheduler) ──
 
@@ -561,24 +575,49 @@ class SMCWorkerV2(BaseSpecWorker):
         # ---- 3. Gamma-1 draft forwards → produce x2..x_gamma ----
         # Step k forwards at position (L + k), consuming (embed(x_{k+1}),
         # current_hidden). Output logits at position L+k predict x_{k+2}.
+        #
+        # NB: seq_lens passed to the attn backend must equal orig+k, NOT
+        # orig+k+1 — with default attn backend (speculative_step_id=0) the
+        # FA backend computes cache_seqlens = seq_lens + step_id + 1, so
+        # seq_lens=orig+k gives the correct attention window (0..orig+k
+        # inclusive). The off-by-one is tolerable for the dense 1B draft but
+        # destroys the 1-layer EAGLE3 draft head's predictions.
         for step in range(gamma - 1):
-            draft_fb.input_ids = current_ids
-            draft_fb.positions = all_positions[:, step].contiguous()
-            draft_fb.out_cache_loc = cache_locs[:, step].contiguous()
-            draft_fb.seq_lens = all_seq_lens[:, step].contiguous()
-            draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
-            draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
-            draft_fb.spec_info = EagleDraftInput(
-                hidden_states=current_hidden,
-                verified_id=current_ids,
-                num_tokens_per_req=1,
-                num_tokens_for_logprob_per_req=1,
-            )
-            draft_fb.capture_hidden_mode = CaptureHiddenMode.LAST
+            pos_step = all_positions[:, step].contiguous()
+            cache_step = cache_locs[:, step].contiguous()
+            sl_step = all_positions[:, step].contiguous()  # NOTE: using positions (= orig+step), not all_seq_lens (= orig+step+1), to avoid off-by-one in FA cache_seqlens
 
-            draft_out = self.draft_runner.forward(draft_fb)
-            logits = draft_out.logits_output.next_token_logits  # (bs, draft_vocab)
-            new_hidden = draft_out.logits_output.hidden_states
+            if (
+                self._draft_cg_runner is not None
+                and self._draft_cg_runner.can_run(bs, int(current_hidden.shape[-1]))
+            ):
+                logits, new_hidden = self._draft_cg_runner.replay(
+                    bs,
+                    input_ids=current_ids,
+                    hidden_states=current_hidden,
+                    positions=pos_step,
+                    seq_lens=sl_step,
+                    out_cache_loc=cache_step,
+                    req_pool_indices=batch.req_pool_indices,
+                )
+            else:
+                draft_fb.input_ids = current_ids
+                draft_fb.positions = pos_step
+                draft_fb.out_cache_loc = cache_step
+                draft_fb.seq_lens = sl_step
+                draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * step
+                draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + step
+                draft_fb.spec_info = EagleDraftInput(
+                    hidden_states=current_hidden,
+                    verified_id=current_ids,
+                    num_tokens_per_req=1,
+                    num_tokens_for_logprob_per_req=1,
+                )
+                draft_fb.capture_hidden_mode = CaptureHiddenMode.LAST
+
+                draft_out = self.draft_runner.forward(draft_fb)
+                logits = draft_out.logits_output.next_token_logits  # (bs, draft_vocab)
+                new_hidden = draft_out.logits_output.hidden_states
 
             scaled = logits / self.smc_draft_temperature
             log_probs = torch.log_softmax(scaled, dim=-1)
@@ -632,8 +671,13 @@ class SMCWorkerV2(BaseSpecWorker):
             f"expected {expected_rows}"
         )
 
+        # Match dense-path convention: compute target logprobs at temp=1 for
+        # the SMC weight math (NOT smc_target_temperature). Dense's empirically
+        # working accuracy is governed by this choice; eagle3 was diverging
+        # by applying smc_target_temperature here. Bonus sampling below
+        # continues to use smc_target_temperature (same as dense).
         score_log_probs_all = torch.log_softmax(
-            score_logits / self.smc_target_temperature, dim=-1
+            score_logits, dim=-1
         ).reshape(bs, gamma + 1, -1)
         # x_{k+1} (= all_tokens[k+1]) is verified at position k+1 of the window.
         # Target log-prob of x_{k+1} is score_log_probs_all[:, k, :].
@@ -668,9 +712,8 @@ class SMCWorkerV2(BaseSpecWorker):
 
         # ---- 7. Rewrite draft KV and sample next cycle's x1 ----
         # For each position L+step (step=0..gamma), feed the COMMITTED token
-        # at that position (shift-by-one convention: input at p = token_{p+1})
-        # paired with target verify aux hidden at p. The LAST step's
-        # (hidden, next_token_logits) seeds the next cycle.
+        # at that position paired with target verify aux hidden at p. The
+        # LAST step's (hidden, next_token_logits) seeds the next cycle.
         h_all = score_result.logits_output.hidden_states
         assert h_all is not None, (
             "EAGLE3 verify must capture FULL target aux hidden states."
@@ -679,30 +722,109 @@ class SMCWorkerV2(BaseSpecWorker):
         target_h_steps = h_all.reshape(bs, gamma + 1, aux_dim).to(
             self._eagle3_hidden_dtype
         )
+        accepted_tokens = output_token_ids  # (bs, gamma+1) [x1, x2, ..., bonus]
 
-        rewrite_fb = draft_fb
-        accepted_tokens = output_token_ids  # [x1, x2, ..., x_gamma, bonus]
-        last_hidden = None
-        last_logits = None
-        for step in range(gamma + 1):
-            tok = accepted_tokens[:, step].contiguous()
-            rewrite_fb.input_ids = tok
-            rewrite_fb.positions = all_positions[:, step].contiguous()
-            rewrite_fb.out_cache_loc = cache_locs[:, step].contiguous()
-            rewrite_fb.seq_lens = all_seq_lens[:, step].contiguous()
-            rewrite_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
-            rewrite_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
-            rewrite_fb.spec_info = EagleDraftInput(
-                hidden_states=target_h_steps[:, step, :].contiguous(),
-                verified_id=tok,
-                num_tokens_per_req=1,
-                num_tokens_for_logprob_per_req=1,
+        _rewrite_mode = os.environ.get("SMC_EAGLE3_REWRITE", "min")
+        if _rewrite_mode == "fused":
+            last_hidden, last_logits = self._rewrite_fused_extend(
+                batch, ctx, accepted_tokens, cache_locs,
+                all_positions, all_seq_lens, target_h_steps,
             )
-            rewrite_fb.capture_hidden_mode = CaptureHiddenMode.LAST
+        elif _rewrite_mode == "min":
+            # Only run the TWO rewrite steps whose positions the draft phase
+            # never wrote: L+gamma-1 (input=x_gamma) and L+gamma (input=bonus).
+            # Positions L+0..L+gamma-2 keep draft-hidden-based KV from the
+            # draft phase — slight inconsistency vs full rewrite, but saves
+            # gamma-1 = 7 forwards per cycle.
+            rewrite_fb = draft_fb
+            last_hidden = None
+            last_logits = None
+            for step in (gamma - 1, gamma):
+                tok = accepted_tokens[:, step].contiguous()
+                pos_step = all_positions[:, step].contiguous()
+                cache_step = cache_locs[:, step].contiguous()
+                # Use positions (= orig+step) as seq_lens so FA's
+                # cache_seqlens = seq_lens + 1 = orig+step+1 matches the
+                # position we're writing.
+                sl_step = all_positions[:, step].contiguous()
+                hidden_step = target_h_steps[:, step, :].contiguous()
 
-            out = self.draft_runner.forward(rewrite_fb).logits_output
-            last_hidden = out.hidden_states
-            last_logits = out.next_token_logits
+                if (
+                    self._draft_cg_runner is not None
+                    and self._draft_cg_runner.can_run(
+                        bs, int(hidden_step.shape[-1])
+                    )
+                ):
+                    last_logits, last_hidden = self._draft_cg_runner.replay(
+                        bs,
+                        input_ids=tok,
+                        hidden_states=hidden_step,
+                        positions=pos_step,
+                        seq_lens=sl_step,
+                        out_cache_loc=cache_step,
+                        req_pool_indices=batch.req_pool_indices,
+                    )
+                else:
+                    rewrite_fb.input_ids = tok
+                    rewrite_fb.positions = pos_step
+                    rewrite_fb.out_cache_loc = cache_step
+                    rewrite_fb.seq_lens = sl_step
+                    rewrite_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * step
+                    rewrite_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + step
+                    rewrite_fb.spec_info = EagleDraftInput(
+                        hidden_states=hidden_step,
+                        verified_id=tok,
+                        num_tokens_per_req=1,
+                        num_tokens_for_logprob_per_req=1,
+                    )
+                    rewrite_fb.capture_hidden_mode = CaptureHiddenMode.LAST
+                    out = self.draft_runner.forward(rewrite_fb).logits_output
+                    last_hidden = out.hidden_states
+                    last_logits = out.next_token_logits
+        else:
+            rewrite_fb = draft_fb
+            last_hidden = None
+            last_logits = None
+            for step in range(gamma + 1):
+                tok = accepted_tokens[:, step].contiguous()
+                pos_step = all_positions[:, step].contiguous()
+                cache_step = cache_locs[:, step].contiguous()
+                # Use positions (= orig+step) as seq_lens to match FA's
+                # cache_seqlens = seq_lens + 1 convention.
+                sl_step = all_positions[:, step].contiguous()
+                hidden_step = target_h_steps[:, step, :].contiguous()
+
+                if (
+                    self._draft_cg_runner is not None
+                    and self._draft_cg_runner.can_run(bs, int(hidden_step.shape[-1]))
+                ):
+                    last_logits, last_hidden = self._draft_cg_runner.replay(
+                        bs,
+                        input_ids=tok,
+                        hidden_states=hidden_step,
+                        positions=pos_step,
+                        seq_lens=sl_step,
+                        out_cache_loc=cache_step,
+                        req_pool_indices=batch.req_pool_indices,
+                    )
+                else:
+                    rewrite_fb.input_ids = tok
+                    rewrite_fb.positions = pos_step
+                    rewrite_fb.out_cache_loc = cache_step
+                    rewrite_fb.seq_lens = sl_step
+                    rewrite_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * step
+                    rewrite_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + step
+                    rewrite_fb.spec_info = EagleDraftInput(
+                        hidden_states=hidden_step,
+                        verified_id=tok,
+                        num_tokens_per_req=1,
+                        num_tokens_for_logprob_per_req=1,
+                    )
+                    rewrite_fb.capture_hidden_mode = CaptureHiddenMode.LAST
+
+                    out = self.draft_runner.forward(rewrite_fb).logits_output
+                    last_hidden = out.hidden_states
+                    last_logits = out.next_token_logits
 
         assert last_hidden is not None and last_logits is not None
 
@@ -749,6 +871,77 @@ class SMCWorkerV2(BaseSpecWorker):
             logprob_diff=logprob_diff,
             can_run_cuda_graph=can_run_cuda_graph,
         )
+
+    def _rewrite_fused_extend(
+        self,
+        batch: ModelWorkerBatch,
+        ctx: SMCDecodeContext,
+        accepted_tokens: torch.Tensor,   # (bs, gamma+1) target-vocab
+        cache_locs: torch.Tensor,         # (bs, gamma+1)
+        all_positions: torch.Tensor,      # (bs, gamma+1)
+        all_seq_lens: torch.Tensor,       # (bs, gamma+1)
+        target_h_steps: torch.Tensor,     # (bs, gamma+1, aux_dim)
+    ):
+        """Single-forward EXTEND-mode rewrite.
+
+        Replaces the gamma+1 sequential decode forwards with ONE extend
+        forward that processes bs*(gamma+1) tokens in a single weight-read
+        pass. Same KV output as the sequential loop; same last-position
+        hidden and logits for next-cycle seeding.
+        """
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        bs = len(ctx.orig_seq_lens)
+        gamma_p1 = self.gamma + 1
+        total_tokens = bs * gamma_p1
+        aux_dim = target_h_steps.shape[-1]
+
+        flat_input_ids = accepted_tokens.reshape(-1).contiguous()
+        flat_positions = all_positions.reshape(-1).contiguous()
+        flat_out_cache = cache_locs.reshape(-1).contiguous()
+        flat_hidden = target_h_steps.reshape(total_tokens, aux_dim).contiguous()
+
+        # After this extend each req's total length is orig + (gamma+1).
+        new_seq_lens = ctx.orig_seq_lens + gamma_p1
+        new_seq_lens_cpu = ctx.orig_seq_lens_cpu + gamma_p1
+        new_seq_lens_sum = ctx.orig_seq_lens_sum + bs * gamma_p1
+        orig_seq_lens_list = ctx.orig_seq_lens_cpu.tolist()
+
+        spec_info = EagleDraftInput(
+            hidden_states=flat_hidden,
+            verified_id=flat_input_ids,
+            num_tokens_per_req=gamma_p1,
+            num_tokens_for_logprob_per_req=1,  # only the last position per req
+        )
+
+        rewrite_batch = dataclasses.replace(
+            batch,
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=flat_input_ids,
+            out_cache_loc=flat_out_cache,
+            seq_lens=new_seq_lens,
+            seq_lens_cpu=new_seq_lens_cpu,
+            seq_lens_sum=new_seq_lens_sum,
+            extend_num_tokens=total_tokens,
+            extend_seq_lens=[gamma_p1] * bs,
+            extend_prefix_lens=orig_seq_lens_list,
+            extend_logprob_start_lens=[self.gamma] * bs,  # only last pos
+            spec_info=spec_info,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            is_extend_in_batch=True,
+            all_extend_in_batch=True,
+            return_logprob=False,
+        )
+
+        rewrite_fb = ForwardBatch.init_new(rewrite_batch, self.draft_runner)
+        # Positions are authoritative for extend rewrite — override what
+        # init_new computed from seq_lens (which would assume a contiguous
+        # suffix starting at orig_seq_lens).
+        rewrite_fb.positions = flat_positions
+
+        out = self.draft_runner.forward(rewrite_fb).logits_output
+        # LAST mode → hidden_states: (bs, H_draft); last_logits: (bs, vocab)
+        return out.hidden_states, out.next_token_logits
 
     def _forward_idle(self, batch: ModelWorkerBatch):
         return GenerationBatchResult(

@@ -105,7 +105,6 @@ class SMCEngine:
             smc_target_temperature=target_temperature,
             smc_resample_threshold=resample_threshold,
             smc_resample_method=resample_method,
-            smc_draft_mode=smc_draft_mode,
             tp_size=tp_size,
             base_gpu_id=base_gpu_id,
         )
@@ -117,6 +116,10 @@ class SMCEngine:
             merged["log_level"] = "error"
 
         server_args = ServerArgs(**merged)
+        # `smc_draft_mode` is not a vendored-sglang ServerArgs field — set it
+        # as a post-init attribute so worker/cuda-graph-runner code that reads
+        # it via ``getattr(server_args, "smc_draft_mode", "dense")`` sees it.
+        server_args.smc_draft_mode = smc_draft_mode
         self.server_args = server_args
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
