@@ -1,15 +1,15 @@
-"""Unit tests for SMC v2 scheduler glue and ScheduleBatchSMC.
+"""Unit tests for SMC scheduler glue and ``ScheduleBatchSMC``.
 
 Covers:
 
-* ``SMCSchedulerV2._admit_prefill_groups`` admission gating against
+* ``SMCScheduler._admit_prefill_groups`` admission gating against
   ``slot_state.available_slot_count()``.
 * ``ScheduleBatchSMC.finalize_group`` — picks the highest-scoring particle
   and respects each particle's ``finished_len`` watermark.
 
-Pure CPU.  Mocks the KV pools / allocator so the test isolates the v2
-logic.  The fused resample path (Triton) is covered by
-``test_smc_v2_kernels.py`` on CUDA.
+Pure CPU.  Mocks the KV pools / allocator so the test isolates the
+scheduler logic.  The fused resample path (Triton) is covered by
+``test_smc_core_kernels.py`` on CUDA.
 """
 
 import unittest
@@ -18,16 +18,16 @@ from types import SimpleNamespace
 
 import torch
 
-from smcsd.v2 import scheduler as v2_scheduler_mod
-from smcsd.v2.req_state import ScheduleBatchSMC
+from smcsd.core import scheduler as core_scheduler_mod
+from smcsd.core.req_state import ScheduleBatchSMC
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
-SMCSchedulerV2 = v2_scheduler_mod.SMCSchedulerV2
-SequenceGroup = v2_scheduler_mod.SequenceGroup
+SMCScheduler = core_scheduler_mod.SMCScheduler
+SequenceGroup = core_scheduler_mod.SequenceGroup
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ SequenceGroup = v2_scheduler_mod.SequenceGroup
 
 
 class _FakeReq:
-    """Stand-in for sglang's Req object, with only the fields v2 reads."""
+    """Stand-in for sglang's Req object, with only the fields SMC reads."""
 
     def __init__(
         self,
@@ -168,7 +168,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
             f"unexpected abort for {req.rid}: {error_msg}"
         )
 
-        admitted = SMCSchedulerV2._admit_prefill_groups(scheduler)
+        admitted = SMCScheduler._admit_prefill_groups(scheduler)
 
         self.assertEqual(admitted, [])
         self.assertEqual(
@@ -188,7 +188,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
             f"unexpected abort for {req.rid}: {error_msg}"
         )
 
-        admitted = SMCSchedulerV2._admit_prefill_groups(scheduler)
+        admitted = SMCScheduler._admit_prefill_groups(scheduler)
 
         self.assertEqual([g.group_id for g in admitted], ["g0", "g1"])
         self.assertEqual(len(scheduler.waiting_groups), 0)
@@ -208,7 +208,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
             f"unexpected abort for {req.rid}: {error_msg}"
         )
 
-        admitted = SMCSchedulerV2._admit_prefill_groups(scheduler)
+        admitted = SMCScheduler._admit_prefill_groups(scheduler)
 
         self.assertEqual(admitted, [])
         self.assertEqual(

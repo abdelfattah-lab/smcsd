@@ -1,9 +1,9 @@
 """Shared SMC verify primitives.
 
-These were originally defined under ``smc/v1/info.py`` but are needed by
-both v1 and v2 (and a couple of core call sites in cuda_graph_runner /
-model_runner that construct an idle/CUDA-graph verify spec_info). Lifting
-them into a v-agnostic ``smc/common`` module is a precursor to retiring v1.
+Used by the SMC scheduler / worker and by a couple of core call sites in
+``cuda_graph_runner`` / ``model_runner`` that construct an idle or CUDA-
+graph-captured verify ``spec_info``.  Kept in ``smc/common`` so those
+core call sites don't have to import the scheduler package.
 """
 
 from __future__ import annotations

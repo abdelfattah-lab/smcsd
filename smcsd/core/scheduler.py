@@ -105,11 +105,7 @@ class SequenceGroup:
         self.particle_reqs = {}
 
 
-### V1b dedicated scheduler classes (ScheduleGroupBatch, SMCCoordinator, SMCScheduler,
-### run_smc_scheduler_process) have been removed. See git history for the old code.
-### The V1a path (Engine() with SMCManager in scheduler.py) is unchanged.
-
-class SMCCoordinatorV2:
+class SMCCoordinator:
     """SMC resample coordinator.
 
     One fused Triton kernel per decode step:
@@ -133,12 +129,12 @@ class SMCCoordinatorV2:
         resample_threshold: float,
     ) -> None:
         if torch.device(device).type != "cuda":
-            raise ValueError("SMCCoordinatorV2 requires CUDA")
+            raise ValueError("SMCCoordinator requires CUDA")
         self.device = device
         self.resample_threshold = resample_threshold
         self._step_counter = 0
         logger.info(
-            "SMCCoordinatorV2: resample_threshold=%s (fused systematic kernel)",
+            "SMCCoordinator: resample_threshold=%s (fused systematic kernel)",
             resample_threshold,
         )
 
@@ -151,7 +147,7 @@ class SMCCoordinatorV2:
         on every call so ``tl.rand(step_counter, row)`` draws independent
         stratified uniforms across steps.
         """
-        from smcsd.v2.kernels.fused_collect import batched_collect_fused
+        from smcsd.core.kernels.fused_collect import batched_collect_fused
 
         self._step_counter += 1
         return batched_collect_fused(
@@ -179,7 +175,7 @@ class SMCCoordinatorV2:
         if plan.n_jobs == 0:
             return
 
-        from smcsd.v2.kernels.fused_resample_kv import batched_resample_kv
+        from smcsd.core.kernels.fused_resample_kv import batched_resample_kv
 
         dst_idx = plan.dst_slots.to(torch.int64)
         src_idx = plan.src_slots.to(torch.int64)
@@ -226,12 +222,9 @@ class SMCCoordinatorV2:
             slot_state.rebuild_active_slots()
 
 
-class SMCSchedulerV2(Scheduler):
-    """Slot-based SMC scheduler. Decode loop uses ScheduleBatchSMC instead of
-    ScheduleGroupBatch. Prefill still uses ScheduleBatch (upstream code).
-
-    Coexists with SMCScheduler — switch via run_smc_scheduler_v2_process.
-    """
+class SMCScheduler(Scheduler):
+    """Slot-based SMC scheduler.  The decode loop uses ``ScheduleBatchSMC``;
+    prefill still goes through upstream ``ScheduleBatch``."""
 
     def __init__(
         self,
@@ -250,7 +243,7 @@ class SMCSchedulerV2(Scheduler):
             pp_rank, attn_cp_rank, moe_dp_rank, dp_rank,
         )
 
-        from smcsd.v2.req_state import ScheduleBatchSMC
+        from smcsd.core.req_state import ScheduleBatchSMC
 
         # SMCEngine (or core auto-resolution) has sized the req_to_token_pool
         # for G * (N+1) Reqs; back out G = max concurrent user groups.
@@ -273,7 +266,7 @@ class SMCSchedulerV2(Scheduler):
             enable_overlap=self.enable_overlap,
             n_particles=n_particles,
         )
-        self.coordinator = SMCCoordinatorV2(
+        self.coordinator = SMCCoordinator(
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
         )
@@ -316,7 +309,7 @@ class SMCSchedulerV2(Scheduler):
         )
 
     def maybe_init_draft_worker(self):
-        from smcsd.v2.worker import SMCWorkerV2
+        from smcsd.core.worker import SMCWorker
 
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -329,7 +322,7 @@ class SMCSchedulerV2(Scheduler):
             attn_cp_rank=self.attn_cp_rank,
             moe_dp_rank=self.moe_dp_rank,
         )
-        self.draft_worker = SMCWorkerV2(**draft_worker_kwargs)
+        self.draft_worker = SMCWorker(**draft_worker_kwargs)
 
     # ── Event Loop ──
 
@@ -338,10 +331,10 @@ class SMCSchedulerV2(Scheduler):
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None
         with self.device_module.StreamContext(self.schedule_stream):
-            self._event_loop_v2()
+            self._event_loop()
 
     @DynamicGradMode()
-    def _event_loop_v2(self) -> None:
+    def _event_loop(self) -> None:
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -371,16 +364,16 @@ class SMCSchedulerV2(Scheduler):
 
     # ── Runtime Memory Checks (override base mixin) ──
     #
-    # SMC v2 keeps its decode KV slots inside ScheduleBatchSMC, which the base
+    # SMC keeps its decode KV slots inside ScheduleBatchSMC, which the base
     # SchedulerRuntimeCheckerMixin doesn't know about.  We override the two
     # idle-path leak checks so slot-held tokens/reqs are folded into the
     # conservation formulas — without leaking SMC concepts into core scheduler
     # code.  Refcount state is already reflected via available_size (a shared
     # page stays out of free_pages until its last refcount drops).
     #
-    # self_check_during_busy is intentionally NOT overridden: _event_loop_v2
+    # self_check_during_busy is intentionally NOT overridden: our event loop
     # never dispatches it (matching the PP / disagg / multiplex loops, which
-    # also omit the busy check).  Re-add it here if the v2 loop is ever wired
+    # also omit the busy check).  Re-add it here if this loop is ever wired
     # to call self_check_during_busy.
 
     def _check_radix_cache_memory(self):
@@ -432,15 +425,15 @@ class SMCSchedulerV2(Scheduler):
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if is_retracted:
-            # SMC v2 has no retraction path: particle groups are atomic and
+            # SMC has no retraction path: particle groups are atomic and
             # cannot be partially retracted, and there is no group-aware
             # re-admission protocol.  ScheduleBatch.retract_decode is also
-            # unreachable in v2 (decode runs through ScheduleBatchSMC).
+            # unreachable here (decode runs through ScheduleBatchSMC).
             raise NotImplementedError(
-                "SMCSchedulerV2 does not support re-admitting retracted reqs."
+                "SMCScheduler does not support re-admitting retracted reqs."
             )
         if self.disaggregation_mode != DisaggregationMode.NULL:
-            raise RuntimeError("SMCSchedulerV2 only supports non-disaggregated generation.")
+            raise RuntimeError("SMCScheduler only supports non-disaggregated generation.")
         if not self._set_or_validate_priority(req):
             return
         if self._abort_on_queue_limit(req):
@@ -478,7 +471,7 @@ class SMCSchedulerV2(Scheduler):
         self._drain_finished_groups()
 
         if self.prefill_groups:
-            raise RuntimeError("SMCSchedulerV2 has an unprocessed prefill batch.")
+            raise RuntimeError("SMCScheduler has an unprocessed prefill batch.")
 
         self.prefill_groups = self._admit_prefill_groups()
         if self.prefill_groups:
@@ -674,7 +667,7 @@ class SMCSchedulerV2(Scheduler):
             result.copy_done.synchronize()
 
         if result.logprob_diff is None:
-            raise RuntimeError("SMCSchedulerV2 requires batched logprob_diff.")
+            raise RuntimeError("SMCScheduler requires batched logprob_diff.")
 
         logprob_diff = (
             result.logprob_diff
@@ -688,7 +681,7 @@ class SMCSchedulerV2(Scheduler):
         next_draft = result.next_draft_input
         bonus_ids = next_draft.verified_id if next_draft is not None else None
         if bonus_ids is None:
-            raise RuntimeError("SMCSchedulerV2: result missing next_draft_input.verified_id")
+            raise RuntimeError("SMCScheduler: result missing next_draft_input.verified_id")
 
         # Write results back to slot state (defer rebuild to end of cycle)
         newly_finished = self.slot_state.process_batch_result(
@@ -727,7 +720,7 @@ class SMCSchedulerV2(Scheduler):
 
     def _finalize_group(self, group: SequenceGroup) -> None:
         if not group.has_materialized_particles():
-            # Shouldn't happen in v2 — but handle gracefully
+            # Shouldn't happen in normal operation — handle gracefully
             parent_req = group.parent_req
             release_kv_cache(parent_req, self.tree_cache)
             parent_req.time_stats.set_completion_time()
@@ -739,7 +732,7 @@ class SMCSchedulerV2(Scheduler):
         self.stream_output([parent_req], False)
 
 
-def run_smc_scheduler_v2_process(
+def run_smc_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     gpu_id: int,
@@ -759,7 +752,7 @@ def run_smc_scheduler_v2_process(
     parent_process = psutil.Process().parent()
 
     try:
-        scheduler = SMCSchedulerV2(
+        scheduler = SMCScheduler(
             server_args,
             port_args,
             gpu_id,
@@ -774,5 +767,5 @@ def run_smc_scheduler_v2_process(
         scheduler.run_event_loop()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"SMCSchedulerV2 hit an exception: {traceback}")
+        logger.error(f"SMCScheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

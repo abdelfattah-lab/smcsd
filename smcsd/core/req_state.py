@@ -40,7 +40,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from smcsd.v2.info import SMCDecodeContext, SMCDraftInputV2
+from smcsd.core.info import SMCDecodeContext, SMCDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
@@ -362,12 +362,12 @@ class ScheduleBatchSMC:
     #  Decode Preparation (sparse → vectorized KV alloc → sparse)
     # ────────────────────────────────────────────────────────
 
-    def prepare_for_decode(self) -> SMCDraftInputV2:
+    def prepare_for_decode(self) -> SMCDraftInput:
         """Gather the live slot tensors, vectorised KV allocation, scatter
-        back, and return a ready-to-use ``SMCDraftInputV2`` for the worker.
+        back, and return a ready-to-use ``SMCDraftInput`` for the worker.
         """
         if self.num_active == 0:
-            return SMCDraftInputV2(
+            return SMCDraftInput(
                 verified_id=torch.empty(0, dtype=torch.int32, device=self.device),
                 num_tokens_per_req=self.gamma_plus_1,
             )
@@ -391,7 +391,7 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
 
-        return SMCDraftInputV2(
+        return SMCDraftInput(
             verified_id=verified_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
@@ -408,7 +408,7 @@ class ScheduleBatchSMC:
 
     def build_model_worker_batch(
         self,
-        draft_input: SMCDraftInputV2,
+        draft_input: SMCDraftInput,
     ) -> ModelWorkerBatch:
         """Assemble a contiguous ``ModelWorkerBatch`` for the worker from
         the live subset of slot-indexed tensors."""

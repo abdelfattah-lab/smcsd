@@ -84,12 +84,11 @@ SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via
 | Path | Description |
 | --- | --- |
 | `smcsd/engine.py` | `SMCEngine` — standalone offline engine (bypasses Tokenizer/Detokenizer managers) |
-| `smcsd/v2/scheduler.py` | `SMCSchedulerV2` + `SMCCoordinatorV2` — slot-based decode loop and resampler |
-| `smcsd/v2/worker.py` | `SMCWorkerV2` — draft AR loop + target scoring + importance weights |
-| `smcsd/v2/req_state.py` | `ScheduleBatchSMC` — per-slot decode state |
-| `smcsd/v2/stacked_state.py` | `StackedGroupState` — GPU-resident per-group tensors for the fast path |
-| `smcsd/v2/info.py` | `SMCDraftInputV2`, `SMCDecodeContext` — spec-info wiring |
-| `smcsd/v2/kernels/` | Fused Triton kernels (`fused_collect`, `fused_resample_kv`) |
+| `smcsd/core/scheduler.py` | `SMCScheduler` + `SMCCoordinator` — slot-based decode loop and resampler |
+| `smcsd/core/worker.py` | `SMCWorker` — draft AR loop + target scoring + importance weights |
+| `smcsd/core/req_state.py` | `ScheduleBatchSMC` — per-slot decode state, flat slot-major weights, and group lookup |
+| `smcsd/core/info.py` | `SMCDraftInput`, `SMCDecodeContext` — spec-info wiring |
+| `smcsd/core/kernels/` | Fused Triton kernels (`fused_collect`, `fused_resample_kv`) |
 | `smcsd/managers/smc_tp_worker.py` | `SMCTpModelWorker` — wires `SMCModelRunner` into the target TP worker |
 | `smcsd/model_executor/smc_model_runner.py` | `SMCModelRunner` — installs refcounted allocator + SMC warmup spec-info |
 | `smcsd/model_executor/smc_cuda_graph_runner.py` | `SMCCudaGraphRunner` — `SMCVerifyInput` during CUDA graph capture |

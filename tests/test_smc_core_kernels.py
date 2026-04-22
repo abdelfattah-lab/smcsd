@@ -1,6 +1,6 @@
-"""Triton kernel correctness tests for SMC v2.
+"""Triton kernel correctness tests for SMC.
 
-Covers the two fused kernels under ``smcsd/v2/kernels/``:
+Covers the two fused kernels under ``smcsd/core/kernels/``:
 
 * ``fused_collect.batched_collect_fused`` — normalise → ESS check →
   systematic resample → dead/excess compaction → flat emission.
@@ -24,8 +24,8 @@ from typing import List, Optional
 
 import torch
 
-from smcsd.v2.kernels.fused_collect import batched_collect_fused
-from smcsd.v2.kernels.fused_resample_kv import batched_resample_kv
+from smcsd.core.kernels.fused_collect import batched_collect_fused
+from smcsd.core.kernels.fused_resample_kv import batched_resample_kv
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
