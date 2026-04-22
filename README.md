@@ -12,6 +12,14 @@ Paper: *Faster LLM Inference via Sequential Monte Carlo*
 
 This repo vendors a patched SGLang as a git submodule at `3rdparty/sglang` (branch `smc_v2_clean`). Install both in editable mode.
 
+`SMCEngine` will not import until the patched SGLang submodule is both checked out and installed. If you hit `ModuleNotFoundError: No module named 'sglang'`, run:
+
+```bash
+git submodule update --init --recursive
+uv pip install -e 3rdparty/sglang/python
+uv pip install -e .
+```
+
 ```bash
 # 1. Clone with submodules
 git clone --recurse-submodules https://github.com/abdelfattah-lab/smcsd.git
@@ -39,7 +47,7 @@ python scripts/accuracy_test_gsm8k.py \
   --particles 12 --gamma 8 \
   --temperature 0.7 \
   --attention-backend fa3 \
-  --num-questions 400 
+  --num-questions 400
 ```
 
 ```bash
