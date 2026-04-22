@@ -99,12 +99,13 @@ seq_lens          int64     [max_slots]             committed tokens in slot
 kv_allocated_lens int64     [max_slots]             KV physically alloc'd
 verified_ids      int32     [max_slots]             last accepted token (x₀ bonus feed)
 token_counts      int32     [max_slots]             #tokens written to all_token_ids
-group_indices     int32     [max_slots]             scheduler-side group number
-particle_indices  int32     [max_slots]             smc_particle_idx (= stacked column)
 finished_mask     bool      [max_slots]             is this particle done
 ignore_eos_t      bool      [max_slots]             from sampling_params
 max_new_tokens_t  int32     [max_slots]             hard length cap
 eos_token_ids_t   int64     [max_slots, 8]          EOS ids (padded with -1)
+
+log_weights       float64   [max_slots]             cumulative SMC log-weight
+interval_weights  float64   [max_slots]             since-last-resample accumulator
 
 all_token_ids     int32     [max_slots, max_output_len]   complete history
 
@@ -114,8 +115,7 @@ top_ks            int32     [max_slots]              SMC worker does its
 min_ps            float32   [max_slots]              own temp adjust)
 ```
 
-`EMPTY_SLOT` (= -1) marks a free slot in `req_pool_indices`,
-`group_indices`, `particle_indices`.
+`EMPTY_SLOT` (= -1) marks a free slot in `req_pool_indices`.
 
 ### 2.2 Per-slot CPU bookkeeping
 
@@ -158,10 +158,12 @@ slot  7  │ group B p2  │   │
                            └── the gather vector passed to GPU ops
 ```
 
-`active_slots` is a length-`num_active` int64 GPU tensor; `group_active_indptr`
-is its CSR-style group boundary on the CPU. Sorting by group lets per-group
-slices of `logprob_diff` land in the right stacked row without any dict
-building on the hot path.
+`active_slots` is a length-`num_active` int64 GPU tensor;
+`group_active_indptr` is its CSR-style group boundary on the CPU.
+Sorting by group keeps per-group slices of `logprob_diff` contiguous
+for downstream bookkeeping — though the hot-path weight update is now
+a single vectorised `log_weights[active_slots] += diffs`, which doesn't
+care about group order.
 
 `rebuild_active_slots` — which produces this tensor — is **O(G·N)** and runs
 **at most once per decode cycle**, only if membership changed. Both
@@ -174,8 +176,9 @@ flag that defaults to False in the scheduler.
   free_slots.popleft()
          │
          ▼
-  [CLAIMED]  ── allocate_slots ─── tensors filled, particle_idx set,
-         │                          stacked row registered, views bound
+  [CLAIMED]  ── allocate_slots ─── tensors filled; one row claimed from
+         │                          _free_rows; group_to_slots[row, :N]
+         │                          = slots; row_in_use[row] = True
          ▼
   [ACTIVE]   ── per cycle: gather → forward → scatter → weight update
          │                           │
@@ -301,8 +304,7 @@ dec_ref_and_free(ix)  → slot_ref_count[ix] -= 1
 
 `inc_ref` / `dec_ref_and_free` are used wherever a KV slot gains or loses
 an owner without a fresh allocation: parent → particle fan-out
-(`copy_block_table`) and resample src → dst copies (slow path and
-`fused_resample_kv` alike).
+(`copy_block_table`) and resample src → dst copies (`fused_resample_kv`).
 
 ### 5.2 `copy_block_table`
 
@@ -327,13 +329,13 @@ by the N particles, not yet free.
 ```
             UNALLOC  ── alloc(n) ──►  OWNED (rc=1)
                                           │
-                     ┌────────────────────┼──────────────────┐
-                     │                    │                  │
-            copy_block_table    fused KV kernel    resample slow path
-              (parent fanout)   (src bump, dst    (inc_ref src)
-                     │           dec_ref)                    │
-                     ▼                    │                  ▼
-                 SHARED (rc≥2) ◄──────────┘ ◄────────────── …
+                     ┌────────────────────┤
+                     │                    │
+            copy_block_table    fused KV kernel
+              (parent fanout)   (src bump, dst
+                     │           dec_ref)
+                     ▼                    │
+                 SHARED (rc≥2) ◄──────────┘
                      │
                      │  dec_ref_and_free
                      │    (parent release /

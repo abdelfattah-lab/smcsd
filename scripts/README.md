@@ -1,7 +1,7 @@
 # SMC Experiment Scripts
 
 Ad hoc entrypoints for SMC (Sequential Monte Carlo) speculative decoding
-experiments on top of the standalone `python/sglang/srt/smc/` implementation.
+experiments on top of the `smcsd/` implementation.
 
 ## Scripts
 

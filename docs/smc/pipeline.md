@@ -337,17 +337,18 @@ matches the implementation.
 
 ### 4.6 Resample
 
-`SMCCoordinator.collect_resample_jobs_batch` returns a
-`BatchedResampleResult` (dst_slots, src_slots, row_of_job, resample_mask,
-n_jobs) produced by one fused Triton kernel; `dispatch_resample_batch`
-consumes it via a second fused Triton kernel (`batched_resample_kv`) plus
-a short Python loop for Req-level metadata copies.
+There is one resample path — two fused Triton kernels in sequence, no
+Python fallback, no flag.  `SMCCoordinator.collect_resample_jobs_batch`
+returns a `BatchedResampleResult` (dst_slots, src_slots, row_of_job,
+resample_mask, n_jobs) produced by the fused collect kernel;
+`dispatch_resample_batch` consumes it via `batched_resample_kv` plus a
+short Python loop for Req-level metadata copies.
 
 The kernel sees **all** allocated particles of a group (including finished
 ones) as candidates — finish state is handled by copy-propagation, not by
 exclusion.
 
-#### 4.6a Collect — one fused Triton kernel
+#### Collect + dispatch
 
 ```
   batched_collect_fused(
@@ -397,36 +398,28 @@ exclusion.
       slot_state.copy_req_metadata(dst, src)
 ```
 
-Visually, slow vs fast:
+Visually:
 
 ```
-SLOW PATH  ──────────────────────────────────────────
-  group₀ ─► Python: normalize, ESS, resample, dst/src
-            ↳ per-pair Python: resample_copy_slot (dec, copy, inc, metadata)
-  group₁ ─► …                   (serialised per group)
-  group₂ ─► …
-
-FAST PATH  ──────────────────────────────────────────
-  [ fused_collect kernel ] ─────────────►  one launch, all rows
-           │
-           ▼
-  flat (dst, src, row) triples on GPU
-           │
-           ▼
-  [ batched_resample_kv ]  ─────────────►  one launch, all pairs
-           │
-           ▼
-  vectorised slot-tensor copies (one line each)
-           │
-           ▼
-  per-pair copy_req_metadata  (the only Python-side loop)
+[ fused_collect kernel ] ─────────────►  one launch, all in-use rows
+         │
+         ▼
+flat (dst, src, row) triples on GPU
+         │
+         ▼
+[ batched_resample_kv ] ─────────────►  one launch, all pairs
+         │
+         ▼
+vectorised slot-tensor copies (one line each)
+         │
+         ▼
+per-pair copy_req_metadata  (the only Python-side loop)
 ```
 
-The fast path is correct only under `resample_method=systematic` on CUDA
-(those are the requirements the coordinator enforces at init). The fused
-collect kernel's Philox seed uses a monotonic `step_counter` to avoid
-reusing the same stratification across consecutive cycles without any
-host allocation.
+The fused collect kernel uses systematic resampling on CUDA
+(`SMCCoordinator.__init__` enforces CUDA).  Its Philox seed is driven
+by a monotonic `step_counter`, so consecutive decode cycles use
+independent stratifications without any host-side allocation or sync.
 
 ### 4.7 `rebuild_active_slots`
 

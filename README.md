@@ -39,8 +39,6 @@ python scripts/accuracy_test_gsm8k.py \
   --particles 12 --gamma 8 \
   --temperature 0.7 \
   --attention-backend fa3 \
-  --smc-fast-resample \
-  --smc-fast-resample \
   --num-questions 400 
 ```
 
@@ -55,7 +53,6 @@ python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
   --attention-backend fa3 \
   --mem-fraction-static 0.60 \
   --max-running-requests 1 \
-  --smc-fast-resample \
   --cuda-graph-max-bs 8 \
   --dataset-name sharegpt \
   --num-prompts 200
