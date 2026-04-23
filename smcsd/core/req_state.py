@@ -545,38 +545,65 @@ class ScheduleBatchSMC:
         #    Req objects (for finalize / streaming).  Keeps finished
         #    particles in the resample candidate set via finished_mask +
         #    ongoing participation in group_to_slots.
+        # One-shot D→H: hoist every field we need for the newly-finished
+        # particles in a single batch of `.cpu()` calls, then loop in pure
+        # Python.  The first `.cpu()` pays the sync wait; subsequent ones
+        # find the stream drained and return in microseconds.  Replaces
+        # the old ~6 `.item()` calls per finish (which under bursty finishes
+        # were spending ~100 ms/step waiting on serialised per-particle
+        # syncs — per the torch.profiler trace).
         newly_finished: List[int] = []
-        if newly_finished_mask.any():
-            finished_indices = newly_finished_mask.nonzero(as_tuple=True)[0]
-            for idx in finished_indices.tolist():
-                slot = int(active[idx].item())
+        finished_indices = newly_finished_mask.nonzero(as_tuple=True)[0]
+        fi_cpu = finished_indices.cpu().tolist()
+        if fi_cpu:
+            slots_g = active[finished_indices]
+            slots_cpu = slots_g.cpu().tolist()
+            counts_cpu = self.token_counts[slots_g].cpu().tolist()
+            seq_lens_cpu_f = self.seq_lens[slots_g].cpu().tolist()
+            kv_alloc_cpu = self.kv_allocated_lens[slots_g].cpu().tolist()
+            length_hit_cpu = length_hit[finished_indices].cpu().tolist()
+            max_tok_cpu = max_tokens[finished_indices].cpu().tolist()
+            eos_ids_cpu = eos_ids[finished_indices].cpu().tolist()
+            accepted_cpu = accepted_2d[finished_indices].cpu().tolist()
+
+            from sglang.srt.managers.schedule_batch import (
+                FINISH_LENGTH,
+                FINISH_MATCHED_TOKEN,
+            )
+
+            finished_lens: List[int] = []
+            finished_reqs: List[Req] = []
+            for i, slot in enumerate(slots_cpu):
                 newly_finished.append(slot)
                 req = self.slot_to_req[slot]
-                count = int(self.token_counts[slot].item())
-                req.kv_committed_len = int(self.seq_lens[slot].item())
-                req.kv_allocated_len = int(self.kv_allocated_lens[slot].item())
-                if length_hit[idx].item():
-                    from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-                    req.finished_reason = FINISH_LENGTH(
-                        length=int(max_tokens[idx].item())
-                    )
-                    req.finished_len = int(max_tokens[idx].item())
+                req.kv_committed_len = seq_lens_cpu_f[i]
+                req.kv_allocated_len = kv_alloc_cpu[i]
+                if length_hit_cpu[i]:
+                    req.finished_reason = FINISH_LENGTH(length=max_tok_cpu[i])
+                    req.finished_len = max_tok_cpu[i]
                 else:
-                    from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
-                    eos_set = set(eos_ids[idx].tolist()) - {-1}
+                    eos_set = set(eos_ids_cpu[i]) - {-1}
                     matched_tok = 0
                     eos_pos_in_stride = stride
-                    for j, t in enumerate(accepted_2d[idx].tolist()):
+                    for j, t in enumerate(accepted_cpu[i]):
                         if t in eos_set:
                             matched_tok = t
                             eos_pos_in_stride = j
                             break
                     req.finished_reason = FINISH_MATCHED_TOKEN(matched=matched_tok)
-                    old_count = count - stride
-                    req.finished_len = old_count + eos_pos_in_stride + 1
-                req.output_ids = self.all_token_ids[
-                    slot, : req.finished_len
-                ].tolist()
+                    req.finished_len = (counts_cpu[i] - stride) + eos_pos_in_stride + 1
+                finished_lens.append(req.finished_len)
+                finished_reqs.append(req)
+
+            # One batched D→H for all output_ids — the copy is
+            # `(n_finished, max_finished_len)` and we slice per-particle in
+            # Python.  Avoids a per-finish `.tolist()` on `all_token_ids`.
+            max_finished_len = max(finished_lens)
+            token_slab = self.all_token_ids[
+                slots_g, :max_finished_len
+            ].cpu().tolist()
+            for i, req in enumerate(finished_reqs):
+                req.output_ids = token_slab[i][: finished_lens[i]]
 
         # e. Accumulate log-weights.  Vectorised over all active slots —
         #    two in-place index_put_s, zero device syncs.
