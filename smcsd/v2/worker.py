@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import sys
 from typing import Optional
 
 import torch
@@ -687,6 +688,51 @@ class SMCWorkerV2(BaseSpecWorker):
         ).squeeze(2)
 
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
+
+        # ---- DIAGNOSTIC (env-gated): dump per-cycle draft vs target picks ----
+        if os.environ.get("SMC_EAGLE3_DIAG", "0") == "1":
+            # For request 0 only, show:
+            #   - drafted token at each position (all_tokens[1..gamma])
+            #   - target's argmax at each verify position (what target would have picked)
+            #   - target's logprob of the drafted token
+            #   - agreement rate
+            self._diag_cycle_count = getattr(self, "_diag_cycle_count", 0)
+            if self._diag_cycle_count < 5 or self._diag_cycle_count % 20 == 0:
+                with torch.no_grad():
+                    tgt_top1 = score_logits.reshape(bs, gamma + 1, -1).argmax(-1)  # (bs, gamma+1)
+                    tgt_top1_r0 = tgt_top1[0].tolist()
+                    drafted_r0 = [int(t[0].item()) for t in all_tokens[1:gamma+1]]
+                    agree = [(d == t) for d, t in zip(drafted_r0, tgt_top1_r0[:gamma])]
+                    tgt_lp_r0 = score_logprobs_stacked[0].tolist()
+                    draft_lp_r0 = draft_logprobs_stacked[0].tolist()
+                try:
+                    tok = self._target_worker.tokenizer_manager.tokenizer \
+                        if hasattr(self._target_worker, "tokenizer_manager") else None
+                except Exception:
+                    tok = None
+                def _dec(tid):
+                    if tok is None:
+                        return f"<{tid}>"
+                    try:
+                        return repr(tok.decode([int(tid)]))
+                    except Exception:
+                        return f"<{tid}>"
+                lines = [f"\n=== SMC_EAGLE3_DIAG cycle#{self._diag_cycle_count} (req 0, bs={bs}) ==="]
+                lines.append(f"  x0 (verified_id): {_dec(int(all_tokens[0][0].item()))}")
+                for k in range(gamma):
+                    drafted = drafted_r0[k]
+                    target = tgt_top1_r0[k]
+                    mark = "=" if agree[k] else "!"
+                    lines.append(
+                        f"  pos[{k}] {mark} drafted={_dec(drafted)} "
+                        f"(dr_lp={draft_lp_r0[k]:.2f} tg_lp={tgt_lp_r0[k]:.2f}) "
+                        f"| tgt_top1={_dec(target)}"
+                    )
+                lines.append(f"  bonus_pos logit argmax: {_dec(tgt_top1_r0[gamma])}")
+                lines.append(f"  draft/target agreement: {sum(agree)}/{gamma}")
+                print("\n".join(lines), file=sys.stderr, flush=True)
+            self._diag_cycle_count += 1
+        # ---- END DIAGNOSTIC ----
 
         # ---- 5. Bonus token from target's last-position logits ----
         bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
