@@ -1,10 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# SMC v2 throughput sweep — Llama 3.1-70B target + Llama 3.2-1B draft, triton, TP=4.
+# SMC throughput sweep — Llama 3.1-70B target + Llama 3.2-1B draft, triton, TP=4.
 # Uses bench_offline_throughput.py with --backend smc_engine, which routes
-# through SMCEngine (the engine-level --speculative-algorithm SMC path was
-# removed with v1 retirement).
+# through SMCEngine.
 
 # --- Sweep parameters ---
 NUM_PROMPTS_LIST=(1 4 8 16)

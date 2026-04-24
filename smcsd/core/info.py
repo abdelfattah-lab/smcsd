@@ -1,14 +1,12 @@
-"""v2 SMC spec info: clean separation of concerns.
+"""SMC spec info: clean separation of concerns.
 
 - SMCDecodeContext: per-cycle state created by scheduler, consumed by worker.
-  Owns prepare_for_draft / prepare_for_verify (moved from SMCDraftInput).
-  Factory method from_slot_gather does vectorized KV allocation.
+  Owns prepare_for_draft / prepare_for_verify.  Factory method
+  ``from_slot_gather`` does vectorised KV allocation.
 
-- SMCDraftInputV2: pure data carrier on batch.spec_info (no prepare methods).
+- SMCDraftInput: pure data carrier on ``batch.spec_info`` (no prepare methods).
 
 - SMCVerifyInput: reused from smc_info.py (unchanged).
-
-Legacy smc_info.py is NOT modified — the non-dedicated scheduler still uses it.
 """
 
 from __future__ import annotations
@@ -44,9 +42,6 @@ if TYPE_CHECKING:
 class SMCDecodeContext:
     """Per-decode-cycle state computed during prepare_for_decode (scheduler side),
     consumed by prepare_for_draft / prepare_for_verify (worker side).
-
-    This replaces the hidden _orig_seq_lens / _orig_seq_lens_cpu / _orig_seq_lens_sum
-    state that was stashed on SMCDraftInput in the v1 API.
     """
 
     orig_seq_lens: torch.Tensor  # (bs,) committed prefix BEFORE advance
@@ -115,7 +110,7 @@ class SMCDecodeContext:
         )
         return ctx, nxt_kv_lens
 
-    # ── Worker-side methods (called in SMCWorkerV2._forward_decode) ──
+    # ── Worker-side methods (called in SMCWorker._forward_decode) ──
 
     def prepare_for_draft(
         self,
@@ -247,16 +242,15 @@ class SMCDecodeContext:
 
 
 # ──────────────────────────────────────────────────────────────
-#  SMCDraftInputV2 — pure data carrier
+#  SMCDraftInput — pure data carrier
 # ──────────────────────────────────────────────────────────────
 
 
 @dataclass
-class SMCDraftInputV2(SpecInput):
-    """Lightweight carrier between scheduler and worker via batch.spec_info.
+class SMCDraftInput(SpecInput):
+    """Lightweight carrier between scheduler and worker via ``batch.spec_info``.
 
-    Unlike v1 SMCDraftInput, this has NO prepare_for_decode / prepare_for_draft /
-    prepare_for_verify methods. Those live on SMCDecodeContext.
+    Has no prepare_* methods — those live on ``SMCDecodeContext``.
     """
 
     verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token
@@ -274,7 +268,7 @@ class SMCDraftInputV2(SpecInput):
         return (self.num_tokens_per_req, self.num_tokens_per_req)
 
     @classmethod
-    def create_idle_input(cls, device: torch.device) -> "SMCDraftInputV2":
+    def create_idle_input(cls, device: torch.device) -> "SMCDraftInput":
         return cls(
             verified_id=torch.empty((0,), dtype=torch.int32, device=device),
             num_tokens_per_req=1,

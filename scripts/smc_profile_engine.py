@@ -5,7 +5,6 @@ Examples:
   source .venv/bin/activate
   python scripts/smc/smc_profile_engine.py --output-dir /tmp/sglang-smc-profile
   python scripts/smc/smc_profile_engine.py --engine-kind smc_engine --output-dir /tmp/sglang-smc-profile
-  python scripts/smc/smc_profile_engine.py --engine-kind smc_engine --smc-fast-resample --output-dir /tmp/sglang-smc-profile
   python scripts/smc/smc_profile_engine.py --profile-v2 --decode-only
 """
 
@@ -83,17 +82,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smc-n-particles", type=int, default=8)
     parser.add_argument("--smc-gamma", type=int, default=8)
     parser.add_argument(
-        "--smc-fast-resample",
-        action="store_true",
-        default=False,
-        help=(
-            "Use the fused SMC resample path (single Triton kernel for "
-            "normalize + ESS + systematic resample + dst/src compaction, "
-            "feeding the fused KV-copy kernel directly). "
-            "Requires systematic resampling + CUDA."
-        ),
-    )
-    parser.add_argument(
         "--prompt",
         action="append",
         dest="prompts",
@@ -165,7 +153,6 @@ def build_engine(args: argparse.Namespace):
             speculative_draft_model_path=args.draft_model_path,
             smc_n_particles=args.smc_n_particles,
             smc_gamma=args.smc_gamma,
-            smc_fast_resample=args.smc_fast_resample,
             page_size=1,
             mem_fraction_static=0.4,
             trust_remote_code=True,
@@ -185,7 +172,6 @@ def build_engine(args: argparse.Namespace):
         draft_model_path=args.draft_model_path,
         n_particles=args.smc_n_particles,
         gamma=args.smc_gamma,
-        smc_fast_resample=args.smc_fast_resample,
         page_size=1,
         mem_fraction_static=0.4,
         trust_remote_code=True,
@@ -242,7 +228,6 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "smc_n_particles": args.smc_n_particles,
             "smc_gamma": args.smc_gamma,
-            "smc_fast_resample": args.smc_fast_resample,
             "prompts": prompts,
         },
     )
@@ -261,7 +246,6 @@ def main() -> None:
                 "draft_model_path": args.draft_model_path,
                 "smc_n_particles": args.smc_n_particles,
                 "smc_gamma": args.smc_gamma,
-                "smc_fast_resample": args.smc_fast_resample,
                 "disable_overlap_schedule": True,
                 "disable_radix_cache": True,
             }
