@@ -230,20 +230,28 @@ class SMCWorker(BaseSpecWorker):
 
             logits = draft_out.logits_output.next_token_logits
 
+            # Sample from softmax directly and log the gathered scalar
+            # instead of `log_softmax(x).exp()` — saves one vocab-sized
+            # exp kernel per draft step (exp(log_softmax(x)) == softmax(x)).
             scaled_logits = logits / self.smc_draft_temperature
-            log_probs = torch.log_softmax(scaled_logits, dim=-1)
             if self.smc_draft_temperature > 0:
+                probs = torch.softmax(scaled_logits, dim=-1)
                 next_token = torch.multinomial(
-                    log_probs.exp(), num_samples=1
+                    probs, num_samples=1
                 ).squeeze(-1)
+                if step < gamma:
+                    token_logprob = probs.gather(
+                        1, next_token.unsqueeze(1)
+                    ).squeeze(1).log()
+                    draft_logprobs.append(token_logprob)
             else:
                 next_token = torch.argmax(logits, dim=-1)
-
-            if step < gamma:
-                token_logprob = log_probs.gather(
-                    1, next_token.unsqueeze(1)
-                ).squeeze(1)
-                draft_logprobs.append(token_logprob)
+                if step < gamma:
+                    log_probs = torch.log_softmax(scaled_logits, dim=-1)
+                    token_logprob = log_probs.gather(
+                        1, next_token.unsqueeze(1)
+                    ).squeeze(1)
+                    draft_logprobs.append(token_logprob)
 
             all_tokens.append(next_token)
             current_ids = next_token
@@ -274,28 +282,38 @@ class SMCWorker(BaseSpecWorker):
             f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
             f"cuda_graph={can_run_cuda_graph})"
         )
-        score_log_probs = torch.log_softmax(score_logits, dim=-1)
-        score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
-        target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
-        score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
+        # Only the first gamma rows participate in the score/draft logprob
+        # diff; the bonus row is softmaxed separately below with a different
+        # temperature.  Slicing before log_softmax avoids 1/(gamma+1) wasted
+        # work on the bonus row.
+        score_logits_3d = score_logits.reshape(bs, gamma + 1, -1)
+        score_log_probs = torch.log_softmax(
+            score_logits_3d[:, :gamma, :], dim=-1
+        )
+
+        # ---- 5. Bonus token ----
+        # Compute bonus before the output stack so we can fuse the two
+        # `torch.stack(all_tokens, ...)` calls into one.
+        bonus_logits = score_logits_3d[:, -1, :]
+        bonus_probs = torch.softmax(
+            bonus_logits / self.smc_target_temperature, dim=-1
+        )
+        bonus = torch.multinomial(bonus_probs, num_samples=1).squeeze(-1)
+
+        # ---- 6. Fused stack: target tokens + bonus in one kernel ----
+        all_outputs_stacked = torch.stack(
+            all_tokens[1 : gamma + 1] + [bonus], dim=1
+        )  # (bs, gamma+1)
+        target_tokens = all_outputs_stacked[:, :gamma]
+        score_logprobs_stacked = score_log_probs.gather(
             2, target_tokens.unsqueeze(2)
         ).squeeze(2)
 
-        # ---- 5. Logprob diff ----
+        # ---- 7. Logprob diff ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
 
-        # ---- 6. Bonus token ----
-        bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
-        bonus_log_probs = torch.log_softmax(
-            bonus_logits / self.smc_target_temperature, dim=-1
-        )
-        bonus = torch.multinomial(bonus_log_probs.exp(), num_samples=1).squeeze(-1)
-
-        # ---- 7. Output ----
-        output_token_ids = torch.stack(
-            all_tokens[1 : gamma + 1] + [bonus], dim=1
-        )
-        next_token_ids = output_token_ids.reshape(-1)
+        # ---- 8. Output ----
+        next_token_ids = all_outputs_stacked.reshape(-1)
         accept_lens = torch.full(
             (bs,), gamma + 1, dtype=torch.int32, device=self.device
         )
