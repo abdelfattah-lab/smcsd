@@ -80,7 +80,6 @@ See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 | Draft temp | `--smc-draft-temperature` | Sampling temperature for draft model |
 | Target temp | `--smc-target-temperature` | Scoring temperature for target model |
 | Resample threshold | `--smc-resample-threshold` | Resample when ESS < N × threshold (0 = disable) |
-| Resample method | `--smc-resample-method` | `systematic` or `multinomial` |
 
 ## Architecture
 
