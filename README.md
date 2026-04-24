@@ -108,10 +108,16 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design
 ## Citation
 
 ```bibtex
-@inproceedings{smcsd2026,
-  title={Faster LLM Inference via Sequential Monte Carlo},
-  author={Yahya Emara, Mauricio Barba da Costa, Chi-Chih Chang, Cameron Freer, Tim Vieira, Ryan Cotterell, Mohamed Abdelfattah},
-  year={2026}
+@misc{smcsd2026,
+  title         = {Faster LLM Inference via Sequential Monte Carlo},
+  author        = {Emara, Yahya and Barba da Costa, Mauricio and Chang, Chi-Chih
+                   and Freer, Cameron and Vieira, Tim and Cotterell, Ryan
+                   and Abdelfattah, Mohamed S.},
+  year          = {2026},
+  eprint        = {2604.15672},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2604.15672},
 }
 ```
 
