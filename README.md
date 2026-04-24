@@ -119,6 +119,7 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design
 
 - [ ] EAGLE support
 - [ ] Async/Delayed resampling (CPU/GPU overlap for KV cache rewrites)
+- [ ] Async SMC-SD at resample threshold 0 (overlap draft and target for SIS)
 - [ ] Disaggregation (draft/target separation)
 
 PRs welcome!
