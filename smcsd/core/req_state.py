@@ -173,7 +173,6 @@ class ScheduleBatchSMC:
         # iteration during rebuild / finalize.  Mirrored on device as
         # `group_to_slots` for the resample kernel.
         self.group_slot_lists: Dict[str, List[int]] = {}
-        self.group_active_indptr: List[int] = [0]
         self._sorted_group_ids: List[str] = []
 
         # ── Group → slot lookup (device, for the fused collect kernel) ──
@@ -202,7 +201,6 @@ class ScheduleBatchSMC:
     def allocate_slots(
         self,
         group_id: str,
-        group_idx: int,  # unused, retained for caller API compatibility
         particle_reqs: List[Req],
         shared_seq_len: int,
     ) -> List[int]:
@@ -331,7 +329,7 @@ class ScheduleBatchSMC:
         self.rebuild_active_slots()
 
     def rebuild_active_slots(self) -> None:
-        """Refresh ``active_slots`` and ``group_active_indptr``.
+        """Refresh ``active_slots``.
 
         ``active_slots`` is the contiguous-batch → slot gather index used to
         build a ``ModelWorkerBatch``.  Slots are grouped by group_id (sorted)
@@ -347,19 +345,16 @@ class ScheduleBatchSMC:
 
         self._sorted_group_ids = sorted(self.group_slot_lists.keys())
         active_list: List[int] = []
-        indptr = [0]
         for group_id in self._sorted_group_ids:
             for s in self.group_slot_lists[group_id]:
                 if not finished_cpu[s]:
                     active_list.append(s)
-            indptr.append(len(active_list))
 
         self.active_slots = torch.tensor(
             active_list, dtype=torch.int64, device=self.device
         )
         self._active_slots_list = active_list
         self.num_active = len(active_list)
-        self.group_active_indptr = indptr
 
     def is_empty(self) -> bool:
         return self.num_active == 0
@@ -710,9 +705,6 @@ class ScheduleBatchSMC:
     def group_has_active(self, group_id: str) -> bool:
         slots = self.group_slot_lists.get(group_id, [])
         return any(not self.finished_mask[s].item() for s in slots)
-
-    def sorted_group_ids(self) -> List[str]:
-        return sorted(self.group_slot_lists.keys())
 
     def active_particle_count(self) -> int:
         return self.num_active

@@ -64,22 +64,6 @@ class SequenceGroup:
     def has_materialized_particles(self) -> bool:
         return bool(self.particle_reqs)
 
-    def active_particle_indices(self) -> List[int]:
-        return [
-            idx for idx, req in self.particle_reqs.items() if not req.finished()
-        ]
-
-    def active_particle_reqs(self) -> List[Req]:
-        return [
-            self.particle_reqs[idx] for idx in sorted(self.active_particle_indices())
-        ]
-
-    def active_slot_keys(self) -> List[Tuple[str, int]]:
-        return [(self.group_id, idx) for idx in self.active_particle_indices()]
-
-    def all_particle_indices(self) -> List[int]:
-        return sorted(self.particle_reqs)
-
     def materialize_particles(self) -> None:
         """Clone ``n_particles`` Reqs off the parent Req and register them.
 
@@ -270,7 +254,6 @@ class SMCScheduler(Scheduler):
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
         )
-        self._group_idx_counter = 0
 
     def _make_runtime_tracking_batch(
         self,
@@ -616,12 +599,9 @@ class SMCScheduler(Scheduler):
         )
 
         # Populate slot state
-        group_idx = self._group_idx_counter
-        self._group_idx_counter += 1
         try:
             self.slot_state.allocate_slots(
                 group_id=group.group_id,
-                group_idx=group_idx,
                 particle_reqs=particle_reqs,
                 shared_seq_len=shared_seq_len,
             )

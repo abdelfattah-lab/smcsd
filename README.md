@@ -38,20 +38,9 @@ uv pip install -e .
 ```
 
 ## Quick Start
-```bash
-# SMC-SD accuracy on GSM8K via the dedicated SMCEngine (N=12 particles, gamma=8)
-python scripts/accuracy_test_gsm8k.py \
-  --mode smc_engine \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --draft-model meta-llama/Llama-3.2-1B-Instruct \
-  --particles 12 --gamma 8 \
-  --temperature 0.7 \
-  --attention-backend fa3 \
-  --num-questions 400
-```
 
 ```bash
-# SMC-SD throughput on ShareGPT (1 concurrent group, 200 prompts, N=8, gamma=8)
+# SMC-SD throughput on ShareGPT
 python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
   --backend smc_engine \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -65,6 +54,20 @@ python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
   --dataset-name sharegpt \
   --num-prompts 200
 ```
+
+```bash
+# SMC-SD accuracy on GSM8K (N=12 particles, gamma=8)
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --particles 12 --gamma 8 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 400
+```
+
+
 
 > [!NOTE] 
 > When using non-Hopper GPU (such as A100, A6000), specify `--attention-backend` to be `triton`

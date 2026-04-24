@@ -228,16 +228,3 @@ def systematic_resample(
         device=weights_t.device,
     )
     return torch.searchsorted(cdf, positions, right=False)
-
-
-def multinomial_resample(
-    weights: Sequence[float] | torch.Tensor,
-    device: Optional[torch.device | str] = None,
-) -> torch.Tensor:
-    """Returns ancestor indices as a GPU tensor (no GPU→CPU sync)."""
-    weights_t = torch.as_tensor(weights, dtype=torch.float64, device=device)
-    if weights_t.numel() == 0:
-        return torch.empty(0, dtype=torch.int64, device=device)
-    return torch.multinomial(
-        weights_t, num_samples=weights_t.numel(), replacement=True
-    )
