@@ -10,7 +10,7 @@ import psutil
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
+from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -306,6 +306,9 @@ class SMCScheduler(Scheduler):
             moe_dp_rank=self.moe_dp_rank,
         )
         self.draft_worker = SMCWorker(**draft_worker_kwargs)
+        # Upstream's base maybe_init_draft_worker sets this; SMC doesn't use
+        # ngram corpus but the attribute is read later in process_input_requests.
+        self.external_corpus_manager = None
 
     # ── Event Loop ──
 
@@ -339,7 +342,7 @@ class SMCScheduler(Scheduler):
                 else:
                     self._process_decode_result(result)
             else:
-                self.self_check_during_idle()
+                self.self_check_during_busy()
 
             self.last_batch = tracking_batch
             if hasattr(self, "waiting_queue"):
@@ -354,10 +357,9 @@ class SMCScheduler(Scheduler):
     # code.  Refcount state is already reflected via available_size (a shared
     # page stays out of free_pages until its last refcount drops).
     #
-    # self_check_during_busy is intentionally NOT overridden: our event loop
-    # never dispatches it (matching the PP / disagg / multiplex loops, which
-    # also omit the busy check).  Re-add it here if this loop is ever wired
-    # to call self_check_during_busy.
+    # Upstream merged the two into a single `self_check_during_busy`; we now
+    # dispatch that on the idle branch of our event loop (when there's no
+    # batch to run) — same structural role as the old `self_check_during_idle`.
 
     def _check_radix_cache_memory(self):
         _, _, available_size, evictable_size = self._get_token_info()
@@ -724,8 +726,8 @@ def run_smc_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    dp_rank = configure_scheduler(
-        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+    dp_rank = configure_scheduler_process(
+        server_args, gpu_id, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
 
     kill_itself_when_parent_died()

@@ -152,8 +152,12 @@ class SMCEngine:
         # so detokenizer_ipc_name is unused and needs no bind.
 
         # -- 6. Launch scheduler subprocess(es) --
-        self._scheduler_init_result = Engine._launch_scheduler_processes(
-            server_args, port_args, run_smc_scheduler_process
+        # Upstream changed the return to a 2-tuple (SchedulerInitResult, procs);
+        # procs is None for RayEngine.
+        self._scheduler_init_result, self._scheduler_procs = (
+            Engine._launch_scheduler_processes(
+                server_args, port_args, run_smc_scheduler_process
+            )
         )
         self._scheduler_init_result.wait_for_ready()
         logger.info("SMCEngine: Scheduler is ready.")
