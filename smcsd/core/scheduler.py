@@ -192,6 +192,22 @@ class SMCCoordinator:
         slot_state.finished_mask[dst_idx] = slot_state.finished_mask[src_idx]
         slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
         slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
+        if slot_state.eagle_hidden_states is not None:
+            slot_state.eagle_hidden_states[dst_idx] = (
+                slot_state.eagle_hidden_states[src_idx]
+            )
+        if slot_state.eagle_first_draft_token_ids is not None:
+            slot_state.eagle_first_draft_token_ids[dst_idx] = (
+                slot_state.eagle_first_draft_token_ids[src_idx]
+            )
+        if slot_state.eagle_first_draft_logprobs is not None:
+            slot_state.eagle_first_draft_logprobs[dst_idx] = (
+                slot_state.eagle_first_draft_logprobs[src_idx]
+            )
+        if slot_state.eagle_topk_p is not None:
+            slot_state.eagle_topk_p[dst_idx] = slot_state.eagle_topk_p[src_idx]
+        if slot_state.eagle_topk_index is not None:
+            slot_state.eagle_topk_index[dst_idx] = slot_state.eagle_topk_index[src_idx]
 
         # Req-level metadata is Python-only (output_ids list, finished_reason
         # object, etc.) — unavoidable per-copy loop.
@@ -240,7 +256,7 @@ class SMCScheduler(Scheduler):
         self.slot_state = ScheduleBatchSMC(
             max_num_reqs=self.max_user_groups * n_particles,
             device=self.device,
-            gamma_plus_1=server_args.speculative_num_draft_tokens,
+            gamma_plus_1=server_args.smc_gamma + 1,
             vocab_size=self.model_config.vocab_size,
             max_output_len=server_args.context_length,
             req_to_token_pool=self.req_to_token_pool,
@@ -532,7 +548,22 @@ class SMCScheduler(Scheduler):
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
-        for group, req, next_token_id in zip(groups, batch.reqs, next_token_ids):
+        next_draft = result.next_draft_input
+        e3_hidden = getattr(next_draft, "hidden_state", None) if next_draft else None
+        e3_x1 = (
+            getattr(next_draft, "first_draft_token_id", None) if next_draft else None
+        )
+        e3_x1_lp = (
+            getattr(next_draft, "first_draft_logprob", None) if next_draft else None
+        )
+        e3_topk_p = getattr(next_draft, "eagle_topk_p", None) if next_draft else None
+        e3_topk_i = (
+            getattr(next_draft, "eagle_topk_index", None) if next_draft else None
+        )
+
+        for i, (group, req, next_token_id) in enumerate(
+            zip(groups, batch.reqs, next_token_ids)
+        ):
             assert req is group.parent_req
 
             req.output_ids.append(next_token_id)
@@ -548,6 +579,19 @@ class SMCScheduler(Scheduler):
             if error_msg is not None:
                 self._abort_group(group, error_msg)
                 continue
+
+            if e3_hidden is not None:
+                slots = self.slot_state.group_slot_lists[group.group_id]
+                self.slot_state.scatter_prefill_eagle3(
+                    slots,
+                    hidden_state=e3_hidden[i],
+                    first_draft_token_id=e3_x1[i : i + 1] if e3_x1 is not None else None,
+                    first_draft_logprob=(
+                        e3_x1_lp[i : i + 1] if e3_x1_lp is not None else None
+                    ),
+                    eagle_topk_p=e3_topk_p[i] if e3_topk_p is not None else None,
+                    eagle_topk_index=e3_topk_i[i] if e3_topk_i is not None else None,
+                )
 
             self.running_groups.append(group)
 
@@ -663,12 +707,23 @@ class SMCScheduler(Scheduler):
         if bonus_ids is None:
             raise RuntimeError("SMCScheduler: result missing next_draft_input.verified_id")
 
+        next_hidden = getattr(next_draft, "hidden_state", None)
+        next_x1 = getattr(next_draft, "first_draft_token_id", None)
+        next_x1_lp = getattr(next_draft, "first_draft_logprob", None)
+        next_topk_p = getattr(next_draft, "eagle_topk_p", None)
+        next_topk_i = getattr(next_draft, "eagle_topk_index", None)
+
         # Write results back to slot state (defer rebuild to end of cycle)
         newly_finished = self.slot_state.process_batch_result(
             next_token_ids=result.next_token_ids,
             accept_lens=result.accept_lens,
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
+            next_hidden_state=next_hidden,
+            next_first_draft_token_id=next_x1,
+            next_first_draft_logprob=next_x1_lp,
+            next_eagle_topk_p=next_topk_p,
+            next_eagle_topk_index=next_topk_i,
             rebuild_active=False,
         )
 

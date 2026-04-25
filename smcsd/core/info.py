@@ -173,6 +173,7 @@ class SMCDecodeContext:
         target_worker: "TpModelWorker",
         all_tokens: list,
         cache_locs: torch.Tensor,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
     ) -> Tuple[ForwardBatch, bool]:
         """Prepare batch and create ForwardBatch for score model verification.
 
@@ -197,7 +198,7 @@ class SMCDecodeContext:
         verify_spec_info = SMCVerifyInput(
             draft_token_num=draft_token_num,
             positions=positions,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=capture_hidden_mode,
             seq_lens_sum=self.orig_seq_lens_sum,
             seq_lens_cpu=orig_seq_lens_cpu,
             num_tokens_per_req=draft_token_num,
@@ -210,7 +211,7 @@ class SMCDecodeContext:
         verify_batch.seq_lens_cpu = orig_seq_lens_cpu
         verify_batch.seq_lens_sum = verify_spec_info.seq_lens_sum
         verify_batch.spec_info = verify_spec_info
-        verify_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        verify_batch.capture_hidden_mode = capture_hidden_mode
         batch = verify_batch
 
         is_idle = batch.forward_mode.is_idle()
@@ -257,6 +258,13 @@ class SMCDraftInput(SpecInput):
     logprob_diff: Optional[torch.Tensor] = None  # (bs,) from last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
+
+    # EAGLE3 state carried across cycles (None in dense mode).
+    hidden_state: Optional[torch.Tensor] = None
+    first_draft_token_id: Optional[torch.Tensor] = None
+    first_draft_logprob: Optional[torch.Tensor] = None
+    eagle_topk_p: Optional[torch.Tensor] = None
+    eagle_topk_index: Optional[torch.Tensor] = None
 
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1

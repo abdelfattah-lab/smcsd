@@ -148,6 +148,13 @@ class ScheduleBatchSMC:
             (self.max_slots, max_output_len), dtype=torch.int32, device=device
         )
 
+        # ── EAGLE3 per-slot state (lazy; unused in dense mode) ──
+        self.eagle_hidden_states: Optional[torch.Tensor] = None
+        self.eagle_first_draft_token_ids: Optional[torch.Tensor] = None
+        self.eagle_first_draft_logprobs: Optional[torch.Tensor] = None
+        self.eagle_topk_p: Optional[torch.Tensor] = None
+        self.eagle_topk_index: Optional[torch.Tensor] = None
+
         # ── Sampling params [max_slots], static after allocation ──
         self.temperatures = torch.ones(
             self.max_slots, 1, dtype=torch.float32, device=device
@@ -193,6 +200,82 @@ class ScheduleBatchSMC:
         # Fused-collect kernel output buffers are allocated per call
         # inside `batched_collect_fused` — they are transient to one
         # kernel launch, not persistent batch state.
+
+    # ────────────────────────────────────────────────────────
+    #  EAGLE3 lazy buffers
+    # ────────────────────────────────────────────────────────
+
+    def _ensure_eagle_hidden_buffer(
+        self, hidden_dim: int, dtype: torch.dtype
+    ) -> None:
+        if (
+            self.eagle_hidden_states is None
+            or self.eagle_hidden_states.shape[-1] != hidden_dim
+            or self.eagle_hidden_states.dtype != dtype
+        ):
+            self.eagle_hidden_states = torch.zeros(
+                (self.max_slots, hidden_dim), dtype=dtype, device=self.device
+            )
+
+    def _ensure_eagle_first_draft_buffers(self) -> None:
+        if self.eagle_first_draft_token_ids is None:
+            self.eagle_first_draft_token_ids = torch.zeros(
+                self.max_slots, dtype=torch.int64, device=self.device
+            )
+        if self.eagle_first_draft_logprobs is None:
+            self.eagle_first_draft_logprobs = torch.zeros(
+                self.max_slots, dtype=torch.float32, device=self.device
+            )
+
+    def _ensure_eagle_topk_buffers(
+        self, topk: int, p_dtype: torch.dtype = torch.float32
+    ) -> None:
+        if (
+            self.eagle_topk_p is None
+            or self.eagle_topk_p.shape[-1] != topk
+            or self.eagle_topk_p.dtype != p_dtype
+        ):
+            self.eagle_topk_p = torch.zeros(
+                (self.max_slots, topk), dtype=p_dtype, device=self.device
+            )
+        if self.eagle_topk_index is None or self.eagle_topk_index.shape[-1] != topk:
+            self.eagle_topk_index = torch.zeros(
+                (self.max_slots, topk), dtype=torch.int64, device=self.device
+            )
+
+    def scatter_prefill_eagle3(
+        self,
+        slots: List[int],
+        hidden_state: torch.Tensor,
+        first_draft_token_id: Optional[torch.Tensor] = None,
+        first_draft_logprob: Optional[torch.Tensor] = None,
+        eagle_topk_p: Optional[torch.Tensor] = None,
+        eagle_topk_index: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Broadcast one parent prefill EAGLE seed across its particle slots."""
+        if not slots:
+            return
+        slot_idx = torch.as_tensor(slots, dtype=torch.long, device=self.device)
+        n = len(slots)
+
+        self._ensure_eagle_hidden_buffer(hidden_state.shape[-1], hidden_state.dtype)
+        self.eagle_hidden_states[slot_idx] = hidden_state.reshape(1, -1).expand(n, -1)
+
+        if first_draft_token_id is not None and first_draft_logprob is not None:
+            self._ensure_eagle_first_draft_buffers()
+            self.eagle_first_draft_token_ids[slot_idx] = (
+                first_draft_token_id.reshape(-1).to(torch.int64).expand(n)
+            )
+            self.eagle_first_draft_logprobs[slot_idx] = (
+                first_draft_logprob.reshape(-1).to(torch.float32).expand(n)
+            )
+
+        if eagle_topk_p is not None and eagle_topk_index is not None:
+            self._ensure_eagle_topk_buffers(eagle_topk_p.shape[-1], eagle_topk_p.dtype)
+            self.eagle_topk_p[slot_idx] = eagle_topk_p.reshape(1, -1).expand(n, -1)
+            self.eagle_topk_index[slot_idx] = (
+                eagle_topk_index.reshape(1, -1).to(torch.int64).expand(n, -1)
+            )
 
     # ────────────────────────────────────────────────────────
     #  Slot Allocation / Deallocation
@@ -322,6 +405,16 @@ class ScheduleBatchSMC:
             self.ignore_eos_t[slot] = False
             self.log_weights[slot] = 0.0
             self.interval_weights[slot] = 0.0
+            if self.eagle_hidden_states is not None:
+                self.eagle_hidden_states[slot] = 0
+            if self.eagle_first_draft_token_ids is not None:
+                self.eagle_first_draft_token_ids[slot] = 0
+            if self.eagle_first_draft_logprobs is not None:
+                self.eagle_first_draft_logprobs[slot] = 0
+            if self.eagle_topk_p is not None:
+                self.eagle_topk_p[slot] = 0
+            if self.eagle_topk_index is not None:
+                self.eagle_topk_index[slot] = 0
 
             self.slot_to_req.pop(slot, None)
             self.free_slots.append(slot)
@@ -396,6 +489,29 @@ class ScheduleBatchSMC:
             verified_id=verified_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
+            hidden_state=(
+                self.eagle_hidden_states[active]
+                if self.eagle_hidden_states is not None
+                else None
+            ),
+            first_draft_token_id=(
+                self.eagle_first_draft_token_ids[active]
+                if self.eagle_first_draft_token_ids is not None
+                else None
+            ),
+            first_draft_logprob=(
+                self.eagle_first_draft_logprobs[active]
+                if self.eagle_first_draft_logprobs is not None
+                else None
+            ),
+            eagle_topk_p=(
+                self.eagle_topk_p[active] if self.eagle_topk_p is not None else None
+            ),
+            eagle_topk_index=(
+                self.eagle_topk_index[active]
+                if self.eagle_topk_index is not None
+                else None
+            ),
         )
 
     def prepare_for_extend(self):
@@ -484,6 +600,11 @@ class ScheduleBatchSMC:
         logprob_diff: torch.Tensor,
         bonus_ids: torch.Tensor,
         *,
+        next_hidden_state: Optional[torch.Tensor] = None,
+        next_first_draft_token_id: Optional[torch.Tensor] = None,
+        next_first_draft_logprob: Optional[torch.Tensor] = None,
+        next_eagle_topk_p: Optional[torch.Tensor] = None,
+        next_eagle_topk_index: Optional[torch.Tensor] = None,
         rebuild_active: bool = True,
     ) -> List[int]:
         """Write forward-pass results back to slot-indexed tensors.
@@ -519,6 +640,29 @@ class ScheduleBatchSMC:
 
         # b. Next step's seed token.
         self.verified_ids[active] = bonus_ids.to(dtype=torch.int32)
+
+        if next_hidden_state is not None:
+            self._ensure_eagle_hidden_buffer(
+                next_hidden_state.shape[-1], next_hidden_state.dtype
+            )
+            self.eagle_hidden_states[active] = next_hidden_state
+        if (
+            next_first_draft_token_id is not None
+            and next_first_draft_logprob is not None
+        ):
+            self._ensure_eagle_first_draft_buffers()
+            self.eagle_first_draft_token_ids[active] = next_first_draft_token_id.to(
+                dtype=torch.int64
+            )
+            self.eagle_first_draft_logprobs[active] = next_first_draft_logprob.to(
+                dtype=torch.float32
+            )
+        if next_eagle_topk_p is not None and next_eagle_topk_index is not None:
+            self._ensure_eagle_topk_buffers(
+                next_eagle_topk_p.shape[-1], next_eagle_topk_p.dtype
+            )
+            self.eagle_topk_p[active] = next_eagle_topk_p
+            self.eagle_topk_index[active] = next_eagle_topk_index.to(torch.int64)
 
         # c. Batched finish check on GPU.
         updated_counts = self.token_counts[active]
@@ -606,6 +750,20 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[dst_slot] = self.kv_allocated_lens[src_slot]
         self.verified_ids[dst_slot] = self.verified_ids[src_slot]
         self.finished_mask[dst_slot] = self.finished_mask[src_slot]
+        if self.eagle_hidden_states is not None:
+            self.eagle_hidden_states[dst_slot] = self.eagle_hidden_states[src_slot]
+        if self.eagle_first_draft_token_ids is not None:
+            self.eagle_first_draft_token_ids[dst_slot] = (
+                self.eagle_first_draft_token_ids[src_slot]
+            )
+        if self.eagle_first_draft_logprobs is not None:
+            self.eagle_first_draft_logprobs[dst_slot] = (
+                self.eagle_first_draft_logprobs[src_slot]
+            )
+        if self.eagle_topk_p is not None:
+            self.eagle_topk_p[dst_slot] = self.eagle_topk_p[src_slot]
+        if self.eagle_topk_index is not None:
+            self.eagle_topk_index[dst_slot] = self.eagle_topk_index[src_slot]
 
         src_count = int(self.token_counts[src_slot].item())
         self.token_counts[dst_slot] = src_count

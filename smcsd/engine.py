@@ -68,6 +68,11 @@ class SMCEngine:
         target_temperature: float = 1.0,
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
+        draft_mode: str = "dense",
+        eagle_topk: int = 4,
+        eagle_num_draft_tokens: Optional[int] = None,
+        eagle3_collect_path: Optional[str] = None,
+        eagle3_collect_shard_mb: int = 512,
         # Hardware
         tp_size: int = 1,
         base_gpu_id: int = 0,
@@ -103,6 +108,11 @@ class SMCEngine:
             smc_target_temperature=target_temperature,
             smc_resample_threshold=resample_threshold,
             smc_resample_method=resample_method,
+            smc_draft_mode=draft_mode,
+            smc_eagle_topk=eagle_topk,
+            smc_eagle_num_draft_tokens=eagle_num_draft_tokens,
+            smc_eagle3_collect_path=eagle3_collect_path,
+            smc_eagle3_collect_shard_mb=eagle3_collect_shard_mb,
             tp_size=tp_size,
             base_gpu_id=base_gpu_id,
         )
