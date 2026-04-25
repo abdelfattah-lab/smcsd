@@ -99,6 +99,11 @@ def run_smc_engine_eval(args, prompts, labels):
         trust_remote_code=True,
         page_size=1,
         attention_backend=args.attention_backend,
+        draft_mode=args.draft_mode,
+        eagle_topk=args.eagle_topk,
+        eagle_num_draft_tokens=args.eagle_num_draft_tokens,
+        eagle3_collect_path=args.eagle3_collect_path,
+        eagle3_collect_shard_mb=args.eagle3_collect_shard_mb,
     )
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
@@ -307,6 +312,44 @@ if __name__ == "__main__":
     smc_grp.add_argument(
         "--resample-threshold", type=float, default=None,
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
+    )
+    smc_grp.add_argument(
+        "--draft-mode",
+        type=str,
+        choices=[
+            "dense",
+            "eagle3",
+            "eagle3_chain",
+            "eagle3_tree_probe",
+            "eagle3_tree_smc",
+            "eagle3_tree_oracle",
+        ],
+        default="dense",
+        help="SMC draft mode (default: dense).",
+    )
+    smc_grp.add_argument(
+        "--eagle-topk",
+        type=int,
+        default=4,
+        help="EAGLE branch top-k for tree modes.",
+    )
+    smc_grp.add_argument(
+        "--eagle-num-draft-tokens",
+        type=int,
+        default=None,
+        help="EAGLE tree node budget for future full-tree modes.",
+    )
+    smc_grp.add_argument(
+        "--eagle3-collect-path",
+        type=str,
+        default=None,
+        help="Reserved path for EAGLE on-policy data collection.",
+    )
+    smc_grp.add_argument(
+        "--eagle3-collect-shard-mb",
+        type=int,
+        default=512,
+        help="Soft shard size for EAGLE on-policy data collection.",
     )
     smc_grp.add_argument(
         "--smc-metrics",
