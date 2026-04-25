@@ -112,6 +112,10 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_running_requests"] = args.max_running_requests
     else:
         engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
+    if args.smc_metrics:
+        engine_kwargs["smc_metrics"] = True
+        engine_kwargs["smc_metrics_log_interval"] = args.smc_metrics_log_interval
+        engine_kwargs["smc_metrics_jsonl"] = args.smc_metrics_jsonl
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
@@ -303,6 +307,23 @@ if __name__ == "__main__":
     smc_grp.add_argument(
         "--resample-threshold", type=float, default=None,
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
+    )
+    smc_grp.add_argument(
+        "--smc-metrics",
+        action="store_true",
+        help="Enable SMC diagnostic logging: ESS/N, log-weight variance, resampling rate.",
+    )
+    smc_grp.add_argument(
+        "--smc-metrics-log-interval",
+        type=int,
+        default=50,
+        help="Log aggregate SMC metrics every N decode steps when --smc-metrics is enabled.",
+    )
+    smc_grp.add_argument(
+        "--smc-metrics-jsonl",
+        type=str,
+        default=None,
+        help="Optional JSONL path for per-step SMC metrics.",
     )
     # Benchmark
     bench = parser.add_argument_group("benchmark")

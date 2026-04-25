@@ -48,6 +48,9 @@ _SMCENGINE_EXPLICIT_ARGS = {
     "smc_target_temperature",        # → target_temperature
     "smc_resample_threshold",        # → resample_threshold
     "smc_resample_method",           # → resample_method
+    "smc_metrics",
+    "smc_metrics_log_interval",
+    "smc_metrics_jsonl",
     "tp_size",
     "base_gpu_id",
 }
@@ -87,6 +90,9 @@ class _SMCEngineBackend:
             target_temperature=server_args.smc_target_temperature,
             resample_threshold=server_args.smc_resample_threshold,
             resample_method=server_args.smc_resample_method,
+            smc_metrics=server_args.smc_metrics,
+            smc_metrics_log_interval=server_args.smc_metrics_log_interval,
+            smc_metrics_jsonl=server_args.smc_metrics_jsonl,
             tp_size=server_args.tp_size,
             base_gpu_id=server_args.base_gpu_id,
             **extras,

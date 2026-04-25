@@ -68,6 +68,10 @@ class SMCEngine:
         target_temperature: float = 1.0,
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
+        # Diagnostics
+        smc_metrics: bool = False,
+        smc_metrics_log_interval: int = 50,
+        smc_metrics_jsonl: Optional[str] = None,
         # Hardware
         tp_size: int = 1,
         base_gpu_id: int = 0,
@@ -103,6 +107,9 @@ class SMCEngine:
             smc_target_temperature=target_temperature,
             smc_resample_threshold=resample_threshold,
             smc_resample_method=resample_method,
+            smc_metrics=smc_metrics,
+            smc_metrics_log_interval=smc_metrics_log_interval,
+            smc_metrics_jsonl=smc_metrics_jsonl,
             tp_size=tp_size,
             base_gpu_id=base_gpu_id,
         )

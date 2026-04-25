@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import signal
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -28,6 +30,136 @@ from sglang.srt.utils import DynamicGradMode, kill_itself_when_parent_died
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+class SMCMetricLogger:
+    """Lightweight host-side aggregator for SMC proposal diagnostics.
+
+    Metrics are computed once per decode cycle from per-group slot weights.
+    This intentionally lives outside the fused resampling kernel so Phase 0
+    instrumentation is easy to audit and can be disabled with near-zero cost.
+    """
+
+    def __init__(self, *, enabled: bool, log_interval: int = 50, jsonl_path: Optional[str] = None):
+        self.enabled = bool(enabled)
+        self.log_interval = max(int(log_interval or 1), 1)
+        self.jsonl_path = jsonl_path
+        self._fh = None
+        self.step = 0
+        self.totals = defaultdict(float)
+        self.counts = defaultdict(int)
+        if self.enabled and jsonl_path:
+            os.makedirs(os.path.dirname(jsonl_path) or ".", exist_ok=True)
+            self._fh = open(jsonl_path, "a", buffering=1)
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    @staticmethod
+    def _safe_float(x) -> float:
+        return float(x) if x is not None else 0.0
+
+    @torch.no_grad()
+    def snapshot_decode_step(self, slot_state: "ScheduleBatchSMC") -> List[Dict]:
+        """Capture pre-resampling group metrics.
+
+        Must be called before ``collect_resample_jobs_batch`` because the fused
+        collect kernel zeroes interval/cumulative weights for rows that resample.
+        """
+        if not self.enabled:
+            return []
+        rows = torch.nonzero(slot_state.row_in_use, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            return []
+
+        group_metrics = []
+        for row_t in rows.cpu().tolist():
+            row = int(row_t)
+            slots = slot_state.group_to_slots[row].to(torch.int64)
+            slots = slots[slots >= 0]
+            if slots.numel() == 0:
+                continue
+            interval_lw = slot_state.interval_weights[slots].detach().double()
+            cumulative_lw = slot_state.log_weights[slots].detach().double()
+            finite_mask = torch.isfinite(interval_lw)
+            if not finite_mask.any():
+                continue
+            finite_interval = interval_lw[finite_mask]
+            finite_cumulative = cumulative_lw[torch.isfinite(cumulative_lw)]
+            norm_lw = finite_interval - torch.logsumexp(finite_interval, dim=0)
+            weights = norm_lw.exp()
+            ess = 1.0 / torch.sum(weights * weights).clamp_min(1e-300)
+            logw_var = finite_interval.var(unbiased=False) if finite_interval.numel() > 1 else torch.zeros((), dtype=torch.float64, device=finite_interval.device)
+            cum_var = finite_cumulative.var(unbiased=False) if finite_cumulative.numel() > 1 else torch.zeros((), dtype=torch.float64, device=finite_interval.device)
+            group_metrics.append({
+                "row": row,
+                "group_id": slot_state.row_to_group_id.get(row, str(row)),
+                "ess": float(ess.item()),
+                "ess_frac": float((ess / max(slots.numel(), 1)).item()),
+                "logw_mean": float(finite_interval.mean().item()),
+                "logw_var": float(logw_var.item()),
+                "cum_logw_mean": float(finite_cumulative.mean().item()) if finite_cumulative.numel() else 0.0,
+                "cum_logw_var": float(cum_var.item()),
+                "min_weight": float(weights.min().item()),
+                "max_weight": float(weights.max().item()),
+                "resampled": False,
+            })
+        return group_metrics
+
+    def record_decode_step(self, group_metrics: List[Dict], plan, did_resample: bool) -> None:
+        if not self.enabled or not group_metrics:
+            return
+        self.step += 1
+        if plan is not None:
+            for g in group_metrics:
+                row = g["row"]
+                g["resampled"] = bool(plan.resample_mask[row].item())
+
+        n = len(group_metrics)
+        aggregate = {
+            "step": self.step,
+            "n_groups": n,
+            "ess_mean": sum(g["ess"] for g in group_metrics) / n,
+            "ess_frac_mean": sum(g["ess_frac"] for g in group_metrics) / n,
+            "logw_var_mean": sum(g["logw_var"] for g in group_metrics) / n,
+            "cum_logw_var_mean": sum(g["cum_logw_var"] for g in group_metrics) / n,
+            "max_weight_mean": sum(g["max_weight"] for g in group_metrics) / n,
+            "resampled_groups": sum(1 for g in group_metrics if g["resampled"]),
+            "did_resample": bool(did_resample),
+            "n_resample_jobs": int(getattr(plan, "n_jobs", 0) if plan is not None else 0),
+        }
+
+        for k, v in aggregate.items():
+            if isinstance(v, (int, float, bool)):
+                self.totals[k] += float(v)
+        self.counts["steps"] += 1
+
+        if self._fh is not None:
+            self._fh.write(json.dumps({"aggregate": aggregate, "groups": group_metrics}, sort_keys=True) + "\n")
+
+        if self.step % self.log_interval == 0:
+            logger.info(
+                "SMC metrics step=%d groups=%d ESS/N=%.3f logw_var=%.3f "
+                "cum_logw_var=%.3f resampled=%d jobs=%d max_w=%.3f",
+                aggregate["step"], aggregate["n_groups"], aggregate["ess_frac_mean"],
+                aggregate["logw_var_mean"], aggregate["cum_logw_var_mean"],
+                aggregate["resampled_groups"], aggregate["n_resample_jobs"],
+                aggregate["max_weight_mean"],
+            )
+
+    def summary(self) -> Dict[str, float]:
+        steps = max(self.counts.get("steps", 0), 1)
+        return {
+            "steps": self.counts.get("steps", 0),
+            "ess_frac_mean": self.totals.get("ess_frac_mean", 0.0) / steps,
+            "logw_var_mean": self.totals.get("logw_var_mean", 0.0) / steps,
+            "cum_logw_var_mean": self.totals.get("cum_logw_var_mean", 0.0) / steps,
+            "resampled_groups_per_step": self.totals.get("resampled_groups", 0.0) / steps,
+            "resample_jobs_per_step": self.totals.get("n_resample_jobs", 0.0) / steps,
+            "max_weight_mean": self.totals.get("max_weight_mean", 0.0) / steps,
+        }
 
 
 def _prepare_req_for_private_prefill(req: Req) -> None:
@@ -253,6 +385,11 @@ class SMCScheduler(Scheduler):
         self.coordinator = SMCCoordinator(
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
+        )
+        self.smc_metrics = SMCMetricLogger(
+            enabled=getattr(server_args, "smc_metrics", False),
+            log_interval=getattr(server_args, "smc_metrics_log_interval", 50),
+            jsonl_path=getattr(server_args, "smc_metrics_jsonl", None),
         )
 
     def _make_runtime_tracking_batch(
@@ -672,11 +809,16 @@ class SMCScheduler(Scheduler):
             rebuild_active=False,
         )
 
+        # Snapshot diagnostics before fused collect mutates resampled rows'
+        # interval/cumulative weights.
+        metrics_snapshot = self.smc_metrics.snapshot_decode_step(self.slot_state)
+
         # One fused collect over every in-use group row, then dispatch the
         # resulting dst/src plan.  The kernel gates on row_in_use, so we
         # don't need to filter the group list on the Python side.
         plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
         did_resample = plan.n_jobs > 0
+        self.smc_metrics.record_decode_step(metrics_snapshot, plan, did_resample)
         if did_resample:
             self.coordinator.dispatch_resample_batch(
                 plan, self.slot_state, rebuild_active=False,
