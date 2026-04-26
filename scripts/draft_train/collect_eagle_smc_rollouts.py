@@ -76,6 +76,7 @@ def main():
     p.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
     p.add_argument("--num-prompts", type=int, default=2000)
     p.add_argument("--num-candidates", type=int, default=8)
+    p.add_argument("--target-topk", type=int, default=64)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--max-prompt-tokens", type=int, default=768)
     p.add_argument("--shard-size", type=int, default=256)
@@ -137,6 +138,7 @@ def main():
         hidden_cat = torch.cat([hs[i][:, -1:, :] for i in layer_ids], dim=-1).to(dtype)
         target_next_logits = out2.logits[:, -1, :].float()
         target_logp = F.log_softmax(target_next_logits, dim=-1)
+        topk_logps, topk_ids = torch.topk(target_logp, k=args.target_topk, dim=-1)
 
         # EAGLE q(. | hidden(prefix+x0), x0)
         hidden_proj = draft.project_hidden_states(hidden_cat)
@@ -170,6 +172,8 @@ def main():
                 "candidates": candidates.to(torch.int32).cpu().view(args.num_candidates, 1),
                 "draft_logps_old": draft_lp.to(torch.float16).cpu().view(args.num_candidates, 1),
                 "target_logps": target_lp.to(torch.float16).cpu().view(args.num_candidates, 1),
+                "target_topk_ids": topk_ids[0].to(torch.int32).cpu(),
+                "target_topk_logps": topk_logps[0].to(torch.float16).cpu(),
                 "gamma_train": 1,
                 "temperature": args.temperature,
             }

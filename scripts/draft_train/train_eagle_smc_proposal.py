@@ -56,21 +56,35 @@ def collate(batch: List[Dict]) -> Dict:
     candidates = torch.stack([r["candidates"].long().view(K) for r in batch], dim=0)
     target_logps = torch.stack([r["target_logps"].float().view(K) for r in batch], dim=0)
     draft_logps_old = torch.stack([r["draft_logps_old"].float().view(K) for r in batch], dim=0)
+    target_topk_ids = torch.stack([r["target_topk_ids"].long() for r in batch], dim=0)
+    target_topk_logps = torch.stack([r["target_topk_logps"].float() for r in batch], dim=0)
     return {
         "hidden_states": hidden,
         "seed_token": seed,
         "candidates": candidates,
         "target_logps": target_logps,
         "draft_logps_old": draft_logps_old,
+        "target_topk_ids": target_topk_ids,
+        "target_topk_logps": target_topk_logps,
     }
 
 
-def compute_loss(draft, batch: Dict, device, dtype, anchor_weight: float = 0.0):
+def compute_loss(
+    draft,
+    batch: Dict,
+    device,
+    dtype,
+    smc_weight: float = 0.1,
+    topk_weight: float = 1.0,
+    anchor_weight: float = 1.0,
+):
     hidden_cat = batch["hidden_states"].to(device=device, dtype=dtype).unsqueeze(1)
     seed = batch["seed_token"].to(device=device).unsqueeze(1)
     candidates = batch["candidates"].to(device=device)
     target_logps = batch["target_logps"].to(device=device)
     draft_logps_old = batch["draft_logps_old"].to(device=device)
+    target_topk_ids = batch["target_topk_ids"].to(device=device)
+    target_topk_logps = batch["target_topk_logps"].to(device=device)
     B, K = candidates.shape
 
     hidden_proj = draft.project_hidden_states(hidden_cat)
@@ -90,7 +104,14 @@ def compute_loss(draft, batch: Dict, device, dtype, anchor_weight: float = 0.0):
     logits = draft.compute_logits(h)[:, -1, :].float()
     log_q = F.log_softmax(logits, dim=-1)
     log_q_cand = log_q.gather(1, candidates)
+    log_q_topk = log_q.gather(1, target_topk_ids)
 
+    # Stable teacher-forced target KL on the target's top-k support.
+    teacher_lp = target_topk_logps - torch.logsumexp(target_topk_logps, dim=1, keepdim=True)
+    teacher_p = teacher_lp.exp().detach()
+    topk_kl = (teacher_p * (teacher_lp.detach() - log_q_topk)).sum(dim=1).mean()
+
+    # SMC proposal-learning term over sampled candidates.
     logw = target_logps - draft_logps_old
     weights = F.softmax(logw, dim=1).detach()
     smc_loss = -(weights * log_q_cand).sum(dim=1).mean()
@@ -103,11 +124,12 @@ def compute_loss(draft, batch: Dict, device, dtype, anchor_weight: float = 0.0):
         new_lp = log_q_cand - torch.logsumexp(log_q_cand, dim=1, keepdim=True)
         anchor = (old_probs * (old_lp - new_lp)).sum(dim=1).mean()
 
-    loss = smc_loss + anchor_weight * anchor
+    loss = topk_weight * topk_kl + smc_weight * smc_loss + anchor_weight * anchor
     with torch.no_grad():
         ess = 1.0 / (weights * weights).sum(dim=1)
         stats = {
             "loss": float(loss.item()),
+            "topk_kl": float(topk_kl.item()),
             "smc_loss": float(smc_loss.item()),
             "anchor": float(anchor.item()),
             "ess": float(ess.mean().item()),
@@ -133,7 +155,9 @@ def main():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--warmup-steps", type=int, default=20)
-    p.add_argument("--anchor-weight", type=float, default=0.1)
+    p.add_argument("--smc-weight", type=float, default=0.1)
+    p.add_argument("--topk-weight", type=float, default=1.0)
+    p.add_argument("--anchor-weight", type=float, default=1.0)
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--save-interval", type=int, default=200)
     args = p.parse_args()
@@ -165,7 +189,15 @@ def main():
         for batch in loader:
             global_step += 1
             opt.zero_grad(set_to_none=True)
-            loss, stats = compute_loss(draft, batch, device, dtype, args.anchor_weight)
+            loss, stats = compute_loss(
+                draft,
+                batch,
+                device,
+                dtype,
+                smc_weight=args.smc_weight,
+                topk_weight=args.topk_weight,
+                anchor_weight=args.anchor_weight,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(draft.parameters(), 0.5)
             opt.step(); sched.step()

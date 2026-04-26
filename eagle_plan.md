@@ -1,5 +1,7 @@
 # EAGLE / SMC-SD Proposal Learning Plan
 
+> Status updated: 2026-04-26. This document now includes completed Phase 0 instrumentation, EAGLE chain porting, full-vocab EAGLE warm-start training, first SMC-native proposal-learning attempts, results, failures, and recommended next steps.
+
 ## Goal
 
 Train a better proposal/draft model for SMC-SD, with the initial target being:
@@ -720,6 +722,910 @@ Be explicit about whether weights use raw target logprobs or tempered target log
 ### 7. Hidden-state OOD/exposure bias
 
 Standard EAGLE hidden states are from target/gold trajectories. SMC proposal finetuning must expose EAGLE to its own sampled paths.
+
+---
+
+## Completed implementation and experiment log
+
+### Branches and commits
+
+Work has been done on:
+
+```text
+smcsd branch: phase0-smc-metrics
+sglang submodule branch: phase0-smc-metrics
+```
+
+Relevant pushed PR URLs:
+
+```text
+SMCSD:  https://github.com/abdelfattah-lab/smcsd/pull/new/phase0-smc-metrics
+SGLang: https://github.com/abdelfattah-lab/sglang/pull/new/phase0-smc-metrics
+```
+
+Important commits in `smcsd`:
+
+```text
+f09cbfd1e Add Phase 0 SMC diagnostics
+c85d0a451 Port experimental SMC EAGLE chain support
+89c11df37 Add full-vocab EAGLE expansion utility
+f1a0f6fb2 Add SMC-native EAGLE proposal training scripts
+```
+
+Important commits in `3rdparty/sglang`:
+
+```text
+0ca7c9197 Add SMC metrics server arguments
+5821cf5ea Add SMC EAGLE draft mode arguments
+628f3d3b4 Route EAGLE3 draft configs in SMC
+```
+
+Untracked/local generated artifacts may exist and should not be committed blindly:
+
+```text
+checkpoints/
+data/
+todo.md
+```
+
+---
+
+## Completed Phase 0: metrics instrumentation
+
+Added SMC diagnostic flags to SGLang server args:
+
+```bash
+--smc-metrics
+--smc-metrics-log-interval
+--smc-metrics-jsonl
+```
+
+Implemented `SMCMetricLogger` in:
+
+```text
+smcsd/core/scheduler.py
+```
+
+Metrics logged per decode step:
+
+```text
+ESS
+ESS / N
+interval log-weight variance
+cumulative log-weight variance
+max normalized particle weight
+resampled groups
+resample jobs
+```
+
+Important implementation detail: metrics are snapshotted **before** fused resampling because the fused collect kernel mutates/zeros interval/cumulative weights for resampled rows.
+
+Plumbed metrics through:
+
+```text
+smcsd/engine.py
+scripts/accuracy_test_gsm8k.py
+scripts/tps_benchmark_scripts/bench_offline_throughput.py
+```
+
+Baseline command used:
+
+```bash
+cd /home/yahya/smcsd
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --particles 12 --gamma 8 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 400 \
+  --max-running-requests 24 \
+  --cuda-graph-max-bs 24 \
+  --smc-metrics \
+  --smc-metrics-log-interval 25 \
+  --smc-metrics-jsonl outputs/metrics_llama1b_8b_gsm8k_N12_g8_t07.jsonl
+```
+
+Baseline result:
+
+```text
+Accuracy:          299/400 (74.8%)
+Invalid:           6/400 (1.5%)
+Output throughput: 298.8 tok/s
+Total tokens:      82898
+Wall time:         277.4s
+```
+
+Baseline metrics:
+
+```text
+steps:             9964
+ESS mean:          5.79 / 12
+ESS/N mean:        0.482
+ESS/N median:      0.464
+ESS/N p10:         0.168
+ESS/N p90:         0.833
+logw_var mean:     13.73
+logw_var median:   5.42
+logw_var p90:      29.51
+logw_var max:      941.27
+max_weight mean:   0.345
+max_weight median: 0.283
+max_weight p90:    0.673
+resampled steps:   54.6%
+total resamples:   5441 groups
+```
+
+Interpretation:
+
+```text
+The AR 1B draft is imperfect but much better than all current EAGLE attempts.
+It has moderate ESS but far lower log-weight variance than EAGLE.
+```
+
+---
+
+## Completed Phase 1: EAGLE chain support port
+
+Ported experimental EAGLE chain/tree code from `smc-eagle-tree` onto `phase0-smc-metrics` / `smc-slot-refactor` base. The tree modes are still experimental; use chain mode first.
+
+EAGLE draft modes added:
+
+```text
+dense
+eagle3
+eagle3_chain
+eagle3_tree_probe
+eagle3_tree_smc
+eagle3_tree_oracle
+```
+
+Main implementation files touched:
+
+```text
+smcsd/core/info.py
+smcsd/core/req_state.py
+smcsd/core/scheduler.py
+smcsd/core/worker.py
+smcsd/engine.py
+smcsd/model_executor/smc_cuda_graph_runner.py
+smcsd/model_executor/smc_model_runner.py
+3rdparty/sglang/python/sglang/srt/server_args.py
+3rdparty/sglang/python/sglang/srt/configs/model_config.py
+```
+
+Important SGLang loading fix:
+
+```text
+If a draft model config contains draft_vocab_size and architecture is LlamaForCausalLM,
+route it to LlamaForCausalLMEagle3 so hot-vocab EAGLE checkpoints load correctly.
+```
+
+Without this fix, `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B` fails loading with:
+
+```text
+AssertionError: self.org_vocab_size=128256 ... loaded_weight.shape[output_dim]=32000
+```
+
+because its config has:
+
+```json
+"architectures": ["LlamaForCausalLM"],
+"vocab_size": 128256,
+"draft_vocab_size": 32000
+```
+
+but its lm_head has only 32k rows.
+
+---
+
+## EAGLE correctness/evaluation experiments
+
+### Experiment A: off-the-shelf hot-vocab EAGLE, N=2, gamma=1, q3
+
+Command skeleton:
+
+```bash
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model yuhuili/EAGLE3-LLaMA3.1-Instruct-8B \
+  --draft-mode eagle3_chain \
+  --particles 2 --gamma 1 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 3 \
+  --max-new-tokens 64 \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs 4 \
+  --smc-metrics
+```
+
+Result:
+
+```text
+Runs end-to-end, but output is nonsensical.
+Accuracy: 0/3
+Invalid: 1/3
+```
+
+Tiny metrics:
+
+```text
+ESS/N mean:      0.561
+logw_var mean:   196.7
+max_weight mean: 0.941
+```
+
+### Experiment B: off-the-shelf hot-vocab EAGLE, N=8, gamma=1, q20
+
+Command:
+
+```bash
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model yuhuili/EAGLE3-LLaMA3.1-Instruct-8B \
+  --draft-mode eagle3_chain \
+  --particles 8 --gamma 1 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 20 \
+  --max-new-tokens 128 \
+  --max-running-requests 12 \
+  --cuda-graph-max-bs 12 \
+  --smc-metrics \
+  --smc-metrics-jsonl outputs/metrics_eagle_chain_gsm8k_N8_g1_q20.jsonl
+```
+
+Result:
+
+```text
+Accuracy:          1/20 (5.0%)
+Invalid:           5/20 (25.0%)
+Output throughput: 138.9 tok/s
+```
+
+Metrics:
+
+```text
+ESS/N mean:        0.616
+logw_var mean:     41.9
+max_weight mean:   0.344
+resampled steps:   36.9%
+```
+
+Conclusion:
+
+```text
+It runs, but off-the-shelf hot-vocab EAGLE is a very bad SMC proposal.
+```
+
+---
+
+## Option A: full-vocab EAGLE support
+
+Added utility:
+
+```text
+scripts/draft_train/expand_eagle3_to_full_vocab.py
+```
+
+Purpose:
+
+```text
+Convert a hot-vocab EAGLE3 checkpoint into a full-vocab checkpoint by creating
+lm_head rows for the full target vocabulary, initializing non-hot rows from the
+target lm_head, and copying trained hot rows into their d2t-mapped positions.
+```
+
+Command used:
+
+```bash
+python scripts/draft_train/expand_eagle3_to_full_vocab.py \
+  --eagle yuhuili/EAGLE3-LLaMA3.1-Instruct-8B \
+  --target meta-llama/Llama-3.1-8B-Instruct \
+  --output checkpoints/eagle3_llama31_8b_full_vocab
+```
+
+Output:
+
+```text
+Wrote full-vocab EAGLE3 checkpoint to checkpoints/eagle3_llama31_8b_full_vocab
+old draft vocab: 32000
+target vocab: 128256
+hidden: 4096
+hot rows copied: 32000
+non-hot init: target lm_head
+```
+
+Smoke result:
+
+```text
+Accuracy: 0/3
+Invalid: 2/3
+ESS/N mean: 0.545
+logw_var mean: 212.5
+```
+
+Conclusion:
+
+```text
+Expansion gives full support, but not quality. Need actual full-vocab EAGLE training.
+```
+
+---
+
+## Full-vocab EAGLE warm-start training
+
+SpecForge was used for standard EAGLE warm-start training.
+
+Relevant repo:
+
+```text
+/home/yahya/SpecForge
+```
+
+Relevant config:
+
+```text
+/home/yahya/SpecForge/configs/llama3-8B-eagle3-smc.json
+```
+
+Important property:
+
+```json
+"draft_vocab_size": 128256
+```
+
+SpecForge already supports:
+
+```bash
+--init-lm-head-from-target
+```
+
+which initializes full-vocab draft lm_head from target lm_head.
+
+Prepared GSM8K data:
+
+```bash
+cd /home/yahya/SpecForge
+python scripts/prepare_data.py \
+  --dataset gsm8k \
+  --sample-size 2000 \
+  --output-path cache/dataset/gsm8k_train_2k.jsonl
+```
+
+Actual data file:
+
+```text
+/home/yahya/SpecForge/cache/dataset/gsm8k_train_2k.jsonl/gsm8k_train.jsonl
+```
+
+Smoke training succeeded and saved:
+
+```text
+/home/yahya/SpecForge/outputs/llama31-8b-eagle3-smc-gsm8k-smoke/epoch_0_step_2/
+```
+
+Full warm-start training command:
+
+```bash
+cd /home/yahya/SpecForge
+CUDA_VISIBLE_DEVICES=0 \
+TORCHINDUCTOR_CACHE_DIR=/home/yahya/SpecForge/cache/compiled_kernels \
+PYTHONUNBUFFERED=1 \
+nohup /home/yahya/miniconda3/envs/specforge/bin/torchrun \
+  --standalone \
+  --nproc_per_node 1 \
+  scripts/train_eagle3.py \
+  --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model-config configs/llama3-8B-eagle3-smc.json \
+  --train-data-path cache/dataset/gsm8k_train_2k.jsonl/gsm8k_train.jsonl \
+  --build-dataset-num-proc 4 \
+  --dataloader-num-workers 0 \
+  --output-dir outputs/llama31-8b-eagle3-smc-gsm8k-2k \
+  --num-epochs 1 \
+  --batch-size 1 \
+  --tp-size 1 \
+  --learning-rate 1e-4 \
+  --max-length 1024 \
+  --chat-template llama3 \
+  --cache-dir cache \
+  --attention-backend sdpa \
+  --target-model-backend sglang \
+  --log-interval 25 \
+  --save-interval 500 \
+  --eval-interval 999999 \
+  --sglang-attention-backend fa3 \
+  --sglang-mem-fraction-static 0.25 \
+  --init-lm-head-from-target \
+  --report-to none
+```
+
+Completed 1 epoch / 2000 examples. Final checkpoint:
+
+```text
+/home/yahya/SpecForge/outputs/llama31-8b-eagle3-smc-gsm8k-2k/epoch_0_step_2000/
+```
+
+Intermediate checkpoints:
+
+```text
+epoch_0_step_500/
+epoch_0_step_1000/
+epoch_0_step_1500/
+epoch_0_step_2000/
+```
+
+Evaluation of warm-start checkpoint:
+
+```bash
+cd /home/yahya/smcsd
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model /home/yahya/SpecForge/outputs/llama31-8b-eagle3-smc-gsm8k-2k/epoch_0_step_2000 \
+  --draft-mode eagle3_chain \
+  --particles 8 --gamma 1 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 20 \
+  --max-new-tokens 128 \
+  --max-running-requests 12 \
+  --cuda-graph-max-bs 12 \
+  --smc-metrics \
+  --smc-metrics-jsonl outputs/metrics_eagle_full_vocab_trained_gsm8k_N8_g1_q20.jsonl
+```
+
+Result:
+
+```text
+Accuracy:          3/20 (15.0%)
+Invalid:           4/20 (20.0%)
+Output throughput: 130.6 tok/s
+```
+
+Metrics:
+
+```text
+ESS/N mean:        0.523
+logw_var mean:     64.2
+max_weight mean:   0.423
+resampled steps:   50.0%
+```
+
+Conclusion:
+
+```text
+Full-vocab warm-start training improves accuracy over off-the-shelf EAGLE (5% -> 15%)
+but is still far from AR baseline and has worse log-weight variance.
+```
+
+---
+
+## SMC-native proposal-learning scripts
+
+Added:
+
+```text
+scripts/draft_train/collect_eagle_smc_rollouts.py
+scripts/draft_train/train_eagle_smc_proposal.py
+```
+
+### `collect_eagle_smc_rollouts.py`
+
+Initial version supports `gamma_train=1`.
+
+For each prompt:
+
+```text
+1. target samples seed x0 from p(. | prompt)
+2. target computes hidden state for prompt+x0
+3. EAGLE proposes R candidate y1 tokens
+4. store q_old(y1), p_target(y1), target hidden, seed token, candidate tokens
+```
+
+Important bug found and fixed:
+
+```text
+Using absolute target position ids in one-step EAGLE draft caused CUDA device-side asserts.
+Fix: use local one-token draft position ids:
+    pos = torch.zeros((1, 1), dtype=torch.long, device=device)
+This matches SpecForge EAGLE training; target hidden state carries prefix information.
+```
+
+### `train_eagle_smc_proposal.py`
+
+Initial pure SMC objective:
+
+```text
+logw_i = log p_target(y_i) - log q_old(y_i)
+w_i = softmax(logw_i)
+L = -sum_i stopgrad(w_i) log q_new(y_i)
+```
+
+Smoke tests passed.
+
+---
+
+## Pure SMC proposal finetune experiment
+
+Rollout collection:
+
+```bash
+python scripts/draft_train/collect_eagle_smc_rollouts.py \
+  --target meta-llama/Llama-3.1-8B-Instruct \
+  --draft /home/yahya/SpecForge/outputs/llama31-8b-eagle3-smc-gsm8k-2k/epoch_0_step_2000 \
+  --data /home/yahya/SpecForge/cache/dataset/gsm8k_train_2k.jsonl/gsm8k_train.jsonl \
+  --output-dir data/eagle_smc_rollouts_gsm8k_2k_R8_g1 \
+  --num-prompts 2000 \
+  --num-candidates 8 \
+  --temperature 0.7 \
+  --max-prompt-tokens 512 \
+  --shard-size 256
+```
+
+Result:
+
+```text
+Done: 2000 prompts, 8 shards
+```
+
+Training:
+
+```bash
+python scripts/draft_train/train_eagle_smc_proposal.py \
+  --init /home/yahya/SpecForge/outputs/llama31-8b-eagle3-smc-gsm8k-2k/epoch_0_step_2000 \
+  --data-dir data/eagle_smc_rollouts_gsm8k_2k_R8_g1 \
+  --output-dir outputs/eagle_smc_proposal_gsm8k_2k_R8_g1 \
+  --batch-size 8 \
+  --epochs 1 \
+  --lr 2e-5 \
+  --warmup-steps 20 \
+  --anchor-weight 0.1 \
+  --log-interval 10 \
+  --save-interval 200
+```
+
+Final checkpoint:
+
+```text
+outputs/eagle_smc_proposal_gsm8k_2k_R8_g1/final
+```
+
+Evaluation result:
+
+```text
+Accuracy:          0/20 (0.0%)
+Invalid:           1/20 (5.0%)
+Output throughput: 123.0 tok/s
+```
+
+Metrics:
+
+```text
+ESS/N mean:        0.533
+logw_var mean:     89.5
+max_weight mean:   0.413
+resampled steps:   49.0%
+```
+
+Conclusion:
+
+```text
+Pure SMC one-step update destabilized proposal quality and made task accuracy worse.
+```
+
+---
+
+## Hybrid target-topk + SMC + anchor experiment
+
+Modified rollout collector to store:
+
+```text
+target_topk_ids
+target_topk_logps
+```
+
+Modified trainer objective to:
+
+```text
+L = topk_weight * KL(target_topk || q_new)
+  + smc_weight  * SMC_weighted_MLE
+  + anchor_weight * KL(q_old || q_new on sampled candidates)
+```
+
+Smoke tests passed.
+
+Full rollout collection:
+
+```bash
+python scripts/draft_train/collect_eagle_smc_rollouts.py \
+  --target meta-llama/Llama-3.1-8B-Instruct \
+  --draft /home/yahya/SpecForge/outputs/llama31-8b-eagle3-smc-gsm8k-2k/epoch_0_step_2000 \
+  --data /home/yahya/SpecForge/cache/dataset/gsm8k_train_2k.jsonl/gsm8k_train.jsonl \
+  --output-dir data/eagle_smc_rollouts_gsm8k_2k_R8_g1_topk64 \
+  --num-prompts 2000 \
+  --num-candidates 8 \
+  --target-topk 64 \
+  --temperature 0.7 \
+  --max-prompt-tokens 512 \
+  --shard-size 256
+```
+
+Training:
+
+```bash
+python scripts/draft_train/train_eagle_smc_proposal.py \
+  --init /home/yahya/SpecForge/outputs/llama31-8b-eagle3-smc-gsm8k-2k/epoch_0_step_2000 \
+  --data-dir data/eagle_smc_rollouts_gsm8k_2k_R8_g1_topk64 \
+  --output-dir outputs/eagle_smc_hybrid_gsm8k_2k_R8_g1 \
+  --batch-size 8 \
+  --epochs 1 \
+  --lr 5e-6 \
+  --warmup-steps 20 \
+  --smc-weight 0.1 \
+  --topk-weight 1.0 \
+  --anchor-weight 1.0 \
+  --log-interval 10 \
+  --save-interval 200
+```
+
+Final checkpoint:
+
+```text
+outputs/eagle_smc_hybrid_gsm8k_2k_R8_g1/final
+```
+
+Evaluation:
+
+```bash
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model outputs/eagle_smc_hybrid_gsm8k_2k_R8_g1/final \
+  --draft-mode eagle3_chain \
+  --particles 8 --gamma 1 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 20 \
+  --max-new-tokens 128 \
+  --max-running-requests 12 \
+  --cuda-graph-max-bs 12 \
+  --smc-metrics \
+  --smc-metrics-jsonl outputs/metrics_eagle_hybrid_gsm8k_N8_g1_q20.jsonl
+```
+
+Result:
+
+```text
+Accuracy:          2/20 (10.0%)
+Invalid:           2/20 (10.0%)
+Output throughput: 127.2 tok/s
+```
+
+Metrics:
+
+```text
+ESS/N mean:        0.527
+logw_var mean:     97.4
+max_weight mean:   0.414
+resampled steps:   49.3%
+```
+
+Conclusion:
+
+```text
+Hybrid loss did not fix proposal quality. It reduced target top-k KL during training,
+but generation quality and SMC metrics remained poor or worse.
+```
+
+---
+
+## Summary table of results so far
+
+| Draft / training | Eval config | Accuracy | TPS | ESS/N mean | logw_var mean | max_w mean | Resample rate |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| AR Llama-3.2-1B -> Llama-3.1-8B | N=12, gamma=8, q400 | 74.8% | 298.8 | 0.482 | 13.7 | 0.345 | 54.6% |
+| Off-shelf hot-vocab EAGLE3 | N=8, gamma=1, q20 | 5.0% | 138.9 | 0.616 | 41.9 | 0.344 | 36.9% |
+| Expanded full-vocab EAGLE3, no training | N=2, gamma=1, q3 | 0.0% | 121.4 | 0.545 | 212.5 | 0.959 | 0.0% |
+| Full-vocab EAGLE warm-start on GSM8K 2k | N=8, gamma=1, q20 | 15.0% | 130.6 | 0.523 | 64.2 | 0.423 | 50.0% |
+| Pure SMC one-step finetune | N=8, gamma=1, q20 | 0.0% | 123.0 | 0.533 | 89.5 | 0.413 | 49.0% |
+| Hybrid topk + SMC one-step finetune | N=8, gamma=1, q20 | 10.0% | 127.2 | 0.527 | 97.4 | 0.414 | 49.3% |
+
+---
+
+## Current conclusion
+
+The EAGLE integration is functional enough to run, and full-vocab EAGLE checkpoints can be trained and loaded. However:
+
+```text
+All current EAGLE proposals are far worse than the AR 1B draft for SMC-SD.
+```
+
+The one-step SMC proposal-learning setup did not work. Even the hybrid top-k + SMC objective did not improve downstream SMC-SD performance.
+
+Main likely reason:
+
+```text
+The collector/trainer only trains isolated one-step EAGLE states.
+But SMC-SD inference uses recurrent EAGLE hidden-state dynamics across accepted tokens.
+```
+
+So the training distribution is still mismatched from inference. We need recurrent path-level training.
+
+---
+
+## Recommended next steps for the next agent
+
+### 1. Stop single-step `gamma_train=1` training
+
+Do not spend more time tuning the current one-step objective unless doing a very small ablation. It is unlikely to solve the core mismatch.
+
+### 2. Implement recurrent EAGLE rollout collection
+
+Create collector v2:
+
+```text
+scripts/draft_train/collect_eagle_smc_rollouts_v2.py
+```
+
+For each prompt:
+
+1. Run target prefill.
+2. Sample seed token `x0` from target.
+3. Capture target hidden state for `prompt + x0`.
+4. Run EAGLE recurrently for `gamma_train = 2 or 4` steps:
+   ```text
+   h_t, logits_t = EAGLE(h_{t-1}, token_{t-1})
+   y_t ~ q_old(logits_t)
+   store log q_old(y_t)
+   ```
+5. Score the full sampled path with target in one teacher-forced pass:
+   ```text
+   log p_target(y_1:K | prompt, x0)
+   ```
+6. Store per-step:
+   ```text
+   candidate paths [R, gamma_train]
+   draft_logps_old [R, gamma_train]
+   target_logps [R, gamma_train]
+   target_topk_ids/logps per step if using KL
+   initial target hidden state
+   seed token
+   ```
+
+### 3. Implement recurrent path-level EAGLE trainer
+
+Create trainer v2:
+
+```text
+scripts/draft_train/train_eagle_smc_recurrent.py
+```
+
+Teacher-force full candidate paths through EAGLE recurrence, matching inference:
+
+```text
+h_0 = initial target hidden state
+for t in 1..K:
+    logits_t, h_t = EAGLE(h_{t-1}, y_{t-1})
+    compute log q_new(y_t)
+```
+
+Loss:
+
+```text
+logw_i = sum_t log p_i,t - sum_t log q_old_i,t
+w_i = softmax(logw_i)
+
+L_smc = - sum_i stopgrad(w_i) * sum_t log q_new_i,t
+```
+
+Add stabilizers:
+
+```text
+L = alpha * recurrent_target_topk_KL
+  + beta  * L_smc
+  + gamma * KL(q_old || q_new on sampled path tokens)
+```
+
+Start conservative:
+
+```text
+gamma_train = 2
+R = 8
+lr = 1e-6 to 5e-6
+alpha = 1.0
+beta = 0.01 to 0.1
+gamma = 1.0 to 5.0
+```
+
+### 4. Evaluate at gamma=1 first, then gamma=2
+
+Do not jump to gamma=8.
+
+Evaluation sequence:
+
+```text
+N=8, gamma=1, q20 GSM8K
+N=8, gamma=2, q20 GSM8K
+then larger q100/q400 if promising
+```
+
+Success criterion:
+
+```text
+Accuracy improves above warm-start 15% on q20
+logw_var mean decreases below 64
+max_weight decreases
+outputs become less degenerate
+```
+
+### 5. If recurrent EAGLE still fails
+
+Then likely issue is not just objective but proposal family or implementation. Options:
+
+1. Train longer standard full-vocab EAGLE on much larger data before SMC finetune.
+2. Implement full-support mixture proposal using hot-vocab EAGLE + AR fallback.
+3. Revisit target hidden-state capture / position semantics in SMC EAGLE chain.
+4. Compare EAGLE logits from SMC runtime vs SpecForge training on the same state to confirm they match.
+
+---
+
+## Useful paths for continuation
+
+SMCSD repo:
+
+```text
+/home/yahya/smcsd
+```
+
+SpecForge repo:
+
+```text
+/home/yahya/SpecForge
+```
+
+Baseline metrics:
+
+```text
+/home/yahya/smcsd/outputs/metrics_llama1b_8b_gsm8k_N12_g8_t07.jsonl
+```
+
+Warm-start EAGLE checkpoint:
+
+```text
+/home/yahya/SpecForge/outputs/llama31-8b-eagle3-smc-gsm8k-2k/epoch_0_step_2000
+```
+
+Pure SMC proposal checkpoint:
+
+```text
+/home/yahya/smcsd/outputs/eagle_smc_proposal_gsm8k_2k_R8_g1/final
+```
+
+Hybrid proposal checkpoint:
+
+```text
+/home/yahya/smcsd/outputs/eagle_smc_hybrid_gsm8k_2k_R8_g1/final
+```
+
+Important scripts:
+
+```text
+scripts/accuracy_test_gsm8k.py
+scripts/draft_train/expand_eagle3_to_full_vocab.py
+scripts/draft_train/collect_eagle_smc_rollouts.py
+scripts/draft_train/train_eagle_smc_proposal.py
+```
+
+SpecForge full-vocab config:
+
+```text
+/home/yahya/SpecForge/configs/llama3-8B-eagle3-smc.json
+```
 
 ---
 
