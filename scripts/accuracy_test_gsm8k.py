@@ -104,6 +104,7 @@ def run_smc_engine_eval(args, prompts, labels):
         eagle_num_draft_tokens=args.eagle_num_draft_tokens,
         eagle3_collect_path=args.eagle3_collect_path,
         eagle3_collect_shard_mb=args.eagle3_collect_shard_mb,
+        eagle_eps_uniform=args.eagle_eps_uniform,
     )
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
@@ -350,6 +351,13 @@ if __name__ == "__main__":
         type=int,
         default=512,
         help="Soft shard size for EAGLE on-policy data collection.",
+    )
+    smc_grp.add_argument(
+        "--eagle-eps-uniform",
+        type=float,
+        default=0.0,
+        help="Universal SMC safety belt epsilon for q_mix = (1-eps)*q_eagle + "
+             "eps*Uniform(V). Bounds worst-case logp - logq weights.",
     )
     smc_grp.add_argument(
         "--smc-metrics",

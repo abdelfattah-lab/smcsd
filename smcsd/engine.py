@@ -73,6 +73,7 @@ class SMCEngine:
         eagle_num_draft_tokens: Optional[int] = None,
         eagle3_collect_path: Optional[str] = None,
         eagle3_collect_shard_mb: int = 512,
+        eagle_eps_uniform: float = 0.0,
         # Diagnostics
         smc_metrics: bool = False,
         smc_metrics_log_interval: int = 50,
@@ -117,6 +118,7 @@ class SMCEngine:
             smc_eagle_num_draft_tokens=eagle_num_draft_tokens,
             smc_eagle3_collect_path=eagle3_collect_path,
             smc_eagle3_collect_shard_mb=eagle3_collect_shard_mb,
+            smc_eagle_eps_uniform=eagle_eps_uniform,
             smc_metrics=smc_metrics,
             smc_metrics_log_interval=smc_metrics_log_interval,
             smc_metrics_jsonl=smc_metrics_jsonl,

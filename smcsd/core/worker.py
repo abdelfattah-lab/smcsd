@@ -15,6 +15,8 @@ import os
 import time
 from typing import Optional
 
+import math
+
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -70,15 +72,39 @@ class SMCWorker(BaseSpecWorker):
             "eagle3_tree_smc",
             "eagle3_tree_oracle",
         )
-        self.eagle_topk = int(getattr(server_args, "speculative_eagle_topk", 1) or 1)
+        self.eagle_topk = int(
+            getattr(
+                server_args,
+                "smc_eagle_topk",
+                getattr(server_args, "speculative_eagle_topk", 1),
+            )
+            or 1
+        )
         self.eagle_num_draft_tokens = int(
-            getattr(server_args, "speculative_num_draft_tokens", None)
+            getattr(
+                server_args,
+                "smc_eagle_num_draft_tokens",
+                getattr(server_args, "speculative_num_draft_tokens", None),
+            )
             or (self.gamma + 1)
         )
         self.eagle_num_draft_tokens = max(self.eagle_num_draft_tokens, self.gamma + 1)
         self.eagle_diag_path = getattr(server_args, "smc_eagle3_collect_path", None)
         self._eagle_diag_file = None
         self._eagle_diag_counter = 0
+        self.eagle_eps_uniform = float(
+            getattr(server_args, "smc_eagle_eps_uniform", 0.0) or 0.0
+        )
+        if self.eagle_eps_uniform < 0.0 or self.eagle_eps_uniform >= 1.0:
+            raise ValueError(
+                f"smc_eagle_eps_uniform must be in [0, 1), got {self.eagle_eps_uniform}"
+            )
+        self._eagle_eps_log1me = (
+            math.log1p(-self.eagle_eps_uniform) if self.eagle_eps_uniform > 0 else 0.0
+        )
+        self._eagle_eps_log_eps = (
+            math.log(self.eagle_eps_uniform) if self.eagle_eps_uniform > 0 else 0.0
+        )
         if self.is_eagle3_tree:
             logger.warning(
                 "SMC EAGLE tree mode is experimental. eagle3_tree_probe keeps "
@@ -218,6 +244,44 @@ class SMCWorker(BaseSpecWorker):
         """No-op: _forward_extend already prefills both models."""
         pass
 
+    def _eagle_sample_with_eps_mix(self, log_probs: torch.Tensor):
+        """Sample from q_mix = (1-eps)*q_eagle + eps*Uniform(V) and return
+        (idx, log_q_mix(idx)).
+
+        log_probs has shape (bs, V) and is the log of q_eagle. When
+        eagle_eps_uniform is 0, this is identical to the legacy multinomial
+        sampling + gather. With eps>0:
+          - With probability eps a row is sampled uniformly at random.
+          - log_q_mix(t) = logsumexp(log(1-eps) + log_q_eagle(t), log(eps/V))
+        bounds the worst-case log q from below by log(eps/V), which caps the
+        worst-case logp - logq weight. This is the universal SMC-SD safety
+        belt; it does not require any sibling model.
+        """
+        eps = self.eagle_eps_uniform
+        if eps <= 0.0:
+            if self.smc_draft_temperature > 0:
+                idx = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
+            else:
+                idx = torch.argmax(log_probs, dim=-1)
+            log_q = log_probs.gather(1, idx.unsqueeze(1)).squeeze(1)
+            return idx, log_q
+
+        bs, vocab = log_probs.shape
+        # branch: with prob eps sample uniform, else sample q_eagle
+        coin = torch.rand(bs, device=log_probs.device) < eps
+        eagle_idx = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
+        unif_idx = torch.randint(0, vocab, (bs,), device=log_probs.device)
+        idx = torch.where(coin, unif_idx, eagle_idx)
+        # exact log q_mix(idx) = logaddexp(log(1-eps) + log_q_eagle(idx),
+        #                                  log(eps) - log(V))
+        log_q_eagle = log_probs.gather(1, idx.unsqueeze(1)).squeeze(1)
+        log_eps_v = self._eagle_eps_log_eps - math.log(vocab)
+        log_q_mix = torch.logaddexp(
+            log_q_eagle + self._eagle_eps_log1me,
+            torch.full_like(log_q_eagle, log_eps_v),
+        )
+        return idx, log_q_mix
+
     # ── Main entry point ──
 
     def forward_batch_generation(self, batch):
@@ -295,13 +359,8 @@ class SMCWorker(BaseSpecWorker):
         probs = torch.softmax(scaled, dim=-1)
         topk_p, topk_index = torch.topk(probs, self.eagle_topk, dim=-1)
 
-        first_idx = (
-            torch.multinomial(probs, num_samples=1).squeeze(-1)
-            if self.smc_draft_temperature > 0
-            else torch.argmax(logits, dim=-1)
-        )
         log_probs = torch.log_softmax(scaled, dim=-1)
-        first_lp = log_probs.gather(1, first_idx.unsqueeze(1)).squeeze(1)
+        first_idx, first_lp = self._eagle_sample_with_eps_mix(log_probs)
         first_target_id = (
             self.hot_token_id[first_idx] if self.hot_token_id is not None else first_idx
         )
@@ -384,6 +443,9 @@ class SMCWorker(BaseSpecWorker):
         x0 = draft_input.verified_id
         all_tokens = [x0]
         draft_logprobs = []
+        draft_topk_ids_steps: list[torch.Tensor] = []
+        draft_topk_logp_steps: list[torch.Tensor] = []
+        diag_topk = max(int(getattr(self, "eagle_topk", 1)), 1)
         current_ids = x0
 
         for step in range(gamma + 1):
@@ -418,6 +480,13 @@ class SMCWorker(BaseSpecWorker):
                     1, next_token.unsqueeze(1)
                 ).squeeze(1)
                 draft_logprobs.append(token_logprob)
+
+                if self.eagle_diag_path is not None:
+                    step_topk_logp, step_topk_ids = torch.topk(
+                        log_probs, diag_topk, dim=-1
+                    )
+                    draft_topk_ids_steps.append(step_topk_ids)
+                    draft_topk_logp_steps.append(step_topk_logp)
 
             all_tokens.append(next_token)
             current_ids = next_token
@@ -454,6 +523,16 @@ class SMCWorker(BaseSpecWorker):
         score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
             2, target_tokens.unsqueeze(2)
         ).squeeze(2)
+
+        if self.eagle_diag_path is not None and len(draft_topk_ids_steps) == gamma:
+            self._write_eagle_chain_diagnostics(
+                target_log_probs=score_log_probs,
+                target_tokens=target_tokens,
+                target_logprobs=score_logprobs_stacked,
+                draft_logprobs=draft_logprobs_stacked,
+                draft_topk_ids_steps=draft_topk_ids_steps,
+                draft_topk_logp_steps=draft_topk_logp_steps,
+            )
 
         # ---- 5. Logprob diff ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
@@ -513,47 +592,36 @@ class SMCWorker(BaseSpecWorker):
         machinery.  It gives us immediate signal on whether target-corrected
         branching helps without taking on full tree KV compaction yet.
         """
-        import copy
-
-        from smcsd.common.verify import SMCVerifyInput
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-
         bs = len(ctx.orig_seq_lens)
-        positions = ctx.orig_seq_lens.contiguous()
-        spec_info = SMCVerifyInput(
-            draft_token_num=1,
-            positions=positions,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            seq_lens_sum=ctx.orig_seq_lens_sum,
-            seq_lens_cpu=ctx.orig_seq_lens_cpu,
-            num_tokens_per_req=1,
-        )
-        verify_batch = copy.copy(batch)
-        verify_batch.input_ids = draft_input.verified_id
-        verify_batch.out_cache_loc = cache_locs[:, 0].contiguous()
-        verify_batch.seq_lens = ctx.orig_seq_lens
-        verify_batch.seq_lens_cpu = ctx.orig_seq_lens_cpu
-        verify_batch.seq_lens_sum = ctx.orig_seq_lens_sum
-        verify_batch.spec_info = spec_info
-        verify_batch.capture_hidden_mode = CaptureHiddenMode.NULL
-        verify_batch.forward_mode = ForwardMode.TARGET_VERIFY
-
-        fb = ForwardBatch.init_new(verify_batch, self._target_worker.model_runner)
-        spec_info.populate_linear_verify_metadata(fb)
-        self._target_worker.model_runner.attn_backend.init_forward_metadata(fb)
-        graph_runner = getattr(self._target_worker.model_runner, "graph_runner", None)
-        self._target_worker.model_runner.graph_runner = None
+        # Reuse the normal SMC verify preparation path for backend metadata
+        # compatibility. We only need logits after x0; trailing dummy tokens are
+        # overwritten later by the real verification pass.
+        all_tokens = [draft_input.verified_id] + [
+            draft_input.verified_id for _ in range(ctx.gamma)
+        ]
+        target_runner = self._target_worker.model_runner
+        graph_runner = getattr(target_runner, "graph_runner", None)
+        target_runner.graph_runner = None
         try:
+            verify_forward_batch, _ = ctx.prepare_for_verify(
+                self.req_to_token_pool,
+                batch,
+                self._target_worker,
+                all_tokens,
+                cache_locs,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
             result = self._target_worker.forward_batch_generation(
                 model_worker_batch=None,
-                forward_batch=fb,
+                forward_batch=verify_forward_batch,
                 is_verify=True,
                 skip_attn_backend_init=True,
             )
         finally:
-            self._target_worker.model_runner.graph_runner = graph_runner
+            target_runner.graph_runner = graph_runner
         logits = result.logits_output.next_token_logits
-        assert logits.shape[0] == bs
+        assert logits.shape[0] == bs * (ctx.gamma + 1)
+        logits = logits.reshape(bs, ctx.gamma + 1, -1)[:, 0, :]
         return torch.log_softmax(logits / self.smc_target_temperature, dim=-1)
 
     def _select_eagle_tree_first_token(
@@ -656,13 +724,76 @@ class SMCWorker(BaseSpecWorker):
         self._eagle_diag_file = open(file_path, "a", buffering=1)
         return self._eagle_diag_file
 
-    def _write_eagle_tree_diagnostics(self, diagnostics: dict) -> None:
+    def _write_eagle_diagnostics(self, diagnostics: dict) -> None:
         self._eagle_diag_counter += 1
         diagnostics["cycle"] = self._eagle_diag_counter
         diagnostics["time"] = time.time()
         fh = self._ensure_eagle_diag_file()
         if fh is not None:
             fh.write(json.dumps(diagnostics, sort_keys=True) + "\n")
+
+    def _write_eagle_tree_diagnostics(self, diagnostics: dict) -> None:
+        self._write_eagle_diagnostics(diagnostics)
+
+    def _write_eagle_chain_diagnostics(
+        self,
+        *,
+        target_log_probs: torch.Tensor,
+        target_tokens: torch.Tensor,
+        target_logprobs: torch.Tensor,
+        draft_logprobs: torch.Tensor,
+        draft_topk_ids_steps: list[torch.Tensor],
+        draft_topk_logp_steps: list[torch.Tensor],
+    ) -> None:
+        if self.eagle_diag_path is None:
+            return
+
+        gamma = target_tokens.shape[1]
+        topk = min(len(draft_topk_ids_steps[0][0]), target_log_probs.shape[-1])
+        target_topk_logp, target_topk_ids = torch.topk(
+            target_log_probs[:, :gamma, :], topk, dim=-1
+        )
+        draft_topk_ids = torch.stack(draft_topk_ids_steps[:gamma], dim=1)
+        draft_topk_logp = torch.stack(draft_topk_logp_steps[:gamma], dim=1)
+        overlap = (
+            draft_topk_ids[:, :, :, None] == target_topk_ids[:, :, None, :]
+        ).any(dim=-1).float()
+
+        token_target_rank = (
+            (target_log_probs[:, :gamma, :] > target_logprobs[:, :, None])
+            .sum(dim=-1)
+            .to(torch.float32)
+            + 1.0
+        )
+        token_in_draft_topk = (
+            draft_topk_ids == target_tokens[:, :, None]
+        ).any(dim=-1).float()
+        token_in_target_topk = (
+            target_topk_ids == target_tokens[:, :, None]
+        ).any(dim=-1).float()
+
+        self._write_eagle_diagnostics(
+            {
+                "mode": self.smc_draft_mode,
+                "bs": int(target_tokens.shape[0]),
+                "gamma": int(gamma),
+                "topk": int(topk),
+                "draft_target_topk_overlap_mean": float(overlap.mean().item()),
+                "sample_in_draft_topk_mean": float(token_in_draft_topk.mean().item()),
+                "sample_in_target_topk_mean": float(token_in_target_topk.mean().item()),
+                "sample_target_rank_mean": float(token_target_rank.mean().item()),
+                "sample_target_rank_median": float(
+                    token_target_rank.flatten().median().item()
+                ),
+                "target_lp_mean": float(target_logprobs.mean().item()),
+                "draft_lp_mean": float(draft_logprobs.mean().item()),
+                "target_minus_draft_lp_mean": float(
+                    (target_logprobs - draft_logprobs).mean().item()
+                ),
+                "draft_topk_lp_mean": float(draft_topk_logp.mean().item()),
+                "target_topk_lp_mean": float(target_topk_logp.mean().item()),
+            }
+        )
 
     def _build_eagle3_tree(self, batch: ModelWorkerBatch, draft_input: SMCDraftInput):
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -1252,6 +1383,12 @@ class SMCWorker(BaseSpecWorker):
 
         all_tokens = [x0, x1]
         draft_logprobs = [x1_logprob]
+        first_topk_p = torch.clamp(draft_input.eagle_topk_p.to(torch.float32), min=1e-30)
+        first_topk_ids = draft_input.eagle_topk_index
+        if self.hot_token_id is not None:
+            first_topk_ids = self.hot_token_id[first_topk_ids]
+        draft_topk_ids_steps = [first_topk_ids]
+        draft_topk_logp_steps = [torch.log(first_topk_p)]
         current_ids = x1
 
         for step in range(gamma - 1):
@@ -1279,11 +1416,14 @@ class SMCWorker(BaseSpecWorker):
             new_hidden = draft_out.logits_output.hidden_states
             scaled = logits / self.smc_draft_temperature
             log_probs = torch.log_softmax(scaled, dim=-1)
-            if self.smc_draft_temperature > 0:
-                draft_idx = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
-            else:
-                draft_idx = torch.argmax(logits, dim=-1)
-            token_logprob = log_probs.gather(1, draft_idx.unsqueeze(1)).squeeze(1)
+            step_topk_logp, step_topk_ids = torch.topk(
+                log_probs, draft_topk_ids_steps[0].shape[-1], dim=-1
+            )
+            if self.hot_token_id is not None:
+                step_topk_ids = self.hot_token_id[step_topk_ids]
+            draft_topk_ids_steps.append(step_topk_ids)
+            draft_topk_logp_steps.append(step_topk_logp)
+            draft_idx, token_logprob = self._eagle_sample_with_eps_mix(log_probs)
             next_token = (
                 self.hot_token_id[draft_idx]
                 if self.hot_token_id is not None
@@ -1327,6 +1467,14 @@ class SMCWorker(BaseSpecWorker):
             2, target_tokens.unsqueeze(2)
         ).squeeze(2)
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
+        self._write_eagle_chain_diagnostics(
+            target_log_probs=score_log_probs_all,
+            target_tokens=target_tokens,
+            target_logprobs=score_logprobs_stacked,
+            draft_logprobs=draft_logprobs_stacked,
+            draft_topk_ids_steps=draft_topk_ids_steps,
+            draft_topk_logp_steps=draft_topk_logp_steps,
+        )
 
         bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
         bonus_log_probs = torch.log_softmax(
