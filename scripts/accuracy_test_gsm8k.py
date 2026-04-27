@@ -97,6 +97,7 @@ def run_smc_engine_eval(args, prompts, labels):
         draft_temperature=args.temperature,
         target_temperature=args.temperature,
         smc_draft_mode=args.smc_draft_mode,
+        eagle3_residual_alpha=args.eagle3_residual_alpha,
         trust_remote_code=True,
         page_size=1,
         attention_backend=args.attention_backend,
@@ -334,6 +335,12 @@ if __name__ == "__main__":
             "matching EAGLE3 checkpoint "
             "(e.g. lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B)."
         ),
+    )
+    smc_grp.add_argument(
+        "--eagle3-residual-alpha",
+        type=float,
+        default=0.0,
+        help="Blend target hidden state into draft recurrence at each step (0=off, 0.5=half)",
     )
     # Benchmark
     bench = parser.add_argument_group("benchmark")

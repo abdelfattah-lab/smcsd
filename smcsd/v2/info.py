@@ -282,6 +282,12 @@ class SMCDraftInputV2(SpecInput):
     # weighting alongside per-step draft log-probs.
     first_draft_logprob: Optional[torch.Tensor] = None  # (bs,)
 
+    # EAGLE3 prefill ONLY: per-parent log-softmax'ed draft prefill logits
+    # (shape: num_parents, draft_vocab). The scheduler fans these out into
+    # n_particles DISTINCT x1 draws per parent via sample_per_particle_x1.
+    # Always None during decode cycles.
+    first_draft_logprobs: Optional[torch.Tensor] = None  # (num_parents, draft_vocab)
+
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1
 

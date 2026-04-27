@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -127,6 +127,7 @@ class SMCWorkerV2(BaseSpecWorker):
         # then disable the draft CUDA graph (EAGLE head runs eagerly).
         self.is_eagle3 = (getattr(server_args, "smc_draft_mode", "dense") == "eagle3")
         self.eagle_use_aux = False
+        self._eagle3_residual_alpha = getattr(server_args, "eagle3_residual_alpha", 0.0)
 
         if self.is_eagle3:
             # Read checkpoint config to determine if aux hidden states are used
@@ -171,9 +172,43 @@ class SMCWorkerV2(BaseSpecWorker):
             if self.hot_token_id is not None:
                 self.hot_token_id = self.hot_token_id.to(embed.device)
 
+                # Build target-vocab → hot-vocab inverse map (t2d).
+                # We need this to gather target log-probs on the SAME support as
+                # the draft so that logprob_diff is a valid importance weight.
+                # Entries not in the hot set stay at -1 (not expected to be hit
+                # since all proposed tokens come from hot_token_id[draft_idx]).
+                target_vocab_size = int(
+                    self._target_worker.model_runner.model_config.vocab_size
+                )
+                self._t2d_map = torch.full(
+                    (target_vocab_size,),
+                    -1,
+                    dtype=torch.int64,
+                    device=embed.device,
+                )
+                hot_ids_int64 = self.hot_token_id.to(torch.int64)
+                self._t2d_map[hot_ids_int64] = torch.arange(
+                    hot_ids_int64.numel(),
+                    dtype=torch.int64,
+                    device=embed.device,
+                )
+            else:
+                self._t2d_map = None
+
+            # Configure the TARGET model to capture aux hidden states from
+            # the 3 designated layers (low, mid, high).  The CUDA graph runner
+            # also does this, but when graphs are disabled (e.g. FA3) we need
+            # to do it explicitly here.
+            target_model = self._target_worker.model_runner.model
+            if hasattr(target_model, "set_eagle3_layers_to_capture"):
+                eagle_aux_layers = None
+                draft_hf = self.draft_runner.model_config.hf_config
+                eagle_cfg = getattr(draft_hf, "eagle_config", {})
+                if eagle_cfg.get("use_aux_hidden_state_layers"):
+                    eagle_aux_layers = eagle_cfg["use_aux_hidden_state_layers"]
+                target_model.set_eagle3_layers_to_capture(eagle_aux_layers)
+
             # EAGLE3 head runs eagerly — disable its CUDA graph.
-            # (set_eagle3_layers_to_capture on the TARGET is called inside
-            # SMCCudaGraphRunner.__init__, before the target graph is captured.)
             backup_disable_cuda_graph = True
 
         # Multi-step draft attention backend
@@ -213,6 +248,38 @@ class SMCWorkerV2(BaseSpecWorker):
 
     def clear_cache_pool(self):
         pass
+
+    def sample_per_particle_x1(
+        self,
+        parent_log_probs: torch.Tensor,
+        n_particles: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """EAGLE3 only: sample ``n_particles`` distinct x1 draws for ONE parent.
+
+        Args:
+            parent_log_probs: (draft_vocab,) log-softmax'ed draft prefill
+                              logits for a single parent.
+            n_particles: group fan-out.
+
+        Returns:
+            (target_ids, logprobs) both of shape (n_particles,). target_ids
+            are already in TARGET-vocab space (mapped via hot_token_id when
+            applicable) so they can be used directly as input_ids for the
+            next draft step.
+        """
+        if self.smc_draft_temperature > 0:
+            idx = torch.multinomial(
+                parent_log_probs.exp(), num_samples=n_particles, replacement=True
+            )
+        else:
+            top_idx = torch.argmax(parent_log_probs, dim=-1)
+            idx = top_idx.expand(n_particles)
+        logprobs = parent_log_probs.gather(0, idx)
+        if self.hot_token_id is not None:
+            target_ids = self.hot_token_id[idx]
+        else:
+            target_ids = idx
+        return target_ids, logprobs
 
     def materialize_smc_parent_draft_prefix(self, req) -> None:
         """No-op: _forward_extend already prefills both models."""
@@ -282,33 +349,22 @@ class SMCWorkerV2(BaseSpecWorker):
             draft_logits_out = self.draft_runner.forward(draft_fwd).logits_output
             h0 = draft_logits_out.hidden_states.contiguous()  # (bs, hidden_dim)
 
-            # Pre-sample x1 from draft prefill's last-position logits.
-            # This is the FIRST proposed draft token for the next decode cycle.
-            # Matches official EAGLE3: decode step 0 uses draft's own
-            # prefill-logit prediction, NOT the verified_id (= target's t_L).
+            # Return the draft's prefill last-position log-probs so the
+            # scheduler can sample a DISTINCT x1 per particle (one row per
+            # parent → fan-out in set_prefill_hidden via
+            # sample_per_particle_x1). Broadcasting a single x1 across all N
+            # particles would destroy particle diversity in the first decode
+            # cycle — this is the critical correctness fix for small gamma.
             prefill_next_logits = draft_logits_out.next_token_logits  # (bs, draft_vocab)
             scaled = prefill_next_logits / self.smc_draft_temperature
             prefill_log_probs = torch.log_softmax(scaled, dim=-1)
-            if self.smc_draft_temperature > 0:
-                x1_idx = torch.multinomial(
-                    prefill_log_probs.exp(), num_samples=1
-                ).squeeze(-1)
-            else:
-                x1_idx = torch.argmax(prefill_next_logits, dim=-1)
-            x1_logprob = prefill_log_probs.gather(
-                1, x1_idx.unsqueeze(1)
-            ).squeeze(1)
-            if self.hot_token_id is not None:
-                x1_target_id = self.hot_token_id[x1_idx]
-            else:
-                x1_target_id = x1_idx
 
             score_result.next_draft_input = SMCDraftInputV2(
                 verified_id=score_result.next_token_ids,
                 num_tokens_per_req=self.speculative_num_draft_tokens,
                 target_hidden_state=h0,
-                first_draft_token_id=x1_target_id,
-                first_draft_logprob=x1_logprob,
+                # Full per-parent logprob row in draft-vocab space.
+                first_draft_logprobs=prefill_log_probs,
             )
             score_result.accept_lens = torch.zeros(
                 bs, dtype=torch.int32, device=self.device
@@ -554,13 +610,17 @@ class SMCWorkerV2(BaseSpecWorker):
             self._eagle3_hidden_dtype
         )
 
+        # Anchor: the fc-projected target hidden state (4096-dim) from the
+        # rewrite step. We blend this back into the draft's recurrent hidden
+        # at each subsequent step so that target information doesn't fade.
+        target_anchor = current_hidden
+        residual_alpha = getattr(self, "_eagle3_residual_alpha", 0.0)
+
         all_tokens = [x0, x1]
         draft_logprobs = [x1_logprob]
         current_ids = x1
 
         # ---- 3. Gamma-1 draft forwards → produce x2..x_gamma ----
-        # Step k forwards at position (L + k), consuming (embed(x_{k+1}),
-        # current_hidden). Output logits at position L+k predict x_{k+2}.
         for step in range(gamma - 1):
             draft_fb.input_ids = current_ids
             draft_fb.positions = all_positions[:, step].contiguous()
@@ -568,17 +628,31 @@ class SMCWorkerV2(BaseSpecWorker):
             draft_fb.seq_lens = all_seq_lens[:, step].contiguous()
             draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
             draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
+
+            draft_fb.spec_info = None
+            self.draft_runner.attn_backend.init_forward_metadata(draft_fb)
+
             draft_fb.spec_info = EagleDraftInput(
                 hidden_states=current_hidden,
+                target_anchor=target_anchor,
+                draft_step=step + 1,
                 verified_id=current_ids,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
             )
             draft_fb.capture_hidden_mode = CaptureHiddenMode.LAST
 
-            draft_out = self.draft_runner.forward(draft_fb)
+            draft_out = self.draft_runner.forward(
+                draft_fb, skip_attn_backend_init=True
+            )
             logits = draft_out.logits_output.next_token_logits  # (bs, draft_vocab)
             new_hidden = draft_out.logits_output.hidden_states
+
+            if residual_alpha > 0:
+                new_hidden = (
+                    (1 - residual_alpha) * new_hidden
+                    + residual_alpha * target_anchor
+                )
 
             scaled = logits / self.smc_draft_temperature
             log_probs = torch.log_softmax(scaled, dim=-1)
@@ -632,15 +706,35 @@ class SMCWorkerV2(BaseSpecWorker):
             f"expected {expected_rows}"
         )
 
-        score_log_probs_all = torch.log_softmax(
-            score_logits / self.smc_target_temperature, dim=-1
-        ).reshape(bs, gamma + 1, -1)
-        # x_{k+1} (= all_tokens[k+1]) is verified at position k+1 of the window.
-        # Target log-prob of x_{k+1} is score_log_probs_all[:, k, :].
+        # Match the dense path: compute target log-probs at T=1 so that
+        # logprob_diff = log p_target(y) - log q_draft(y) is a well-formed
+        # importance weight on the same scale as the dense SMC path.
+        # (Bonus sampling below still uses smc_target_temperature — same as dense.)
+        #
+        # Additionally, if the EAGLE3 draft has a "hot" sub-vocabulary, project
+        # the target logits onto the hot set before log-softmax so that `p` and
+        # `q` share support. Otherwise `log p` is normalized over the full
+        # vocabulary while `log q` is normalized only over hot tokens, which
+        # biases the IS weight by log(sum_hot p) on every step.
         target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)  # (bs, gamma)
-        score_logprobs_stacked = score_log_probs_all[:, :gamma, :].gather(
-            2, target_tokens.unsqueeze(2)
-        ).squeeze(2)
+        if self.hot_token_id is not None:
+            hot_logits = score_logits.index_select(
+                1, self.hot_token_id.to(torch.int64)
+            )
+            hot_log_probs = torch.log_softmax(hot_logits, dim=-1).reshape(
+                bs, gamma + 1, -1
+            )
+            draft_idx_tokens = self._t2d_map[target_tokens.to(torch.int64)]
+            score_logprobs_stacked = hot_log_probs[:, :gamma, :].gather(
+                2, draft_idx_tokens.unsqueeze(2)
+            ).squeeze(2)
+        else:
+            score_log_probs_all = torch.log_softmax(
+                score_logits, dim=-1
+            ).reshape(bs, gamma + 1, -1)
+            score_logprobs_stacked = score_log_probs_all[:, :gamma, :].gather(
+                2, target_tokens.unsqueeze(2)
+            ).squeeze(2)
 
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
 
@@ -680,6 +774,15 @@ class SMCWorkerV2(BaseSpecWorker):
             self._eagle3_hidden_dtype
         )
 
+        # Rewrite draft KV with gamma+1 eager DECODE forwards (one per
+        # committed position). An earlier attempt to collapse this into a
+        # single DRAFT_EXTEND_V2 multi-token forward (mirroring
+        # eagle_worker_v2._draft_extend_for_decode) ran but produced
+        # gibberish outputs — almost certainly due to a mismatch between
+        # our ForwardBatch setup and what FA3's DRAFT_EXTEND_V2 path
+        # expects (positions / cache_seqlens / metadata). Left as a known
+        # perf opportunity for a follow-up that ports the dedicated
+        # EAGLE3 draft-extend CUDA graph runner.
         rewrite_fb = draft_fb
         accepted_tokens = output_token_ids  # [x1, x2, ..., x_gamma, bonus]
         last_hidden = None
@@ -692,6 +795,10 @@ class SMCWorkerV2(BaseSpecWorker):
             rewrite_fb.seq_lens = all_seq_lens[:, step].contiguous()
             rewrite_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
             rewrite_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
+
+            rewrite_fb.spec_info = None
+            self.draft_runner.attn_backend.init_forward_metadata(rewrite_fb)
+
             rewrite_fb.spec_info = EagleDraftInput(
                 hidden_states=target_h_steps[:, step, :].contiguous(),
                 verified_id=tok,
@@ -700,7 +807,9 @@ class SMCWorkerV2(BaseSpecWorker):
             )
             rewrite_fb.capture_hidden_mode = CaptureHiddenMode.LAST
 
-            out = self.draft_runner.forward(rewrite_fb).logits_output
+            out = self.draft_runner.forward(
+                rewrite_fb, skip_attn_backend_init=True
+            ).logits_output
             last_hidden = out.hidden_states
             last_logits = out.next_token_logits
 

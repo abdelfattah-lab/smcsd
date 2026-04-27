@@ -728,20 +728,18 @@ class SMCSchedulerV2(Scheduler):
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
-        # EAGLE3: per-parent prefill hidden state (num_parents, aux_dim) — same
-        # order as batch.reqs. None in dense mode.
+        # EAGLE3: per-parent prefill hidden state (num_parents, aux_dim) and
+        # the full draft-prefill log-prob row per parent (num_parents,
+        # draft_vocab). The scheduler samples N DISTINCT x1 draws per parent
+        # for particle diversity — same order as batch.reqs. None in dense mode.
         prefill_hidden = None
-        prefill_first_draft_ids = None
-        prefill_first_draft_logprobs = None
+        prefill_first_draft_logprobs_full = None
         if result.next_draft_input is not None:
             prefill_hidden = getattr(
                 result.next_draft_input, "target_hidden_state", None
             )
-            prefill_first_draft_ids = getattr(
-                result.next_draft_input, "first_draft_token_id", None
-            )
-            prefill_first_draft_logprobs = getattr(
-                result.next_draft_input, "first_draft_logprob", None
+            prefill_first_draft_logprobs_full = getattr(
+                result.next_draft_input, "first_draft_logprobs", None
             )
 
         for i, (group, req, next_token_id) in enumerate(
@@ -759,16 +757,19 @@ class SMCSchedulerV2(Scheduler):
                 continue
 
             h_i = prefill_hidden[i] if prefill_hidden is not None else None
-            fd_id_i = (
-                prefill_first_draft_ids[i : i + 1]
-                if prefill_first_draft_ids is not None
-                else None
-            )
-            fd_lp_i = (
-                prefill_first_draft_logprobs[i : i + 1]
-                if prefill_first_draft_logprobs is not None
-                else None
-            )
+
+            # Fan out the parent's prefill log-probs into n_particles
+            # DISTINCT x1 samples (one per particle slot). This is the
+            # correctness fix that prevents all particles in a group from
+            # starting the first decode cycle with the same token.
+            fd_id_i = None
+            fd_lp_i = None
+            if prefill_first_draft_logprobs_full is not None:
+                fd_id_i, fd_lp_i = self.model_worker.sample_per_particle_x1(
+                    prefill_first_draft_logprobs_full[i],
+                    n_particles=group.n_particles,
+                )
+
             error_msg = self._materialize_group(
                 group,
                 prefill_hidden=h_i,

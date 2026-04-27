@@ -250,12 +250,22 @@ class ScheduleBatchSMC:
         first_draft_token_id: Optional[torch.Tensor] = None,
         first_draft_logprob: Optional[torch.Tensor] = None,
     ) -> None:
-        """EAGLE3: scatter a single parent's prefill hidden state (and the
-        pre-sampled first draft token / logprob) across its fanned-out
-        particle slots. Called after allocate_slots."""
+        """EAGLE3: seed particle slots for one parent.
+
+        ``prefill_hidden`` is shared across all particles of the group (same
+        target-hidden-state seed after the shared prefill). ``first_draft_token_id``
+        and ``first_draft_logprob`` are PER-PARTICLE — one distinct x1 draw per
+        slot — to preserve SMC diversity in the first decode cycle.
+
+        Accepted shapes:
+          prefill_hidden:        (hidden_dim,) — broadcast to all slots.
+          first_draft_token_id:  (len(slots),) — scatter 1:1 with slots.
+          first_draft_logprob:   (len(slots),) — scatter 1:1 with slots.
+        """
         if not slots:
             return
         slot_idx = torch.tensor(slots, dtype=torch.long, device=self.device)
+        n = len(slots)
 
         if prefill_hidden is not None:
             new_dim = prefill_hidden.shape[-1]
@@ -269,26 +279,34 @@ class ScheduleBatchSMC:
                     device=self.device,
                 )
             self.target_hidden_states[slot_idx] = prefill_hidden.unsqueeze(0).expand(
-                len(slots), -1
+                n, -1
             )
 
         if first_draft_token_id is not None:
+            assert first_draft_token_id.shape[0] == n, (
+                f"first_draft_token_id must have one entry per slot: "
+                f"got {tuple(first_draft_token_id.shape)} for {n} slots."
+            )
             if self.first_draft_token_ids is None:
                 self.first_draft_token_ids = torch.zeros(
                     self.max_slots, dtype=torch.int64, device=self.device,
                 )
             self.first_draft_token_ids[slot_idx] = first_draft_token_id.to(
                 dtype=torch.int64
-            ).expand(len(slots))
+            )
 
         if first_draft_logprob is not None:
+            assert first_draft_logprob.shape[0] == n, (
+                f"first_draft_logprob must have one entry per slot: "
+                f"got {tuple(first_draft_logprob.shape)} for {n} slots."
+            )
             if self.first_draft_logprobs is None:
                 self.first_draft_logprobs = torch.zeros(
                     self.max_slots, dtype=torch.float32, device=self.device,
                 )
             self.first_draft_logprobs[slot_idx] = first_draft_logprob.to(
                 dtype=torch.float32
-            ).expand(len(slots))
+            )
 
     def free_group_slots(self, group_id: str) -> None:
         """Free all slots for a finalized group."""
