@@ -61,7 +61,10 @@ def eagle_layer_ids(target_config, explicit: str | None = None) -> List[int]:
     if explicit:
         return [int(x) for x in explicit.split(",") if x.strip()]
     n = int(getattr(target_config, "num_hidden_layers"))
-    return [1, n // 2, max(n - 4, 1)]
+    # SpecForge captures outputs of transformer layers [1, N//2 - 1, N - 4].
+    # HF output_hidden_states has embedding output at index 0, so add one.
+    # This also matches SMC-SD/SGLang EAGLE's default effective captures.
+    return [2, n // 2, max(n - 3, 1)]
 
 
 @torch.no_grad()

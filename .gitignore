@@ -246,6 +246,19 @@ ctags/
 outputs/
 inputs/
 
+# SMC-SD training artifacts (top-level paths are symlinks to /mnt/raid0;
+# trailing slash would only match directories, not symlinks — so leave it off)
+/data
+/checkpoints
+/logs
+/outputs
+
+# Vestigial old sglang stub that shadows the vendored 3rdparty/sglang
+/python/
+
+# Local planning notes superseded by updates.md
+todo.md
+
 # Eval Cache
 .longbench_cache/
 

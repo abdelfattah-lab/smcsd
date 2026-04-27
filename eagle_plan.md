@@ -1687,3 +1687,603 @@ SMC-native EAGLE training reduces heldout logw variance and improves ESS/N.
 ```
 
 Only then should we expect accuracy/TPS improvements.
+
+---
+
+## 2026-04-26 postmortem: what went wrong, what was fixed, and what to do next
+
+This section supersedes the earlier "recommended next steps" above where they conflict. The most important update is that recurrent rollout collection/training was implemented and tested, but it did **not** make EAGLE a good SMC-SD proposal. The failure is now better understood: some earlier results were confounded by implementation mismatches, but after fixing those mismatches the EAGLE proposal itself still remains poorly aligned with the target distribution under SMC-SD decode.
+
+### Short answer
+
+EAGLE currently does not work well for GSM8K SMC-SD because it is an overconfident, hidden-state-conditioned local proposal whose sampled tokens often have much lower target probability than draft probability. SMC then pays for this as high-variance `p/q` weights, frequent particle collapse, degenerate text, and poor downstream accuracy.
+
+The main lesson is:
+
+```text
+Do not train or evaluate SMC-SD drafts only by CE/KL or one-step next-token quality.
+Train and select drafts by on-policy SMC metrics:
+  logw = log p_target(path) - log q_draft(path)
+  ESS/N
+  max particle weight
+  downstream task accuracy
+```
+
+### Mistakes identified
+
+#### 1. Wrong EAGLE hidden layer indices in offline collection
+
+The first rollout collectors used the wrong target hidden-state indices:
+
+```text
+old: [1, 16, 28]
+```
+
+For Llama-3.1-8B with HF `output_hidden_states`, the runtime/SpecForge-compatible effective indices are:
+
+```text
+correct: [2, 16, 29]
+```
+
+Reason: HF hidden states include the embedding output at index 0, so layer-output indices are offset by one relative to some SpecForge/SGLang layer conventions.
+
+Fix applied:
+
+```text
+scripts/draft_train/collect_eagle_smc_rollouts.py
+scripts/draft_train/collect_eagle_smc_rollouts_v2.py
+```
+
+now use:
+
+```python
+return [2, n // 2, max(n - 3, 1)]
+```
+
+#### 2. Offline EAGLE prefill did not match runtime prefill
+
+The earlier collector/trainer treated the first EAGLE state as if it could be produced from:
+
+```text
+target_hidden(prompt + x0 at last position)
+```
+
+But SMC-SD runtime does something more specific:
+
+1. Target prefill runs on the prompt and samples/produces `x0`.
+2. EAGLE draft prefill receives the full prompt auxiliary hidden-state sequence.
+3. EAGLE draft input IDs are the prompt IDs shifted left, ending in `x0`.
+
+Runtime-like form:
+
+```text
+target_h_3_seq = target aux hidden states for all prompt positions
+shifted_input_ids = prompt shifted left, with last token replaced by x0
+EAGLE prefill(target_h_3_seq, shifted_input_ids)
+```
+
+The mismatch was large enough that offline logits and runtime-like logits had very low overlap.
+
+Fix applied in:
+
+```text
+scripts/draft_train/collect_eagle_smc_rollouts_v2.py
+scripts/draft_train/train_eagle_smc_recurrent.py
+```
+
+The v2 collector now stores:
+
+```text
+target_h_3_seq
+shifted_input_ids
+seed_token
+candidates [R, gamma_train]
+draft_logps_old [R, gamma_train]
+target_logps [R, gamma_train]
+target_topk_ids/logps
+```
+
+The recurrent trainer now replays the same full-prompt EAGLE prefill and teacher-forces the sampled path through the recurrent EAGLE state machine.
+
+#### 3. Single-step SMC-native training was the wrong objective shape
+
+The original SMC-native proposal learning trained `gamma_train=1` states. That does not match SMC-SD inference, where EAGLE state evolves recurrently across speculative tokens and across accepted/resampled particles.
+
+One-step training can improve a local token objective while worsening the path proposal. It misses:
+
+```text
+exposure bias from EAGLE's own sampled tokens
+hidden-state drift across recurrent EAGLE steps
+path-level p/q weight variance
+resampling-induced state distribution changes
+```
+
+Fix attempted:
+
+```text
+scripts/draft_train/collect_eagle_smc_rollouts_v2.py
+scripts/draft_train/train_eagle_smc_recurrent.py
+```
+
+with:
+
+```text
+gamma_train = 2
+R = 8
+runtime-matched full-prompt prefill
+path-level logw = sum logp_target - sum logq_old
+weighted path MLE + top-k KL + q_old anchor
+```
+
+This fixed the training/inference mismatch, but did not make the proposal good.
+
+#### 4. `--eagle-topk` and `--eagle-num-draft-tokens` were ignored by the worker
+
+The engine passed:
+
+```text
+smc_eagle_topk
+smc_eagle_num_draft_tokens
+```
+
+but `SMCWorker` was reading:
+
+```text
+speculative_eagle_topk
+speculative_num_draft_tokens
+```
+
+This meant top-k diagnostics and tree experiments were accidentally using the wrong values, often effectively `topk=1`.
+
+Fix applied in:
+
+```text
+smcsd/core/worker.py
+```
+
+The worker now reads the SMC-specific args first and falls back to the SGLang speculative args only if needed.
+
+#### 5. Diagnostics existed for tree mode but not chain mode
+
+The existing `--eagle3-collect-path` hook only wrote useful diagnostics for tree modes. Chain mode was the primary mode under evaluation, so we lacked direct runtime evidence of draft/target mismatch.
+
+Fix applied in:
+
+```text
+smcsd/core/worker.py
+```
+
+Chain diagnostics now log:
+
+```text
+draft_target_topk_overlap_mean
+sample_in_draft_topk_mean
+sample_in_target_topk_mean
+sample_target_rank_mean
+sample_target_rank_median
+target_lp_mean
+draft_lp_mean
+target_minus_draft_lp_mean
+```
+
+This made the failure mode much clearer.
+
+#### 6. EAGLE tree paths are not production-ready
+
+Tree probe can run on Triton, but FA3 tree-probe currently fails because an auxiliary target-verify path hits an FA3 attention-backend assumption about `custom_mask`.
+
+Observed FA3 failure:
+
+```text
+TypeError: 'NoneType' object is not subscriptable
+```
+
+Full tree SMC is also not ready. A Triton smoke run fell back into the chain path and then hit a CUDA-graph shape mismatch:
+
+```text
+RuntimeError: The size of tensor a (...) must match the size of tensor b (...)
+```
+
+Conclusion: tree modes should remain experimental until their target-verify metadata, KV layout, and graph capture behavior are fixed.
+
+### What was run after the fixes
+
+#### Runtime-matched recurrent rollout collection
+
+Collected fresh runtime-matched v2 rollouts:
+
+```text
+data/eagle_smc_rollouts_v2_runtime_gsm8k_2k_R8_K2
+```
+
+Stats:
+
+```text
+n_rows:            2000
+R:                 8
+gamma_train:       2
+logw_var mean:     42.98
+logw_var median:   36.58
+ESS/N mean:        0.175
+ESS/N median:      0.139
+max weight mean:   0.858
+max weight median: 0.948
+```
+
+Interpretation:
+
+```text
+The corrected runtime proposal is already highly degenerate during rollout collection.
+Most prompt-level candidate sets are dominated by one particle.
+```
+
+#### Runtime-matched recurrent training
+
+Trained conservative recurrent proposal:
+
+```text
+outputs/eagle_smc_recurrent_runtime_gsm8k_2k_R8_K2_lr5e-7_b001_a5_s250/final
+```
+
+Config:
+
+```text
+lr:             5e-7
+max_steps:      250
+batch_size:     2
+alpha_topk:     1.0
+beta_smc:       0.01
+gamma_anchor:   5.0
+temperature:    0.7
+```
+
+Result:
+
+```text
+N=8, gamma=1, q20: 0/20 initially; rerun with topk20 diagnostics: 2/20
+N=8, gamma=2, q20: 0/20 initially; rerun with topk20 diagnostics: 2/20
+```
+
+The small q20 variation is sampling noise; neither run is a meaningful improvement over the 15% full-vocab warm start.
+
+#### Runtime chain diagnostics after top-k fix
+
+With real `--eagle-topk 20`:
+
+```text
+chain N=8 gamma=1 q20:
+  accuracy:      2/20
+  TPS:           127.4
+  logw_var mean: 51.0
+  ESS/N mean:    0.518
+
+chain N=8 gamma=2 q20:
+  accuracy:      2/20
+  TPS:           151.8
+  logw_var mean: 46.9
+  ESS/N mean:    0.378
+```
+
+Draft/target distribution diagnostics:
+
+```text
+gamma=1:
+  draft/target top-20 overlap:       35.3%
+  sampled token in draft top-20:     86.0%
+  sampled token in target top-20:    59.0%
+  target_minus_draft lp mean:       -5.71
+
+gamma=2:
+  draft/target top-20 overlap:       37.7%
+  sampled token in draft top-20:     88.5%
+  sampled token in target top-20:    64.0%
+  target_minus_draft lp mean:       -4.56
+```
+
+Interpretation:
+
+```text
+EAGLE samples tokens it believes are likely, but the target often assigns those
+tokens much lower probability. This produces bad p/q weights and bad text.
+```
+
+#### Tree-probe result
+
+Triton tree-probe with target-reranked first EAGLE branch:
+
+```text
+draft-mode: eagle3_tree_probe
+backend:    triton
+N:          8
+gamma:      2
+topk:       20
+q20
+```
+
+Result:
+
+```text
+accuracy:        0/20
+invalid:         5/20
+TPS:             78.5
+logw_var mean:   40.7
+ESS/N mean:      0.359
+```
+
+Diagnostics:
+
+```text
+sampled token in target top-20: 76.5%
+sample target rank median:     1.0
+target_minus_draft lp mean:   -3.48
+```
+
+Interpretation:
+
+```text
+Tree-probe improves local target alignment and reduces the p/q gap, but it is
+slower and still does not solve GSM8K. It is a diagnostic upper-bound-ish
+heuristic, not a final valid proposal unless its selection probability is
+properly included in q.
+```
+
+### Why EAGLE still does not work for SMC-SD
+
+#### 1. EAGLE is overconfident where the target disagrees
+
+The most direct evidence is the negative target-minus-draft logprob gap:
+
+```text
+chain gamma=2 mean target_minus_draft lp ~= -4.56 per sampled token/step aggregate
+```
+
+This means the proposal often assigns high probability to tokens that the target assigns much lower probability. SMC weights become highly variable:
+
+```text
+logw = logp - logq
+```
+
+When `q` is confidently wrong, one or a few particles dominate.
+
+#### 2. Local top-k agreement is too low
+
+Draft/target top-20 overlap is only:
+
+```text
+~35-38%
+```
+
+For a proposal that needs to cheaply mimic the target over sampled paths, this is too low. Even when sampled tokens land in the target top-20, the distribution shape is still different enough to cause large `p/q` variation.
+
+#### 3. Training data is too small and too narrow for a target-hidden proposal
+
+The full-vocab warm start was trained on only 2k GSM8K examples. That is enough to test plumbing, not enough to train a robust EAGLE proposal for an 8B target. EAGLE relies on target hidden states and has to learn a nontrivial transition function from those states plus previous tokens to target-like logits.
+
+#### 4. SMC objective has high-variance labels when the behavior proposal is already bad
+
+The corrected rollout collection shows:
+
+```text
+ESS/N mean ~= 0.175
+max weight mean ~= 0.858
+```
+
+That is a bad regime for offline weighted MLE. Most candidate sets provide only one useful particle, and the normalized weights are extremely spiky. Training on this can reinforce narrow behavior instead of learning a stable proposal.
+
+#### 5. EAGLE chain is a poor proposal family for this task unless made much better
+
+The AR 1B draft is a full language model with a strong prior over reasoning text. Current EAGLE is a small hidden-state-conditioned head trained on limited data. It can be fast, but for GSM8K it does not yet preserve enough of the target's reasoning distribution.
+
+#### 6. Tree/reranking helps local alignment but hurts speed and validity
+
+Tree-probe shows that target-reranking EAGLE branches can improve local target rank and reduce the logprob gap. But it:
+
+```text
+halves throughput in the q20 Triton run
+does not improve accuracy
+is not a clean proposal unless q(path) includes the selection process
+is not currently FA3-compatible
+```
+
+So tree mode is diagnostic, not the immediate solution.
+
+### How to train drafts for SMC-SD
+
+The draft should be trained as an SMC proposal, not as a speculative-decoding acceptor and not only as a next-token student.
+
+#### Required objective
+
+For each prefix/state `s`, sample `R` paths from the current proposal:
+
+```text
+y_i ~ q_old(. | s)
+```
+
+Score each path under the target:
+
+```text
+logp_i = sum_t log p_target(y_i,t | s, y_i,<t)
+logq_i = sum_t log q_old(y_i,t | s, y_i,<t)
+logw_i = logp_i - logq_i
+w_i    = softmax(logw_i)
+```
+
+Train:
+
+```text
+L_smc = - sum_i stopgrad(w_i) * sum_t log q_new(y_i,t | s, y_i,<t)
+```
+
+But do not use this loss alone. Add stabilizers:
+
+```text
+L = alpha * KL(target_topk || q_new)
+  + beta  * L_smc
+  + gamma * KL(q_old || q_new)
+  + optional entropy/temperature regularization
+```
+
+Selection rule:
+
+```text
+The best draft is the one that lowers heldout logw variance and improves ESS/N,
+not the one with the lowest CE.
+```
+
+#### Practical training curriculum
+
+1. Train a strong full-vocab warm-start first.
+
+   Use much more data than 2k GSM8K. Include math reasoning and general instruction data:
+
+   ```text
+   GSM8K train
+   MetaMath / MATH-style reasoning
+   OpenMathInstruct-style data if available
+   ShareGPT/UltraChat-style general chat
+   ```
+
+   Goal before SMC finetuning:
+
+   ```text
+   chain q20 accuracy clearly above current 15%
+   logw_var mean below current ~64 warm-start baseline
+   sampled-token target top-20 hit much higher than 60-65%
+   ```
+
+2. Use runtime-matched recurrent on-policy rollouts.
+
+   The collector must store and replay:
+
+   ```text
+   target_h_3_seq
+   shifted_input_ids
+   seed_token
+   recurrent candidate paths
+   old q logprobs
+   target logprobs
+   target top-k ids/logps
+   ```
+
+   Do not return to the old one-step `target_hidden(prompt+x0)` approximation.
+
+3. Improve the rollout distribution before doing heavy offline SMC training.
+
+   If rollout ESS is as low as 0.175, offline weighted MLE will be unstable. Use one or more of:
+
+   ```text
+   lower draft temperature during collection only if q remains full-support and logq is exact
+   collect more candidates R=16 or R=32
+   use target-topk guided candidate augmentation
+   mix proposal samples with target-topk samples and train with exact mixture q
+   use replay buffers filtered by non-degenerate ESS
+   ```
+
+4. Consider a full-support mixture proposal.
+
+   A more robust SMC-SD proposal may be:
+
+   ```text
+   q_mix = (1 - epsilon) q_draft + epsilon q_target_topk_or_AR_fallback
+   ```
+
+   But the exact `log q_mix(token)` must be computed and used in SMC weights. This is the clean way to combine EAGLE speed with a safer fallback distribution.
+
+5. Compare against AR drafts honestly.
+
+   The AR 1B baseline remains the real reference:
+
+   ```text
+   Accuracy:      ~74.8%
+   TPS:           ~299
+   logw_var mean: ~13.7
+   ESS/N mean:    ~0.482
+   ```
+
+   EAGLE should not be considered promising until it beats the warm-start and approaches the AR draft's log-weight quality.
+
+### Recommended next actions
+
+#### Immediate
+
+1. Do not spend more time tuning the current 2k recurrent checkpoint.
+
+   It fixed the mismatch but did not improve the proposal. More steps on the same weak/off-policy data are unlikely to solve the core issue.
+
+2. Keep the runtime diagnostics in `smcsd/core/worker.py`.
+
+   They are now the most useful way to see whether a draft is aligned with the target:
+
+   ```text
+   draft/target top-k overlap
+   sampled-token target rank
+   target_minus_draft logprob gap
+   logw_var / ESS/N
+   ```
+
+3. Fix or clearly quarantine tree modes.
+
+   Current status:
+
+   ```text
+   eagle3_tree_probe: works on Triton, fails on FA3
+   eagle3_tree_smc: not reliable; graph/KV shape issue
+   eagle3_tree_oracle: diagnostic only, not a valid proposal unless labeled upper bound
+   ```
+
+#### Best next experiment
+
+Train a much stronger full-vocab EAGLE warm-start before more SMC finetuning:
+
+```text
+data:     >=50k-200k math/general instruction examples
+target:   meta-llama/Llama-3.1-8B-Instruct
+draft:    full-vocab EAGLE3
+metrics:  chain q20/q100, top-k overlap, target-rank diagnostics, logw_var, ESS/N
+```
+
+Only after the warm-start is a reasonable proposal should recurrent SMC finetuning be repeated.
+
+#### Best SMC-native training direction
+
+Use a conservative on-policy loop:
+
+```text
+repeat:
+  collect runtime-matched recurrent rollouts from current q
+  reject or downweight batches with near-zero ESS
+  train q_new with:
+    strong target-topk KL
+    small weighted SMC path-MLE
+    strong q_old anchor
+  evaluate q_new by heldout logw_var and ESS/N
+  only promote q_new if heldout SMC metrics improve
+```
+
+Suggested starting values:
+
+```text
+gamma_train: 2
+R:           16
+lr:          2e-7 to 1e-6
+alpha_topk:  1.0 to 5.0
+beta_smc:    0.001 to 0.03
+gamma_anchor:5.0 to 20.0
+temperature: 0.7
+```
+
+The previous `beta_smc=0.01, gamma_anchor=5.0` was conservative but still trained on highly degenerate rollouts. Increase data quality and warm-start quality before increasing SMC loss weight.
+
+#### If EAGLE still fails after a stronger warm-start
+
+Then stop treating EAGLE chain as the main proposal family for GSM8K. Prefer:
+
+```text
+AR draft proposal
+AR + EAGLE hybrid proposal
+full-support mixture proposal
+target-topk-assisted proposal with exact q
+task-specific small draft trained directly on reasoning continuations
+```
+
+EAGLE may still be useful for targets without a good AR draft, but for Llama-3.1-8B GSM8K the AR 1B draft is currently much stronger.
