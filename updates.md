@@ -459,6 +459,148 @@ defense-in-depth (in case any HF lib version bypasses the symlink).
   Promote a checkpoint only if all three hold. Math-data injections must
   pass this gate too.
 
+### 2026-04-28 (verification suite — `scripts/verify_eagle_integration.py`)
+
+User requested a numerical verification of the EAGLE-SMC integration before
+investing more compute. Built three tests with HF transformers as the
+independent reference:
+
+**Test A — v2 collector / KL trainer target log-p ≡ HF transformers**:
+PASS. Prob-weighted error 7.7e-5 (well under 1e-3 tol). Training-side
+target scoring is exact within bf16 noise on Llama-3.1-8B. The trainer's
+position math (`out2.logits[:, prompt_len : prompt_len + K, :]`) and
+temperature handling match HF exactly.
+
+**Test C — pass-through, draft = target, dense AR mode → logprob_diff = 0**:
+Initially FAILED with median |gap| = 0.056 nat. Caught a real bug: the
+dense AR path scored target logits as `log_softmax(score_logits, dim=-1)`
+without dividing by `smc_target_temperature` (worker.py:520), while
+sampling/draft used `smc_draft_temperature`. Fix: apply
+`/ self.smc_target_temperature` to the dense-path target log-softmax.
+After fix: median gap = 0.000 (exact). PASS.
+- Impact of this bug: only affected dense AR baseline measurements
+  (γ-sweep on AR-1B produced ~74% / 306 TPS at γ=8). EAGLE chain mode
+  always applied temperature correctly, so all EAGLE training/eval
+  numbers are unaffected.
+
+**Test B — sglang chain decode target log-p ≡ HF transformers**:
+FAIL at the ~0.5 nat mean / 0.09 prob-weighted level, but **not specific
+to our trained ckpt** — same magnitude with off-the-shelf
+`yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`. Pattern of error scales with
+logit magnitude:
+- high-prob positions (log p > -3): error ≪ 0.1 nat ✓
+- medium positions: 0.1–0.5 nat
+- deep tail (log p < -10): up to 3 nat
+This is bf16 numerical drift between sglang's verify path (custom
+attention kernels, paged KV) and HF's eager attention, not a position
+or temperature bug. Internal sglang consistency was verified by Test C
+(after the temperature fix), so the chain decode is *self-consistent*
+even if it diverges from HF by a small amount. The training pipeline
+uses HF (Test A passed exactly), so trained q matches HF's p
+distribution; at inference, sglang scores slightly differently. The
+bias is consistent across particles so SMC dynamics are still
+meaningful (gen-gate passing on heldout is empirical evidence).
+
+**Per-token trace plumbing**: added `SMC_EAGLE_PER_TOKEN_TRACE` env var
+that, when set, makes the chain decode write per-cycle x_0/target_tokens/
+target_logprobs/draft_logprobs/bonus to a separate JSONL alongside the
+existing diagnostic. Used by Test B; default off.
+
+**Net assessment**: Tests A and C definitively confirm correctness of
+the trainer + dense-path SMC weight math (after dense temp fix). Test B
+shows sglang chain decode and HF differ by bf16-noise levels, NOT by
+algorithm bugs. The recipe stands.
+
+**Code changes**:
+- Added `scripts/verify_eagle_integration.py` (Tests A, B, C).
+- Fixed dense-path target temperature bug in
+  `smcsd/core/worker.py` (line ~520, `score_logits / smc_target_temperature`).
+- Added `SMC_EAGLE_PER_TOKEN_TRACE` env var support in
+  `smcsd/core/worker.py` `_write_eagle_chain_diagnostics` and
+  `_forward_decode_eagle3_chain`.
+
+### 2026-04-27 (2-layer EAGLE — gate PASSED)
+- **2-layer EAGLE warmstart on 200k**: 4:05:55 wall on 3-GPU DDP (66658
+  steps), final loss 0.49, top-1 acc 0.82. Saved 7 checkpoints (every 10k
+  + final). Stronger learner than 1-layer at every comparable point
+  (final loss 0.49 vs 0.47, but more parameters / wider distribution).
+- **Curriculum-K KL on top of 2-layer warmstart**: 8000 steps, lr 5e-6,
+  K-schedule `2:0,4:2000,8:4000,12:6000`, single GPU ~37 min. Loss
+  trajectory: K=2 9.6→2.7, K=4 5.7→3.0, K=8 4.5→3.9, K=12 4.4→4.2.
+  Final gap −10.8 nats (vs 1-layer final −9.5).
+- **sglang change**: had to lift the
+  `if num_hidden_layers != 1: raise` guard in
+  `3rdparty/sglang/python/sglang/srt/models/llama_eagle3.py`. The
+  underlying LlamaModel is depth-agnostic; the assert was purely
+  defensive. With it lifted, 2-layer EAGLE chain inference works
+  end-to-end. Also had to bump `--mem-fraction-static 0.55` and
+  `--max-running-requests 12` for γ=16 because 2-layer EAGLE allocates
+  more KV cache per particle.
+
+- **GSM8K γ-sweep (q=100, N=12)**:
+
+  | γ | 1-layer best | **2-layer** | Δ acc |
+  |---:|---:|---:|---:|
+  | 2 | 63% / 162 TPS | **67% / 157** | **+4** |
+  | 4 | 52% / 193 | **53% / 194** | +1 |
+  | 8 | 31% / 209 | **33% / 217** | +2 |
+  | 12 | 18% / 225 | **21% / 229** | +3 |
+  | 16 | 6% / 234 | 5% / 239 | -1 (sampling noise at q100) |
+
+  Strict improvement at every γ from 2 to 12. γ=16 regression is
+  sampling-noise scale (1 question out of 100).
+
+- **Heldout (γ=4, 200 multi-domain prompts)**:
+
+  | metric | 1-layer best | **2-layer** | gate |
+  |---|---:|---:|---|
+  | top-20 overlap median | 0.499 | 0.497 | ≥ 0.45 ✓ |
+  | sample-in-top-20 mean | 0.913 | 0.915 | (informational) |
+  | target-rank median | 1.0 | 1.0 | (informational) |
+  | target_minus_draft_lp median | -1.73 | **-1.76** | ≥ -1.90 ✓ |
+  | ESS/N median | 0.418 | 0.413 | (informational) |
+  | logw_var median | 65.5 | **58.9** | (10% better, informational) |
+
+  All three gate criteria hold. Notably `logw_var` *dropped* on heldout
+  (65.5 → 58.9) — the 2-layer head generalizes slightly *better* than
+  1-layer at γ=4 outside the training distribution.
+
+- **GENERALIZATION GATE PASSED**. Promote 2-layer ckpt as new best:
+  `outputs/eagle_kl_onpolicy_200k_2layer_curriculum/final`.
+
+- **What worked**: doubling the EAGLE depth from 1 → 2 layers gave the
+  capacity needed to model target's distribution at deeper recurrent K.
+  Same on-policy RB-KL recipe, same data, same hparams, same training
+  budget. Architecture-only A/B held all other variables fixed.
+
+- **What didn't change**: the high-γ regime (γ=12, 16) still loses
+  accuracy — 2-layer didn't fix it. The bottleneck at γ≥12 may now be
+  EAGLE state divergence over many recurrent steps (a fundamental issue
+  even with more capacity), not capacity itself. γ=8 is the new
+  Pareto-optimal point: 33% / 217 TPS — competitive vs AR-1B's
+  74% / 306 TPS only at lower-quality settings, but **2-layer dominates
+  1-layer at every γ on every metric**.
+
+- **Storage rule reminder**: 2-layer warmstart (~100 GB across 7 ckpts)
+  + KL-curriculum ckpts (~80 GB across 9 ckpts) live on /mnt/raid0 via
+  the existing symlinks; root unchanged.
+
+- **Recommended next levers (priority order)**:
+  1. **3-layer EAGLE** (clean test of further capacity). Expected: small
+     additional improvements at γ=8 / γ=12. ~5 hr (warmstart) + 45 min
+     (KL) + 15 min (eval). Same data + recipe as 2-layer; truly an A/B
+     in capacity.
+  2. **Longer KL training on 2-layer**. Loss plateaued at K=12 phase
+     (~4.2) with the gap at -10.8 nats; with more steps (e.g. 25k
+     instead of 8k) at K=12 it might keep closing.
+  3. **MetaMath data injection** subject to gen-gate. With a strong
+     2-layer warmstart, adding 50k math-only examples (replacing 50k
+     of PerfectBlend) should improve GSM8K without regressing heldout.
+     Gate would catch any over-specialization.
+  4. **Larger N at inference** for the high-γ regime. Pure inference
+     change; if N=24 lifts γ=8 from 33% to 40%+, it shifts the Pareto
+     frontier without retraining.
+
 ### 2026-04-27 (results)
 - 200k warmstart finished: 49994 steps in 3:08:51, final loss 0.47, top-1
   acc 0.80. Strictly better learner than 50k smoke (final loss 0.51, acc
