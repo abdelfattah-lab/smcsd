@@ -1,9 +1,9 @@
 # SMC Particle-Group Aware VLLM Backend — Draft Model Design
 
-**Scope**: within a single `execute_model` call — draft model runs γ+1
-autoregressive decode steps over N particles, then the target model immediately
-scores those tokens.  Both draft and target run on the same GPU.
-Resampling is **out of scope** for this doc.
+**Scope**: draft model runs γ+1 autoregressive decode steps over N particles
+derived from one parent request.  
+
+Target verify and resampling are **out of scope** for this doc.
 
 ---
 
