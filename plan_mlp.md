@@ -111,7 +111,7 @@ why.
 
 ---
 
-## Architecture choices (defaults — confirm with advisor if uncertain)
+## Architecture choices 
 
 ### Per-layer head
 
@@ -133,10 +133,6 @@ frozen target lm_head.
 `Linear(hidden, vocab)` projection, that's ~525M extra params per layer
 (vocab × hidden), and we'd run out of memory long before convergence.
 
-If the advisor wants something simpler ("just the lm_head with a
-per-layer bias/projection"), substitute that. The architecture above is
-a reasonable default that's been validated as the kind of head that
-EAGLE3 uses.
 
 ### Loss
 
