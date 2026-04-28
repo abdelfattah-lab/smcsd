@@ -1,8 +1,9 @@
 # SMC Particle-Group Aware VLLM Backend — Draft Model Design
 
-**Scope**: draft model runs γ+1 autoregressive decode steps over N particles
-derived from one parent request.  
-Target verify and resampling are **out of scope** for this doc.
+**Scope**: within a single `execute_model` call — draft model runs γ+1
+autoregressive decode steps over N particles, then the target model immediately
+scores those tokens.  Both draft and target run on the same GPU.
+Resampling is **out of scope** for this doc.
 
 ---
 
@@ -160,8 +161,8 @@ class SMCGroupBatch:
 
 @dataclass
 class SMCSchedulerOutput(SchedulerOutput):
-    new_particle_groups: list[NewParticleGroupData] = field(default_factory=list)
-    smc_groups: list[SMCGroupBatch] = field(default_factory=list)
+    new_particle_groups: list[NewParticleGroupData] = field(default_factory=list) # new group where we need to create row idx
+    smc_groups: list[SMCGroupBatch] = field(default_factory=list) # ongoing draft groups
 ```
 
 ---
@@ -243,7 +244,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         """Free all particle rows.  Called after verify+resample committed."""
         ...
 
-    # Draft cycle
+    # Draft + verify cycle
 
     def smc_draft_cycle(
         self,
@@ -257,8 +258,27 @@ class SMCGPUModelRunner(GPUModelRunner):
         """Run γ+1 draft decode steps for all P particles.
 
         Returns:
-            draft_token_ids  [P, γ+1]   — tokens sampled at each step (step 0 = seed)
+            draft_token_ids  [P, γ+1]    — tokens sampled at each step (step 0 = seed)
             draft_log_probs  [P, γ+1, V] — log-softmax'd logits at each step
+        """
+        ...
+
+    def smc_target_score(
+        self,
+        particle_rows: torch.Tensor,   # [P]
+        draft_token_ids: torch.Tensor, # [P, γ+1]
+        seq_lens: torch.Tensor,        # [P] — num_computed_tokens at draft start
+        kv_slots: torch.Tensor,        # [num_kv_groups, P, γ+1] — same slots as draft
+    ) -> torch.Tensor:
+        """Score all draft tokens with the target model in one batched pass.
+
+        Runs the target model on the P×(γ+1) draft tokens attending to the
+        prefix KV already in cache.  On single GPU the target model is the
+        same model used for drafting; the draft KV written during smc_draft_cycle
+        is reused here.
+
+        Returns:
+            target_log_probs  [P, γ+1, V]
         """
         ...
 ```
@@ -333,8 +353,7 @@ def _gather_block_tables(self, particle_rows: torch.Tensor) -> tuple[Tensor, ...
 def execute_model(
     self, scheduler_output: SMCSchedulerOutput
 ) -> ModelRunnerOutput:
-    # Normal requests: prefill / decode (mirrors base class handling of
-    # scheduled_new_reqs then scheduled_running_reqs).
+    # Prefill: parent requests still prefilling, delegated to base runner.
     output = super().execute_model(scheduler_output)
 
     # Newly forked groups: register rows in RequestState + BlockTables,
@@ -349,16 +368,22 @@ def execute_model(
             decode_block_ids     = new_group.decode_block_ids,
         )
         particle_rows = self.particle_groups[new_group.group_id].particle_rows
-        self.smc_draft_cycle(particle_rows, new_group.seed_token_ids,
-                             new_group.kv_slots, new_group.seq_lens,
-                             new_group.gamma, new_group.temperature)
+        draft_token_ids, draft_log_probs = self.smc_draft_cycle(
+            particle_rows, new_group.seed_token_ids,
+            new_group.kv_slots, new_group.seq_lens,
+            new_group.gamma, new_group.temperature,
+        )
+        # target verify
 
-    # Ongoing groups: already registered, look up particle_rows locally.
+    # Ongoing groups: already registered
     for group_batch in scheduler_output.smc_groups:
         particle_rows = self.particle_groups[group_batch.group_id].particle_rows
-        self.smc_draft_cycle(particle_rows, group_batch.seed_token_ids,
-                             group_batch.kv_slots, group_batch.seq_lens,
-                             group_batch.gamma, group_batch.temperature)
+        draft_token_ids, draft_log_probs = self.smc_draft_cycle(
+            particle_rows, group_batch.seed_token_ids,
+            group_batch.kv_slots, group_batch.seq_lens,
+            group_batch.gamma, group_batch.temperature,
+        )
+        # target verify
 
     return output
 ```
@@ -379,6 +404,7 @@ SMCGPUModelRunner.execute_model()
     → for new_group in new_particle_groups:
           add_particle_group(...)        # assigns particle_rows, populates BlockTables
           smc_draft_cycle(...)           # first draft cycle runs immediately
+          # target verify
 
 # Subsequent cycles (particles already registered):
 Scheduler.schedule()
@@ -389,27 +415,24 @@ SMCGPUModelRunner.execute_model()
     → for group_batch in smc_groups:
           particle_rows = self.particle_groups[group_batch.group_id].particle_rows
           smc_draft_cycle(...)           # lookup particle_rows locally, no block IDs needed
+          # target verify
 
-# ← target verify + resampling: out of scope for this doc
+# ← resampling: out of scope for this doc
 ```
 
 ---
 
-## 6. Open questions (not resolved in this doc)
+## 6. Notes
+SMCScheduler
 
-1. **CUDA graph capture**: the draft loop has variable `P` (number of particles)
-   and fixed `γ+1` sequence length.  Do we capture graphs for fixed `P` values
-   (like vllm captures for fixed batch sizes), or run eager?
+- Request is CPU state and lives at scheduler/engine level
+- scheduler allocates/free block
+- smc scheduler need to fork a parent request into N particles when its prefill completes
+- smc scheduler need to pre-allocate kV blocks for all N particles
+- SMC doesn’t change prefill: let prefill flow through the vllm base scheduler and base model runner
+- smc scheduler scheduler() is responsible for populating running_req (for normal prefill), new_particle_groups (register rows) and smc_groups (ongoing draft) and return in scheduler output
 
-2. **Multi-group batching**: in a real system multiple parent requests may be
-   active simultaneously.  `smc_draft_cycle` needs to handle a batch of groups,
-   not just one.  The `particle_rows` tensor naturally accommodates this (just
-   concatenate all particles across groups), but `group_id` boundaries need
-   tracking for per-group resampling later.
+SMCGPUModelRunner
 
-3. **Particle retirement ordering**: when verify+resample commits and all N
-   particles are freed, the order in which `kv_cache_manager.free()` is called
-   per particle affects eviction priority (tail blocks evicted first per vllm's
-   convention).  The right order is: non-winning particles freed first, winning
-   particle freed last — so the winning particle's decode blocks are eviction
-   candidates before the shared prefix blocks.
+- row idx contains the persistent row indices that identify each request through its lifetime. Row indices are assigned and owned by the runner
+- smc gpu runner: add_particle_group: allocate N RequestState rows
