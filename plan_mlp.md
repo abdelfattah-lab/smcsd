@@ -148,7 +148,7 @@ total_loss = sum over positions, then sum over layers ℓ
 ```
 
 - **Forward KL** (`p ‖ q`), mode-covering. Matches the Rao-Blackwell
-estimator from Amini et al. 2025 (which is the paper Ryan co-authored,
+estimator from Amini et al. 2025 (kl.pdf),
 the same one we used for `train_eagle_kl_onpolicy.py`).
 - Temperature T = 0.7 (matches inference and our existing recipe; see
 `accuracy_test_gsm8k.py --temperature 0.7`).
@@ -312,7 +312,7 @@ relevant ℓ).
 ### Stage 2 — Per-layer KL evaluation (~30 min)
 
 **Goal**: produce the per-layer KL curve. This is the **first
-deliverable** Ryan asked for ("how well each head works").
+deliverable**.
 
 Reuse the heldout slice (last 200 prompts of the 200k file). For each
 ℓ ∈ {1, …, L−1}, on heldout:
@@ -343,7 +343,7 @@ have KL < 0.5").
 
 **Goal**: actually run SMC-SD with the trained heads as the proposal
 distribution and measure accuracy + ESS/N + TPS at γ-sweep. This is
-the **second deliverable** Ryan asked for.
+the **second deliverable**.
 
 This is the heavier engineering piece. Two paths:
 
@@ -451,22 +451,6 @@ in updates.md.
   wrap the per-layer MLP application in `torch.utils.checkpoint`. The
    target is frozen so doesn't checkpoint; the MLP heads can.
 
----
-
-## Open questions for the advisor (already in flight)
-
-These were in the message sent to Ryan on 2026-04-28. Don't act on
-defaults until he replies if any of these matter to you:
-
-- KL direction (forward vs reverse). Default: forward `KL(p || q)`.
-- MLP architecture (tied lm_head + small bottleneck, or unconstrained
-per-layer head). Default: tied lm_head + bottleneck.
-- Joint vs per-layer training. Default: joint (single target forward,
-summed loss over all heads).
-- "Show with SMC-SD" — KL ablation only, or full inference. Default:
-KL first (Stage 2), then inference for selected layers (Stage 3).
-- Target model — Llama-3.1-8B or other. Default: Llama-3.1-8B
-(infrastructure ready).
 
 ---
 
