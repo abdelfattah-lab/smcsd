@@ -517,7 +517,15 @@ class SMCWorker(BaseSpecWorker):
             f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
             f"cuda_graph={can_run_cuda_graph})"
         )
-        score_log_probs = torch.log_softmax(score_logits, dim=-1)
+        # NOTE: must apply smc_target_temperature so target log-p matches the
+        # temperature regime the draft sampled at. Dropping this divisor was
+        # a bug caught by scripts/verify_eagle_integration.py Test C
+        # (pass-through with draft=target gave median |logprob_diff|=0.056
+        # instead of 0). The EAGLE chain path at line 1462 applies it; the
+        # dense path now matches.
+        score_log_probs = torch.log_softmax(
+            score_logits / self.smc_target_temperature, dim=-1
+        )
         score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
         target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
         score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
@@ -772,27 +780,35 @@ class SMCWorker(BaseSpecWorker):
             target_topk_ids == target_tokens[:, :, None]
         ).any(dim=-1).float()
 
-        self._write_eagle_diagnostics(
-            {
-                "mode": self.smc_draft_mode,
-                "bs": int(target_tokens.shape[0]),
-                "gamma": int(gamma),
-                "topk": int(topk),
-                "draft_target_topk_overlap_mean": float(overlap.mean().item()),
-                "sample_in_draft_topk_mean": float(token_in_draft_topk.mean().item()),
-                "sample_in_target_topk_mean": float(token_in_target_topk.mean().item()),
-                "sample_target_rank_mean": float(token_target_rank.mean().item()),
-                "sample_target_rank_median": float(
-                    token_target_rank.flatten().median().item()
-                ),
-                "target_lp_mean": float(target_logprobs.mean().item()),
-                "draft_lp_mean": float(draft_logprobs.mean().item()),
-                "target_minus_draft_lp_mean": float(
-                    (target_logprobs - draft_logprobs).mean().item()
-                ),
-                "draft_topk_lp_mean": float(draft_topk_logp.mean().item()),
-                "target_topk_lp_mean": float(target_topk_logp.mean().item()),
-            }
+        rec = {
+            "mode": self.smc_draft_mode,
+            "bs": int(target_tokens.shape[0]),
+            "gamma": int(gamma),
+            "topk": int(topk),
+            "draft_target_topk_overlap_mean": float(overlap.mean().item()),
+            "sample_in_draft_topk_mean": float(token_in_draft_topk.mean().item()),
+            "sample_in_target_topk_mean": float(token_in_target_topk.mean().item()),
+            "sample_target_rank_mean": float(token_target_rank.mean().item()),
+            "sample_target_rank_median": float(
+                token_target_rank.flatten().median().item()
+            ),
+            "target_lp_mean": float(target_logprobs.mean().item()),
+            "draft_lp_mean": float(draft_logprobs.mean().item()),
+            "target_minus_draft_lp_mean": float(
+                (target_logprobs - draft_logprobs).mean().item()
+            ),
+            "draft_topk_lp_mean": float(draft_topk_logp.mean().item()),
+            "target_topk_lp_mean": float(target_topk_logp.mean().item()),
+        }
+        self._write_eagle_diagnostics(rec)
+        # Side-channel: when SMC_EAGLE_PER_TOKEN_TRACE is set, expose the raw
+        # per-batch per-position tensors to the chain-decode caller so it
+        # can write a separate trace file with x0 and bonus included.
+        # See scripts/verify_eagle_integration.py Test B.
+        self._last_chain_per_token = (
+            target_tokens.to(torch.int32).cpu(),
+            target_logprobs.float().cpu(),
+            draft_logprobs.float().cpu(),
         )
 
     def _build_eagle3_tree(self, batch: ModelWorkerBatch, draft_input: SMCDraftInput):
@@ -1484,6 +1500,34 @@ class SMCWorker(BaseSpecWorker):
             bonus = torch.multinomial(bonus_log_probs.exp(), num_samples=1).squeeze(-1)
         else:
             bonus = torch.argmax(bonus_logits, dim=-1)
+
+        # Test B per-token trace: write x0, target_tokens, target_lp,
+        # draft_lp, and bonus per cycle to a separate JSONL when
+        # SMC_EAGLE_PER_TOKEN_TRACE is set. Side-channel buffer was
+        # populated by _write_eagle_chain_diagnostics above.
+        per_tok = getattr(self, "_last_chain_per_token", None)
+        if (
+            per_tok is not None
+            and os.environ.get("SMC_EAGLE_PER_TOKEN_TRACE")
+            and self.eagle_diag_path is not None
+        ):
+            tt_cpu, tlp_cpu, dlp_cpu = per_tok
+            x0_cpu = all_tokens[0].to(torch.int32).cpu().tolist()
+            bonus_cpu = bonus.to(torch.int32).cpu().tolist()
+            trace_path = str(self.eagle_diag_path) + ".pertoken.jsonl"
+            os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+            with open(trace_path, "a") as f:
+                f.write(json.dumps({
+                    "cycle": int(self._eagle_diag_counter),
+                    "bs": int(tt_cpu.shape[0]),
+                    "gamma": int(tt_cpu.shape[1]),
+                    "x0": x0_cpu,
+                    "target_tokens": tt_cpu.tolist(),
+                    "target_logprobs": tlp_cpu.tolist(),
+                    "draft_logprobs": dlp_cpu.tolist(),
+                    "bonus": bonus_cpu,
+                }) + "\n")
+            self._last_chain_per_token = None
 
         output_token_ids = torch.stack(all_tokens[1 : gamma + 1] + [bonus], dim=1)
         next_token_ids = output_token_ids.reshape(-1)
