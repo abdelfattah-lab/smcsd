@@ -2,3 +2,7 @@
 	path = 3rdparty/sglang
 	url = git@github.com:abdelfattah-lab/sglang.git
 	branch = smc_v2_clean
+[submodule "3rdparty/vllm"]
+	path = 3rdparty/vllm
+	url = git@github.com:vllm-project/vllm.git
+	branch = releases/v0.20.0
