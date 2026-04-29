@@ -162,7 +162,7 @@ class SMCGroupBatch:
 @dataclass
 class SMCSchedulerOutput(SchedulerOutput):
     new_particle_groups: list[NewParticleGroupData] = field(default_factory=list) # new group where we need to create row idx
-    smc_groups: list[SMCGroupBatch] = field(default_factory=list) # ongoing draft groups
+    ongoing_smc_groups: list[SMCGroupBatch] = field(default_factory=list)
 ```
 
 ---
@@ -376,7 +376,7 @@ def execute_model(
         # target verify
 
     # Ongoing groups: already registered
-    for group_batch in scheduler_output.smc_groups:
+    for group_batch in scheduler_output.ongoing_smc_groups:
         particle_rows = self.particle_groups[group_batch.group_id].particle_rows
         draft_token_ids, draft_log_probs = self.smc_draft_cycle(
             particle_rows, group_batch.seed_token_ids,
@@ -408,11 +408,11 @@ SMCGPUModelRunner.execute_model()
 
 # Subsequent cycles (particles already registered):
 Scheduler.schedule()
-    → return SMCSchedulerOutput(new_particle_groups=[], smc_groups=[SMCGroupBatch(...)])
+    → return SMCSchedulerOutput(new_particle_groups=[], ongoing_smc_groups=[SMCGroupBatch(...)])
 
 SMCGPUModelRunner.execute_model()
     → super().execute_model()
-    → for group_batch in smc_groups:
+    → for group_batch in ongoing_smc_groups:
           particle_rows = self.particle_groups[group_batch.group_id].particle_rows
           smc_draft_cycle(...)           # lookup particle_rows locally, no block IDs needed
           # target verify
@@ -426,11 +426,9 @@ SMCGPUModelRunner.execute_model()
 SMCScheduler
 
 - Request is CPU state and lives at scheduler/engine level
-- scheduler allocates/free block
-- smc scheduler need to fork a parent request into N particles when its prefill completes
-- smc scheduler need to pre-allocate kV blocks for all N particles
-- SMC doesn’t change prefill: let prefill flow through the vllm base scheduler and base model runner
-- smc scheduler scheduler() is responsible for populating running_req (for normal prefill), new_particle_groups (register rows) and smc_groups (ongoing draft) and return in scheduler output
+- Scheduler needs to pre-allocate kV blocks for all N particles
+- SMC doesn’t change prefill: let prefill flow through the vllm base scheduler and base model runner implementation
+- smc scheduler scheduler() is responsible for populating running_req (for normal prefill), new_particle_groups (register rows) and ongoing_smc_groups (ongoing draft) and return in scheduler output
 
 SMCGPUModelRunner
 
