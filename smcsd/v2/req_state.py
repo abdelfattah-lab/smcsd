@@ -120,6 +120,11 @@ class ScheduleBatchSMC:
         # Allocated lazily on first eagle3 use to avoid memory cost in dense mode.
         # aux_hidden_dim = 3*hidden_dim (use_aux_hidden_state=True) or hidden_dim.
         self.target_hidden_states: Optional[torch.Tensor] = None
+        # DFlash: variable-length full target-hidden context per slot.
+        # Stored as Python tensors because sequence length grows per particle and
+        # can differ across active groups. Hot tensor state remains in the dense
+        # per-slot arrays above; this path is eager and correctness-first.
+        self.target_hidden_contexts: Dict[int, torch.Tensor] = {}
 
         # ── EAGLE3: per-slot carry of the pre-sampled "first draft token" ──
         # Allocated lazily. These are the draft's own prediction of the next
@@ -249,6 +254,7 @@ class ScheduleBatchSMC:
         prefill_hidden: torch.Tensor,
         first_draft_token_id: Optional[torch.Tensor] = None,
         first_draft_logprob: Optional[torch.Tensor] = None,
+        prefill_hidden_context: Optional[torch.Tensor] = None,
     ) -> None:
         """EAGLE3: seed particle slots for one parent.
 
@@ -308,6 +314,10 @@ class ScheduleBatchSMC:
                 dtype=torch.float32
             )
 
+        if prefill_hidden_context is not None:
+            for slot in slots:
+                self.target_hidden_contexts[int(slot)] = prefill_hidden_context
+
     def free_group_slots(self, group_id: str) -> None:
         """Free all slots for a finalized group."""
         slots = self.group_slot_lists.pop(group_id, [])
@@ -336,6 +346,7 @@ class ScheduleBatchSMC:
 
             self.slot_to_req.pop(slot, None)
             self.slot_to_group_id.pop(slot, None)
+            self.target_hidden_contexts.pop(slot, None)
             self.free_slots.append(slot)
 
         self.group_log_weights.pop(group_id, None)
@@ -425,6 +436,12 @@ class ScheduleBatchSMC:
             if self.first_draft_logprobs is not None
             else None
         )
+        active_list = active.tolist()
+        hidden_contexts_g = None
+        if self.target_hidden_contexts:
+            hidden_contexts_g = [
+                self.target_hidden_contexts[int(slot)] for slot in active_list
+            ]
 
         return SMCDraftInputV2(
             verified_id=verified_g,
@@ -433,6 +450,7 @@ class ScheduleBatchSMC:
             target_hidden_state=hidden_g,
             first_draft_token_id=fd_ids_g,
             first_draft_logprob=fd_logp_g,
+            target_hidden_contexts=hidden_contexts_g,
         )
 
     # ────────────────────────────────────────────────────────
@@ -531,6 +549,7 @@ class ScheduleBatchSMC:
         next_hidden_state: Optional[torch.Tensor] = None,
         next_first_draft_token_id: Optional[torch.Tensor] = None,
         next_first_draft_logprob: Optional[torch.Tensor] = None,
+        next_hidden_contexts: Optional[List[torch.Tensor]] = None,
         rebuild_active: bool = True,
     ) -> List[int]:
         """Write forward results back to slot state. Returns newly finished slots.
@@ -593,6 +612,14 @@ class ScheduleBatchSMC:
             self.first_draft_logprobs[active] = next_first_draft_logprob.to(
                 dtype=torch.float32
             )
+
+        if next_hidden_contexts is not None:
+            assert len(next_hidden_contexts) == bs, (
+                f"next_hidden_contexts must have one tensor per active slot: "
+                f"got {len(next_hidden_contexts)} for {bs} slots."
+            )
+            for slot, hidden_context in zip(active.tolist(), next_hidden_contexts):
+                self.target_hidden_contexts[int(slot)] = hidden_context
 
         # c. Batched finish check
         newly_finished: List[int] = []
@@ -700,6 +727,10 @@ class ScheduleBatchSMC:
             self.first_draft_token_ids[dst_slot] = self.first_draft_token_ids[src_slot]
         if self.first_draft_logprobs is not None:
             self.first_draft_logprobs[dst_slot] = self.first_draft_logprobs[src_slot]
+        if src_slot in self.target_hidden_contexts:
+            self.target_hidden_contexts[dst_slot] = self.target_hidden_contexts[src_slot]
+        else:
+            self.target_hidden_contexts.pop(dst_slot, None)
 
         src_count = int(self.token_counts[src_slot].item())
         self.token_counts[dst_slot] = src_count
@@ -743,6 +774,10 @@ class ScheduleBatchSMC:
         dst_req.decoded_text = src_req.decoded_text
         dst_req.surr_offset = src_req.surr_offset
         dst_req.read_offset = src_req.read_offset
+        if src_slot in self.target_hidden_contexts:
+            self.target_hidden_contexts[dst_slot] = self.target_hidden_contexts[src_slot]
+        else:
+            self.target_hidden_contexts.pop(dst_slot, None)
 
     def copy_req_metadata(self, dst_slot: int, src_slot: int) -> None:
         """Copy req-side state from src to dst after fused tensor/KV copies."""

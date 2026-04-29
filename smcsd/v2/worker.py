@@ -16,6 +16,7 @@ import logging
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -56,6 +57,9 @@ class SMCWorkerV2(BaseSpecWorker):
         self.smc_target_temperature = max(
             float(server_args.smc_target_temperature), 1e-5
         )
+        self.smc_draft_mode = getattr(server_args, "smc_draft_mode", "dense")
+        self.is_dflash = self.smc_draft_mode == "dflash"
+        self.is_eagle3 = self.smc_draft_mode == "eagle3"
 
         # Share req_to_token_pool, separate KV caches
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -65,13 +69,24 @@ class SMCWorkerV2(BaseSpecWorker):
         # Set class-level constant for KV allocation
         SMCDraftInputV2.ALLOC_LEN_PER_DECODE = self.speculative_num_draft_tokens
 
+        server_args.context_length = target_worker.model_runner.model_config.context_len
+        self.score_runner = self._target_worker.model_runner
+        if self.is_dflash:
+            self._draft_worker = None
+            self.draft_runner = None
+            self.draft_attn_backend = None
+            self.hot_token_id = None
+            self._t2d_map = None
+            self._init_dflash_direct()
+            return
+
         # Override context length of draft model to match score model.
         # For EAGLE3, the draft head has a small max_position_embeddings (2048)
         # in its config, but it operates within the target's full context window.
         # We set the env var to suppress the validation error before constructing
         # the draft TpModelWorker.
         import os
-        _eagle3_mode = getattr(server_args, "smc_draft_mode", "dense") == "eagle3"
+        _eagle3_mode = self.is_eagle3
         _prev_allow_overwrite = os.environ.get("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
         _prev_dtype = server_args.dtype
         if _eagle3_mode:
@@ -88,8 +103,6 @@ class SMCWorkerV2(BaseSpecWorker):
             server_args.dtype = _torch_to_str.get(
                 _target_torch_dtype, "bfloat16"
             )
-        server_args.context_length = target_worker.model_runner.model_config.context_len
-
         # Do not capture cuda graph during TpModelWorker init —
         # we capture manually after the draft model is fully set up
         backup_disable_cuda_graph = server_args.disable_cuda_graph
@@ -121,11 +134,9 @@ class SMCWorkerV2(BaseSpecWorker):
             server_args.dtype = _prev_dtype
 
         self.draft_runner = self._draft_worker.model_runner
-        self.score_runner = self._target_worker.model_runner
 
         # EAGLE3 draft mode: share target embed/lm_head with draft head,
         # then disable the draft CUDA graph (EAGLE head runs eagerly).
-        self.is_eagle3 = (getattr(server_args, "smc_draft_mode", "dense") == "eagle3")
         self.eagle_use_aux = False
         self._eagle3_residual_alpha = getattr(server_args, "eagle3_residual_alpha", 0.0)
 
@@ -246,6 +257,67 @@ class SMCWorkerV2(BaseSpecWorker):
     def model_runner(self):
         return self._target_worker.model_runner
 
+    def _init_dflash_direct(self) -> None:
+        """Load a SpecForge DFlash checkpoint as an eager draft module.
+
+        DFlash is not an autoregressive SGLang draft model: it consumes target
+        hidden-state context and predicts a whole masked block. Loading it
+        directly keeps the target model in SGLang while avoiding a fake
+        TpModelWorker with incompatible KV-cache semantics.
+        """
+        if self.tp_rank != 0 or getattr(self.server_args, "tp_size", 1) != 1:
+            raise NotImplementedError(
+                "smc_draft_mode=dflash currently supports tp_size=1 only. "
+                "The eager DFlash path shares the target embedding/lm_head weights "
+                "directly and has not implemented tensor-parallel vocab gathering."
+            )
+
+        from transformers import AutoModel
+
+        draft_path = self.server_args.speculative_draft_model_path
+        target_model = self._target_worker.model_runner.model
+        embed_weight, lm_head_weight = target_model.get_embed_and_head()
+        self._dflash_embed_weight = embed_weight
+        self._dflash_lm_head_weight = lm_head_weight
+        self._dflash_device = embed_weight.device
+        self._dflash_dtype = embed_weight.dtype
+
+        self.dflash_model = AutoModel.from_pretrained(
+            draft_path,
+            trust_remote_code=True,
+            torch_dtype=self._dflash_dtype,
+        ).to(device=self._dflash_device, dtype=self._dflash_dtype)
+        self.dflash_model.eval()
+        self.dflash_model.requires_grad_(False)
+
+        self._dflash_block_size = int(
+            getattr(self.dflash_model, "block_size", self.gamma + 1)
+        )
+        self._dflash_mask_token_id = getattr(self.dflash_model, "mask_token_id", None)
+        if self._dflash_mask_token_id is None:
+            dflash_cfg = getattr(self.dflash_model.config, "dflash_config", {}) or {}
+            self._dflash_mask_token_id = dflash_cfg.get("mask_token_id", None)
+        if self._dflash_mask_token_id is None:
+            raise ValueError(
+                "DFlash checkpoint config must define dflash_config.mask_token_id."
+            )
+
+        self._dflash_target_layer_ids = list(self.dflash_model.target_layer_ids)
+        if hasattr(target_model, "set_eagle3_layers_to_capture"):
+            target_model.set_eagle3_layers_to_capture(self._dflash_target_layer_ids)
+        else:
+            raise ValueError(
+                "Target model does not expose set_eagle3_layers_to_capture; "
+                "DFlash needs selected target hidden states."
+            )
+
+        logger.info(
+            "Initialized eager DFlash draft: path=%s layers=%s block_size=%d",
+            draft_path,
+            self._dflash_target_layer_ids,
+            self._dflash_block_size,
+        )
+
     def clear_cache_pool(self):
         pass
 
@@ -285,6 +357,122 @@ class SMCWorkerV2(BaseSpecWorker):
         """No-op: _forward_extend already prefills both models."""
         pass
 
+    def _sample_from_logits(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if temperature > 0:
+            scaled = logits / temperature
+            log_probs = torch.log_softmax(scaled, dim=-1)
+            token_ids = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
+        else:
+            log_probs = torch.log_softmax(logits, dim=-1)
+            token_ids = torch.argmax(logits, dim=-1)
+        token_logprobs = log_probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        return token_ids, token_logprobs
+
+    def _prepare_dflash_cache_metadata(
+        self,
+        ctx: SMCDecodeContext,
+        batch: ModelWorkerBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from smcsd.common.verify import assign_smc_cache_locs_kernel
+
+        orig_seq_lens = ctx.orig_seq_lens
+        bs = len(orig_seq_lens)
+        device = orig_seq_lens.device
+        gamma = ctx.gamma
+
+        out_cache_loc = torch.empty(
+            bs * (gamma + 1), dtype=torch.int64, device=device
+        )
+        assign_smc_cache_locs_kernel[(bs,)](
+            batch.req_pool_indices,
+            self.req_to_token_pool.req_to_token,
+            orig_seq_lens,
+            out_cache_loc,
+            self.req_to_token_pool.req_to_token.shape[1],
+            gamma + 1,
+        )
+        cache_locs = out_cache_loc.reshape(bs, gamma + 1)
+
+        step_offsets = torch.arange(gamma + 1, device=device)
+        all_positions = orig_seq_lens.unsqueeze(1) + step_offsets
+        all_seq_lens = all_positions + 1
+        return cache_locs, all_positions, all_seq_lens
+
+    def _make_dflash_attention_mask(
+        self,
+        *,
+        context_len: int,
+        draft_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        # One DFlash block anchored at context_len. The block can see all target
+        # context tokens and all positions inside its masked draft block.
+        return torch.ones(
+            (1, 1, draft_len, context_len + draft_len),
+            dtype=torch.bool,
+            device=device,
+        )
+
+    @torch.inference_mode()
+    def _dflash_propose_one(
+        self,
+        target_hidden_context: torch.Tensor,
+        verified_id: torch.Tensor,
+        position_start: int,
+        gamma: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        draft_len = gamma + 1
+        device = self._dflash_device
+        noise_ids = torch.full(
+            (1, draft_len),
+            int(self._dflash_mask_token_id),
+            dtype=torch.long,
+            device=device,
+        )
+        noise_ids[:, 0] = verified_id.to(device=device, dtype=torch.long)
+        noise_embedding = F.embedding(noise_ids, self._dflash_embed_weight)
+
+        position_ids = torch.arange(
+            position_start + draft_len,
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(0)
+        attention_mask = self._make_dflash_attention_mask(
+            context_len=int(target_hidden_context.shape[0]),
+            draft_len=draft_len,
+            device=device,
+        )
+
+        hidden = self.dflash_model(
+            position_ids=position_ids,
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden_context.unsqueeze(0).to(
+                device=device, dtype=self._dflash_dtype
+            ),
+            attention_mask=attention_mask,
+            is_causal=False,
+        )
+        logits = torch.matmul(
+            hidden[:, 1:, :].to(self._dflash_lm_head_weight.dtype),
+            self._dflash_lm_head_weight.T,
+        ).squeeze(0)
+
+        sampled_ids = []
+        sampled_logprobs = []
+        for step in range(gamma):
+            token_id, token_logprob = self._sample_from_logits(
+                logits[step : step + 1],
+                self.smc_draft_temperature,
+            )
+            sampled_ids.append(token_id.squeeze(0))
+            sampled_logprobs.append(token_logprob.squeeze(0))
+
+        return torch.stack(sampled_ids), torch.stack(sampled_logprobs)
+
     # ── Main entry point ──
 
     def forward_batch_generation(self, batch):
@@ -300,6 +488,31 @@ class SMCWorkerV2(BaseSpecWorker):
 
     def _forward_extend(self, batch: ModelWorkerBatch):
         bs = len(batch.seq_lens)
+
+        if self.is_dflash:
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            score_result = self._target_worker.forward_batch_generation(batch)
+
+            target_h = score_result.logits_output.hidden_states
+            if target_h is None:
+                raise RuntimeError("DFlash prefill requires target hidden states.")
+
+            hidden_contexts = []
+            pt = 0
+            for extend_len in batch.extend_seq_lens:
+                extend_len = int(extend_len)
+                hidden_contexts.append(target_h[pt : pt + extend_len].contiguous())
+                pt += extend_len
+
+            score_result.next_draft_input = SMCDraftInputV2(
+                verified_id=score_result.next_token_ids,
+                num_tokens_per_req=self.speculative_num_draft_tokens,
+                target_hidden_contexts=hidden_contexts,
+            )
+            score_result.accept_lens = torch.zeros(
+                bs, dtype=torch.int32, device=self.device
+            )
+            return score_result
 
         if self.is_eagle3:
             # Target prefill — request aux hidden states for EAGLE3 head input
@@ -407,6 +620,19 @@ class SMCWorkerV2(BaseSpecWorker):
 
         if draft_input.verified_id is not None:
             draft_input.verified_id.record_stream(current_stream)
+
+        if self.is_dflash:
+            cache_locs, all_positions, _ = self._prepare_dflash_cache_metadata(
+                ctx, batch
+            )
+            return self._forward_decode_dflash(
+                batch,
+                draft_input,
+                ctx,
+                cache_locs,
+                all_positions,
+                current_stream,
+            )
 
         # ---- 1. Prepare draft ----
         draft_fb, can_cuda_graph, cache_locs, all_positions, all_seq_lens = (
@@ -549,6 +775,131 @@ class SMCWorkerV2(BaseSpecWorker):
             verified_id=next_verified_id,
             logprob_diff=logprob_diff,
             num_tokens_per_req=self.speculative_num_draft_tokens,
+        )
+
+        return GenerationBatchResult(
+            logits_output=score_result.logits_output,
+            next_token_ids=next_token_ids,
+            accept_lens=accept_lens,
+            next_draft_input=next_draft_input,
+            logprob_diff=logprob_diff,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def _forward_decode_dflash(
+        self,
+        batch: ModelWorkerBatch,
+        draft_input: SMCDraftInputV2,
+        ctx: SMCDecodeContext,
+        cache_locs: torch.Tensor,
+        all_positions: torch.Tensor,
+        current_stream,
+    ):
+        bs = len(ctx.orig_seq_lens)
+        gamma = self.gamma
+        assert draft_input.target_hidden_contexts is not None, (
+            "DFlash decode requires per-particle target_hidden_contexts."
+        )
+        assert len(draft_input.target_hidden_contexts) == bs
+
+        x0 = draft_input.verified_id.to(torch.long)
+        proposed_tokens = []
+        draft_logprobs = []
+
+        for i in range(bs):
+            context = draft_input.target_hidden_contexts[i]
+            position_start = int(ctx.orig_seq_lens_cpu[i].item())
+            token_ids, token_logprobs = self._dflash_propose_one(
+                target_hidden_context=context,
+                verified_id=x0[i],
+                position_start=position_start,
+                gamma=gamma,
+            )
+            proposed_tokens.append(token_ids)
+            draft_logprobs.append(token_logprobs)
+
+        proposed_tokens = torch.stack(proposed_tokens, dim=0).to(
+            device=self.device, dtype=torch.long
+        )
+        draft_logprobs_stacked = torch.stack(draft_logprobs, dim=0).to(
+            device=self.device, dtype=torch.float32
+        )
+        all_tokens = [x0] + [
+            proposed_tokens[:, step].contiguous() for step in range(gamma)
+        ]
+
+        verify_forward_batch, can_run_cuda_graph = ctx.prepare_for_verify(
+            self.req_to_token_pool,
+            batch,
+            self._target_worker,
+            all_tokens,
+            cache_locs,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
+        score_result = self._target_worker.forward_batch_generation(
+            model_worker_batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+        )
+
+        score_logits = score_result.logits_output.next_token_logits
+        expected_rows = bs * (gamma + 1)
+        assert score_logits.shape[0] == expected_rows, (
+            f"TARGET_VERIFY logits truncated: got {score_logits.shape[0]} rows, "
+            f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1})"
+        )
+
+        score_log_probs = torch.log_softmax(score_logits, dim=-1).reshape(
+            bs, gamma + 1, -1
+        )
+        score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
+            2, proposed_tokens.unsqueeze(2)
+        ).squeeze(2)
+        logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
+
+        bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
+        bonus, _ = self._sample_from_logits(bonus_logits, self.smc_target_temperature)
+
+        output_token_ids = torch.cat(
+            [proposed_tokens, bonus.unsqueeze(1).to(proposed_tokens.dtype)],
+            dim=1,
+        )
+        next_token_ids = output_token_ids.reshape(-1)
+        accept_lens = torch.full(
+            (bs,), gamma + 1, dtype=torch.int32, device=self.device
+        )
+
+        h_all = score_result.logits_output.hidden_states
+        if h_all is None:
+            raise RuntimeError("DFlash verify must capture FULL target hidden states.")
+        aux_dim = h_all.shape[-1]
+        target_h_steps = h_all.reshape(bs, gamma + 1, aux_dim)
+        next_hidden_contexts = []
+        for i in range(bs):
+            next_hidden_contexts.append(
+                torch.cat(
+                    [
+                        draft_input.target_hidden_contexts[i],
+                        target_h_steps[i].contiguous(),
+                    ],
+                    dim=0,
+                )
+            )
+
+        next_verified_id = bonus.to(dtype=torch.long)
+
+        next_token_ids.record_stream(current_stream)
+        accept_lens.record_stream(current_stream)
+        next_verified_id.record_stream(current_stream)
+        logprob_diff.record_stream(current_stream)
+
+        next_draft_input = SMCDraftInputV2(
+            verified_id=next_verified_id,
+            logprob_diff=logprob_diff,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+            target_hidden_contexts=next_hidden_contexts,
         )
 
         return GenerationBatchResult(

@@ -69,7 +69,7 @@ class SMCEngine:
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
         # Draft mode
-        smc_draft_mode: str = "dense",  # "dense" or "eagle3"
+        smc_draft_mode: str = "dense",  # "dense", "eagle3", or "dflash"
         # Hardware
         tp_size: int = 1,
         base_gpu_id: int = 0,

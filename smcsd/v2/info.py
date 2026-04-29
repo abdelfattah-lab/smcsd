@@ -288,6 +288,13 @@ class SMCDraftInputV2(SpecInput):
     # Always None during decode cycles.
     first_draft_logprobs: Optional[torch.Tensor] = None  # (num_parents, draft_vocab)
 
+    # DFlash mode: full target-hidden context per request/particle.
+    # Each tensor is shaped (seq_len_without_verified_bonus, aux_hidden_dim), where
+    # aux_hidden_dim is len(target_layer_ids) * target_hidden_size. The final
+    # verified bonus token is intentionally not included because it has no target KV
+    # or hidden state until the next verify pass consumes it.
+    target_hidden_contexts: Optional[List[torch.Tensor]] = None
+
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1
 

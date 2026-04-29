@@ -118,6 +118,8 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
     if getattr(args, "dtype", None):
         engine_kwargs["dtype"] = args.dtype
+    if getattr(args, "disable_cuda_graph", False):
+        engine_kwargs["disable_cuda_graph"] = True
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
@@ -173,6 +175,8 @@ def run_baseline_eval(args, prompts, labels):
         engine_kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
+    if getattr(args, "disable_cuda_graph", False):
+        engine_kwargs["disable_cuda_graph"] = True
 
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
@@ -326,14 +330,15 @@ if __name__ == "__main__":
     smc_grp.add_argument(
         "--smc-draft-mode",
         type=str,
-        choices=["dense", "eagle3"],
+        choices=["dense", "eagle3", "dflash"],
         default="dense",
         help=(
             "SMC draft mode. 'dense' (default) = separate draft model "
             "(e.g. Llama-3.2-1B). 'eagle3' = EAGLE3 head that uses the "
             "target model's hidden states; --draft-model should be the "
             "matching EAGLE3 checkpoint "
-            "(e.g. lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B)."
+            "(e.g. lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B). "
+            "'dflash' = SpecForge DFlash draft head."
         ),
     )
     smc_grp.add_argument(
@@ -364,6 +369,12 @@ if __name__ == "__main__":
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=16)
+    eng.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        default=False,
+        help="Disable CUDA graphs (faster startup, slower decode; useful for smoke tests).",
+    )
 
     args = parser.parse_args()
     main(args)

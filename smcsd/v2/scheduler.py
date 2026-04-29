@@ -734,12 +734,16 @@ class SMCSchedulerV2(Scheduler):
         # for particle diversity — same order as batch.reqs. None in dense mode.
         prefill_hidden = None
         prefill_first_draft_logprobs_full = None
+        prefill_hidden_contexts = None
         if result.next_draft_input is not None:
             prefill_hidden = getattr(
                 result.next_draft_input, "target_hidden_state", None
             )
             prefill_first_draft_logprobs_full = getattr(
                 result.next_draft_input, "first_draft_logprobs", None
+            )
+            prefill_hidden_contexts = getattr(
+                result.next_draft_input, "target_hidden_contexts", None
             )
 
         for i, (group, req, next_token_id) in enumerate(
@@ -757,6 +761,11 @@ class SMCSchedulerV2(Scheduler):
                 continue
 
             h_i = prefill_hidden[i] if prefill_hidden is not None else None
+            hctx_i = (
+                prefill_hidden_contexts[i]
+                if prefill_hidden_contexts is not None
+                else None
+            )
 
             # Fan out the parent's prefill log-probs into n_particles
             # DISTINCT x1 samples (one per particle slot). This is the
@@ -775,6 +784,7 @@ class SMCSchedulerV2(Scheduler):
                 prefill_hidden=h_i,
                 first_draft_token_id=fd_id_i,
                 first_draft_logprob=fd_lp_i,
+                prefill_hidden_context=hctx_i,
             )
             if error_msg is not None:
                 self._abort_group(group, error_msg)
@@ -788,6 +798,7 @@ class SMCSchedulerV2(Scheduler):
         prefill_hidden: Optional[torch.Tensor] = None,
         first_draft_token_id: Optional[torch.Tensor] = None,
         first_draft_logprob: Optional[torch.Tensor] = None,
+        prefill_hidden_context: Optional[torch.Tensor] = None,
     ) -> Optional[str]:
         parent_req = group.parent_req
         try:
@@ -852,12 +863,14 @@ class SMCSchedulerV2(Scheduler):
                 prefill_hidden is not None
                 or first_draft_token_id is not None
                 or first_draft_logprob is not None
+                or prefill_hidden_context is not None
             ):
                 self.slot_state.set_prefill_hidden(
                     slots,
                     prefill_hidden,
                     first_draft_token_id=first_draft_token_id,
                     first_draft_logprob=first_draft_logprob,
+                    prefill_hidden_context=prefill_hidden_context,
                 )
         except Exception as exc:
             for particle_req in particle_reqs:
@@ -933,6 +946,11 @@ class SMCSchedulerV2(Scheduler):
             if next_draft is not None
             else None
         )
+        next_hidden_contexts = (
+            next_draft.target_hidden_contexts
+            if next_draft is not None
+            else None
+        )
         newly_finished = self.slot_state.process_batch_result(
             next_token_ids=result.next_token_ids,
             accept_lens=result.accept_lens,
@@ -941,6 +959,7 @@ class SMCSchedulerV2(Scheduler):
             next_hidden_state=next_hidden,
             next_first_draft_token_id=next_first_draft_id,
             next_first_draft_logprob=next_first_draft_lp,
+            next_hidden_contexts=next_hidden_contexts,
             rebuild_active=False,
         )
 
