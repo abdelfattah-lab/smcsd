@@ -4,5 +4,5 @@
 	branch = smc_v2_clean-upstream-sync-2
 [submodule "3rdparty/vllm"]
 	path = 3rdparty/vllm
-	url = git@github.com:vllm-project/vllm.git
+	url = git@github.com:abdelfattah-lab/vllm.git
 	branch = releases/v0.20.0
