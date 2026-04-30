@@ -250,6 +250,14 @@ class SMCScheduler(Scheduler):
             enable_overlap=self.enable_overlap,
             n_particles=n_particles,
         )
+        # Only the fused systematic kernel is wired up today; keep the
+        # ServerArgs option for future variants (multinomial / async SIS)
+        # but fail fast instead of silently coercing.
+        if server_args.smc_resample_method != "systematic":
+            raise ValueError(
+                f"smc_resample_method={server_args.smc_resample_method!r} is "
+                "not supported; only 'systematic' is currently implemented."
+            )
         self.coordinator = SMCCoordinator(
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
