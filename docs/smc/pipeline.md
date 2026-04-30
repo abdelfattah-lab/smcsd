@@ -19,7 +19,7 @@ once when the group drains.
 
 ## 0. Outer event loop
 
-`SMCSchedulerV2.run_event_loop` runs forever in the scheduler subprocess,
+`SMCScheduler.run_event_loop` runs forever in the scheduler subprocess,
 driving one batch per iteration on the schedule CUDA stream:
 
 ```
@@ -117,7 +117,7 @@ gets established.
                │
   ┌────────────┴────────────────────────────────────────────────┐
   │                                                             │
-  │  a) SMCWorkerV2.materialize_smc_parent_draft_prefix(parent) │
+  │  a) SMCWorker.materialize_smc_parent_draft_prefix(parent) │
   │       draft model materializes its own KV for the same L    │
   │       tokens (target and draft have separate KV caches).    │
   │                                                             │
@@ -145,8 +145,9 @@ gets established.
   │  f) slot_state.allocate_slots(gid, group_idx, particles, L) │
   │       claim N slots from free_slots                         │
   │       fill per-slot tensors                                 │
-  │       StackedGroupState.register_group → row of (max_G, N)  │
-  │       bind views: group_log_weights[gid] → row              │
+  │       claim row from _free_rows                             │
+  │       group_to_slots[row, :N] = slots; row_in_use[row] = T  │
+  │       log_weights[slots]=0; interval_weights[slots]=0       │
   │       rebuild_active_slots()                                │
   │                                                             │
   └─────────────────────────────────────────────────────────────┘
@@ -183,7 +184,7 @@ One cycle does seven things, in order:
 ### 4.1 `prepare_for_decode`
 
 Input: current `active_slots` (see [`state.md` §2.3](./state.md#23-active_slots--the-sparse--dense-idx-mapping)).
-Output: `SMCDraftInputV2` with an attached `SMCDecodeContext`.
+Output: `SMCDraftInput` with an attached `SMCDecodeContext`.
 
 ```
   active = slot_state.active_slots                     # [bs] int64
@@ -221,11 +222,11 @@ the draft loop can set per-step positions without another CPU sync.
 A straight gather of slot tensors into a dense `ModelWorkerBatch`. No SMC
 math — just layout. The `SamplingBatchInfo` is minimal (greedy flags False,
 temp/top-p/top-k tensors gathered from slots) because the SMC worker does
-its own temperature adjustment. `spec_info = SMCDraftInputV2`.
+its own temperature adjustment. `spec_info = SMCDraftInput`.
 
 ### 4.3 Draft AR × (γ+1)
 
-In `SMCWorkerV2._forward_decode`:
+In `SMCWorker._forward_decode`:
 
 ```
   ctx       = draft_input.decode_ctx
@@ -291,7 +292,7 @@ Returned as `GenerationBatchResult` with:
 ```
   next_token_ids  = cat(all_tokens[1..γ+1] + [bonus]).reshape(-1)
   accept_lens     = full(bs, γ+1)
-  next_draft_input= SMCDraftInputV2(verified_id=bonus, logprob_diff=…)
+  next_draft_input= SMCDraftInput(verified_id=bonus, logprob_diff=…)
   logprob_diff    = [bs]
 ```
 
@@ -323,13 +324,12 @@ matches the implementation.
      finished_mask stays True forever for that slot; it drops out of
      active_slots on the next rebuild.
 
-  e) weight accumulation, per group:
-     for each group row in the stacked storage:
-         slice logprob_diff for that group (via group_active_indptr)
-         stacked.log_weights[row, pidxs_in_slice]      += diffs
-         stacked.interval_weights[row, pidxs_in_slice] += diffs
-     (views group_log_weights[gid] / group_interval_weights[gid] see
-      the writes — same underlying storage.)
+  e) weight accumulation, vectorised:
+     d = logprob_diff.to(float64)
+     log_weights[active_slots]      += d
+     interval_weights[active_slots] += d
+     # Two in-place index_puts over the full active set. No per-group
+     # loop, no `.item()` syncs.
 
   f) optionally rebuild_active_slots
      (scheduler passes rebuild_active=False here — batched with resample)
@@ -337,69 +337,39 @@ matches the implementation.
 
 ### 4.6 Resample
 
-`SMCCoordinatorV2.collect_resample_jobs_batch` returns either a
-`List[ResampleJobSet]` (slow) or a `BatchedResampleResult` (fast);
-`dispatch_resample_batch` accepts both.
+There is one resample path — two fused Triton kernels in sequence, no
+Python fallback, no flag.  `SMCCoordinator.collect_resample_jobs_batch`
+returns a `BatchedResampleResult` (dst_slots, src_slots, row_of_job,
+resample_mask, n_jobs) produced by the fused collect kernel;
+`dispatch_resample_batch` consumes it via `batched_resample_kv` plus a
+short Python loop for Req-level metadata copies.
 
-The slow path is the reference implementation. The fast path is a
-single fused Triton kernel that performs the same logical operation with
-no `.tolist()` on the critical path. Both paths see **all** allocated
-particles of a group (including finished ones) as candidates — finish
-state is handled by copy-propagation, not by exclusion.
+The kernel sees **all** allocated particles of a group (including finished
+ones) as candidates — finish state is handled by copy-propagation, not by
+exclusion.
 
-#### 4.6a Slow path — per-group Python
-
-```
-  for each group in running_groups with ≥ 2 particles:
-      pidxs      = particle_indices[slot_state.group_slot_lists[gid]]   # GPU
-      weights    = normalize_log_weights( interval_weights[gid][pidxs] )
-
-      if ESS(weights) >= threshold * n_active:
-          skip                                       # no resample
-
-      ancestors  = systematic_resample(weights)      # or multinomial
-      # reset cumulative weights (writes through views into stacked row)
-      group_log_weights[gid][pidxs]      = 0
-      group_interval_weights[gid][pidxs] = 0
-
-      # Counter-pair: which pidxs need to be overwritten, which are srcs
-      build (dst_pidxs, src_pidxs) from ancestors & keep_counts
-      dst_slots = [ pidx_to_slot[p] for p in dst_pidxs ]
-      src_slots = [ pidx_to_slot[p] for p in src_pidxs ]
-      jobs.append(ResampleJobSet(gid, dst_slots, src_slots))
-
-  # dispatch: per-pair copies inside one free_group_begin/end window
-  allocator.free_group_begin()
-  for job in jobs:
-      for dst, src in zip(job.dst_slots, job.src_slots):
-          slot_state.resample_copy_slot(dst, src)
-          # • dec_ref_and_free old dst KV
-          # • clone src block-table → dst + inc_ref
-          # • copy slot tensors dst ← src
-          # • copy Req-side metadata dst ← src
-  allocator.free_group_end()
-```
-
-Golden truth. Slow because of the `.tolist()` in `_collect_one`, the
-per-pair Python dispatch, and the per-slot `resample_copy_slot`.
-
-#### 4.6b Fast path — one fused collect + one fused KV kernel
+#### Collect + dispatch
 
 ```
-  batched_collect_fused( stacked, threshold, step_counter )
+  batched_collect_fused(
+      log_weights, interval_weights, group_to_slots, row_in_use,
+      threshold, step_counter,
+  )
     ─────────────────────────────────────────────────────
-    one Triton program per row:
-      • mask inactive cells to -inf, lse-normalize → weights
-      • ess = 1 / Σ w²;   resample iff ess < threshold · n_active
+    one Triton program per row, gated on row_in_use[row]:
+      • slots  = group_to_slots[row, :N]
+      • lw_raw = interval_weights[slots]            ← gather
+      • lse-normalise → weights
+      • ess = 1 / Σ w²;   resample iff ess < threshold · N
       • cdf = cumsum(weights)
-      • u   = tl.rand(step_counter, row)        ← Philox, no host sync
+      • u   = tl.rand(step_counter, row)            ← Philox, no host sync
       • systematic draws via scalar searchsorted
       • counts[ancestor] via per-draw scatter-add
-      • dead_flag = (counts==0) & active_cell_mask
-      • excess    = max(counts-1, 0)
+      • dead_flag = (counts == 0)   (all N cells allocated under global N)
+      • excess    = max(counts - 1, 0)
       • offset = atomic_add(global_counter, n_copies)
       • scatter flat (dst_slot, src_slot, row_of_job) triples
-      • zero log_weights / interval_weights row in-place
+      • scatter-zero log_weights[slots] and interval_weights[slots]
     returns BatchedResampleResult  (one .item() sync at boundary)
 
   batched_resample_kv( req_to_token, slot_ref_count,
@@ -428,36 +398,28 @@ per-pair Python dispatch, and the per-slot `resample_copy_slot`.
       slot_state.copy_req_metadata(dst, src)
 ```
 
-Visually, slow vs fast:
+Visually:
 
 ```
-SLOW PATH  ──────────────────────────────────────────
-  group₀ ─► Python: normalize, ESS, resample, dst/src
-            ↳ per-pair Python: resample_copy_slot (dec, copy, inc, metadata)
-  group₁ ─► …                   (serialised per group)
-  group₂ ─► …
-
-FAST PATH  ──────────────────────────────────────────
-  [ fused_collect kernel ] ─────────────►  one launch, all rows
-           │
-           ▼
-  flat (dst, src, row) triples on GPU
-           │
-           ▼
-  [ batched_resample_kv ]  ─────────────►  one launch, all pairs
-           │
-           ▼
-  vectorised slot-tensor copies (one line each)
-           │
-           ▼
-  per-pair copy_req_metadata  (the only Python-side loop)
+[ fused_collect kernel ] ─────────────►  one launch, all in-use rows
+         │
+         ▼
+flat (dst, src, row) triples on GPU
+         │
+         ▼
+[ batched_resample_kv ] ─────────────►  one launch, all pairs
+         │
+         ▼
+vectorised slot-tensor copies (one line each)
+         │
+         ▼
+per-pair copy_req_metadata  (the only Python-side loop)
 ```
 
-The fast path is correct only under `resample_method=systematic` on CUDA
-(those are the requirements the coordinator enforces at init). The fused
-collect kernel's Philox seed uses a monotonic `step_counter` to avoid
-reusing the same stratification across consecutive cycles without any
-host allocation.
+The fused collect kernel uses systematic resampling on CUDA
+(`SMCCoordinator.__init__` enforces CUDA).  Its Philox seed is driven
+by a monotonic `step_counter`, so consecutive decode cycles use
+independent stratifications without any host-side allocation or sync.
 
 ### 4.7 `rebuild_active_slots`
 
@@ -483,12 +445,11 @@ Triggered from `_drain_finished_groups` when `slot_state.group_has_active(gid)`
 is False. Calls `slot_state.finalize_group(gid, parent_req)`:
 
 ```
-  lw    = group_log_weights[gid]                    # view into stacked row
   slots = group_slot_lists[gid]
 
   # Pick best by (log_weight, visible_output_len).
   # visible_output_len = min(req.finished_len or token_count, token_count)
-  best_slot = argmax over slots of (lw[particle_indices[s]], visible_output_len(s))
+  best_slot = argmax over slots of (log_weights[s], visible_output_len(s))
   best_req  = slot_to_req[best_slot]
 
   parent_req.output_ids      = list(best_req.output_ids)
@@ -497,24 +458,24 @@ is False. Calls `slot_state.finalize_group(gid, parent_req)`:
   (fallback to FINISH_ABORT if best_req.finished_reason is None)
 
   free_group_slots(gid)
-    ├── for each slot:
-    │     dec_ref_and_free on this slot's KV block-table slice
-    │     req_to_token_pool.free(Req)
-    │     reset slot tensors to EMPTY_SLOT / 0 / False
-    │     push slot back onto free_slots
-    ├── drop group_log_weights[gid] / group_interval_weights[gid]
-    └── stacked.unregister_group(gid)       → row returned to _free_rows
+    ├── row_in_use[row] = False; group_to_slots[row] = -1
+    │   row returned to _free_rows
+    └── for each slot:
+          dec_ref_and_free on this slot's KV block-table slice
+          req_to_token_pool.free(Req)
+          reset slot tensors to EMPTY_SLOT / 0 / False
+          log_weights[slot] = 0; interval_weights[slot] = 0
+          push slot back onto free_slots
 
   rebuild_active_slots()
 
   stream_output([parent_req])
 ```
 
-Because the slow path included finished particles in the resample
-candidate set (and the fast path mirrors it), a group that finalises
-here can have any of its slots marked finished and still hold the best
-weight — the `argmax` picks it regardless. After unregister, the row of
-`StackedGroupState` can be reused by a future group.
+Because the fused kernel includes finished particles in the resample
+candidate set, a group that finalises here can have any of its slots
+marked finished and still hold the best weight — the `argmax` picks it
+regardless. The freed row goes back on `_free_rows` for a future group.
 
 ---
 
@@ -533,7 +494,7 @@ One glance, one decode cycle:
                  │    ↓                           │
                  │   TARGET_VERIFY                │
                  │    ↓ logprob_diff, bonus       │
-                 │   process_batch_result ───────►│ (weights → stacked row)
+                 │   process_batch_result ───────►│ (weights → log_weights[active])
                  │    ↓                           │
                  │   coordinator.collect          │
                  │    ↓                           │

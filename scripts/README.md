@@ -11,8 +11,8 @@ experiments on top of the standalone `smcsd/` implementation.
 - **`quick_quality_check.py`** — Quick output quality sanity check
   (vanilla vs SMC) on a handful of hardcoded prompts.
 - **`smc_profile_engine.py`** — Offline profiler harness for SMC. Use
-  `--engine-kind smc_engine` to target the production v2 path; emits
-  Chrome-compatible traces.
+  `--engine-kind smc_engine` to target the dedicated ``SMCEngine`` path;
+  emits Chrome-compatible traces.
 - **`tps_benchmark_scripts/`** — Throughput sweeps (shell scripts)
   across (gamma, n) pairs and batch sizes. See
   `tps_benchmark_scripts/BENCHMARK_CONFIGS.md` for details.
@@ -77,7 +77,7 @@ python scripts/smc_profile_engine.py --engine-kind smc_engine \
 
 ## Notes
 
-- SMC runs through `SMCEngine` (dedicated offline path) + `SMCSchedulerV2`
+- SMC runs through `SMCEngine` (dedicated offline path) + `SMCScheduler`
   (subclass of the base `Scheduler`). There is no "engine-level" SMC via
   the regular `sgl.Engine` factory anymore.
 - `FLASHINFER_WORKSPACE_BASE=/tmp/<user>-flashinfer` is often needed on

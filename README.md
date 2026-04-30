@@ -38,21 +38,9 @@ uv pip install -e .
 ```
 
 ## Quick Start
-```bash
-# SMC-SD accuracy on GSM8K via the dedicated SMCEngine (N=12 particles, gamma=8)
-python scripts/accuracy_test_gsm8k.py \
-  --mode smc_engine \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --draft-model meta-llama/Llama-3.2-1B-Instruct \
-  --particles 12 --gamma 8 \
-  --temperature 0.7 \
-  --attention-backend fa3 \
-  --smc-fast-resample \
-  --num-questions 400
-```
 
 ```bash
-# SMC-SD throughput on ShareGPT (1 concurrent group, 200 prompts, N=8, gamma=8)
+# SMC-SD throughput on ShareGPT
 python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
   --backend smc_engine \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -62,11 +50,24 @@ python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
   --attention-backend fa3 \
   --mem-fraction-static 0.60 \
   --max-running-requests 1 \
-  --smc-fast-resample \
   --cuda-graph-max-bs 8 \
   --dataset-name sharegpt \
   --num-prompts 200
 ```
+
+```bash
+# SMC-SD accuracy on GSM8K (N=12 particles, gamma=8)
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --particles 12 --gamma 8 \
+  --temperature 0.7 \
+  --attention-backend fa3 \
+  --num-questions 400
+```
+
+
 
 > [!NOTE] 
 > When using non-Hopper GPU (such as A100, A6000), specify `--attention-backend` to be `triton`
@@ -82,7 +83,6 @@ See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 | Draft temp | `--smc-draft-temperature` | Sampling temperature for draft model |
 | Target temp | `--smc-target-temperature` | Scoring temperature for target model |
 | Resample threshold | `--smc-resample-threshold` | Resample when ESS < N × threshold (0 = disable) |
-| Resample method | `--smc-resample-method` | `systematic` or `multinomial` |
 
 ## Architecture
 
@@ -91,12 +91,11 @@ SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via
 | Path | Description |
 | --- | --- |
 | `smcsd/engine.py` | `SMCEngine` — standalone offline engine (bypasses Tokenizer/Detokenizer managers) |
-| `smcsd/v2/scheduler.py` | `SMCSchedulerV2` + `SMCCoordinatorV2` — slot-based decode loop and resampler |
-| `smcsd/v2/worker.py` | `SMCWorkerV2` — draft AR loop + target scoring + importance weights |
-| `smcsd/v2/req_state.py` | `ScheduleBatchSMC` — per-slot decode state |
-| `smcsd/v2/stacked_state.py` | `StackedGroupState` — GPU-resident per-group tensors for the fast path |
-| `smcsd/v2/info.py` | `SMCDraftInputV2`, `SMCDecodeContext` — spec-info wiring |
-| `smcsd/v2/kernels/` | Fused Triton kernels (`fused_collect`, `fused_resample_kv`) |
+| `smcsd/core/scheduler.py` | `SMCScheduler` + `SMCCoordinator` — slot-based decode loop and resampler |
+| `smcsd/core/worker.py` | `SMCWorker` — draft AR loop + target scoring + importance weights |
+| `smcsd/core/req_state.py` | `ScheduleBatchSMC` — per-slot decode state, flat slot-major weights, and group lookup |
+| `smcsd/core/info.py` | `SMCDraftInput`, `SMCDecodeContext` — spec-info wiring |
+| `smcsd/core/kernels/` | Fused Triton kernels (`fused_collect`, `fused_resample_kv`) |
 | `smcsd/managers/smc_tp_worker.py` | `SMCTpModelWorker` — wires `SMCModelRunner` into the target TP worker |
 | `smcsd/model_executor/smc_model_runner.py` | `SMCModelRunner` — installs refcounted allocator + SMC warmup spec-info |
 | `smcsd/model_executor/smc_cuda_graph_runner.py` | `SMCCudaGraphRunner` — `SMCVerifyInput` during CUDA graph capture |
@@ -109,10 +108,16 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design
 ## Citation
 
 ```bibtex
-@inproceedings{smcsd2026,
-  title={Faster LLM Inference via Sequential Monte Carlo},
-  author={Yahya Emara, Mauricio Barba da Costa, Chi-Chih Chang, Cameron Freer, Tim Vieira, Ryan Cotterell, Mohamed Abdelfattah},
-  year={2026}
+@misc{smcsd2026,
+  title         = {Faster LLM Inference via Sequential Monte Carlo},
+  author        = {Emara, Yahya and Barba da Costa, Mauricio and Chang, Chi-Chih
+                   and Freer, Cameron and Vieira, Tim and Cotterell, Ryan
+                   and Abdelfattah, Mohamed S.},
+  year          = {2026},
+  eprint        = {2604.15672},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2604.15672},
 }
 ```
 
@@ -120,6 +125,7 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design
 
 - [ ] EAGLE support
 - [ ] Async/Delayed resampling (CPU/GPU overlap for KV cache rewrites)
+- [ ] Async SMC-SD at resample threshold 0 (overlap draft and target for SIS)
 - [ ] Disaggregation (draft/target separation)
 
 PRs welcome!

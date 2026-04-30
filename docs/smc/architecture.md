@@ -4,7 +4,8 @@ Entry point for the Sequential-Monte-Carlo speculative-decoding implementation.
 This doc is the map; two companions go deeper:
 
 - [`state.md`](./state.md) — data structures: `SequenceGroup`,
-  `ScheduleBatchSMC`, `StackedGroupState`, the refcounted KV allocator.
+  `ScheduleBatchSMC` (slot-major weights + group lookup), the
+  refcounted KV allocator.
 - [`pipeline.md`](./pipeline.md) — the end-to-end flow: admit → prefill →
   materialize → decode cycle → resample → finalize.
 
@@ -56,19 +57,19 @@ thin forward-pass executors.
 │  Scheduler subprocess                                                │
 │                                                                      │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │  SMCSchedulerV2                                                │  │
+│  │  SMCScheduler                                                  │  │
 │  │    waiting_groups  ┐                                           │  │
 │  │    prefill_groups  ├─ List[SequenceGroup]                      │  │
 │  │    running_groups  ┘                                           │  │
 │  │                                                                │  │
 │  │    slot_state : ScheduleBatchSMC        ← slot-major GPU state │  │
-│  │       └── stacked : StackedGroupState   ← group-major GPU state│  │
-│  │    coordinator : SMCCoordinatorV2       ← ESS + resample       │  │
+│  │       (log_weights, interval_weights, group_to_slots, row_in_use) │
+│  │    coordinator : SMCCoordinator         ← ESS + resample       │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 │             │                                   │                    │
 │             ▼                                   ▼                    │
 │  ┌────────────────────────┐    ┌───────────────────────────────────┐ │
-│  │  SMCTpModelWorker      │    │  SMCWorkerV2  (BaseSpecWorker)    │ │
+│  │  SMCTpModelWorker      │    │  SMCWorker  (BaseSpecWorker)    │ │
 │  │   target / score model │    │    owns a plain TpModelWorker     │ │
 │  │    → SMCModelRunner    │    │    for the draft model and a ref  │ │
 │  │    → SMCRefCounted-    │    │    to the target worker.          │ │
@@ -82,7 +83,7 @@ thin forward-pass executors.
 │                     └────────┬────────────────────┘                  │
 │                              ▼                                       │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │  Fused Triton kernels  (v2/kernels/)                           │  │
+│  │  Fused Triton kernels  (core/kernels/)                         │  │
 │  │    fused_collect      — mask/normalize/ESS/systematic/compact  │  │
 │  │    fused_resample_kv  — batched block-table dec / copy / inc   │  │
 │  └────────────────────────────────────────────────────────────────┘  │
@@ -91,7 +92,7 @@ thin forward-pass executors.
 
 Two models live in one process. The **score (target)** model owns the
 refcounted KV pool; the **draft** model shares that pool via its own
-`TpModelWorker` attached to `SMCWorkerV2`.
+`TpModelWorker` attached to `SMCWorker`.
 
 ---
 
@@ -100,13 +101,12 @@ refcounted KV pool; the **draft** model shares that pool via its own
 | Area            | Module                                | Role                                                              |
 |-----------------|---------------------------------------|-------------------------------------------------------------------|
 | Entry           | `engine`                              | `SMCEngine` — tokenization, ZMQ, fork scheduler.                  |
-| Scheduler       | `v2/scheduler`                        | `SMCSchedulerV2`, `SequenceGroup`, `SMCCoordinatorV2`.            |
-| Slot state      | `v2/req_state`                        | `ScheduleBatchSMC` — slot-major persistent decode batch.          |
-| Group state     | `v2/stacked_state`                    | `StackedGroupState` — group-major `(max_G, N)` tensors.           |
-| Spec IO         | `v2/info`                             | `SMCDecodeContext` (cycle) + `SMCDraftInputV2` (batch.spec_info). |
-| Worker          | `v2/worker`                           | `SMCWorkerV2` — draft AR, verify, logprob diff, bonus.            |
-| Kernels         | `v2/kernels/fused_collect`            | Fused normalize + ESS + systematic resample + compaction.         |
-| Kernels         | `v2/kernels/fused_resample_kv`        | Fused block-table dec_ref / copy / inc_ref over many jobs.        |
+| Scheduler       | `core/scheduler`                      | `SMCScheduler`, `SequenceGroup`, `SMCCoordinator`.                |
+| Slot state      | `core/req_state`                      | `ScheduleBatchSMC` — slot-major state + group lookup.             |
+| Spec IO         | `core/info`                           | `SMCDecodeContext` (cycle) + `SMCDraftInput` (batch.spec_info).   |
+| Worker          | `core/worker`                         | `SMCWorker` — draft AR, verify, logprob diff, bonus.              |
+| Kernels         | `core/kernels/fused_collect`          | Fused normalize + ESS + systematic resample + compaction.         |
+| Kernels         | `core/kernels/fused_resample_kv`      | Fused block-table dec_ref / copy / inc_ref over many jobs.        |
 | KV memory       | `mem_cache/allocator`                 | `SMCRefCountedTokenAllocator`, `copy_block_table`.                |
 | TP worker       | `managers/smc_tp_worker`              | Installs refcounted allocator on the target runner.               |
 | Target runner   | `model_executor/smc_model_runner`     | Allocator swap, spec-info shape for warmup.                       |
@@ -163,9 +163,8 @@ on the parent.
                     ▼
          slot_state.allocate_slots(...)
              • N free slots claimed
-             • StackedGroupState.register_group → a row of (max_G, N)
-             • views: group_log_weights[gid]  →  log_weights[row, :N]
-                      group_interval_weights  →  interval_weights[row, :N]
+             • one free row claimed for group_to_slots[row, :N] = slots
+             • log_weights[slots] / interval_weights[slots] zeroed
 ```
 
 After this, the group is in `running_groups` and its N particles live at
@@ -181,19 +180,20 @@ Each cycle does:
   build_model_worker_batch gather active slot tensors → dense ModelWorkerBatch
        │
        ▼
-  SMCWorkerV2              draft AR × (γ+1) → TARGET_VERIFY → logprob_diff + bonus
+  SMCWorker              draft AR × (γ+1) → TARGET_VERIFY → logprob_diff + bonus
        │
        ▼
   process_batch_result     scatter accepted tokens back into per-slot
        │                   all_token_ids, accumulate weights into the
-       │                   stacked row, mark newly finished slots.
+       │                   slot-indexed log/interval_weights, mark newly
+       │                   finished slots.
        ▼
-  coordinator.collect      ESS check per group; either a per-group Python
-       │                   pass (slow) or one fused kernel over every
-       │                   stacked row (fast).
+  coordinator.collect      one fused Triton kernel: per in-use row, ESS
+       │                   check + systematic resample + dead/excess
+       │                   compaction, emitting flat dst/src slot pairs.
        ▼
-  coordinator.dispatch     copy KV block table + slot tensors + Req
-       │                   metadata from src → dst for every resample pair.
+  coordinator.dispatch     fused KV block-table copy + slot tensor copies
+       │                   + Req metadata for every resample pair.
        ▼
   rebuild_active_slots     at most once per cycle, only if membership moved.
 ```
@@ -201,9 +201,9 @@ Each cycle does:
 See [`pipeline.md`](./pipeline.md) for each substage in detail.
 
 **FINALIZE.** When a group runs out of active slots, the best particle is
-picked by `argmax(log_weight, output_length)`, its `output_ids` /
+picked by `argmax(log_weight[slot], output_length)`, its `output_ids` /
 `finished_reason` are copied onto the parent `Req`, the group's slots are
-freed (allocator refcounts drop), the stacked row is released, and the
+freed (allocator refcounts drop), the group row is released, and the
 parent is streamed out.
 
 ---
@@ -219,21 +219,20 @@ docs lean on them.
    `active_slots` gather vector, not by rebuilding the batch.
 
 2. **Rows are for life.** Each `SequenceGroup` owns one row of
-   `StackedGroupState` from materialize to finalize. The dict-style
-   `group_log_weights[gid]` and `group_interval_weights[gid]` are thin
-   slices into that row — writes land in the stacked tensors, which are
-   the ground truth consumed by the fused collect kernel.
+   `group_to_slots[max_G, N]` from materialize to finalize.  The row's N
+   cells point to the group's slot ids; the kernel reads those slots
+   directly to gather weights for that group.
 
-3. **`smc_particle_idx` is the column.** The particle index a clone gets
-   at `clone_req_for_smc_particle` time *is* its column in the stacked
-   row, stable forever.
+3. **Weights are slot-indexed.** `log_weights[slot]` and
+   `interval_weights[slot]` are flat `(max_slots,) float64` tensors —
+   one entry per particle slot.  Accumulation is one vectorised
+   `tensor[active] += diffs` per decode step; no per-group loop.
 
-4. **`active_cell_mask` is about allocation, not finish.** It flips True
-   at `register_group`, False at `unregister_group`. Finished particles
-   remain in the candidate set for resampling; the `finished_mask` bit
-   is then copy-propagated through `resample_copy_slot` / the fused KV
-   kernel — so a particle that finishes with high weight can still act
-   as a resample ancestor for a dying sibling.
+4. **Finished particles stay in the candidate set.** `row_in_use[r]`
+   flips True at `allocate_slots`, False at `free_group_slots` — never
+   on finish.  A particle that finishes with high weight can still act
+   as a resample ancestor; the `finished_mask` bit is copy-propagated
+   through the fused KV kernel.
 
 5. **KV is multi-owner via refcount.** Both `copy_block_table` (parent
    fan-out) and the fused KV kernel (resample) `inc_ref` on slots they

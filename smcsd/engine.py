@@ -16,37 +16,22 @@ from typing import Deque, Dict, List, Optional, Type, TypeVar, Union
 import zmq
 from transformers import AutoTokenizer
 
-_SGLANG_IMPORT_HELP = (
-    "smcsd requires the patched SGLang checkout in `3rdparty/sglang`.\n"
-    "If you cloned without submodules or have not installed it yet, run:\n"
-    "  git submodule update --init --recursive\n"
-    "  uv pip install -e 3rdparty/sglang/python\n"
-    "Then reinstall this package if needed:\n"
-    "  uv pip install -e ."
+from sglang.srt.entrypoints.engine import Engine, _set_envs_and_config
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchTokenIDOutput,
+    ProfileReq,
+    ProfileReqOutput,
+    ProfileReqType,
+    RpcReqInput,
+    RpcReqOutput,
+    TokenizedGenerateReqInput,
 )
-
-try:
-    from sglang.srt.entrypoints.engine import Engine, _set_envs_and_config
-    from sglang.srt.managers.io_struct import (
-        AbortReq,
-        BatchTokenIDOutput,
-        ProfileReq,
-        ProfileReqOutput,
-        ProfileReqType,
-        RpcReqInput,
-        RpcReqOutput,
-        TokenizedGenerateReqInput,
-    )
-    from smcsd.v2.scheduler import run_smc_scheduler_v2_process
-    from sglang.srt.sampling.sampling_params import SamplingParams
-    from sglang.srt.server_args import PortArgs, ServerArgs
-    from sglang.srt.utils import configure_logger, get_bool_env_var, kill_process_tree
-    from sglang.srt.utils.network import get_zmq_socket
-except ModuleNotFoundError as exc:
-    missing_root = (exc.name or "").split(".")[0]
-    if missing_root == "sglang":
-        raise ModuleNotFoundError(_SGLANG_IMPORT_HELP) from exc
-    raise
+from smcsd.core.scheduler import run_smc_scheduler_process
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import configure_logger, get_bool_env_var, kill_process_tree
+from sglang.srt.utils.network import get_zmq_socket
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -92,7 +77,7 @@ class SMCEngine:
         # -- 1. Build ServerArgs --
         # Each SMC group needs N+1 Req slots (1 parent + N particles co-exist
         # briefly during materialize).  Expand max_running_requests upfront so
-        # the core req_to_token_pool is sized correctly; SMCSchedulerV2 backs
+        # the core req_to_token_pool is sized correctly; SMCScheduler backs
         # out the user-facing concurrency from the expanded value.
         user_max = kwargs.pop("max_running_requests", None)
         if user_max is not None:
@@ -168,7 +153,7 @@ class SMCEngine:
 
         # -- 6. Launch scheduler subprocess(es) --
         self._scheduler_init_result = Engine._launch_scheduler_processes(
-            server_args, port_args, run_smc_scheduler_v2_process
+            server_args, port_args, run_smc_scheduler_process
         )
         self._scheduler_init_result.wait_for_ready()
         logger.info("SMCEngine: Scheduler is ready.")

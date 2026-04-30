@@ -104,8 +104,6 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["random_seed"] = args.seed
     if args.resample_threshold is not None:
         engine_kwargs["resample_threshold"] = args.resample_threshold
-    if args.smc_fast_resample:
-        engine_kwargs["smc_fast_resample"] = True
     if args.mem_fraction_static is not None:
         engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
     if args.cuda_graph_max_bs is not None:
@@ -305,18 +303,6 @@ if __name__ == "__main__":
     smc_grp.add_argument(
         "--resample-threshold", type=float, default=None,
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
-    )
-    smc_grp.add_argument(
-        "--smc-fast-resample",
-        action="store_true",
-        default=False,
-        help=(
-            "Use the fused SMC resample path (single Triton kernel for "
-            "normalize + ESS + systematic resample + dst/src compaction, "
-            "feeding the fused KV-copy kernel directly). "
-            "Requires systematic resampling + CUDA.  "
-            "Default (off) is the slow per-group Python path (golden truth)."
-        ),
     )
     # Benchmark
     bench = parser.add_argument_group("benchmark")

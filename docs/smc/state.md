@@ -11,9 +11,9 @@ This doc catalogs every piece of state the SMC scheduler touches. Three tiers:
                             │  materialize
                             ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  TIER 2 — Batch state (GPU, two views of the same particles)            │
-│    ScheduleBatchSMC        — slot-major, [max_slots]     (sparse)       │
-│    StackedGroupState       — group-major, (max_G, N)     (dense)        │
+│  TIER 2 — Batch state (GPU, slot-major)                                 │
+│    ScheduleBatchSMC        — per-particle tensors, shape [max_slots]    │
+│                              + group lookup: group_to_slots [max_G, N]  │
 └───────────────────────────┬─────────────────────────────────────────────┘
                             │  forward pass reads / writes KV
                             ▼
@@ -99,12 +99,13 @@ seq_lens          int64     [max_slots]             committed tokens in slot
 kv_allocated_lens int64     [max_slots]             KV physically alloc'd
 verified_ids      int32     [max_slots]             last accepted token (x₀ bonus feed)
 token_counts      int32     [max_slots]             #tokens written to all_token_ids
-group_indices     int32     [max_slots]             scheduler-side group number
-particle_indices  int32     [max_slots]             smc_particle_idx (= stacked column)
 finished_mask     bool      [max_slots]             is this particle done
 ignore_eos_t      bool      [max_slots]             from sampling_params
 max_new_tokens_t  int32     [max_slots]             hard length cap
 eos_token_ids_t   int64     [max_slots, 8]          EOS ids (padded with -1)
+
+log_weights       float64   [max_slots]             cumulative SMC log-weight
+interval_weights  float64   [max_slots]             since-last-resample accumulator
 
 all_token_ids     int32     [max_slots, max_output_len]   complete history
 
@@ -114,8 +115,7 @@ top_ks            int32     [max_slots]              SMC worker does its
 min_ps            float32   [max_slots]              own temp adjust)
 ```
 
-`EMPTY_SLOT` (= -1) marks a free slot in `req_pool_indices`,
-`group_indices`, `particle_indices`.
+`EMPTY_SLOT` (= -1) marks a free slot in `req_pool_indices`.
 
 ### 2.2 Per-slot CPU bookkeeping
 
@@ -124,15 +124,15 @@ free_slots          : deque[int]               available slot ids
 slot_to_req         : {slot -> Req}            back-pointer for req-side
                                                state (output_ids,
                                                finished_reason, etc.)
-slot_to_group_id    : {slot -> group_id}
 
 group_slot_lists    : {group_id -> [slot, ...]}      every particle of
-group_n_particles   : {group_id -> int}              a group, sorted by
+                                                     a group, sorted by
                                                      smc_particle_idx
 
-# Thin VIEWS into stacked.{log,interval}_weights — see §3
-group_log_weights       : {group_id -> tensor[:N]}
-group_interval_weights  : {group_id -> tensor[:N]}
+# Group → row mapping (mirror of the GPU-side group_to_slots / row_in_use)
+_free_rows          : [int, ...]               available row ids
+group_id_to_row     : {group_id -> row}
+row_to_group_id     : {row -> group_id}
 ```
 
 ### 2.3 `active_slots` — the sparse → dense idx mapping
@@ -158,10 +158,12 @@ slot  7  │ group B p2  │   │
                            └── the gather vector passed to GPU ops
 ```
 
-`active_slots` is a length-`num_active` int64 GPU tensor; `group_active_indptr`
-is its CSR-style group boundary on the CPU. Sorting by group lets per-group
-slices of `logprob_diff` land in the right stacked row without any dict
-building on the hot path.
+`active_slots` is a length-`num_active` int64 GPU tensor;
+`group_active_indptr` is its CSR-style group boundary on the CPU.
+Sorting by group keeps per-group slices of `logprob_diff` contiguous
+for downstream bookkeeping — though the hot-path weight update is now
+a single vectorised `log_weights[active_slots] += diffs`, which doesn't
+care about group order.
 
 `rebuild_active_slots` — which produces this tensor — is **O(G·N)** and runs
 **at most once per decode cycle**, only if membership changed. Both
@@ -174,8 +176,9 @@ flag that defaults to False in the scheduler.
   free_slots.popleft()
          │
          ▼
-  [CLAIMED]  ── allocate_slots ─── tensors filled, particle_idx set,
-         │                          stacked row registered, views bound
+  [CLAIMED]  ── allocate_slots ─── tensors filled; one row claimed from
+         │                          _free_rows; group_to_slots[row, :N]
+         │                          = slots; row_in_use[row] = True
          ▼
   [ACTIVE]   ── per cycle: gather → forward → scatter → weight update
          │                           │
@@ -196,86 +199,60 @@ flag that defaults to False in the scheduler.
 
 ---
 
-## 3. `StackedGroupState` — group-major GPU state
+## 3. Weights and group lookup (on `ScheduleBatchSMC`)
 
-Primary storage for per-group SMC state. Shape `(max_G, N)`, one row per
-group, one column per particle index:
-
-```
-              col 0   col 1   col 2   col 3   col 4   col 5   col 6   col 7
-            ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
-   row 0    │  w₀   │  w₁   │  w₂   │   0   │   0   │   0   │   0   │   0   │
-            │  s₃   │  s₄   │  s₅   │  -1   │  -1   │  -1   │  -1   │  -1   │
-            │   T   │   T   │   T   │   F   │   F   │   F   │   F   │   F   │   n_active=3, in_use
-            ├───────┼───────┼───────┼───────┼───────┼───────┼───────┼───────┤
-   row 1    │   —    free row, on the _free_rows stack   —                  │   n_active=0, not in_use
-            ├───────┼───────┼───────┼───────┼───────┼───────┼───────┼───────┤
-   row 2    │  w₀   │  w₁   │  w₂   │  w₃   │  w₄   │   0   │   0   │   0   │
-            │  s₉   │ s₁₀   │ s₁₁   │ s₁₂   │ s₁₃   │  -1   │  -1   │  -1   │
-            │   T   │   T   │   T   │   T   │   T   │   F   │   F   │   F   │   n_active=5, in_use
-            ├───────┼───────┼───────┼───────┼───────┼───────┼───────┼───────┤
-   row 3    │   —   free —                                                  │
-            └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
-
-            log_weights     (max_G, N)  float64     ─── cumulative log-weight
-            interval_weights(max_G, N)  float64     ─── resets on resample
-            particle_to_slot(max_G, N)  int32       ─── column → slot index
-            active_cell_mask(max_G, N)  bool        ─── allocated, not finished
-            n_active        (max_G,)    int32       ─── number of used columns
-            row_in_use      (max_G,)    bool        ─── row is claimed
-```
-
-### 3.1 Column semantics
-
-The column of a particle is its `smc_particle_idx` — assigned at
-`clone_req_for_smc_particle`, fixed for life. This is the same integer
-stored in `ScheduleBatchSMC.particle_indices[slot]`. So:
+Per-particle SMC weights live slot-indexed in flat tensors, and per-group
+membership is a small fixed-width lookup table.
 
 ```
-  stacked.log_weights[row, slot_state.particle_indices[slot]]
-  == this particle's cumulative log-weight
+  log_weights       (max_slots,)  float64    cumulative log-weight per slot
+  interval_weights  (max_slots,)  float64    since-last-resample accumulator
+
+  group_to_slots    (max_groups, N)  int32   row r's slot ids, [:N] when in use
+  row_in_use        (max_groups,)    bool    which rows are claimed
 ```
 
-### 3.2 `active_cell_mask` is **allocation**, not **finish**
+Under the "every group has exactly ``server_args.smc_n_particles``" invariant,
+an in-use row is always fully populated with N slot ids — there is no
+``active_cell_mask`` or per-row ``n_active`` to track.
 
-Flipped True at `register_group`, False at `unregister_group`. It does
-**not** flip when a particle finishes. This is deliberate — the resample
-candidate set is "all allocated particles", including finished ones.
-`finished_mask` is then copy-propagated by `resample_copy_slot` / the fused
-KV kernel, so a finished-but-high-weight particle can still act as a
-resample ancestor for a dying sibling.
+### 3.1 Accumulating weights (hot path)
 
-### 3.3 Views: the dict-style API is a thin slice
+``process_batch_result`` accumulates logprob diffs across the whole active
+set in two vectorised index-puts:
 
 ```
-  slot_state.group_log_weights[gid]
-     └── is a VIEW of:  stacked.log_weights[row, :n_particles]
-
-  slot_state.group_interval_weights[gid]
-     └── is a VIEW of:  stacked.interval_weights[row, :n_particles]
+  d = logprob_diff.to(torch.float64)
+  log_weights[active_slots]      += d     # cumulative, used at finalize
+  interval_weights[active_slots] += d     # since-last-resample, zeroed by kernel
 ```
 
-Writes through these dict entries land in the stacked tensors. The stacked
-tensors are the single source of truth consumed by `fused_collect`; the
-dicts exist only because the slow-path Python coordinator reads them.
+No per-group Python loop, no ``.item()`` syncs.
 
-### 3.4 Scratch buffers for the fused kernel
+### 3.2 Kernel reads weights by gather
 
-One `StackedGroupState` also owns persistent scratch, sized to the worst
-case `max_G * N`. Reused across every decode step — no per-step allocation:
+``batched_collect_fused`` launches one Triton program per in-use row, and
+inside the kernel each program reads its weights through ``group_to_slots``:
 
 ```
-scratch_dst_flat        int32  [max_G * N]    dead-slot destinations
-scratch_src_flat        int32  [max_G * N]    surviving-slot sources
-scratch_row_of_job      int32  [max_G * N]    which row each (dst,src) came from
-scratch_counter         int32  [1]            atomic add target for job count
-scratch_resample_mask   int32  [max_G]        per-row "did we resample" flag
+  slots  = group_to_slots[row, :N]
+  lw_raw = interval_weights[slots]   # gather
+  ...
+  # on resample: scatter zeros back into interval_weights and log_weights
+  interval_weights[slots] = 0
+  log_weights[slots]      = 0
 ```
 
-One fused collect kernel launch writes all five, atomically packing
-`(dst, src, row)` triples into the flat arrays in completion order. The
-only boundary sync is a single `.item()` to read `scratch_counter` and
-slice the outputs down to `n_jobs`.
+Slot ids are unique across groups (every slot belongs to at most one
+particle), so the scatter-zero for one row cannot collide with another row.
+
+### 3.3 Finished particles remain in the candidate set
+
+``row_in_use[r]`` flips True at ``allocate_slots``, False at
+``free_group_slots`` — never on finish.  A particle that finishes with high
+weight stays at its slot with its last log-weight, and can act as a
+resample ancestor for a dying sibling.  ``finished_mask`` is copy-propagated
+from src → dst by the fused KV kernel during dispatch.
 
 ---
 
@@ -283,7 +260,7 @@ slice the outputs down to `n_jobs`.
 
 Not persistent. Built once per decode cycle by
 `ScheduleBatchSMC.prepare_for_decode` from gathered slot tensors, consumed
-by `SMCWorkerV2._forward_decode`, thrown away at cycle end.
+by `SMCWorker._forward_decode`, thrown away at cycle end.
 
 ```
 SMCDecodeContext
@@ -300,7 +277,7 @@ one `assign_req_to_token_pool_func` kernel to write the new slots into
 each particle's block table. That replaces what used to be a per-request
 Python loop.
 
-`SMCDraftInputV2` is the pure-data carrier on `batch.spec_info` — just
+`SMCDraftInput` is the pure-data carrier on `batch.spec_info` — just
 `verified_id`, `logprob_diff`, `num_tokens_per_req`, and the
 `SMCDecodeContext` attached by `prepare_for_decode`. It has no prepare
 methods; those live on the context.
@@ -327,8 +304,7 @@ dec_ref_and_free(ix)  → slot_ref_count[ix] -= 1
 
 `inc_ref` / `dec_ref_and_free` are used wherever a KV slot gains or loses
 an owner without a fresh allocation: parent → particle fan-out
-(`copy_block_table`) and resample src → dst copies (slow path and
-`fused_resample_kv` alike).
+(`copy_block_table`) and resample src → dst copies (`fused_resample_kv`).
 
 ### 5.2 `copy_block_table`
 
@@ -353,13 +329,13 @@ by the N particles, not yet free.
 ```
             UNALLOC  ── alloc(n) ──►  OWNED (rc=1)
                                           │
-                     ┌────────────────────┼──────────────────┐
-                     │                    │                  │
-            copy_block_table    fused KV kernel    resample slow path
-              (parent fanout)   (src bump, dst    (inc_ref src)
-                     │           dec_ref)                    │
-                     ▼                    │                  ▼
-                 SHARED (rc≥2) ◄──────────┘ ◄────────────── …
+                     ┌────────────────────┤
+                     │                    │
+            copy_block_table    fused KV kernel
+              (parent fanout)   (src bump, dst
+                     │           dec_ref)
+                     ▼                    │
+                 SHARED (rc≥2) ◄──────────┘
                      │
                      │  dec_ref_and_free
                      │    (parent release /
