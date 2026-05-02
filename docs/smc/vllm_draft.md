@@ -419,18 +419,3 @@ SMCGPUModelRunner.execute_model()
 
 # ← resampling: out of scope for this doc
 ```
-
----
-
-## 6. Notes
-SMCScheduler
-
-- Request is CPU state and lives at scheduler/engine level
-- Scheduler needs to pre-allocate kV blocks for all N particles
-- SMC doesn’t change prefill: let prefill flow through the vllm base scheduler and base model runner implementation
-- smc scheduler scheduler() is responsible for populating running_req (for normal prefill), new_particle_groups (register rows) and ongoing_smc_groups (ongoing draft) and return in scheduler output
-
-SMCGPUModelRunner
-
-- row idx contains the persistent row indices that identify each request through its lifetime. Row indices are assigned and owned by the runner
-- smc gpu runner: add_particle_group: allocate N RequestState rows

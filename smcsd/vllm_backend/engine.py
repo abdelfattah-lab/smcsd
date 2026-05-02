@@ -22,6 +22,7 @@ from vllm.v1.engine.core import EngineCore
 from vllm.v1.executor import UniProcExecutor
 from vllm.v1.request import Request
 
+from smcsd.vllm_backend.config import SMCConfig
 from smcsd.vllm_backend.scheduler import SMCVLLMScheduler
 
 _SMC_WORKER_CLS = "smcsd.vllm_backend.worker.SMCGPUWorker"
@@ -34,6 +35,7 @@ class SMCVLLMEngine:
 
         engine = SMCVLLMEngine(
             model_path="meta-llama/Llama-3.1-8B-Instruct",
+            draft_model_path="meta-llama/Llama-3.2-1B-Instruct",
             n_particles=4,
             gamma=4,
             temperature=1.0,
@@ -46,6 +48,7 @@ class SMCVLLMEngine:
     def __init__(
         self,
         model_path: str,
+        draft_model_path: str,
         *,
         n_particles: int = 4,
         gamma: int = 4,
@@ -54,21 +57,23 @@ class SMCVLLMEngine:
         max_model_len: int | None = None,
         **kwargs,
     ) -> None:
+        smc_config = SMCConfig(
+            draft_model_path=draft_model_path,
+            n_particles=n_particles,
+            gamma=gamma,
+            draft_temperature=temperature,
+        )
+
         engine_args = EngineArgs(
             model=model_path,
             tensor_parallel_size=tp_size,
             max_model_len=max_model_len,
-            # SpeculativeConfig carries SMC hyper-parameters.
-            speculative_config={
-                "num_speculative_tokens": gamma,
-                "smc_n_particles": n_particles,
-                "smc_temperature": temperature,
-            },
             **kwargs,
         )
         vllm_config = engine_args.create_engine_config()
 
-        # Inject SMC scheduler and worker (runner is swapped inside the worker).
+        # Attach SMC config and inject scheduler and worker.
+        vllm_config.smc_config = smc_config
         vllm_config.scheduler_config.scheduler_cls = SMCVLLMScheduler
         vllm_config.parallel_config.worker_cls = _SMC_WORKER_CLS
 
@@ -146,9 +151,9 @@ class SMCVLLMEngine:
             )
             self._engine.add_request(request)
 
-        # Drive the step loop 
+        # Drive the step loop until all parent requests finish.
         pending = set(rids)
-        accumulated: dict[str, list[int]] = {rid: [] for rid in rids}
+        seed_tokens: dict[str, list[int]] = {rid: [] for rid in rids}
 
         while pending:
             engine_core_outputs, _ = self._engine.step()
@@ -156,21 +161,26 @@ class SMCVLLMEngine:
                 for out in outputs.outputs:
                     if out.request_id not in pending:
                         continue
-                    accumulated[out.request_id].extend(out.new_token_ids)
+                    # Collect the prefill seed token
+                    seed_tokens[out.request_id].extend(out.new_token_ids)
                     if out.finished:
                         pending.discard(out.request_id)
 
-        results = [
-            {
-                "text": self.tokenizer.decode(
-                    accumulated[rid], skip_special_tokens=True
-                ),
-                "output_ids": accumulated[rid],
+        scheduler = self._engine.scheduler
+        results = []
+        for rid in rids:
+            # Per-particle draft token sequences accumulated during draft cycles.
+            particles: list[list[int]] = scheduler._completed_groups.pop(rid, [])
+            # Particle 0 tokens as the primary output (placeholder until resampling).
+            primary = particles[0] if particles else []
+            all_tokens = seed_tokens[rid] + primary
+            results.append({
+                "text": self.tokenizer.decode(all_tokens, skip_special_tokens=True),
+                "output_ids": all_tokens,
                 "prompt_tokens": prompt_token_counts[rid],
-                "completion_tokens": len(accumulated[rid]),
-            }
-            for rid in rids
-        ]
+                "completion_tokens": len(all_tokens),
+                "particles": particles,  # [N][tokens] — all particle sequences
+            })
         return results[0] if is_single else results
 
     def shutdown(self) -> None:

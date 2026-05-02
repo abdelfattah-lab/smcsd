@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.nn as nn
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata, build_slot_mappings_by_layer
 
@@ -16,8 +19,12 @@ from smcsd.vllm_backend.scheduler import (
     SMCSchedulerOutput,
 )
 
+from vllm.v1.outputs import ModelRunnerOutput
+
+from smcsd.vllm_backend.outputs import SMCModelRunnerOutput
+
 if TYPE_CHECKING:
-    from vllm.v1.outputs import ModelRunnerOutput
+    pass
 
 
 @dataclass
@@ -37,7 +44,21 @@ class SMCGPUModelRunner(GPUModelRunner):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.draft_model: nn.Module
         self.particle_groups: dict[str, ParticleGroup] = {}  # group_id -> ParticleGroup
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        smc = self.vllm_config.smc_config
+        assert smc is not None, "SMCGPUModelRunner requires smc_config"
+        draft_model_config = copy.copy(self.vllm_config.model_config)
+        draft_model_config.model = smc.draft_model_path
+        draft_model = get_model(
+            vllm_config=self.vllm_config,
+            model_config=draft_model_config,
+        )
+        draft_model.eval()
+        self.draft_model = draft_model
 
     def add_particle_group(
         self,
@@ -97,12 +118,15 @@ class SMCGPUModelRunner(GPUModelRunner):
         seq_lens: torch.Tensor,        # [N] — num_computed_tokens at cycle start
         gamma: int,
         temperature: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run gamma+1 autoregressive draft steps for all N particles.
 
         Returns:
-            draft_token_ids  [N, gamma+1]    — sampled token at each step
-            draft_log_probs  [N, gamma+1, V] — log-softmax logits at each step
+            draft_token_ids   [N, gamma+1] — draft tokens ([:, 0] = seed input,
+                                             [:, 1:] = gamma newly sampled tokens)
+            draft_log_probs   [N, gamma+1, V] — log-softmax logits at each step
+            next_seed_ids     [N] — sampled from step-gamma logits; correct input
+                                    token for the first step of the next cycle
         """
         P = particle_rows.shape[0]
         block_tables = self._gather_block_tables(particle_rows)  # once before loop
@@ -132,27 +156,33 @@ class SMCGPUModelRunner(GPUModelRunner):
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 batch_descriptor=BatchDescriptor(num_tokens=P, has_lora=False),
             ):
-                hidden_states = self.model(
+                hidden_states = self.draft_model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=None,
                     inputs_embeds=None,
-                )  # [P, hidden_dim]
+                )  # [N, hidden_dim]
 
-            logits = self.model.compute_logits(hidden_states)   # [N, vocab_size]
+            logits = self.draft_model.compute_logits(hidden_states)   # [N, vocab_size]
             log_probs = torch.log_softmax(logits / temperature, dim=-1)  # [N, V]
             draft_log_probs[:, step] = log_probs
 
+            if temperature > 0:
+                next_tokens = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
+            else:
+                next_tokens = logits.argmax(dim=-1)
+
             if step < gamma:
-                if temperature > 0:
-                    next_tokens = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
-                else:
-                    next_tokens = logits.argmax(dim=-1)
                 draft_token_ids[:, step + 1] = next_tokens
+            # TODO: The bonus should be sampled from the target model, not the draft model.
+            # For the checkpoint we're using the draft model's sample as a placeholder. 
+            # When we implement target verify, next_seed_ids should come from target logits at position γ instead.
+            else:
+                next_seed_ids = next_tokens  # token at position seq_len+gamma+1
 
             seq_lens_cur = seq_lens_cur + 1
 
-        return draft_token_ids, draft_log_probs
+        return draft_token_ids, draft_log_probs, next_seed_ids
 
     def smc_target_score(
         self,
@@ -212,14 +242,17 @@ class SMCGPUModelRunner(GPUModelRunner):
             kv_cache_config=self.kv_cache_config,
         )
 
-    def _run_draft_and_verify(self, batch: SMCGroupBatch) -> None:
-        """Look up particle rows and run one draft + verify cycle for a group."""
+    def _run_draft_and_verify(
+        self,
+        batch: SMCGroupBatch | NewParticleGroupData,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one draft cycle for a group; return (draft_token_ids, draft_log_probs)."""
         particle_rows = torch.tensor(
             self.particle_groups[batch.group_id].particle_rows,
             dtype=torch.int32,
             device=self.device,
         )
-        self.smc_draft_cycle(
+        draft_token_ids, draft_log_probs, next_seed_ids = self.smc_draft_cycle(
             particle_rows=particle_rows,
             seed_token_ids=batch.seed_token_ids,
             kv_slots=batch.kv_slots,
@@ -228,15 +261,18 @@ class SMCGPUModelRunner(GPUModelRunner):
             temperature=batch.temperature,
         )
         # TODO: target verify
+        return draft_token_ids, draft_log_probs, next_seed_ids
 
     def execute_model(
         self,
         scheduler_output: SMCSchedulerOutput,
-    ) -> ModelRunnerOutput:
+    ) -> SMCModelRunnerOutput:
         # Prefill parent requests: delegated to base runner
-        output = super().execute_model(scheduler_output)
+        base_output = super().execute_model(scheduler_output)
 
-        # Newly forked groups: register particle rows
+        smc_draft_results: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+        # Newly forked groups: register particle rows then run first draft cycle.
         for new_group in scheduler_output.new_particle_groups:
             self.add_particle_group(
                 group_id=new_group.group_id,
@@ -246,10 +282,22 @@ class SMCGPUModelRunner(GPUModelRunner):
                 prefix_block_ids=new_group.prefix_block_ids,
                 decode_block_ids=new_group.decode_block_ids,
             )
-            self._run_draft_and_verify(new_group)
+            smc_draft_results[new_group.group_id] = self._run_draft_and_verify(new_group)
 
         # Ongoing groups: run draft + verify.
         for batch in scheduler_output.ongoing_smc_groups:
-            self._run_draft_and_verify(batch)
+            smc_draft_results[batch.group_id] = self._run_draft_and_verify(batch)
 
-        return output
+        return SMCModelRunnerOutput(
+            req_ids=base_output.req_ids,
+            req_id_to_index=base_output.req_id_to_index,
+            sampled_token_ids=base_output.sampled_token_ids,
+            logprobs=base_output.logprobs,
+            prompt_logprobs_dict=base_output.prompt_logprobs_dict,
+            pooler_output=base_output.pooler_output,
+            kv_connector_output=base_output.kv_connector_output,
+            ec_connector_output=base_output.ec_connector_output,
+            num_nans_in_logits=base_output.num_nans_in_logits,
+            cudagraph_stats=base_output.cudagraph_stats,
+            smc_draft_results=smc_draft_results,
+        )
