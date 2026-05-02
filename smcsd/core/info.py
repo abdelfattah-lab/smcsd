@@ -194,6 +194,13 @@ class SMCDecodeContext:
         step_offsets = torch.arange(draft_token_num, device=device)
         positions = (orig_seq_lens.unsqueeze(1) + step_offsets).reshape(-1)
 
+        # Carry the shared-prefix metadata stamped onto the SMCDraftInput
+        # in build_model_worker_batch.  These are bs-aligned int32 tensors
+        # consumed by the cascade-attention backend; harmless if None.
+        carrier_spec = batch.spec_info
+        shared_prefix_lens = getattr(carrier_spec, "shared_prefix_lens", None)
+        group_row_ids = getattr(carrier_spec, "group_row_ids", None)
+
         verify_spec_info = SMCVerifyInput(
             draft_token_num=draft_token_num,
             positions=positions,
@@ -201,6 +208,8 @@ class SMCDecodeContext:
             seq_lens_sum=self.orig_seq_lens_sum,
             seq_lens_cpu=orig_seq_lens_cpu,
             num_tokens_per_req=draft_token_num,
+            shared_prefix_lens=shared_prefix_lens,
+            group_row_ids=group_row_ids,
         )
 
         verify_batch = copy.copy(batch)
@@ -257,6 +266,11 @@ class SMCDraftInput(SpecInput):
     logprob_diff: Optional[torch.Tensor] = None  # (bs,) from last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
+    # Shared-prefix metadata for cascade-attention backend (one per active
+    # particle, bs-aligned).  Populated in build_model_worker_batch from
+    # ScheduleBatchSMC slot tensors.
+    shared_prefix_lens: Optional[torch.Tensor] = None  # (bs,) int32
+    group_row_ids: Optional[torch.Tensor] = None  # (bs,) int32
 
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1

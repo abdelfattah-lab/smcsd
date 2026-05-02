@@ -131,6 +131,18 @@ class ScheduleBatchSMC:
             (self.max_slots, max_eos_count), -1, dtype=torch.int64, device=device
         )
 
+        # Per-slot shared-prefix length and group-row id, used by the
+        # cascade-attention backend to gang queries within a group against
+        # the shared prefix KV.  Set at allocate_slots, cleared at
+        # free_group_slots.  Resample preserves the materialise-time prefix
+        # invariant (see docs/smc/architecture.md core invariant 6).
+        self.shared_prefix_lens = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
+        )
+        self.group_row_ids = torch.full(
+            (self.max_slots,), -1, dtype=torch.int32, device=device
+        )
+
         # Cumulative SMC weights per particle — slot-indexed, float64 for
         # numerical stability across long decodes.  `log_weights` is the
         # running log-weight used at finalize time.  `interval_weights` is
@@ -281,6 +293,11 @@ class ScheduleBatchSMC:
         self.log_weights[slot_idx64] = 0.0
         self.interval_weights[slot_idx64] = 0.0
 
+        # Stamp shared-prefix metadata: every particle in this group shares
+        # the materialise-time prefix of length ``shared_seq_len``.
+        self.shared_prefix_lens[slot_idx64] = int(shared_seq_len)
+        self.group_row_ids[slot_idx64] = int(row)
+
         self.rebuild_active_slots()
         return slots
 
@@ -322,6 +339,8 @@ class ScheduleBatchSMC:
             self.ignore_eos_t[slot] = False
             self.log_weights[slot] = 0.0
             self.interval_weights[slot] = 0.0
+            self.shared_prefix_lens[slot] = 0
+            self.group_row_ids[slot] = -1
 
             self.slot_to_req.pop(slot, None)
             self.free_slots.append(slot)
@@ -423,6 +442,13 @@ class ScheduleBatchSMC:
         seq_lens_sum = int(seq_lens_cpu.sum().item())
 
         reqs = [self.slot_to_req[s] for s in self._active_slots_list]
+
+        # Stamp shared-prefix metadata onto draft_input so it survives the
+        # SMCDecodeContext → prepare_for_verify hand-off.  These tensors are
+        # bs-aligned with req_pool_indices/seq_lens and are consumed by
+        # SMCFlashInferAttnBackend when --smc-shared-prefix-attn is on.
+        draft_input.shared_prefix_lens = self.shared_prefix_lens[active]
+        draft_input.group_row_ids = self.group_row_ids[active]
 
         # Minimal SamplingBatchInfo — SMC worker does its own sampling.
         sampling_info = SamplingBatchInfo(

@@ -99,6 +99,7 @@ def run_smc_engine_eval(args, prompts, labels):
         trust_remote_code=True,
         page_size=1,
         attention_backend=args.attention_backend,
+        shared_prefix_attn=args.shared_prefix_attn,
     )
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
@@ -112,6 +113,8 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_running_requests"] = args.max_running_requests
     else:
         engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
+    if args.disable_cuda_graph:
+        engine_kwargs["disable_cuda_graph"] = True
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
@@ -319,11 +322,29 @@ if __name__ == "__main__":
     # Engine overrides (smc_engine / baseline modes)
     eng = parser.add_argument_group("engine overrides (smc_engine/baseline)")
     eng.add_argument("--attention-backend", type=str, default="triton",
-                      choices=["triton", "fa3"],
+                      choices=["triton", "fa3", "flashinfer"],
                       help="attention backend for smc_engine mode (default: triton)")
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=16)
+    eng.add_argument(
+        "--shared-prefix-attn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable cascade-attention for the SMC verify pass.  Requires "
+            "--attention-backend flashinfer.  Default off."
+        ),
+    )
+    eng.add_argument(
+        "--disable-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Disable CUDA graphs (the v1 cascade path is eager-mode only; "
+            "set this for apples-to-apples comparison with --shared-prefix-attn)."
+        ),
+    )
 
     args = parser.parse_args()
     main(args)

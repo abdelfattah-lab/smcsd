@@ -9,7 +9,7 @@ core call sites don't have to import the scheduler package.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -63,6 +63,10 @@ class SMCVerifyInput(SpecInput):
     seq_lens_sum: int = None
     seq_lens_cpu: torch.Tensor = None
     num_tokens_per_req: int = -1
+    # Shared-prefix metadata for cascade attention (bs-aligned with the
+    # verify batch).  None when the cascade backend is disabled.
+    shared_prefix_lens: Optional[torch.Tensor] = None  # (bs,) int32
+    group_row_ids: Optional[torch.Tensor] = None  # (bs,) int32
 
     def __post_init__(self):
         super().__init__(SpecInputType.SMC_VERIFY)
