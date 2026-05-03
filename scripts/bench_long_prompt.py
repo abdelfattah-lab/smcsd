@@ -57,9 +57,11 @@ def build_prompt(tokenizer, target_tokens: int, question: str) -> str:
 def run_one(
     *, model: str, draft: str, prompt: str, cascade: bool,
     n_particles: int, gamma: int, max_new: int, mem_fraction: float, seed: int,
+    disable_cuda_graph: bool = False,
 ) -> tuple[float, int, str]:
     backend = "flashinfer" if cascade else "fa3"
-    print(f"\n--- Booting SMCEngine cascade={cascade} attn={backend} ---")
+    mode_str = "eager" if disable_cuda_graph else "graphs"
+    print(f"\n--- Booting SMCEngine cascade={cascade} attn={backend} {mode_str} ---")
     torch.manual_seed(seed)
     engine = SMCEngine(
         model_path=model,
@@ -73,7 +75,7 @@ def run_one(
         attention_backend=backend,
         mem_fraction_static=mem_fraction,
         max_running_requests=1,
-        disable_cuda_graph=True,
+        disable_cuda_graph=disable_cuda_graph,
     )
     sp = {"temperature": 0.7, "max_new_tokens": max_new}
     # Warmup forward (don't time)
@@ -102,6 +104,7 @@ def main():
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--mem-fraction", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--disable-cuda-graph", action="store_true")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -116,6 +119,7 @@ def main():
         cascade=False,
         n_particles=args.particles, gamma=args.gamma,
         max_new=args.max_new, mem_fraction=args.mem_fraction, seed=args.seed,
+        disable_cuda_graph=args.disable_cuda_graph,
     )
     print(f"  fa3:  {t_fa3:.2f}s, {n_fa3} new tokens, {n_fa3/t_fa3:.1f} tok/s")
 
@@ -125,6 +129,7 @@ def main():
         cascade=True,
         n_particles=args.particles, gamma=args.gamma,
         max_new=args.max_new, mem_fraction=args.mem_fraction, seed=args.seed,
+        disable_cuda_graph=args.disable_cuda_graph,
     )
     print(f"  cas:  {t_cas:.2f}s, {n_cas} new tokens, {n_cas/t_cas:.1f} tok/s")
 

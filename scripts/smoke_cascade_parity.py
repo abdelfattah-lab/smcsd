@@ -43,7 +43,9 @@ def run_once(
     # support SMC's linear verify, so the only non-cascade backend that
     # works with SMC is fa3.  Treatment: flashinfer + our cascade wrapper.
     backend = "flashinfer" if cascade else "fa3"
-    print(f"\n=== Booting SMCEngine (cascade={cascade}, attn={backend}) ===")
+    import os
+    disable_graphs = os.environ.get("DISABLE_CUDA_GRAPH", "1") == "1"
+    print(f"\n=== Booting SMCEngine (cascade={cascade}, attn={backend}, graphs={'OFF' if disable_graphs else 'ON'}) ===")
     torch.manual_seed(seed)
     engine = SMCEngine(
         model_path=model,
@@ -57,7 +59,7 @@ def run_once(
         attention_backend=backend,
         mem_fraction_static=0.5,
         max_running_requests=1,
-        disable_cuda_graph=True,
+        disable_cuda_graph=disable_graphs,
     )
     sp = {"temperature": temperature, "max_new_tokens": max_new_tokens}
     print(f"--- Generating (seed={seed}, temp={temperature}, max_new={max_new_tokens}) ---")
