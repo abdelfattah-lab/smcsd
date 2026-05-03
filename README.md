@@ -10,7 +10,14 @@ Paper: [*Faster LLM Inference via Sequential Monte Carlo*](https://arxiv.org/abs
 
 ## Installation
 
-This repo vendors a patched SGLang as a git submodule at `3rdparty/sglang` (branch `smc_v2_clean`). Install both in editable mode.
+This repo vendors a patched SGLang as a git submodule at `3rdparty/sglang`. Two branches are available:
+
+- **`main`** — pins SGLang at `smc_v2_clean` (older upstream snapshot, torch ~2.5, CUDA 12.4). Stable.
+- **`upstream`** — pins SGLang at `smc_v2_clean-upstream-sync-2` (smc_v2_clean + latest `upstream/main` merged in). Requires **CUDA 13**, `torch==2.11.0`, and `sglang-kernel==0.4.2` (formerly `sgl-kernel`; same import path, new pip name).
+
+Pick one before installing.
+
+**Host requirements (`upstream` branch only):** CUDA 13 toolkit installed (provides `libnvrtc.so.13`). On CUDA 12 systems the prebuilt `sglang-kernel` wheel will fail to load with an undefined-symbol or `libnvrtc.so.13: cannot open shared object file` error. The Python deps (`torch==2.11.0`, `sglang-kernel==0.4.2`) are pinned by the SGLang submodule's `pyproject.toml` and will be resolved automatically.
 
 `SMCEngine` will not import until the patched SGLang submodule is both checked out and installed. If you hit `ModuleNotFoundError: No module named 'sglang'`, run:
 
@@ -21,8 +28,10 @@ uv pip install -e .
 ```
 
 ```bash
-# 1. Clone with submodules
-git clone --recurse-submodules https://github.com/abdelfattah-lab/smcsd.git
+# 1. Clone with submodules — pick the branch you want
+git clone --recurse-submodules --branch main     https://github.com/abdelfattah-lab/smcsd.git
+# OR for the latest upstream-merged build (needs CUDA 13):
+# git clone --recurse-submodules --branch upstream https://github.com/abdelfattah-lab/smcsd.git
 cd smcsd
 
 # If you already cloned without --recurse-submodules, initialise now:
