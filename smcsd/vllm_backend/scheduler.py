@@ -97,7 +97,10 @@ class SMCVLLMScheduler(Scheduler):
             for i in range(n_particles)
         ]
 
-        n_decode_blocks = math.ceil((gamma + 1) / self.block_size)
+        sp = parent_req.sampling_params
+        max_tokens = sp.max_tokens if (sp is not None and sp.max_tokens is not None) else 128
+        # +1 to cover the partial last prefix block when num_computed_tokens is not block-aligned.
+        n_decode_blocks = math.ceil(max_tokens / self.block_size) + 1
 
         # Fork blocks: touches prefix N times and allocates decode blocks per particle
         # frees parent's ownership of prefix blocks.
@@ -120,6 +123,7 @@ class SMCVLLMScheduler(Scheduler):
         ]
 
         kv_slots = self._compute_kv_slots(
+            prefix_block_ids=shared_prefix_block_ids,
             decode_block_ids=decode_block_ids,
             num_computed_tokens=num_computed_tokens,
             n_particles=n_particles,
@@ -168,6 +172,7 @@ class SMCVLLMScheduler(Scheduler):
         """
         state = self.smc_groups[group_id]
         kv_slots = self._compute_kv_slots(
+            prefix_block_ids=state.shared_prefix_block_ids,
             decode_block_ids=state.decode_block_ids,
             num_computed_tokens=state.num_computed_tokens,
             n_particles=state.n_particles,
@@ -339,6 +344,7 @@ class SMCVLLMScheduler(Scheduler):
 
     def _compute_kv_slots(
         self,
+        prefix_block_ids: tuple[list[int], ...],
         decode_block_ids: list[tuple[list[int], ...]],
         num_computed_tokens: int,
         n_particles: int,
@@ -347,20 +353,19 @@ class SMCVLLMScheduler(Scheduler):
     ) -> torch.Tensor:
         """Compute kv_slots tensor shaped [num_kv_groups, P, gamma+1].
 
-        slot_id[g, p, s] = decode_block_ids[p][g][block_index] * block_size
-                           + block_offset
-        where position = num_computed_tokens + s.
+        slot_id[g, p, s] = full_block_table[g][p][block_index] * block_size + block_offset
+        where position = num_computed_tokens + s and block_index is absolute.
         """
         block_size = self.block_size
         slots = torch.zeros(
             (num_kv_groups, n_particles, gamma + 1), dtype=torch.long
         )
-        for s in range(gamma + 1):
-            position = num_computed_tokens + s
-            block_index = position // block_size
-            block_offset = position % block_size
+        for g in range(num_kv_groups):
             for p in range(n_particles):
-                for g in range(num_kv_groups):
-                    block_id = decode_block_ids[p][g][block_index]
-                    slots[g, p, s] = block_id * block_size + block_offset
+                full_blocks = list(prefix_block_ids[g]) + list(decode_block_ids[p][g])
+                for s in range(gamma + 1):
+                    position = num_computed_tokens + s
+                    block_index = position // block_size
+                    block_offset = position % block_size
+                    slots[g, p, s] = full_blocks[block_index] * block_size + block_offset
         return slots

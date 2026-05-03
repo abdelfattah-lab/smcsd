@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.model_loader import get_model
+from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata, build_slot_mappings_by_layer
 
@@ -19,6 +20,7 @@ from smcsd.vllm_backend.scheduler import (
     SMCSchedulerOutput,
 )
 
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from smcsd.vllm_backend.outputs import SMCModelRunnerOutput
@@ -97,6 +99,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             self.block_tables.append_block_ids(req_index, combined_block_ids, overwrite=True)
 
         self.req_states.apply_staged_writes()
+        self.block_tables.apply_staged_writes()
 
         self.particle_groups[group_id] = ParticleGroup(
             group_id=group_id,
@@ -265,10 +268,19 @@ class SMCGPUModelRunner(GPUModelRunner):
 
     def execute_model(
         self,
-        scheduler_output: SMCSchedulerOutput,
-    ) -> SMCModelRunnerOutput:
-        # Prefill parent requests: delegated to base runner
-        base_output = super().execute_model(scheduler_output)
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        is_profile: bool = False,
+    ) -> ModelRunnerOutput | IntermediateTensors | None:
+        base_output = super().execute_model(
+            scheduler_output, intermediate_tensors, dummy_run, skip_attn_for_dummy_run, is_profile
+        )
+
+        # Skip SMC logic during _dummy_run profiling pass 
+        if not isinstance(scheduler_output, SMCSchedulerOutput) or not isinstance(base_output, ModelRunnerOutput):
+            return base_output
 
         smc_draft_results: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
