@@ -12,7 +12,7 @@ import psutil
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
+from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -31,7 +31,7 @@ from smcsd.common.utils import (
 )
 from smcsd.mem_cache.allocator import copy_block_table
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import DynamicGradMode, kill_itself_when_parent_died
+from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -488,6 +488,10 @@ class SMCSchedulerV2(Scheduler):
         )
 
     def maybe_init_draft_worker(self):
+        # Upstream's Scheduler.maybe_init_draft_worker initializes
+        # external_corpus_manager (used only by ngram speculative decoding).
+        # Our override replaces the body, so we must set it ourselves.
+        self.external_corpus_manager = None
         from smcsd.v2.worker import SMCWorkerV2
 
         draft_worker_kwargs = dict(
@@ -535,7 +539,9 @@ class SMCSchedulerV2(Scheduler):
                 else:
                     self._process_decode_result(result)
             else:
-                self.self_check_during_idle()
+                # self_check_during_idle was removed in upstream sglang;
+                # only self_check_during_busy remains.
+                pass
 
             self.last_batch = tracking_batch
             if hasattr(self, "waiting_queue"):
@@ -1024,11 +1030,13 @@ def run_smc_scheduler_v2_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    dp_rank = configure_scheduler(
-        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+    # upstream renamed configure_scheduler -> configure_scheduler_process,
+    # added gpu_id as the second positional arg, and now calls
+    # kill_itself_when_parent_died() internally.
+    dp_rank = configure_scheduler_process(
+        server_args, gpu_id, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
 
-    kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
     try:

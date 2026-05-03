@@ -155,7 +155,9 @@ class SMCEngine:
         # so detokenizer_ipc_name is unused and needs no bind.
 
         # -- 6. Launch scheduler subprocess(es) --
-        self._scheduler_init_result = Engine._launch_scheduler_processes(
+        # Upstream Engine._launch_scheduler_processes now returns
+        # (SchedulerInitResult, scheduler_procs); the procs list is unused here.
+        self._scheduler_init_result, _ = Engine._launch_scheduler_processes(
             server_args, port_args, run_smc_scheduler_v2_process
         )
         self._scheduler_init_result.wait_for_ready()
