@@ -11,6 +11,7 @@ Injection points:
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from typing import Union
@@ -64,6 +65,8 @@ class SMCVLLMEngine:
             draft_temperature=temperature,
         )
 
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+
         engine_args = EngineArgs(
             model=model_path,
             tensor_parallel_size=tp_size,
@@ -76,6 +79,7 @@ class SMCVLLMEngine:
         vllm_config.smc_config = smc_config
         vllm_config.scheduler_config.scheduler_cls = SMCVLLMScheduler
         vllm_config.parallel_config.worker_cls = _SMC_WORKER_CLS
+        vllm_config.scheduler_config.async_scheduling = False
 
         self._engine = EngineCore(
             vllm_config=vllm_config,

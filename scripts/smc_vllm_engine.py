@@ -1,8 +1,8 @@
 from smcsd.vllm_backend.engine import SMCVLLMEngine
 
 engine = SMCVLLMEngine(
-    model_path="meta-llama/Llama-3.1-8B-Instruct",
-    draft_model_path="meta-llama/Llama-3.2-1B-Instruct",
+    model_path="Qwen/Qwen3-8B",
+    draft_model_path="Qwen/Qwen3-8B",
     n_particles=8,
     gamma=8,
     temperature=0.7,
