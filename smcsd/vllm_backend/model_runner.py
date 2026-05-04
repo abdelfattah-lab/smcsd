@@ -55,12 +55,20 @@ class SMCGPUModelRunner(GPUModelRunner):
         assert smc is not None, "SMCGPUModelRunner requires smc_config"
         draft_model_config = copy.copy(self.vllm_config.model_config)
         draft_model_config.model = smc.draft_model_path
+
+        # Give the draft model its own compilation config with a fresh static_forward_context
+        draft_vllm_config = copy.copy(self.vllm_config)
+        draft_compilation_config = copy.copy(self.vllm_config.compilation_config)
+        draft_compilation_config.static_forward_context = {}
+        draft_vllm_config.compilation_config = draft_compilation_config
+
         draft_model = get_model(
-            vllm_config=self.vllm_config,
+            vllm_config=draft_vllm_config,
             model_config=draft_model_config,
         )
         draft_model.eval()
         self.draft_model = draft_model
+        self.draft_vllm_config = draft_vllm_config
 
     def add_particle_group(
         self,
@@ -153,7 +161,7 @@ class SMCGPUModelRunner(GPUModelRunner):
 
             with set_forward_context(
                 attn_metadata,
-                self.vllm_config,
+                self.draft_vllm_config,
                 num_tokens=P,
                 slot_mapping=slot_mappings_by_layer,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
