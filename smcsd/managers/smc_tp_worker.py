@@ -54,18 +54,20 @@ class SMCDraftTpModelWorker(TpModelWorker):
     def _init_model_config(self):
         # Override: pass is_draft_model=False to skip the automatic
         # architecture → MTP rewrite (model_config._config_draft_model).
-        # SMC doesn't want MTP semantics on the draft.
+        # SMC doesn't want MTP semantics on the draft. Mirror upstream's
+        # arg shape (managers/tp_worker.py:_init_model_config) but flip
+        # the draft flag.
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
-            (
+            model_path=(
                 self.server_args.model_path
                 if not self.is_draft_worker
                 else self.server_args.speculative_draft_model_path
             ),
-            (
-                self.server_args.tokenizer_path
+            model_revision=(
+                self.server_args.revision
                 if not self.is_draft_worker
-                else self.server_args.speculative_draft_tokenizer_path
+                else self.server_args.speculative_draft_model_revision
             ),
             is_draft_model=False,
         )
