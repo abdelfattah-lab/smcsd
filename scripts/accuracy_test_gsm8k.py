@@ -172,10 +172,17 @@ def run_baseline_eval(args, prompts, labels):
         engine_kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
+    if args.context_length is not None:
+        engine_kwargs["context_length"] = args.context_length
+    if getattr(args, "disable_cuda_graph", False):
+        engine_kwargs["disable_cuda_graph"] = True
+    if args.tp_size > 1:
+        engine_kwargs["tp_size"] = args.tp_size
 
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
+        "temperature": args.temperature,
     }
 
     with sgl.Engine(**engine_kwargs) as engine:
