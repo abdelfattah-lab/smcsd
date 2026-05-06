@@ -30,9 +30,10 @@ APP_NAME = "smcsd-smc-hybrid-qwen"
 SMCSD_DIR = "/root/smcsd"
 HF_HOME = "/root/.cache/huggingface"
 SMCSD_REPO = "https://github.com/abdelfattah-lab/smcsd.git"
-# Run from the local working branch; the runtime patches in the local
-# scripts/ + smcsd/ on top so we can iterate without re-pushing.
-SMCSD_BRANCH = "main"
+# The image clones this branch from origin; local edits are then layered
+# on top via add_local_dir / add_local_file so we can iterate without
+# re-pushing every patch. Push when you want a clean cold-start image.
+SMCSD_BRANCH = "qwen35-hybrid"
 
 image = (
     modal.Image.from_registry(
@@ -91,6 +92,7 @@ def run_smc_hybrid(
     max_running_requests: int = 4,
     attention_backend: str = "fa3",
     resample_threshold: float = 0.5,
+    context_length: int = 8192,
 ) -> None:
     import os
     import shlex
@@ -127,6 +129,11 @@ def run_smc_hybrid(
         check=False,
     )
 
+    # Allow capping the model's declared max_position_embeddings down to the
+    # rope-derived effective context length (Qwen3-Next claims 262144 but
+    # only ~40960 is rope-supported in practice).
+    os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+
     print("\n=== nvidia-smi ===", flush=True)
     subprocess.run(["nvidia-smi"], check=False)
 
@@ -148,6 +155,7 @@ def run_smc_hybrid(
         "--attention-backend", attention_backend,
         "--resample-threshold", str(resample_threshold),
         "--tp-size", str(tp_size),
+        "--context-length", str(context_length),
         "--seed", "0",
     ]
 
@@ -173,6 +181,7 @@ def main(
     max_running_requests: int = 4,
     attention_backend: str = "fa3",
     resample_threshold: float = 0.5,
+    context_length: int = 8192,
 ):
     run_smc_hybrid.remote(
         target_model=target_model,
@@ -188,4 +197,5 @@ def main(
         max_running_requests=max_running_requests,
         attention_backend=attention_backend,
         resample_threshold=resample_threshold,
+        context_length=context_length,
     )

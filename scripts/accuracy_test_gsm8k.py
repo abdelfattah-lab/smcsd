@@ -101,6 +101,8 @@ def run_smc_engine_eval(args, prompts, labels):
         attention_backend=args.attention_backend,
         tp_size=args.tp_size,
     )
+    if args.context_length is not None:
+        engine_kwargs["context_length"] = args.context_length
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
     if args.resample_threshold is not None:
@@ -327,6 +329,10 @@ if __name__ == "__main__":
     eng.add_argument("--max-running-requests", type=int, default=16)
     eng.add_argument("--tp-size", type=int, default=1,
                       help="tensor-parallel size for the target (and draft, if shared)")
+    eng.add_argument("--context-length", type=int, default=None,
+                      help="cap context length to this many tokens (helps fit hybrid Qwen3.5/Next "
+                           "models whose declared max_position_embeddings is much longer than "
+                           "what the rope-derived effective length supports)")
 
     args = parser.parse_args()
     main(args)
