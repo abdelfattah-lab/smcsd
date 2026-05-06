@@ -70,8 +70,13 @@ class SMCWorker(BaseSpecWorker):
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
 
-        # Create draft TpModelWorker — fully independent, no shared lm_head/embed
-        self._draft_worker = TpModelWorker(
+        # Create draft TpModelWorker — fully independent, no shared lm_head/embed.
+        # Use SMCDraftTpModelWorker so the draft loads as its native causal-LM
+        # architecture (upstream auto-rewrites Qwen3.5/Qwen3-Next drafts into
+        # MTP variants under spec decoding; that doesn't fit SMC's API).
+        from smcsd.managers.smc_tp_worker import SMCDraftTpModelWorker
+
+        self._draft_worker = SMCDraftTpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
