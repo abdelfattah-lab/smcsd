@@ -333,9 +333,27 @@ def run_smc_hybrid_small(
         cmd.append("--disable-cuda-graph")
     if not enable_thinking:
         cmd.append("--no-enable-thinking")
+
+    # Optional per-step debug dump. Set SMCSD_DEBUG_DUMP_PATH to enable.
+    env = os.environ.copy()
+    debug_path = "/tmp/smc_debug.jsonl"
+    if os.environ.get("SMCSD_ENABLE_DEBUG_DUMP", "0") == "1":
+        env["SMCSD_DEBUG_DUMP"] = debug_path
+
     print("Running:", " ".join(shlex.quote(p) for p in cmd), flush=True)
-    rc = subprocess.run(cmd, cwd=SMCSD_DIR)
+    rc = subprocess.run(cmd, cwd=SMCSD_DIR, env=env)
     print(f"smc-hybrid-small rc={rc.returncode}", flush=True)
+
+    # If debug dump is on, print the first ~50 records so we can analyze.
+    if env.get("SMCSD_DEBUG_DUMP") and os.path.exists(debug_path):
+        print("\n=== SMC DEBUG DUMP (first 50 records) ===", flush=True)
+        with open(debug_path) as f:
+            for i, line in enumerate(f):
+                if i >= 50:
+                    break
+                print(line.rstrip(), flush=True)
+        print("=== END DUMP ===\n", flush=True)
+
     if rc.returncode != 0:
         sys.exit(rc.returncode)
 

@@ -23,7 +23,18 @@ from sglang.srt.server_args import ServerArgs
 from smcsd.core.info import SMCDecodeContext, SMCDraftInput
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 
+import os
+import json
+
 logger = logging.getLogger(__name__)
+
+# Per-step debug dump for SMC pipeline. Set SMCSD_DEBUG_DUMP=/tmp/smc_debug.jsonl
+# to enable; one JSON line per decode step with (step_idx, log_weights,
+# logprob_diff, draft_logprobs, target_logprobs at matching positions, bonus
+# tokens, accepted_tokens). Only safe to use with very small workloads
+# (overhead = serialize tensors + jsonl write per step).
+_SMC_DEBUG_PATH = os.environ.get("SMCSD_DEBUG_DUMP", "")
+_smc_debug_step = [0]  # mutable counter wrapper
 
 
 class SMCWorker(BaseSpecWorker):
@@ -331,6 +342,30 @@ class SMCWorker(BaseSpecWorker):
 
         # ---- 5. Logprob diff (IS weight in log-space) ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
+
+        if _SMC_DEBUG_PATH:
+            try:
+                step_idx = _smc_debug_step[0]
+                _smc_debug_step[0] += 1
+                # Per-particle, per-token: (target_logprob, draft_logprob) at the
+                # matching positions. On same-model + same-temp these should be
+                # numerically equal up to floating point. Anything else is the
+                # source of the bug.
+                rec = {
+                    "step": step_idx,
+                    "bs": int(bs),
+                    "gamma": int(gamma),
+                    "draft_temp": float(self.smc_draft_temperature),
+                    "target_temp": float(self.smc_target_temperature),
+                    "draft_logprobs": draft_logprobs_stacked.detach().to(torch.float32).cpu().tolist(),
+                    "target_logprobs": score_logprobs_stacked.detach().to(torch.float32).cpu().tolist(),
+                    "logprob_diff": logprob_diff.detach().to(torch.float32).cpu().tolist(),
+                    "drafted_tokens": [t.detach().cpu().tolist() for t in all_tokens[1:gamma+1]],
+                }
+                with open(_SMC_DEBUG_PATH, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except Exception as e:
+                logger.warning(f"SMC debug dump failed: {e}")
 
         # ---- 6. Bonus token ----
         bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
