@@ -21,9 +21,11 @@ class SMCParticleGroupState:
     parent_req: Request
     n_particles: int
     num_computed_tokens: int               # advances by gamma+1 after each draft cycle
+    draft_temperature: float
     seed_token_ids: list[int]              # per particle; updated after each cycle
     shared_prefix_block_ids: tuple[list[int], ...]   # [kv_group][block]
     decode_block_ids: list[tuple[list[int], ...]]    # [particle][kv_group][block]
+    particle_req_ids: list[str] = field(default_factory=list)  # needed for KV block free
     accumulated_tokens: list[list[int]] = field(default_factory=list)  # [N][tokens]
 
 
@@ -39,7 +41,6 @@ class NewParticleGroupData:
     prefix_block_ids: tuple[list[int], ...]        # [kv_group][block]
     decode_block_ids: list[tuple[list[int], ...]]  # [particle][kv_group][block]
     seed_token_ids: torch.Tensor   # [N]
-    kv_slots: torch.Tensor         # [num_kv_groups, N, gamma+1]
     seq_lens: torch.Tensor         # [N]
     gamma: int
     temperature: float
@@ -50,7 +51,6 @@ class SMCGroupBatch:
     """Ongoing draft cycle — group already registered."""
     group_id: str
     seed_token_ids: torch.Tensor   # [N]
-    kv_slots: torch.Tensor         # [num_kv_groups, N, gamma+1]
     seq_lens: torch.Tensor         # [N]
     gamma: int
     temperature: float
@@ -70,7 +70,6 @@ class SMCVLLMScheduler(Scheduler):
         assert smc is not None, "SMCVLLMScheduler requires smc_config"
         self.smc_n_particles: int = smc.n_particles
         self.smc_gamma: int = smc.gamma
-        self.particle_temperature: float = smc.draft_temperature
         self.smc_groups: dict[str, SMCParticleGroupState] = {}  # group_id -> state
         # Stores final per-particle token sequences after a group finishes
         self._completed_groups: dict[str, list[list[int]]] = {} # key: parent_req_id
@@ -89,8 +88,10 @@ class SMCVLLMScheduler(Scheduler):
     ) -> NewParticleGroupData:
         """Allocate KV blocks for N particles."""
         parent_req = self.requests[parent_req_id]
-        num_computed_tokens = parent_req.num_computed_tokens
         prompt_token_ids = list(parent_req.prompt_token_ids)
+        # At this point only the prompt is materialized in KV
+        # the sampled seed has not yet been written into the cache
+        num_computed_tokens = len(prompt_token_ids)
 
         particle_req_ids = [
             f"{parent_req_id}__p{i}__{uuid.uuid4().hex[:8]}"
@@ -99,11 +100,15 @@ class SMCVLLMScheduler(Scheduler):
 
         sp = parent_req.sampling_params
         max_tokens = sp.max_tokens if (sp is not None and sp.max_tokens is not None) else 128
-        # +1 to cover the partial last prefix block when num_computed_tokens is not block-aligned.
-        n_decode_blocks = math.ceil(max_tokens / self.block_size) + 1
+
+        # Share only full prefix blocks across particles
+        num_full_shared_blocks = num_computed_tokens // self.block_size
+        num_shared_tokens = num_full_shared_blocks * self.block_size
+        private_tokens_needed = (num_computed_tokens - num_shared_tokens) + max_tokens
+        n_decode_blocks = math.ceil(private_tokens_needed / self.block_size)
 
         # Fork blocks: touches prefix N times and allocates decode blocks per particle
-        # frees parent's ownership of prefix blocks.
+        # Free parent's ownership of prefix blocks
         prefix_block_ids, decode_block_ids_flat = self.kv_cache_manager.fork_blocks(
             parent_req_id=parent_req_id,
             particle_req_ids=particle_req_ids,
@@ -115,27 +120,18 @@ class SMCVLLMScheduler(Scheduler):
         # fork_blocks returns flat block ids; for now assume single group.
         # TODO: extend fork_blocks to return per-group ids for MLA / hybrid.
         shared_prefix_block_ids: tuple[list[int], ...] = tuple(
-            prefix_block_ids for _ in range(num_kv_groups)
+            list(prefix_block_ids[:num_full_shared_blocks]) for _ in range(num_kv_groups)
         )
         decode_block_ids: list[tuple[list[int], ...]] = [
             tuple(dec for _ in range(num_kv_groups))
             for dec in decode_block_ids_flat
         ]
 
-        kv_slots = self._compute_kv_slots(
-            prefix_block_ids=shared_prefix_block_ids,
-            decode_block_ids=decode_block_ids,
-            num_computed_tokens=num_computed_tokens,
-            n_particles=n_particles,
-            num_kv_groups=num_kv_groups,
-            gamma=gamma,
-        )
-
         seed_token_ids_tensor = torch.full(
             (n_particles,), seed_token_id, dtype=torch.long
         )
         seq_lens = torch.full(
-            (n_particles,), num_computed_tokens, dtype=torch.long
+            (n_particles,), num_computed_tokens, dtype=torch.int32
         )
 
         group_id = parent_req_id
@@ -143,9 +139,11 @@ class SMCVLLMScheduler(Scheduler):
             parent_req=parent_req,
             n_particles=n_particles,
             num_computed_tokens=num_computed_tokens,
+            draft_temperature=temperature,
             seed_token_ids=[seed_token_id] * n_particles,
             shared_prefix_block_ids=shared_prefix_block_ids,
             decode_block_ids=decode_block_ids,
+            particle_req_ids=particle_req_ids,
             accumulated_tokens=[[] for _ in range(n_particles)],
         )
         self.smc_groups[group_id] = state
@@ -158,38 +156,24 @@ class SMCVLLMScheduler(Scheduler):
             prefix_block_ids=shared_prefix_block_ids,
             decode_block_ids=decode_block_ids,
             seed_token_ids=seed_token_ids_tensor,
-            kv_slots=kv_slots,
             seq_lens=seq_lens,
             gamma=gamma,
             temperature=temperature,
         )
 
     def update_particle_group(self, group_id: str) -> SMCGroupBatch:
-        """Build an SMCGroupBatch from current group state (read-only).
-
-        State (seed_token_ids, num_computed_tokens) is updated in
-        update_from_output after each cycle completes.
-        """
+        """Build an SMCGroupBatch from current group state."""
         state = self.smc_groups[group_id]
-        kv_slots = self._compute_kv_slots(
-            prefix_block_ids=state.shared_prefix_block_ids,
-            decode_block_ids=state.decode_block_ids,
-            num_computed_tokens=state.num_computed_tokens,
-            n_particles=state.n_particles,
-            num_kv_groups=len(state.shared_prefix_block_ids),
-            gamma=self.smc_gamma,
-        )
         seq_lens = torch.full(
-            (state.n_particles,), state.num_computed_tokens, dtype=torch.long
+            (state.n_particles,), state.num_computed_tokens, dtype=torch.int32
         )
         seed_tensor = torch.tensor(state.seed_token_ids, dtype=torch.long)
         return SMCGroupBatch(
             group_id=group_id,
             seed_token_ids=seed_tensor,
-            kv_slots=kv_slots,
             seq_lens=seq_lens,
             gamma=self.smc_gamma,
-            temperature=self.particle_temperature,
+            temperature=state.draft_temperature,
         )
 
     def finish_particle_group(self, group_id: str) -> None:
@@ -220,17 +204,16 @@ class SMCVLLMScheduler(Scheduler):
 
         pending_fork: list[Request] = []
         for req in list(self.running):
-            # Detect requests that completed prefill last cycle:
-            # output_token_ids has exactly 1 token and not yet forked.
+            # Detect requests that completed prefill last cycle: output_token_ids has exactly 1 token and not yet forked
             if (len(req.output_token_ids) == 1
                     and req.request_id not in self.smc_groups):
                 self.running.remove(req)
                 pending_fork.append(req)
 
-        # Prefill requests flow through vllm's base scheduler and execute_model.
+        # Prefill requests flow through vllm's base scheduler and execute_model
         base_output = super().schedule()
 
-        # Allocate KV blocks for N particles after prefill completes.
+        # Allocate KV blocks for N particles after prefill completes
         new_particle_groups: list[NewParticleGroupData] = []
         for req in pending_fork:
             new_group = self.process_prefill_result(
@@ -238,7 +221,8 @@ class SMCVLLMScheduler(Scheduler):
                 seed_token_id=req.output_token_ids[0],
                 n_particles=self.smc_n_particles,
                 gamma=self.smc_gamma,
-                temperature=self.particle_temperature,
+                temperature=getattr(req, "smc_draft_temperature", 
+                                    req.sampling_params.temperature),
             )
             new_particle_groups.append(new_group)
 
@@ -280,10 +264,16 @@ class SMCVLLMScheduler(Scheduler):
             if state is None:
                 continue
 
-            # draft_token_ids: [N, gamma+1]; [:, 0] is seed, [:, 1:] are new tokens.
-            new_tokens = draft_token_ids[:, 1:]  # [N, gamma]
+            # draft_token_ids: [N, gamma+1]; [:, 0] is the carried seed input.
+            # TODO: In the draft-only checkpoint we commit all newly sampled tokens:
+            # x_1..x_gamma from draft_token_ids[:, 1:] plus next_seed_ids,
+            # which is x_{gamma+1} and also seeds the next cycle.
+            new_tokens = torch.cat(
+                (draft_token_ids[:, 1:], next_seed_ids.unsqueeze(1)),
+                dim=1,
+            )  # [N, gamma+1]
 
-            # Accumulate per-particle tokens.
+            # Accumulate per-particle visible output tokens for this cycle.
             for p in range(state.n_particles):
                 state.accumulated_tokens[p].extend(new_tokens[p].tolist())
 
@@ -306,8 +296,6 @@ class SMCVLLMScheduler(Scheduler):
             if eos_hit or budget_hit:
                 self._finish_group(group_id, state, result)
             else:
-                # Advance state for next cycle.
-                # next_seed_ids is sampled from step-gamma logits: the token at position num_computed_tokens+gamma+1
                 state.seed_token_ids = next_seed_ids.tolist()
                 state.num_computed_tokens += self.smc_gamma + 1
 
@@ -340,32 +328,6 @@ class SMCVLLMScheduler(Scheduler):
             )
 
         self.finish_requests(group_id, RequestStatus.FINISHED_STOPPED)
+        for p_id in state.particle_req_ids:
+            self.kv_cache_manager.coordinator.free(p_id)
         self.finish_particle_group(group_id)
-
-    def _compute_kv_slots(
-        self,
-        prefix_block_ids: tuple[list[int], ...],
-        decode_block_ids: list[tuple[list[int], ...]],
-        num_computed_tokens: int,
-        n_particles: int,
-        num_kv_groups: int,
-        gamma: int,
-    ) -> torch.Tensor:
-        """Compute kv_slots tensor shaped [num_kv_groups, P, gamma+1].
-
-        slot_id[g, p, s] = full_block_table[g][p][block_index] * block_size + block_offset
-        where position = num_computed_tokens + s and block_index is absolute.
-        """
-        block_size = self.block_size
-        slots = torch.zeros(
-            (num_kv_groups, n_particles, gamma + 1), dtype=torch.long
-        )
-        for g in range(num_kv_groups):
-            for p in range(n_particles):
-                full_blocks = list(prefix_block_ids[g]) + list(decode_block_ids[p][g])
-                for s in range(gamma + 1):
-                    position = num_computed_tokens + s
-                    block_index = position // block_size
-                    block_offset = position % block_size
-                    slots[g, p, s] = full_blocks[block_index] * block_size + block_offset
-        return slots

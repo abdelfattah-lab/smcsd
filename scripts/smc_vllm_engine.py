@@ -1,28 +1,41 @@
 from smcsd.vllm_backend.engine import SMCVLLMEngine
 
+
+PROMPTS = [
+    "The capital of France is",
+    "Write one sentence about why overlap scheduling matters for inference systems.",
+    "List two prime numbers and one composite number.",
+    "In one short paragraph, explain speculative decoding.",
+    "What is 1+1?",
+]
+
 engine = SMCVLLMEngine(
-    model_path="Qwen/Qwen3-8B",
-    draft_model_path="Qwen/Qwen3-8B",
+    model_path="meta-llama/Llama-3.1-8B-Instruct",
+    draft_model_path="meta-llama/Llama-3.2-1B-Instruct",
     n_particles=8,
     gamma=8,
-    temperature=0.7,
     tp_size=1,
-    max_model_len=4096,
-    gpu_memory_utilization=0.6,
+    max_model_len=1024,
+    gpu_memory_utilization=0.5,
+    #enable_prefix_caching=False
 )
 
 out = engine.generate(
-    prompt="Write one sentence about speculative decoding.",
+    prompt=PROMPTS,
     sampling_params={
-        "max_tokens": 32,
-        "temperature": 0.7,
+        "draft_temperature": 0,
+        "target_temperature": 0,
     },
 )
 
-print("text:", out["text"])
-print("output_ids:", out["output_ids"])
-print("num_particles:", len(out["particles"]))
-print("particle_lengths:", [len(p) for p in out["particles"]])
+results = [out] if isinstance(out, dict) else out
+
+for prompt_idx, result in enumerate(results):
+    print(f"\nprompt[{prompt_idx}]: {PROMPTS[prompt_idx]}")
+    for particle_idx, particle_ids in enumerate(result["particles"]):
+        text = engine.tokenizer.decode(particle_ids, skip_special_tokens=True)
+        print(
+            f"particle[{particle_idx}] ({len(particle_ids)} tokens): {text}"
+        )
 
 engine.shutdown()
-
