@@ -103,6 +103,8 @@ def run_smc_engine_eval(args, prompts, labels):
     )
     if args.context_length is not None:
         engine_kwargs["context_length"] = args.context_length
+    if getattr(args, "disable_cuda_graph", False):
+        engine_kwargs["disable_cuda_graph"] = True
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
     if args.resample_threshold is not None:
@@ -333,6 +335,9 @@ if __name__ == "__main__":
                       help="cap context length to this many tokens (helps fit hybrid Qwen3.5/Next "
                            "models whose declared max_position_embeddings is much longer than "
                            "what the rope-derived effective length supports)")
+    eng.add_argument("--disable-cuda-graph", action="store_true",
+                      help="skip CUDA graph capture (slower decode but avoids capture-time OOMs "
+                           "on tight memory budgets; useful while bringing up a new model)")
 
     args = parser.parse_args()
     main(args)

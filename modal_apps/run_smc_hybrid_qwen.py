@@ -87,12 +87,13 @@ def run_smc_hybrid(
     gamma: int = 2,
     temperature: float = 0.7,
     tp_size: int = 4,
-    mem_fraction_static: float = 0.55,
+    mem_fraction_static: float = 0.30,
     cuda_graph_max_bs: int = 4,
     max_running_requests: int = 2,
     attention_backend: str = "fa3",
     resample_threshold: float = 0.5,
     context_length: int = 8192,
+    disable_cuda_graph: bool = True,
 ) -> None:
     import os
     import shlex
@@ -158,6 +159,8 @@ def run_smc_hybrid(
         "--context-length", str(context_length),
         "--seed", "0",
     ]
+    if disable_cuda_graph:
+        cmd.append("--disable-cuda-graph")
 
     print("Running:", " ".join(shlex.quote(p) for p in cmd), flush=True)
     rc = subprocess.run(cmd, cwd=SMCSD_DIR)
@@ -176,12 +179,13 @@ def main(
     gamma: int = 2,
     temperature: float = 0.7,
     tp_size: int = 4,
-    mem_fraction_static: float = 0.55,
+    mem_fraction_static: float = 0.30,
     cuda_graph_max_bs: int = 4,
     max_running_requests: int = 2,
     attention_backend: str = "fa3",
     resample_threshold: float = 0.5,
     context_length: int = 8192,
+    disable_cuda_graph: bool = True,
 ):
     run_smc_hybrid.remote(
         target_model=target_model,
@@ -198,4 +202,5 @@ def main(
         attention_backend=attention_backend,
         resample_threshold=resample_threshold,
         context_length=context_length,
+        disable_cuda_graph=disable_cuda_graph,
     )
