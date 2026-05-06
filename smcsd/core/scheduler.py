@@ -23,7 +23,11 @@ from smcsd.common.utils import (
     compute_smc_shared_prefix_len,
     validate_smc_parent_req,
 )
-from smcsd.mem_cache.allocator import copy_block_table
+from smcsd.mem_cache.allocator import (
+    copy_block_table,
+    copy_mamba_state_batched,
+    copy_mamba_state_one,
+)
 from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
 
@@ -184,6 +188,16 @@ class SMCCoordinator:
         )
         if to_free.numel() > 0:
             slot_state.token_to_kv_pool_allocator.free(to_free)
+
+        # Hybrid-only: copy ancestor's full Mamba/SSM recurrent state into
+        # the resampled slot. The flat-KV refcount machinery doesn't apply
+        # to mamba state (each slot owns its own state, not a shared page),
+        # so we fully copy. No-op on dense models.
+        copy_mamba_state_batched(
+            slot_state.req_to_token_pool,
+            src_pool_indices,
+            dst_pool_indices,
+        )
 
         # Vector-copy the per-slot tensors dst ← src.
         slot_state.seq_lens[dst_idx] = slot_state.seq_lens[src_idx]
@@ -589,6 +603,17 @@ class SMCScheduler(Scheduler):
                     particle_req.req_pool_idx,
                     shared_seq_len,
                     self.token_to_kv_pool_allocator,
+                )
+                # Hybrid-only: copy parent's Mamba/SSM recurrent state into
+                # this particle's slot. Each particle gets its own mamba slot
+                # at alloc time (HybridReqToTokenPool.alloc) but it's
+                # zero-initialized, so we must seed it from the parent —
+                # otherwise the first decode step on the particle reads a
+                # zero state and corrupts the prefix context. No-op on dense.
+                copy_mamba_state_one(
+                    self.req_to_token_pool,
+                    parent_req.req_pool_idx,
+                    particle_req.req_pool_idx,
                 )
                 particle_req.kv_committed_len = shared_seq_len
                 particle_req.kv_allocated_len = shared_seq_len

@@ -128,6 +128,14 @@ def _release_internal_req(
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(indices)
 
+    # Hybrid: return the per-request Mamba/SSM state slot to the mamba pool.
+    # ReqToTokenPool.free only frees the req-pool slot; on hybrid models the
+    # mamba_pool slot must be freed explicitly (otherwise it leaks until the
+    # pool runs out, since smcsd's radix cache is disabled and there's no
+    # tree_cache layer to do this for us).
+    if hasattr(req_to_token_pool, "free_mamba_cache") and req.mamba_pool_idx is not None:
+        req_to_token_pool.free_mamba_cache(req)
+
     req_to_token_pool.free(req)
     req.prefix_indices = _empty_prefix_indices()
     req.kv_committed_len = 0
@@ -167,6 +175,13 @@ def _release_smc_parent_req(
             req.req_pool_idx, start_p:end_p
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(overalloc_indices)
+
+    # Hybrid: free the parent's mamba slot. Particles inherit a *copy* of
+    # the parent's mamba state in their own slots (see copy_mamba_state_one
+    # in scheduler._materialize_group), so freeing the parent's slot does
+    # not affect them.
+    if hasattr(req_to_token_pool, "free_mamba_cache") and req.mamba_pool_idx is not None:
+        req_to_token_pool.free_mamba_cache(req)
 
     req_to_token_pool.free(req)
     if req.last_node is not None:

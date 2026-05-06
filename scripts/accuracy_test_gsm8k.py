@@ -99,6 +99,7 @@ def run_smc_engine_eval(args, prompts, labels):
         trust_remote_code=True,
         page_size=1,
         attention_backend=args.attention_backend,
+        tp_size=args.tp_size,
     )
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
@@ -324,6 +325,8 @@ if __name__ == "__main__":
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=16)
+    eng.add_argument("--tp-size", type=int, default=1,
+                      help="tensor-parallel size for the target (and draft, if shared)")
 
     args = parser.parse_args()
     main(args)
