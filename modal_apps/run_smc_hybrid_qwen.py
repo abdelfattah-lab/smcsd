@@ -170,6 +170,81 @@ def run_smc_hybrid(
         sys.exit(rc.returncode)
 
 
+# Medium pair: Qwen3.6-27B target + Qwen3.5-9B draft on 2×H200. Both hybrid
+# (Mamba+attention), both full causal LMs (unlike the small Qwen3.5 MTP variants),
+# and both use the same extended Qwen3.5/3.6 vocab. Exercises the
+# hybrid-target + hybrid-draft path that the 80B+0.6B-dense pair didn't.
+@app.function(
+    gpu="H200:2",
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name("hf-llama-token")],
+    volumes={HF_HOME: hf_cache},
+)
+def run_smc_hybrid_medium(
+    target_model: str = "Qwen/Qwen3.6-27B",
+    draft_model: str = "Qwen/Qwen3.5-9B",
+    num_questions: int = 3,
+    max_new_tokens: int = 1024,
+    particles: int = 2,
+    gamma: int = 2,
+    temperature: float = 0.7,
+    tp_size: int = 2,
+    mem_fraction_static: float = 0.25,
+    cuda_graph_max_bs: int = 2,
+    max_running_requests: int = 2,
+    attention_backend: str = "fa3",
+    resample_threshold: float = 0.5,
+    context_length: int = 8192,
+    disable_cuda_graph: bool = True,
+    mode: str = "smc_engine",
+) -> None:
+    import os, shlex, subprocess, sys
+    for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN",
+              "HUGGINGFACE_TOKEN", "HF_HUB_TOKEN"):
+        token = os.environ.get(k)
+        if token:
+            os.environ["HF_TOKEN"] = token
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+            break
+
+    os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+
+    print("\n=== nvidia-smi ===", flush=True)
+    subprocess.run(["nvidia-smi"], check=False)
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade",
+         "torch==2.11.0", "torchvision", "torchaudio==2.11.0",
+         "sglang-kernel==0.4.2"], check=False,
+    )
+
+    cmd = [
+        sys.executable, "-u", "scripts/accuracy_test_gsm8k.py",
+        "--mode", mode,
+        "--model", target_model,
+        "--draft-model", draft_model,
+        "--num-questions", str(num_questions),
+        "--max-new-tokens", str(max_new_tokens),
+        "--particles", str(particles),
+        "--gamma", str(gamma),
+        "--temperature", str(temperature),
+        "--mem-fraction-static", str(mem_fraction_static),
+        "--cuda-graph-max-bs", str(cuda_graph_max_bs),
+        "--max-running-requests", str(max_running_requests),
+        "--attention-backend", attention_backend,
+        "--resample-threshold", str(resample_threshold),
+        "--tp-size", str(tp_size),
+        "--context-length", str(context_length),
+        "--seed", "0",
+    ]
+    if disable_cuda_graph:
+        cmd.append("--disable-cuda-graph")
+    print("Running:", " ".join(shlex.quote(p) for p in cmd), flush=True)
+    rc = subprocess.run(cmd, cwd=SMCSD_DIR)
+    print(f"smc-hybrid-medium rc={rc.returncode}", flush=True)
+    if rc.returncode != 0:
+        sys.exit(rc.returncode)
+
+
 # Small-model (Qwen3.5-2B/9B class) variant on a single H200. Both models in this
 # pair are hybrid GDN/Mamba — exercises hybrid-target + hybrid-draft, which is a
 # different code path than the 80B + 0.6B-dense pair tested above.
@@ -273,6 +348,41 @@ def main(
         temperature=temperature,
         tp_size=tp_size,
         mem_fraction_static=mem_fraction_static,
+        cuda_graph_max_bs=cuda_graph_max_bs,
+        max_running_requests=max_running_requests,
+        attention_backend=attention_backend,
+        resample_threshold=resample_threshold,
+        context_length=context_length,
+        disable_cuda_graph=disable_cuda_graph,
+        mode=mode,
+    )
+
+
+@app.local_entrypoint()
+def medium(
+    target_model: str = "Qwen/Qwen3.6-27B",
+    draft_model: str = "Qwen/Qwen3.5-9B",
+    num_questions: int = 3,
+    max_new_tokens: int = 1024,
+    particles: int = 2,
+    gamma: int = 2,
+    temperature: float = 0.7,
+    tp_size: int = 2,
+    mem_fraction_static: float = 0.25,
+    cuda_graph_max_bs: int = 2,
+    max_running_requests: int = 2,
+    attention_backend: str = "fa3",
+    resample_threshold: float = 0.5,
+    context_length: int = 8192,
+    disable_cuda_graph: bool = True,
+    mode: str = "smc_engine",
+):
+    """Hybrid-target + hybrid-draft smoke test (Qwen3.6-27B + Qwen3.5-9B)."""
+    run_smc_hybrid_medium.remote(
+        target_model=target_model, draft_model=draft_model,
+        num_questions=num_questions, max_new_tokens=max_new_tokens,
+        particles=particles, gamma=gamma, temperature=temperature,
+        tp_size=tp_size, mem_fraction_static=mem_fraction_static,
         cuda_graph_max_bs=cuda_graph_max_bs,
         max_running_requests=max_running_requests,
         attention_backend=attention_backend,
