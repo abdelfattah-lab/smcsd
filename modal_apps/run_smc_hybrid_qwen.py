@@ -65,6 +65,15 @@ image = (
         f"{SMCSD_DIR}/scripts/accuracy_test_gsm8k.py",
         copy=True,
     )
+    # The cached `git clone --recurse-submodules` layer pinned the sglang
+    # submodule at an older commit; overlay our patched ModelConfig
+    # directly so the SMC draft-MTP-rewrite skip takes effect without
+    # busting the whole image cache.
+    .add_local_file(
+        "3rdparty/sglang/python/sglang/srt/configs/model_config.py",
+        f"{SMCSD_DIR}/3rdparty/sglang/python/sglang/srt/configs/model_config.py",
+        copy=True,
+    )
     .env({"HF_HOME": HF_HOME, "PYTHONUNBUFFERED": "1"})
 )
 
