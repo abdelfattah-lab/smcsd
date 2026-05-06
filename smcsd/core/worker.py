@@ -258,6 +258,8 @@ class SMCWorker(BaseSpecWorker):
         x0 = draft_input.verified_id
         all_tokens = [x0]
         draft_logprobs = []
+        draft_argmax_steps = []
+        draft_top1_logits = []
         current_ids = x0
 
         for step in range(gamma + 1):
@@ -292,6 +294,9 @@ class SMCWorker(BaseSpecWorker):
                     1, next_token.unsqueeze(1)
                 ).squeeze(1)
                 draft_logprobs.append(token_logprob)
+                if _SMC_DEBUG_PATH:
+                    draft_argmax_steps.append(torch.argmax(logits, dim=-1))
+                    draft_top1_logits.append(logits.max(dim=-1).values)
 
             all_tokens.append(next_token)
             current_ids = next_token
@@ -347,10 +352,14 @@ class SMCWorker(BaseSpecWorker):
             try:
                 step_idx = _smc_debug_step[0]
                 _smc_debug_step[0] += 1
-                # Per-particle, per-token: (target_logprob, draft_logprob) at the
-                # matching positions. On same-model + same-temp these should be
-                # numerically equal up to floating point. Anything else is the
-                # source of the bug.
+                target_logits_3d = score_logits.reshape(bs, gamma + 1, -1)[:, :gamma, :]
+                target_argmax = target_logits_3d.argmax(dim=-1)
+                target_top1_val = target_logits_3d.max(dim=-1).values
+                target_logits_at_drafted = target_logits_3d.gather(
+                    2, target_tokens.unsqueeze(2)
+                ).squeeze(2)
+                draft_argmax = torch.stack(draft_argmax_steps, dim=1) if draft_argmax_steps else None
+                draft_top1 = torch.stack(draft_top1_logits, dim=1) if draft_top1_logits else None
                 rec = {
                     "step": step_idx,
                     "bs": int(bs),
@@ -361,11 +370,65 @@ class SMCWorker(BaseSpecWorker):
                     "target_logprobs": score_logprobs_stacked.detach().to(torch.float32).cpu().tolist(),
                     "logprob_diff": logprob_diff.detach().to(torch.float32).cpu().tolist(),
                     "drafted_tokens": [t.detach().cpu().tolist() for t in all_tokens[1:gamma+1]],
+                    "target_argmax": target_argmax.detach().cpu().tolist(),
+                    "draft_argmax": draft_argmax.detach().cpu().tolist() if draft_argmax is not None else None,
+                    "target_top1_logit": target_top1_val.detach().to(torch.float32).cpu().tolist(),
+                    "draft_top1_logit": draft_top1.detach().to(torch.float32).cpu().tolist() if draft_top1 is not None else None,
+                    "target_logit_at_drafted": target_logits_at_drafted.detach().to(torch.float32).cpu().tolist(),
                 }
                 with open(_SMC_DEBUG_PATH, "a") as f:
                     f.write(json.dumps(rec) + "\n")
             except Exception as e:
                 logger.warning(f"SMC debug dump failed: {e}")
+
+        # ---- 5b. Commit target's intermediate mamba state to ssm_state.
+        #
+        # Critical: the spec verify path uses
+        # ``selective_state_update(disable_state_update=True, ...)`` and
+        # ``causal_conv1d_update_triton(intermediate_conv_window=...)`` which
+        # write per-step intermediate states to ``intermediate_ssm`` /
+        # ``intermediate_conv_window`` but DO NOT advance the request's
+        # actual ``ssm_state`` / ``conv_state``. The next cycle's verify
+        # would then read STALE state (frozen at prefill across all cycles)
+        # producing logits conditioned only on the prompt + this cycle's
+        # γ+1 tokens, missing all prior cycles' history. EAGLE / dflash /
+        # MTP all call ``update_mamba_state_after_mtp_verify`` after verify
+        # to scatter intermediate_ssm[step] -> ssm_state. SMC didn't, which
+        # caused same-model 9B+9B at temp=0.1 to drop to 42% (the model
+        # forgets all output past the prompt).
+        attn_backend = getattr(self.score_runner, "attn_backend", None)
+        if attn_backend is not None and hasattr(
+            attn_backend, "update_mamba_state_after_mtp_verify"
+        ):
+            # SMC accepts all γ drafted tokens. The chunk has γ+1 positions
+            # (verified_id at 0, x_1..x_γ at 1..γ); intermediate_ssm[γ] is
+            # the state after consuming x_γ — the conditioning needed by the
+            # next cycle's draft AR step 0 (which feeds bonus_k as input).
+            accepted_steps = torch.full(
+                (bs,), gamma, dtype=torch.int32, device=self.device
+            )
+            attn_backend.update_mamba_state_after_mtp_verify(
+                accepted_steps=accepted_steps,
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=self.score_runner.model,
+            )
+
+        # ---- 5c. Sync draft mamba state from target's now-committed state.
+        # On hybrid+hybrid the draft maintains a separate MambaPool. Copy
+        # target's just-committed extend-kernel state into the draft pool so
+        # the next cycle's draft AR step 0 reads the same conditioning the
+        # target verify position 0 will read. No-op on dense drafts (the
+        # draft pool aliases the target's). Without this, the draft's
+        # decode-kernel ssm_state and the target's extend-kernel ssm_state
+        # diverge by 2-13 logit units within a single cycle and cause
+        # spurious IS-weight inflation that drives ESS-collapse resampling.
+        from smcsd.mem_cache.allocator import sync_draft_from_target_mamba
+        sync_draft_from_target_mamba(
+            self.req_to_token_pool,
+            self.draft_req_to_token_pool,
+            batch.req_pool_indices,
+        )
 
         # ---- 6. Bonus token ----
         bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]

@@ -111,6 +111,60 @@ def _copy_batched(
     pool.mamba_pool.copy_from(src_mamba, dst_mamba)
 
 
+def sync_draft_from_target_mamba(
+    req_to_token_pool,
+    draft_req_to_token_pool,
+    req_pool_indices: torch.Tensor,
+) -> None:
+    """Cross-pool copy of the recurrent state from target slots to draft slots.
+
+    Called at the end of each SMC cycle after target verify writes its
+    extend-kernel mamba state. Without this, the draft pool retains
+    decode-kernel mamba states from the just-finished cycle's draft AR;
+    on the next cycle the draft AR step 0 conditioning state diverges from
+    target verify position 0's conditioning, breaking IS-weight equivalence
+    on same-model SMC and inflating IS-weight variance on hybrid+hybrid
+    pairs.
+
+    No-op when:
+      * Target pool is dense (no mamba_pool).
+      * Draft pool is None or aliases the target pool.
+      * No active reqs.
+    """
+    if not is_hybrid_req_to_token_pool(req_to_token_pool):
+        return
+    if (
+        draft_req_to_token_pool is None
+        or draft_req_to_token_pool is req_to_token_pool
+        or not is_hybrid_req_to_token_pool(draft_req_to_token_pool)
+    ):
+        return
+    if req_pool_indices.numel() == 0:
+        return
+    rpi = req_pool_indices.to(torch.int64)
+    src_mamba = req_to_token_pool.req_index_to_mamba_index_mapping[rpi].to(
+        torch.int64
+    )
+    dst_mamba = draft_req_to_token_pool.req_index_to_mamba_index_mapping[rpi].to(
+        torch.int64
+    )
+    src_cache = req_to_token_pool.mamba_pool.mamba_cache
+    dst_cache = draft_req_to_token_pool.mamba_pool.mamba_cache
+    # Cross-arch pairs (e.g. 9B target + 2B draft) have different
+    # num_layers / conv-dim / temporal-dim, so the cross-pool copy is
+    # not meaningful — each model maintains its own state. Only sync
+    # when shapes match (same-model SMC, e.g. 9B+9B self-pair).
+    if dst_cache.temporal.shape != src_cache.temporal.shape:
+        return
+    if len(dst_cache.conv) != len(src_cache.conv) or any(
+        dc.shape != sc.shape for dc, sc in zip(dst_cache.conv, src_cache.conv)
+    ):
+        return
+    for i in range(len(dst_cache.conv)):
+        dst_cache.conv[i][:, dst_mamba] = src_cache.conv[i][:, src_mamba]
+    dst_cache.temporal[:, dst_mamba] = src_cache.temporal[:, src_mamba]
+
+
 def copy_mamba_state_one(
     req_to_token_pool,
     src_req_pool_idx: int,
