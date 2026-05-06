@@ -59,7 +59,7 @@ def format_instruction(question: str) -> str:
     )
 
 
-def load_gsm8k(tokenizer, num_questions: int):
+def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False):
     """Load GSM8K and build chat-template prompts + gold labels."""
     print("Loading GSM8K dataset...")
     dataset = load_dataset("gsm8k", "main", split="test")
@@ -68,10 +68,14 @@ def load_gsm8k(tokenizer, num_questions: int):
     labels = []
     for sample in dataset.select(range(num_questions)):
         instruction = format_instruction(sample["question"])
+        chat_template_kwargs = {}
+        if disable_thinking:
+            chat_template_kwargs["enable_thinking"] = False
         prompt = tokenizer.apply_chat_template(
             [{"role": "user", "content": instruction}],
             tokenize=False,
             add_generation_prompt=True,
+            **chat_template_kwargs,
         )
         prompts.append(prompt)
         labels.append(extract_answer(sample["answer"]))
@@ -116,6 +120,8 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_running_requests"] = args.max_running_requests
     else:
         engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
+    if args.max_total_tokens is not None:
+        engine_kwargs["max_total_tokens"] = args.max_total_tokens
     if getattr(args, "dtype", None):
         engine_kwargs["dtype"] = args.dtype
     if getattr(args, "disable_cuda_graph", False):
@@ -123,6 +129,7 @@ def run_smc_engine_eval(args, prompts, labels):
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
+        "temperature": args.temperature,
     }
 
     with SMCEngine(**engine_kwargs) as engine:
@@ -175,6 +182,8 @@ def run_baseline_eval(args, prompts, labels):
         engine_kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
+    if args.max_total_tokens is not None:
+        engine_kwargs["max_total_tokens"] = args.max_total_tokens
     if getattr(args, "disable_cuda_graph", False):
         engine_kwargs["disable_cuda_graph"] = True
 
@@ -239,6 +248,8 @@ def main(args):
         f"  num_questions={args.num_questions}, max_new_tokens={args.max_new_tokens}, "
         f"ignore_eos={args.ignore_eos}"
     )
+    if args.disable_thinking:
+        print("  chat_template: enable_thinking=False")
     print()
 
     if args.seed is not None:
@@ -246,7 +257,11 @@ def main(args):
 
     # Load tokenizer and data (shared across all modes)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    prompts, labels = load_gsm8k(tokenizer, args.num_questions)
+    prompts, labels = load_gsm8k(
+        tokenizer,
+        args.num_questions,
+        disable_thinking=args.disable_thinking,
+    )
 
     # Run evaluation
     if args.mode == "smc_engine":
@@ -358,6 +373,12 @@ if __name__ == "__main__":
         default=False,
         help="pass ignore_eos through engine sampling_params for throughput comparisons",
     )
+    bench.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        default=False,
+        help="Pass enable_thinking=False to Qwen-style chat templates.",
+    )
 
     # Engine overrides (smc_engine / baseline modes)
     eng = parser.add_argument_group("engine overrides (smc_engine/baseline)")
@@ -369,6 +390,12 @@ if __name__ == "__main__":
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=16)
+    eng.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        help="Cap the KV-token memory pool size (useful for dense hybrid draft smoke tests).",
+    )
     eng.add_argument(
         "--disable-cuda-graph",
         action="store_true",

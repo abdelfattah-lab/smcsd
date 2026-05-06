@@ -332,6 +332,11 @@ class ScheduleBatchSMC:
                 self.token_to_kv_pool_allocator.dec_ref_and_free(indices)
                 req = self.slot_to_req.get(slot)
                 if req is not None:
+                    if (
+                        hasattr(self.req_to_token_pool, "free_mamba_cache")
+                        and req.mamba_pool_idx is not None
+                    ):
+                        self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
 
             self.req_pool_indices[slot] = EMPTY_SLOT

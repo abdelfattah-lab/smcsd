@@ -835,6 +835,9 @@ class SMCSchedulerV2(Scheduler):
                     particle_req.req_pool_idx, :shared_seq_len
                 ].to(dtype=torch.int64, copy=True)
                 particle_req.cache_protected_len = shared_seq_len
+            self.model_worker.fanout_smc_parent_hybrid_state(
+                parent_req, particle_reqs
+            )
         except Exception as exc:
             for particle_req in particle_reqs:
                 _release_internal_req(
@@ -986,6 +989,9 @@ class SMCSchedulerV2(Scheduler):
         if did_resample:
             self.coordinator.dispatch_resample_batch(
                 plan, self.slot_state, rebuild_active=False,
+            )
+            self.model_worker.copy_smc_resampled_hybrid_state(
+                self.slot_state, plan
             )
 
         # Single rebuild per decode cycle if membership changed

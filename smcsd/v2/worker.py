@@ -30,6 +30,28 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 logger = logging.getLogger(__name__)
 
 
+class SMCDenseDraftTpModelWorker(TpModelWorker):
+    """Draft worker that keeps a standalone draft model as a normal LM.
+
+    Upstream SGLang rewrites several hybrid architectures (including Qwen3.5)
+    to their MTP draft variants whenever ``is_draft_model=True``. That is
+    correct for NEXTN/MTP speculative decoding, but SMC's dense mode expects a
+    fully autoregressive draft model. Keep ``is_draft_worker=True`` for shared
+    request/KV-pool semantics, while loading the draft config without the MTP
+    architecture rewrite.
+    """
+
+    def _init_model_config(self):
+        from sglang.srt.configs.model_config import ModelConfig
+
+        self.model_config = ModelConfig.from_server_args(
+            self.server_args,
+            model_path=self.server_args.speculative_draft_model_path,
+            model_revision=self.server_args.speculative_draft_model_revision,
+            is_draft_model=False,
+        )
+
+
 class SMCWorkerV2(BaseSpecWorker):
     """Standalone SMC worker using v2 API (SMCDecodeContext + SMCDraftInputV2)."""
 
@@ -60,6 +82,7 @@ class SMCWorkerV2(BaseSpecWorker):
         self.smc_draft_mode = getattr(server_args, "smc_draft_mode", "dense")
         self.is_dflash = self.smc_draft_mode == "dflash"
         self.is_eagle3 = self.smc_draft_mode == "eagle3"
+        self._dense_draft_hybrid_req_to_token_pool = None
 
         # Share req_to_token_pool, separate KV caches
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -108,8 +131,11 @@ class SMCWorkerV2(BaseSpecWorker):
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
 
-        # Create draft TpModelWorker — fully independent, no shared lm_head/embed
-        self._draft_worker = TpModelWorker(
+        # Create draft TpModelWorker — fully independent, no shared lm_head/embed.
+        # Dense SMC uses a normal AR draft; EAGLE3 keeps upstream draft-model
+        # config rewriting because its checkpoint is an EAGLE/MTP-style head.
+        draft_worker_cls = TpModelWorker if self.is_eagle3 else SMCDenseDraftTpModelWorker
+        self._draft_worker = draft_worker_cls(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -221,6 +247,8 @@ class SMCWorkerV2(BaseSpecWorker):
 
             # EAGLE3 head runs eagerly — disable its CUDA graph.
             backup_disable_cuda_graph = True
+        else:
+            self._maybe_isolate_dense_hybrid_draft_state()
 
         # Multi-step draft attention backend
         from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -238,6 +266,209 @@ class SMCWorkerV2(BaseSpecWorker):
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         if not backup_disable_cuda_graph:
             self.draft_runner.init_device_graphs()
+
+    def _dense_hybrid_state_shape(self) -> Optional[Tuple[Tuple, Tuple]]:
+        target_cfg = getattr(self.score_runner, "hybrid_gdn_config", None)
+        draft_cfg = getattr(self.draft_runner, "hybrid_gdn_config", None)
+        if target_cfg is None or draft_cfg is None:
+            return None
+
+        keys = (
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+        )
+        target_shape = tuple(getattr(target_cfg, key, None) for key in keys)
+        draft_shape = tuple(getattr(draft_cfg, key, None) for key in keys)
+        return target_shape, draft_shape
+
+    def _maybe_isolate_dense_hybrid_draft_state(self) -> None:
+        """Give dense hybrid drafts their own recurrent state and KV layout.
+
+        Dense SMC still shares request/token slot indices so target and draft KV
+        caches stay aligned. For hybrid GDN drafts, the recurrent state shape is
+        model-specific, and normal AR drafts need every full-attention layer in
+        their KV pool rather than SGLang's one-layer MTP draft layout.
+        """
+        shapes = self._dense_hybrid_state_shape()
+        target_shape, draft_shape = shapes or (None, None)
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            HybridReqToTokenPool,
+        )
+
+        target_pool = self.req_to_token_pool
+        draft_config = self.draft_runner.mambaish_config
+        if not hasattr(target_pool, "mamba_pool") or draft_config is None:
+            return
+
+        draft_pool = HybridReqToTokenPool(
+            size=target_pool.size,
+            mamba_size=target_pool.size,
+            mamba_spec_state_size=target_pool.size,
+            max_context_len=target_pool.max_context_len,
+            device=self.draft_runner.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            cache_params=draft_config.mamba2_cache_params,
+            mamba_layer_ids=[
+                i
+                for i in draft_config.mamba2_cache_params.layers
+                if self.draft_runner.start_layer <= i < self.draft_runner.end_layer
+            ],
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=None,
+            enable_overlap_schedule=False,
+            start_layer=self.draft_runner.start_layer,
+        )
+        # Share token block-table storage; isolate only the recurrent state pool.
+        draft_pool.req_to_token = target_pool.req_to_token
+        draft_pool.req_index_to_mamba_index_mapping.copy_(
+            torch.arange(
+                target_pool.size + 1,
+                dtype=torch.int32,
+                device=self.draft_runner.device,
+            )
+        )
+        draft_pool.free_slots = []
+        draft_pool.mamba_pool.free_slots = torch.empty(
+            0, dtype=torch.int64, device=self.draft_runner.device
+        )
+
+        self.draft_runner.req_to_token_pool = draft_pool
+
+        extra_args = {}
+        if self.draft_runner.use_mla_backend:
+            extra_args = {
+                "kv_lora_rank": self.draft_runner.model_config.kv_lora_rank,
+                "qk_rope_head_dim": self.draft_runner.model_config.qk_rope_head_dim,
+            }
+        self.draft_runner.token_to_kv_pool = HybridLinearKVPool(
+            page_size=self.draft_runner.page_size,
+            size=self.draft_runner.max_total_num_tokens,
+            dtype=self.draft_runner.kv_cache_dtype,
+            head_num=self.draft_runner.model_config.get_num_kv_heads(
+                get_attention_tp_size()
+            ),
+            head_dim=self.draft_runner.model_config.head_dim,
+            full_attention_layer_ids=[
+                i
+                for i in draft_config.full_attention_layer_ids
+                if self.draft_runner.start_layer <= i < self.draft_runner.end_layer
+            ],
+            enable_kvcache_transpose=False,
+            device=self.draft_runner.device,
+            mamba_pool=draft_pool.mamba_pool,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            use_mla=self.draft_runner.use_mla_backend,
+            start_layer=self.draft_runner.start_layer,
+            **extra_args,
+        )
+
+        linear_backend = getattr(
+            self.draft_runner.attn_backend, "linear_attn_backend", None
+        )
+        if linear_backend is not None:
+            linear_backend = self.draft_runner.attn_backend.linear_attn_backend
+            linear_backend.req_to_token_pool = draft_pool
+            linear_backend.conv_states_shape = draft_pool.mamba_pool.mamba_cache.conv[
+                0
+            ].shape
+            if hasattr(linear_backend, "verify_intermediate_state_indices"):
+                linear_backend.verify_intermediate_state_indices = torch.arange(
+                    draft_pool.size,
+                    dtype=torch.int32,
+                    device=self.draft_runner.device,
+                )
+
+        self._dense_draft_hybrid_req_to_token_pool = draft_pool
+        logger.warning(
+            "SMC dense mode isolated hybrid draft state/KV: target=%s shape=%s "
+            "draft=%s shape=%s full_attn_layers=%s",
+            self.score_runner.model_config.model_path,
+            target_shape,
+            self.draft_runner.model_config.model_path,
+            draft_shape,
+            self.draft_runner.token_to_kv_pool.full_attention_layer_id_mapping.keys(),
+        )
+
+    @staticmethod
+    def _copy_hybrid_state_pairwise(pool, src_req_pool_indices, dst_req_pool_indices):
+        if pool is None or not hasattr(pool, "mamba_pool"):
+            return
+        if src_req_pool_indices.numel() == 0:
+            return
+        mapping = pool.req_index_to_mamba_index_mapping
+        src_mamba = mapping[src_req_pool_indices.to(torch.long)].to(torch.long)
+        dst_mamba = mapping[dst_req_pool_indices.to(torch.long)].to(torch.long)
+        pool.mamba_pool.copy_from(src_mamba, dst_mamba)
+
+    def fanout_smc_parent_hybrid_state(self, parent_req, particle_reqs) -> None:
+        """Copy hybrid recurrent state from the prefilled parent to particles."""
+        if parent_req.req_pool_idx is None or not particle_reqs:
+            return
+        dst = torch.tensor(
+            [req.req_pool_idx for req in particle_reqs],
+            dtype=torch.long,
+            device=self.device,
+        )
+        src = torch.full_like(dst, int(parent_req.req_pool_idx))
+        self._copy_hybrid_state_pairwise(self.req_to_token_pool, src, dst)
+        self._copy_hybrid_state_pairwise(
+            self._dense_draft_hybrid_req_to_token_pool, src, dst
+        )
+
+    def copy_smc_resampled_hybrid_state(self, slot_state, plan) -> None:
+        """Copy hybrid recurrent state after SMC resampling clones particles."""
+        if isinstance(plan, list):
+            dst_slots = []
+            src_slots = []
+            for job in plan:
+                dst_slots.extend(job.dst_slots)
+                src_slots.extend(job.src_slots)
+            if not dst_slots:
+                return
+            dst_slots_t = torch.tensor(dst_slots, dtype=torch.long, device=self.device)
+            src_slots_t = torch.tensor(src_slots, dtype=torch.long, device=self.device)
+        else:
+            if plan.n_jobs == 0:
+                return
+            dst_slots_t = plan.dst_slots.to(torch.long)
+            src_slots_t = plan.src_slots.to(torch.long)
+
+        dst_req_pool = slot_state.req_pool_indices[dst_slots_t]
+        src_req_pool = slot_state.req_pool_indices[src_slots_t]
+        self._copy_hybrid_state_pairwise(
+            self.req_to_token_pool, src_req_pool, dst_req_pool
+        )
+        self._copy_hybrid_state_pairwise(
+            self._dense_draft_hybrid_req_to_token_pool, src_req_pool, dst_req_pool
+        )
+
+    def _commit_target_mamba_state_after_verify(
+        self,
+        verify_forward_batch: ForwardBatch,
+        accepted_steps: torch.Tensor,
+    ) -> None:
+        """Commit hybrid recurrent state produced during TARGET_VERIFY.
+
+        Official SGLang speculative paths run hybrid/GDN target verification with
+        deferred state updates, then scatter the accepted intermediate state back
+        into the live mamba cache. Dense SMC also uses TARGET_VERIFY, so it must
+        perform the same commit for Qwen3.5-style hybrid targets.
+        """
+        attn_backend = self._target_worker.model_runner.attn_backend
+        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            return
+        if verify_forward_batch.forward_mode.is_idle():
+            return
+
+        attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps.to(dtype=torch.int64),
+            mamba_track_indices=verify_forward_batch.mamba_track_indices,
+            mamba_steps_to_track=None,
+            model=self._target_worker.model_runner.model,
+        )
 
     # ── Properties (required by BaseSpecWorker / scheduler) ──
 
@@ -729,6 +960,13 @@ class SMCWorkerV2(BaseSpecWorker):
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        if self.score_runner.hybrid_gdn_config is not None:
+            accepted_steps = torch.full(
+                (bs,), gamma, dtype=torch.int64, device=self.device
+            )
+            self._commit_target_mamba_state_after_verify(
+                verify_forward_batch, accepted_steps
+            )
 
         # ---- 4. Extract score logprobs ----
         score_logits = score_result.logits_output.next_token_logits
