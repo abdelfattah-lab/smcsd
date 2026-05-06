@@ -1,24 +1,13 @@
-"""SMC variants of TpModelWorker.
+"""SMC variant of TpModelWorker.
 
-Two subclasses:
-
-- ``SMCTpModelWorker`` (target): constructs ``SMCModelRunner`` so SMC's
-  refcount-tracking allocator is used for the target model.
-
-- ``SMCDraftTpModelWorker`` (draft): bypasses upstream's automatic
-  draft-model architecture rewrite. Upstream maps the draft's HF
-  architecture (e.g. ``Qwen3_5ForConditionalGeneration`` or
-  ``Qwen3NextForCausalLM``) onto an MTP variant whose forward expects
-  ``forward_batch.spec_info.hidden_states`` from the target — that's the
-  EAGLE / NextN convention. SMC instead uses an independent draft model
-  that runs its own forward without seeing target hidden states, so we
-  need to keep the draft's original architecture. We do this by passing
-  ``is_draft_model=False`` into ``ModelConfig.from_server_args`` and then
-  re-setting ``model_config.is_draft_model = True`` so quantization and
-  context-length checks that key on it still take the draft branch.
+Constructs ``SMCModelRunner`` instead of ``ModelRunner`` so SMC's
+refcount-tracking allocator is used for the target model.  The draft
+worker uses upstream's plain ``TpModelWorker`` — upstream's
+``ModelConfig._config_draft_model`` already gates the draft → MTP
+architecture rewrite on ``speculative_algorithm`` and skips it for SMC,
+so the draft loads as its native causal-LM architecture.
 """
 
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.tp_worker import TpModelWorker
 from smcsd.model_executor.smc_model_runner import SMCModelRunner
 
@@ -45,32 +34,3 @@ class SMCTpModelWorker(TpModelWorker):
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
-
-
-class SMCDraftTpModelWorker(TpModelWorker):
-    """Draft worker for SMC. Loads the draft as its native causal-LM
-    architecture, NOT as the MTP variant upstream forces for spec decoding."""
-
-    def _init_model_config(self):
-        # Override: pass is_draft_model=False to skip the automatic
-        # architecture → MTP rewrite (model_config._config_draft_model).
-        # SMC doesn't want MTP semantics on the draft. Mirror upstream's
-        # arg shape (managers/tp_worker.py:_init_model_config) but flip
-        # the draft flag.
-        self.model_config = ModelConfig.from_server_args(
-            self.server_args,
-            model_path=(
-                self.server_args.model_path
-                if not self.is_draft_worker
-                else self.server_args.speculative_draft_model_path
-            ),
-            model_revision=(
-                self.server_args.revision
-                if not self.is_draft_worker
-                else self.server_args.speculative_draft_model_revision
-            ),
-            is_draft_model=False,
-        )
-        # Restore the draft flag for downstream code paths (quantization
-        # config skip, context-length messaging, etc.).
-        self.model_config.is_draft_model = True
