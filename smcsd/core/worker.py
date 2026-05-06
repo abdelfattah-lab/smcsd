@@ -103,16 +103,40 @@ class SMCWorker(BaseSpecWorker):
         # with target mamba state during fan-out and resampling.
         self.draft_req_to_token_pool = self._draft_worker.req_to_token_pool
 
-        # Multi-step draft attention backend
-        from sglang.srt.speculative.draft_utils import DraftBackendFactory
-
-        factory = DraftBackendFactory(
-            server_args,
-            self.draft_runner,
-            topk=1,
-            speculative_num_steps=self.gamma + 2,
+        # Multi-step draft attention backend.
+        #
+        # ``DraftBackendFactory.create_decode_backend`` returns a flat-attention
+        # multi-step backend (FlashAttentionMultiStepBackend, etc.). That's
+        # correct for dense Qwen / Llama drafts, but it doesn't know about
+        # Mamba/SSM layers — the linear_attn forward in qwen3_next.py takes
+        # the slow path (forward_batch.attn_backend.forward(layer=..., mixed_qkv=..., a=..., b=...))
+        # and crashes with::
+        #
+        #     TypeError: AttentionBackend.forward() missing 3 required positional
+        #     arguments: 'q', 'k', and 'v'
+        #
+        # because the multi-step backend's signature is the dense (q, k, v, ...)
+        # one. For hybrid drafts (Qwen3-Next, Qwen3.5, Falcon-H1, ...), skip
+        # the multi-step path and let per-step draft decode go through the
+        # draft model_runner's regular ``HybridLinearAttnBackend`` (set up by
+        # upstream's ``attn_backend_wrapper`` when ``mambaish_config`` is set),
+        # which dispatches mamba layers through the GDN / Mamba2 backend
+        # correctly.
+        draft_is_hybrid = (
+            getattr(self.draft_runner, "mambaish_config", None) is not None
         )
-        self.draft_attn_backend = factory.create_decode_backend()
+        if draft_is_hybrid:
+            self.draft_attn_backend = None
+        else:
+            from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
+            factory = DraftBackendFactory(
+                server_args,
+                self.draft_runner,
+                topk=1,
+                speculative_num_steps=self.gamma + 2,
+            )
+            self.draft_attn_backend = factory.create_decode_backend()
 
         # Restore cuda graph and capture for draft model
         server_args.disable_cuda_graph = backup_disable_cuda_graph
