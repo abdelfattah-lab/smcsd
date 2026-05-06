@@ -334,11 +334,15 @@ def run_smc_hybrid_small(
     if not enable_thinking:
         cmd.append("--no-enable-thinking")
 
-    # Optional per-step debug dump. Set SMCSD_DEBUG_DUMP_PATH to enable.
+    # Per-step SMC debug dump — always on for the small entrypoint when
+    # max_new_tokens <= 64 (cheap, useful for diagnosing the SMC machinery).
     env = os.environ.copy()
     debug_path = "/tmp/smc_debug.jsonl"
-    if os.environ.get("SMCSD_ENABLE_DEBUG_DUMP", "0") == "1":
+    if max_new_tokens <= 64:
         env["SMCSD_DEBUG_DUMP"] = debug_path
+        # Make sure file is empty
+        if os.path.exists(debug_path):
+            os.remove(debug_path)
 
     print("Running:", " ".join(shlex.quote(p) for p in cmd), flush=True)
     rc = subprocess.run(cmd, cwd=SMCSD_DIR, env=env)
