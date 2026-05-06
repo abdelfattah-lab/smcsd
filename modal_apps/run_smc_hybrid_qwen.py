@@ -94,6 +94,7 @@ def run_smc_hybrid(
     resample_threshold: float = 0.5,
     context_length: int = 8192,
     disable_cuda_graph: bool = False,
+    mode: str = "smc_engine",
 ) -> None:
     import os
     import shlex
@@ -142,7 +143,7 @@ def run_smc_hybrid(
         sys.executable,
         "-u",
         "scripts/accuracy_test_gsm8k.py",
-        "--mode", "smc_engine",
+        "--mode", mode,
         "--model", target_model,
         "--draft-model", draft_model,
         "--num-questions", str(num_questions),
@@ -186,6 +187,7 @@ def main(
     resample_threshold: float = 0.5,
     context_length: int = 8192,
     disable_cuda_graph: bool = False,
+    mode: str = "smc_engine",
 ):
     run_smc_hybrid.remote(
         target_model=target_model,
@@ -203,4 +205,5 @@ def main(
         resample_threshold=resample_threshold,
         context_length=context_length,
         disable_cuda_graph=disable_cuda_graph,
+        mode=mode,
     )
