@@ -311,14 +311,25 @@ class SMCWorker(BaseSpecWorker):
             f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
             f"cuda_graph={can_run_cuda_graph})"
         )
-        score_log_probs = torch.log_softmax(score_logits, dim=-1)
+        # IS weight = log p_target(x) - log p_draft(x), where both p's are
+        # evaluated at their respective sampling temperatures. The draft
+        # logprobs (above) are computed at smc_draft_temperature. The target
+        # logprobs MUST be computed at smc_target_temperature to match — the
+        # bonus-token sampling at the bottom of this method already does
+        # that; this verify step previously did not, which made IS weights
+        # systematically non-zero even when target = draft (same model). On
+        # an SMC self-pair with temp=0.7 that bug pushed accuracy from ~96%
+        # to ~20% via spurious resampling.
+        score_log_probs = torch.log_softmax(
+            score_logits / self.smc_target_temperature, dim=-1
+        )
         score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
         target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
         score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
             2, target_tokens.unsqueeze(2)
         ).squeeze(2)
 
-        # ---- 5. Logprob diff ----
+        # ---- 5. Logprob diff (IS weight in log-space) ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
 
         # ---- 6. Bonus token ----
