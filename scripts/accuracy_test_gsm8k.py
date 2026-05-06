@@ -59,20 +59,40 @@ def format_instruction(question: str) -> str:
     )
 
 
-def load_gsm8k(tokenizer, num_questions: int):
-    """Load GSM8K and build chat-template prompts + gold labels."""
-    print("Loading GSM8K dataset...")
+def load_gsm8k(tokenizer, num_questions: int, enable_thinking: bool = True):
+    """Load GSM8K and build chat-template prompts + gold labels.
+
+    ``enable_thinking`` is forwarded to ``tokenizer.apply_chat_template`` for
+    Qwen3-family models that gate the ``<think>`` block on this kwarg. Set
+    ``False`` to skip thinking and answer directly — much shorter outputs,
+    useful when the thinking budget is the bottleneck.
+    """
+    print(f"Loading GSM8K dataset (enable_thinking={enable_thinking}) ...")
     dataset = load_dataset("gsm8k", "main", split="test")
 
     prompts = []
     labels = []
     for sample in dataset.select(range(num_questions)):
         instruction = format_instruction(sample["question"])
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": instruction}],
+        chat_kwargs = dict(
             tokenize=False,
             add_generation_prompt=True,
         )
+        # Qwen3 / Qwen3.5 / Qwen3-Next chat templates honor enable_thinking.
+        # On templates that don't, the kwarg is silently ignored.
+        chat_kwargs["enable_thinking"] = enable_thinking
+        try:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": instruction}],
+                **chat_kwargs,
+            )
+        except TypeError:
+            # Older tokenizer signatures may not accept enable_thinking.
+            chat_kwargs.pop("enable_thinking")
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": instruction}],
+                **chat_kwargs,
+            )
         prompts.append(prompt)
         labels.append(extract_answer(sample["answer"]))
     assert all(l is not None for l in labels), "Some gold labels could not be parsed"
@@ -247,7 +267,9 @@ def main(args):
 
     # Load tokenizer and data (shared across all modes)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    prompts, labels = load_gsm8k(tokenizer, args.num_questions)
+    prompts, labels = load_gsm8k(
+        tokenizer, args.num_questions, enable_thinking=args.enable_thinking
+    )
 
     # Run evaluation
     if args.mode == "smc_engine":
@@ -326,6 +348,15 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=False,
         help="pass ignore_eos through engine sampling_params for throughput comparisons",
+    )
+    bench.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="for Qwen3 / Qwen3.5 / Qwen3-Next chat templates: include the "
+             "<think> block (default True). Pass --no-enable-thinking to "
+             "disable thinking — outputs are much shorter and don't blow "
+             "through the max_new_tokens budget on hard questions.",
     )
 
     # Engine overrides (smc_engine / baseline modes)

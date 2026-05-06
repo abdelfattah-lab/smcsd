@@ -212,6 +212,7 @@ def run_smc_hybrid_medium(
     context_length: int = 8192,
     disable_cuda_graph: bool = True,
     mode: str = "smc_engine",
+    enable_thinking: bool = True,
 ) -> None:
     import os, shlex, subprocess, sys
     for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN",
@@ -253,6 +254,8 @@ def run_smc_hybrid_medium(
     ]
     if disable_cuda_graph:
         cmd.append("--disable-cuda-graph")
+    if not enable_thinking:
+        cmd.append("--no-enable-thinking")
     print("Running:", " ".join(shlex.quote(p) for p in cmd), flush=True)
     rc = subprocess.run(cmd, cwd=SMCSD_DIR)
     print(f"smc-hybrid-medium rc={rc.returncode}", flush=True)
@@ -286,6 +289,7 @@ def run_smc_hybrid_small(
     context_length: int = 8192,
     disable_cuda_graph: bool = True,
     mode: str = "smc_engine",
+    enable_thinking: bool = True,
 ) -> None:
     import os, shlex, subprocess, sys
     for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN",
@@ -327,6 +331,8 @@ def run_smc_hybrid_small(
     ]
     if disable_cuda_graph:
         cmd.append("--disable-cuda-graph")
+    if not enable_thinking:
+        cmd.append("--no-enable-thinking")
     print("Running:", " ".join(shlex.quote(p) for p in cmd), flush=True)
     rc = subprocess.run(cmd, cwd=SMCSD_DIR)
     print(f"smc-hybrid-small rc={rc.returncode}", flush=True)
@@ -352,6 +358,7 @@ def main(
     context_length: int = 8192,
     disable_cuda_graph: bool = False,
     mode: str = "smc_engine",
+    enable_thinking: bool = True,
 ):
     run_smc_hybrid.remote(
         target_model=target_model,
@@ -370,6 +377,7 @@ def main(
         context_length=context_length,
         disable_cuda_graph=disable_cuda_graph,
         mode=mode,
+        enable_thinking=enable_thinking,
     )
 
 
@@ -391,6 +399,7 @@ def medium(
     context_length: int = 8192,
     disable_cuda_graph: bool = True,
     mode: str = "smc_engine",
+    enable_thinking: bool = True,
 ):
     """Hybrid-target + hybrid-draft smoke test (Qwen3.6-27B + Qwen3.5-9B)."""
     run_smc_hybrid_medium.remote(
@@ -405,6 +414,7 @@ def medium(
         context_length=context_length,
         disable_cuda_graph=disable_cuda_graph,
         mode=mode,
+        enable_thinking=enable_thinking,
     )
 
 
@@ -426,6 +436,7 @@ def small(
     context_length: int = 8192,
     disable_cuda_graph: bool = True,
     mode: str = "smc_engine",
+    enable_thinking: bool = True,
 ):
     """Smoke test the hybrid-target + hybrid-draft path (Qwen3.5-9B + Qwen3.5-2B)."""
     run_smc_hybrid_small.remote(
@@ -440,4 +451,5 @@ def small(
         context_length=context_length,
         disable_cuda_graph=disable_cuda_graph,
         mode=mode,
+        enable_thinking=enable_thinking,
     )
