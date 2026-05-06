@@ -124,8 +124,7 @@ class SMCCoordinator:
 
     # ── Public API ──────────────────────────────────────────
 
-    def collect_resample_jobs_batch(self, slot_st
-    ate: "ScheduleBatchSMC"):
+    def collect_resample_jobs_batch(self, slot_state: "ScheduleBatchSMC"):
         """Run the fused collect kernel over all in-use group rows.
 
         Returns a ``BatchedResampleResult``.  The ``step_counter`` increments

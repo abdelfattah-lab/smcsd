@@ -39,9 +39,14 @@ class SMCVLLMEngine:
             draft_model_path="meta-llama/Llama-3.2-1B-Instruct",
             n_particles=4,
             gamma=4,
-            temperature=1.0,
         )
-        result = engine.generate("What is 2+2?")
+        result = engine.generate(
+            "What is 2+2?",
+            sampling_params={
+                "draft_temperature": 1.0,
+                "target_temperature": 1.0,
+            },
+        )
         print(result["text"])
         engine.shutdown()
     """
@@ -53,7 +58,6 @@ class SMCVLLMEngine:
         *,
         n_particles: int = 4,
         gamma: int = 4,
-        temperature: float = 1.0,
         tp_size: int = 1,
         max_model_len: int | None = None,
         **kwargs,
@@ -62,7 +66,6 @@ class SMCVLLMEngine:
             draft_model_path=draft_model_path,
             n_particles=n_particles,
             gamma=gamma,
-            draft_temperature=temperature,
         )
 
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
@@ -105,7 +108,9 @@ class SMCVLLMEngine:
         Args:
             prompt: A single string or list of strings.
             sampling_params: Sampling config dict(s) with keys accepted by
-                vllm.SamplingParams (e.g. ``max_tokens``, ``temperature``).
+                vllm.SamplingParams plus SMC-specific ``draft_temperature`` and
+                ``target_temperature``. ``target_temperature`` is translated to
+                the normal vLLM ``temperature`` field for the parent request.
             input_ids: Pre-tokenized input(s). Mutually exclusive with *prompt*.
 
         Returns:
@@ -145,7 +150,22 @@ class SMCVLLMEngine:
             rid = uuid.uuid4().hex
             rids.append(rid)
             prompt_token_counts[rid] = len(ids)
-            sp = SamplingParams(**sp_dict) if isinstance(sp_dict, dict) else sp_dict
+            if isinstance(sp_dict, dict):
+                sp_dict = dict(sp_dict)
+                target_temperature = sp_dict.pop(
+                    "target_temperature",
+                    sp_dict.get("temperature", 1.0),
+                )
+                draft_temperature = sp_dict.pop(
+                    "draft_temperature",
+                    target_temperature,
+                )
+                sp_dict["temperature"] = target_temperature
+                sp = SamplingParams(**sp_dict)
+            else:
+                sp = sp_dict
+                target_temperature = sp.temperature
+                draft_temperature = target_temperature
             request = Request(
                 request_id=rid,
                 prompt_token_ids=ids,
@@ -153,6 +173,7 @@ class SMCVLLMEngine:
                 pooling_params=None,
                 arrival_time=time.time(),
             )
+            request.smc_draft_temperature = float(draft_temperature)
             self._engine.add_request(request)
 
         # Drive the step loop until all parent requests finish.
@@ -174,16 +195,17 @@ class SMCVLLMEngine:
         results = []
         for rid in rids:
             # Per-particle draft token sequences accumulated during draft cycles.
-            particles: list[list[int]] = scheduler._completed_groups.pop(rid, [])
-            # Particle 0 tokens as the primary output (placeholder until resampling).
-            primary = particles[0] if particles else []
-            all_tokens = seed_tokens[rid] + primary
+            draft_particles: list[list[int]] = scheduler._completed_groups.pop(rid, [])
+            seed = seed_tokens[rid]
+            particles = [seed + p for p in draft_particles]
+            # Particle 0 as the primary output (placeholder until resampling).
+            all_tokens = particles[0] if particles else seed
             results.append({
                 "text": self.tokenizer.decode(all_tokens, skip_special_tokens=True),
                 "output_ids": all_tokens,
                 "prompt_tokens": prompt_token_counts[rid],
                 "completion_tokens": len(all_tokens),
-                "particles": particles,  # [N][tokens] — all particle sequences
+                "particles": particles,  # [N][seed + draft tokens]
             })
         return results[0] if is_single else results
 
