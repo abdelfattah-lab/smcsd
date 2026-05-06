@@ -679,12 +679,30 @@ class ScheduleBatchSMC:
     # ────────────────────────────────────────────────────────
 
     def finalize_group(self, group_id: str, parent_req: Req) -> Req:
-        """Pick the best particle (by cumulative log-weight, tiebroken by
-        visible output length) and copy its text state to ``parent_req``.
+        """Pick the best particle (by cumulative log-weight, then by
+        finish quality, then by visible output length) and copy its text
+        state to ``parent_req``.
 
         Frees all group slots and returns ``parent_req`` ready for
         ``stream_output``.
+
+        Tiebreak ordering matters when log-weights are near-equal — common
+        on low-variance pairs (e.g. SMC self-pair, or hybrid+hybrid where
+        IS weights are dominated by numerical noise). The previous tiebreak
+        was just ``visible_output_len``, which preferred a particle that
+        capped at ``max_new_tokens`` over one that finished concisely with
+        an EOS / stop token. On math benchmarks this systematically picked
+        the wrong particle.
+
+        New ordering: (log_weight, finished_naturally, visible_output_len)
+        with max:
+          - higher log-weight wins
+          - tie? prefer particle that hit EOS / stop token over one that
+            hit FINISH_LENGTH (token-budget cap)
+          - tie? longer visible output wins (more reasoning content)
         """
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+
         slots = self.group_slot_lists[group_id]
 
         def visible_output_len(slot: int) -> int:
@@ -694,11 +712,20 @@ class ScheduleBatchSMC:
                 return token_count
             return min(req.finished_len, token_count)
 
+        def finished_naturally(slot: int) -> int:
+            req = self.slot_to_req[slot]
+            # 1 if the particle stopped at an EOS/stop token, 0 if it
+            # exhausted its token budget (FINISH_LENGTH) or never finished.
+            if req.finished_reason is None:
+                return 0
+            return 0 if isinstance(req.finished_reason, FINISH_LENGTH) else 1
+
         # Slot-indexed log_weights: no more particle_idx indirection.
         best_slot = max(
             slots,
             key=lambda s: (
                 float(self.log_weights[s].item()),
+                finished_naturally(s),
                 visible_output_len(s),
             ),
         )
