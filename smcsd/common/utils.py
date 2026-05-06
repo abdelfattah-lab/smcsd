@@ -117,6 +117,7 @@ def _release_internal_req(
     req: Req,
     req_to_token_pool,
     token_to_kv_pool_allocator,
+    draft_req_to_token_pool=None,
 ):
     if req.req_pool_idx is None:
         return
@@ -136,6 +137,17 @@ def _release_internal_req(
     if hasattr(req_to_token_pool, "free_mamba_cache") and req.mamba_pool_idx is not None:
         req_to_token_pool.free_mamba_cache(req)
 
+    # Hybrid+hybrid: also free the draft-side mamba slot. (Dense draft path
+    # passes draft_req_to_token_pool=None or an alias of the target pool, so
+    # this is a no-op.)
+    if (
+        draft_req_to_token_pool is not None
+        and draft_req_to_token_pool is not req_to_token_pool
+        and hasattr(draft_req_to_token_pool, "free_mamba_cache")
+        and getattr(req, "draft_mamba_pool_idx", None) is not None
+    ):
+        draft_req_to_token_pool.free_mamba_cache(req)
+
     req_to_token_pool.free(req)
     req.prefix_indices = _empty_prefix_indices()
     req.kv_committed_len = 0
@@ -147,6 +159,7 @@ def _release_smc_parent_req(
     tree_cache,
     req_to_token_pool,
     token_to_kv_pool_allocator,
+    draft_req_to_token_pool=None,
 ):
     """Release an SMC parent req after its KV has been shared to particles.
 
@@ -182,6 +195,16 @@ def _release_smc_parent_req(
     # not affect them.
     if hasattr(req_to_token_pool, "free_mamba_cache") and req.mamba_pool_idx is not None:
         req_to_token_pool.free_mamba_cache(req)
+
+    # Hybrid+hybrid: free the parent's draft-side mamba slot too. None or
+    # alias-of-target on dense draft -> no-op.
+    if (
+        draft_req_to_token_pool is not None
+        and draft_req_to_token_pool is not req_to_token_pool
+        and hasattr(draft_req_to_token_pool, "free_mamba_cache")
+        and getattr(req, "draft_mamba_pool_idx", None) is not None
+    ):
+        draft_req_to_token_pool.free_mamba_cache(req)
 
     req_to_token_pool.free(req)
     if req.last_node is not None:

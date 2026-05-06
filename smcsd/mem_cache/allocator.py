@@ -86,10 +86,37 @@ def is_hybrid_req_to_token_pool(req_to_token_pool) -> bool:
     return isinstance(req_to_token_pool, HybridReqToTokenPool)
 
 
+def _copy_one(pool, src_req_pool_idx: int, dst_req_pool_idx: int) -> None:
+    src_idx = pool.req_index_to_mamba_index_mapping[src_req_pool_idx]
+    dst_idx = pool.req_index_to_mamba_index_mapping[dst_req_pool_idx]
+    pool.mamba_pool.copy_from(
+        src_idx.unsqueeze(0).to(torch.int64),
+        dst_idx.unsqueeze(0).to(torch.int64),
+    )
+
+
+def _copy_batched(
+    pool,
+    src_req_pool_indices: torch.Tensor,
+    dst_req_pool_indices: torch.Tensor,
+) -> None:
+    if src_req_pool_indices.numel() == 0:
+        return
+    src_mamba = pool.req_index_to_mamba_index_mapping[
+        src_req_pool_indices.to(torch.int64)
+    ].to(torch.int64)
+    dst_mamba = pool.req_index_to_mamba_index_mapping[
+        dst_req_pool_indices.to(torch.int64)
+    ].to(torch.int64)
+    pool.mamba_pool.copy_from(src_mamba, dst_mamba)
+
+
 def copy_mamba_state_one(
     req_to_token_pool,
     src_req_pool_idx: int,
     dst_req_pool_idx: int,
+    *,
+    draft_req_to_token_pool=None,
 ) -> None:
     """Copy the Mamba/SSM recurrent state from src's slot to dst's slot.
 
@@ -97,37 +124,44 @@ def copy_mamba_state_one(
     full prefix mamba state so the first decode step starts from the correct
     recurrent context (zero-state would be silently wrong on hybrid models).
 
-    No-op on dense models (the pool has no mamba_pool).
+    On hybrid+hybrid pairs, ``draft_req_to_token_pool`` (a
+    ``DraftHybridReqToTokenPool``) is passed in so the draft-side state is
+    copied in lockstep — otherwise the draft's recurrent context for the
+    new particle would also start at zero. ``draft_req_to_token_pool`` is
+    None / aliases the target on hybrid+dense.
+
+    No-op on dense targets (the pool has no mamba_pool).
     """
-    if not is_hybrid_req_to_token_pool(req_to_token_pool):
-        return
-    src_idx = req_to_token_pool.req_index_to_mamba_index_mapping[src_req_pool_idx]
-    dst_idx = req_to_token_pool.req_index_to_mamba_index_mapping[dst_req_pool_idx]
-    # MambaPool.copy_from accepts 1-D index tensors.
-    req_to_token_pool.mamba_pool.copy_from(
-        src_idx.unsqueeze(0).to(torch.int64),
-        dst_idx.unsqueeze(0).to(torch.int64),
-    )
+    if is_hybrid_req_to_token_pool(req_to_token_pool):
+        _copy_one(req_to_token_pool, src_req_pool_idx, dst_req_pool_idx)
+    if (
+        draft_req_to_token_pool is not None
+        and draft_req_to_token_pool is not req_to_token_pool
+        and is_hybrid_req_to_token_pool(draft_req_to_token_pool)
+    ):
+        _copy_one(draft_req_to_token_pool, src_req_pool_idx, dst_req_pool_idx)
 
 
 def copy_mamba_state_batched(
     req_to_token_pool,
     src_req_pool_indices: torch.Tensor,
     dst_req_pool_indices: torch.Tensor,
+    *,
+    draft_req_to_token_pool=None,
 ) -> None:
     """Batched variant: copy mamba state from src[i] to dst[i] for every i.
 
     Used during SMC resampling: each resampled slot receives the ancestor
-    slot's full mamba state. No-op on dense models.
+    slot's full mamba state. Operates on both target and draft pools when
+    the pair is hybrid+hybrid. No-op on dense targets.
     """
-    if not is_hybrid_req_to_token_pool(req_to_token_pool):
-        return
-    if src_req_pool_indices.numel() == 0:
-        return
-    src_mamba = req_to_token_pool.req_index_to_mamba_index_mapping[
-        src_req_pool_indices.to(torch.int64)
-    ].to(torch.int64)
-    dst_mamba = req_to_token_pool.req_index_to_mamba_index_mapping[
-        dst_req_pool_indices.to(torch.int64)
-    ].to(torch.int64)
-    req_to_token_pool.mamba_pool.copy_from(src_mamba, dst_mamba)
+    if is_hybrid_req_to_token_pool(req_to_token_pool):
+        _copy_batched(req_to_token_pool, src_req_pool_indices, dst_req_pool_indices)
+    if (
+        draft_req_to_token_pool is not None
+        and draft_req_to_token_pool is not req_to_token_pool
+        and is_hybrid_req_to_token_pool(draft_req_to_token_pool)
+    ):
+        _copy_batched(
+            draft_req_to_token_pool, src_req_pool_indices, dst_req_pool_indices
+        )

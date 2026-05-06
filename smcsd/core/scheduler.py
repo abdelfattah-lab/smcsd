@@ -192,11 +192,15 @@ class SMCCoordinator:
         # Hybrid-only: copy ancestor's full Mamba/SSM recurrent state into
         # the resampled slot. The flat-KV refcount machinery doesn't apply
         # to mamba state (each slot owns its own state, not a shared page),
-        # so we fully copy. No-op on dense models.
+        # so we fully copy. On hybrid+hybrid, also copy the draft-side
+        # recurrent state so the next draft step starts from the ancestor's
+        # context, not the loser slot's stale state. No-op on dense targets.
+        draft_pool = getattr(slot_state, "draft_req_to_token_pool", None)
         copy_mamba_state_batched(
             slot_state.req_to_token_pool,
             src_pool_indices,
             dst_pool_indices,
+            draft_req_to_token_pool=draft_pool,
         )
 
         # Vector-copy the per-slot tensors dst ← src.
@@ -264,6 +268,10 @@ class SMCScheduler(Scheduler):
             enable_overlap=self.enable_overlap,
             n_particles=n_particles,
         )
+        # Hybrid+hybrid: stash the draft worker's req_to_token_pool here so
+        # the resample dispatcher can copy draft mamba state in lockstep
+        # with target mamba state. None / aliases target on dense draft.
+        self.slot_state.draft_req_to_token_pool = self._draft_req_to_token_pool()
         # Only the fused systematic kernel is wired up today; keep the
         # ServerArgs option for future variants (multinomial / async SIS)
         # but fail fast instead of silently coercing.
@@ -543,7 +551,24 @@ class SMCScheduler(Scheduler):
             self.spec_algorithm,
         )
         batch.prepare_for_extend()
+
+        # Hybrid+hybrid: target's prepare_for_extend allocated each parent's
+        # *target* mamba slot. The DRAFT model has its own MambaPool (sized
+        # for draft state shapes) and needs its own mamba slot for the same
+        # parent so the draft prefill writes recurrent state into a valid
+        # location. Dense draft -> draft pool aliases target -> no-op.
+        draft_pool = self._draft_req_to_token_pool()
+        if draft_pool is not None and draft_pool is not self.req_to_token_pool:
+            draft_pool.alloc_mamba_for_reqs(parent_reqs)
+
         return batch
+
+    def _draft_req_to_token_pool(self):
+        """Return the draft worker's req_to_token_pool, if it exists. On
+        hybrid+hybrid this is a DraftHybridReqToTokenPool (separate
+        MambaPool); on dense drafts (or no spec) it's the target's pool."""
+        worker = getattr(self, "draft_worker", None)
+        return getattr(worker, "draft_req_to_token_pool", None) if worker else None
 
     def _process_prefill_result(
         self,
@@ -593,6 +618,13 @@ class SMCScheduler(Scheduler):
             group.clear_particles()
             return "SMC particle allocation failed: req_to_token_pool full."
 
+        # Hybrid+hybrid: target.alloc just gave each particle its own
+        # *target* mamba slot. Allocate the parallel *draft* mamba slot.
+        # Dense draft -> draft_pool aliases target -> skipped.
+        draft_pool = self._draft_req_to_token_pool()
+        if draft_pool is not None and draft_pool is not self.req_to_token_pool:
+            draft_pool.alloc_mamba_for_reqs(particle_reqs)
+
         shared_seq_len = compute_smc_shared_prefix_len(parent_req)
 
         try:
@@ -609,11 +641,13 @@ class SMCScheduler(Scheduler):
                 # at alloc time (HybridReqToTokenPool.alloc) but it's
                 # zero-initialized, so we must seed it from the parent —
                 # otherwise the first decode step on the particle reads a
-                # zero state and corrupts the prefix context. No-op on dense.
+                # zero state and corrupts the prefix context. On hybrid+hybrid
+                # we also seed the draft-side state. No-op on dense targets.
                 copy_mamba_state_one(
                     self.req_to_token_pool,
                     parent_req.req_pool_idx,
                     particle_req.req_pool_idx,
+                    draft_req_to_token_pool=draft_pool,
                 )
                 particle_req.kv_committed_len = shared_seq_len
                 particle_req.kv_allocated_len = shared_seq_len
@@ -627,6 +661,7 @@ class SMCScheduler(Scheduler):
                     particle_req,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    draft_req_to_token_pool=draft_pool,
                 )
             group.clear_particles()
             return f"SMC bootstrap KV fanout failed: {exc}"
@@ -636,6 +671,7 @@ class SMCScheduler(Scheduler):
             tree_cache=self.tree_cache,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            draft_req_to_token_pool=draft_pool,
         )
 
         # Populate slot state
@@ -651,6 +687,7 @@ class SMCScheduler(Scheduler):
                     particle_req,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    draft_req_to_token_pool=draft_pool,
                 )
             group.clear_particles()
             return f"SMC slot allocation failed: {exc}"
@@ -660,12 +697,14 @@ class SMCScheduler(Scheduler):
         parent_req = group.parent_req
         parent_req.finished_reason = FINISH_ABORT(error_msg)
         parent_req.finished_len = len(parent_req.output_ids)
+        draft_pool = self._draft_req_to_token_pool()
         if group.has_materialized_particles():
             for req in group.particle_reqs.values():
                 _release_internal_req(
                     req,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    draft_req_to_token_pool=draft_pool,
                 )
             group.clear_particles()
         if parent_req.req_pool_idx is not None:

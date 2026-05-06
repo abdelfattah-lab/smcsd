@@ -320,6 +320,16 @@ class ScheduleBatchSMC:
                         and req.mamba_pool_idx is not None
                     ):
                         self.req_to_token_pool.free_mamba_cache(req)
+                    # Hybrid+hybrid: also free the draft-side mamba slot
+                    # (separate MambaPool when draft has its own state shapes).
+                    draft_pool = getattr(self, "draft_req_to_token_pool", None)
+                    if (
+                        draft_pool is not None
+                        and draft_pool is not self.req_to_token_pool
+                        and hasattr(draft_pool, "free_mamba_cache")
+                        and getattr(req, "draft_mamba_pool_idx", None) is not None
+                    ):
+                        draft_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
 
             self.req_pool_indices[slot] = EMPTY_SLOT

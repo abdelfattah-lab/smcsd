@@ -71,9 +71,13 @@ class SMCWorker(BaseSpecWorker):
         server_args.disable_cuda_graph = True
 
         # Create draft TpModelWorker — fully independent, no shared lm_head/embed.
-        # Plain TpModelWorker is fine: upstream's ModelConfig now skips the
-        # draft → MTP architecture rewrite when speculative_algorithm == "SMC".
-        self._draft_worker = TpModelWorker(
+        # Use SMCDraftTpModelWorker so a hybrid draft gets its own MambaPool
+        # (DraftHybridReqToTokenPool) sized to the draft's state shapes, with
+        # the req_to_token block table still aliased to the target's pool.
+        # On a dense draft this is a no-op pass-through.
+        from smcsd.managers.smc_tp_worker import SMCDraftTpModelWorker
+
+        self._draft_worker = SMCDraftTpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -91,6 +95,13 @@ class SMCWorker(BaseSpecWorker):
 
         self.draft_runner = self._draft_worker.model_runner
         self.score_runner = self._target_worker.model_runner
+
+        # Draft's req_to_token_pool — when the draft is hybrid, this is a
+        # DraftHybridReqToTokenPool with its own MambaPool. When the draft
+        # is dense, it's the target's pool (alias). The SMC scheduler
+        # reads this to alloc/copy/free draft mamba state in lockstep
+        # with target mamba state during fan-out and resampling.
+        self.draft_req_to_token_pool = self._draft_worker.req_to_token_pool
 
         # Multi-step draft attention backend
         from sglang.srt.speculative.draft_utils import DraftBackendFactory
