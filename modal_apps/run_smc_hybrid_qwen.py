@@ -66,12 +66,18 @@ image = (
         copy=True,
     )
     # The cached `git clone --recurse-submodules` layer pinned the sglang
-    # submodule at an older commit; overlay our patched ModelConfig
-    # directly so the SMC draft-MTP-rewrite skip takes effect without
+    # submodule at an older commit; overlay our patched files directly so
+    # SMC-specific tweaks (skip draft-MTP rewrite, don't restrict draft
+    # full_attention_layer_ids on independent drafts) take effect without
     # busting the whole image cache.
     .add_local_file(
         "3rdparty/sglang/python/sglang/srt/configs/model_config.py",
         f"{SMCSD_DIR}/3rdparty/sglang/python/sglang/srt/configs/model_config.py",
+        copy=True,
+    )
+    .add_local_file(
+        "3rdparty/sglang/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py",
+        f"{SMCSD_DIR}/3rdparty/sglang/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py",
         copy=True,
     )
     .env({"HF_HOME": HF_HOME, "PYTHONUNBUFFERED": "1"})
