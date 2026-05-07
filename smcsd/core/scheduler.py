@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import logging
 import signal
-from collections import deque
+import time
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -21,13 +23,27 @@ from smcsd.common.utils import (
     _release_smc_parent_req,
     clone_req_for_smc_particle,
     compute_smc_shared_prefix_len,
+    multinomial_resample,
+    normalize_log_weights,
+    should_resample,
+    systematic_resample,
     validate_smc_parent_req,
 )
 from smcsd.mem_cache.allocator import copy_block_table
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ResampleJobSet:
+    """Per-group dst/src pairs produced by the slow path."""
+
+    group_id: str
+    dst_slots: List[int]
+    src_slots: List[int]
 
 
 def _prepare_req_for_private_prefill(req: Req) -> None:
@@ -44,18 +60,12 @@ def _prepare_req_for_private_prefill(req: Req) -> None:
 
 @dataclass
 class SequenceGroup:
-    """Scheduler-side handle for one SMC group before/during decoding.
-
-    Owns the parent ``Req`` (the user-visible request), the materialised
-    particle ``Req`` objects, and basic metadata.  Cumulative weights live
-    slot-indexed on ``ScheduleBatchSMC`` (not here) once the group is
-    materialised.
-    """
-
     parent_req: Req
     n_particles: int
     particle_temperature: float
     particle_reqs: Dict[int, Req] = field(default_factory=dict)
+    log_weights: Optional[torch.Tensor] = None
+    interval_log_weights: Optional[torch.Tensor] = None
 
     @property
     def group_id(self) -> str:
@@ -64,12 +74,27 @@ class SequenceGroup:
     def has_materialized_particles(self) -> bool:
         return bool(self.particle_reqs)
 
-    def materialize_particles(self) -> None:
-        """Clone ``n_particles`` Reqs off the parent Req and register them.
+    def active_particle_indices(self) -> List[int]:
+        return [
+            idx for idx, req in self.particle_reqs.items() if not req.finished()
+        ]
 
-        Weight tensors are allocated slot-indexed on ``ScheduleBatchSMC`` at
-        ``allocate_slots`` time — not on the SequenceGroup.
-        """
+    def active_particle_reqs(self) -> List[Req]:
+        return [
+            self.particle_reqs[idx] for idx in sorted(self.active_particle_indices())
+        ]
+
+    def active_slot_keys(self) -> List[Tuple[str, int]]:
+        return [(self.group_id, idx) for idx in self.active_particle_indices()]
+
+    def all_particle_indices(self) -> List[int]:
+        return sorted(self.particle_reqs)
+
+    def materialize_particles(
+        self,
+        *,
+        device: torch.device | str,
+    ) -> None:
         if self.particle_reqs:
             return
         parent_req = self.parent_req
@@ -84,26 +109,35 @@ class SequenceGroup:
             particle_reqs.append(particle_req)
 
         self.particle_reqs = {req.smc_particle_idx: req for req in particle_reqs}
+        self.log_weights = torch.zeros(
+            self.n_particles,
+            dtype=torch.float64,
+            device=device,
+        )
+        self.interval_log_weights = torch.zeros_like(self.log_weights)
 
     def clear_particles(self) -> None:
         self.particle_reqs = {}
+        self.log_weights = None
+        self.interval_log_weights = None
 
+
+### V1b dedicated scheduler classes (ScheduleGroupBatch, SMCCoordinator, SMCScheduler,
+### run_smc_scheduler_process) have been removed. See git history for the old code.
+### The V1a path (Engine() with SMCManager in scheduler.py) is unchanged.
 
 class SMCCoordinator:
-    """SMC resample coordinator.
+    """SMC resample coordinator with two paths:
 
-    One fused Triton kernel per decode step:
-
-    1. ``collect`` — for every in-use group row, normalise interval weights,
-       check ESS against ``threshold * N``, and (if below threshold) run
-       systematic resampling, emitting flat ``dst_slots`` / ``src_slots`` /
-       ``row_of_job`` tensors.  Zeros the resampled rows' weights in place.
-
-    2. ``dispatch`` — hand those flat tensors to ``batched_resample_kv`` for
-       a fused KV block-table copy + refcount update, then vector-copy the
-       per-slot state tensors (seq_lens, finished_mask, token_counts,
-       all_token_ids, …).  Python-side ``copy_req_metadata`` loops over the
-       at-most-``max_slots`` copies — accepted unavoidable cost.
+    1. **slow path** (`fast_resample=False`, default): per-group Python
+       normalize + ESS + systematic/multinomial resample + Counter-based
+       dst/src pairing + per-slot `resample_copy_slot`.  Zero fusion — the
+       reference against which the fast path is validated.
+    2. **fast path** (`fast_resample=True`): one fused Triton kernel (see
+       `fused_collect_kernel.py`) emits flat `dst/src/row_of_job` tensors
+       consumed directly by `batched_resample_kv` (fused KV copy) plus a
+       per-pair `copy_req_metadata` Python loop (inherent unavoidable cost).
+       Requires systematic resampling + CUDA.
     """
 
     def __init__(
@@ -111,37 +145,43 @@ class SMCCoordinator:
         *,
         device: torch.device | str,
         resample_threshold: float,
+        resample_method: str,
+        fast_resample: bool = False,
     ) -> None:
-        if torch.device(device).type != "cuda":
-            raise ValueError("SMCCoordinator requires CUDA")
         self.device = device
         self.resample_threshold = resample_threshold
-        self._step_counter = 0
-        logger.info(
-            "SMCCoordinator: resample_threshold=%s (fused systematic kernel)",
-            resample_threshold,
+        self.resample_method = resample_method
+        self.fast_resample = fast_resample
+        self._fast_step_counter = 0
+        if self.fast_resample:
+            if resample_method != "systematic":
+                raise ValueError(
+                    "fast_resample requires --smc-resample-method=systematic"
+                )
+            if torch.device(device).type != "cuda":
+                raise ValueError("fast_resample requires CUDA")
+        logger.warning(
+            "SMCCoordinator: resample_method=%s fast_resample=%s",
+            resample_method,
+            fast_resample,
         )
 
     # ── Public API ──────────────────────────────────────────
 
-    def collect_resample_jobs_batch(self, slot_state: "ScheduleBatchSMC"):
-        """Run the fused collect kernel over all in-use group rows.
+    def collect_resample_jobs_batch(
+        self,
+        group_ids: List[str],
+        slot_state: "ScheduleBatchSMC",
+    ):
+        """Collect resample jobs for all active groups.
 
-        Returns a ``BatchedResampleResult``.  The ``step_counter`` increments
-        on every call so ``tl.rand(step_counter, row)`` draws independent
-        stratified uniforms across steps.
+        Returns a `BatchedResampleResult` (fast path) or a plain
+        `List[ResampleJobSet]` (slow path).  `dispatch_resample_batch`
+        accepts both.
         """
-        from smcsd.core.kernels.fused_collect import batched_collect_fused
-
-        self._step_counter += 1
-        return batched_collect_fused(
-            slot_state.log_weights,
-            slot_state.interval_weights,
-            slot_state.group_to_slots,
-            slot_state.row_in_use,
-            self.resample_threshold,
-            step_counter=self._step_counter,
-        )
+        if self.fast_resample:
+            return self._collect_fast(slot_state)
+        return self._collect_slow(group_ids, slot_state)
 
     def dispatch_resample_batch(
         self,
@@ -150,15 +190,159 @@ class SMCCoordinator:
         *,
         rebuild_active: bool = True,
     ) -> None:
-        """Apply a ``BatchedResampleResult`` plan.
-
-        Fused KV copy + per-slot state copies + Req-metadata loop.  No-op on
-        an empty plan.  ``rebuild_active`` may be deferred by the caller if
-        other membership changes are about to happen in the same cycle.
+        """Dispatch a collect plan.  Fast path → fused KV copy; slow path →
+        per-slot `resample_copy_slot`.  No-op on empty plans.
         """
-        if plan.n_jobs == 0:
-            return
+        if isinstance(plan, list):
+            if not plan:
+                return
+            self._dispatch_slow(plan, slot_state)
+        else:
+            # BatchedResampleResult
+            if plan.n_jobs == 0:
+                return
+            self._dispatch_fast(plan, slot_state)
 
+        # Resampling can copy finished ancestors into previously active slots.
+        # Caller may defer rebuild to batch with other membership changes.
+        if rebuild_active:
+            slot_state.rebuild_active_slots()
+
+    # ── Slow path (golden truth) ────────────────────────────
+
+    def _collect_slow(
+        self,
+        group_ids: List[str],
+        slot_state: "ScheduleBatchSMC",
+    ) -> List[ResampleJobSet]:
+        """Per-group Python collection.  Preserves legacy semantics
+        (includes all particles, relies on finished_mask propagation via
+        `resample_copy_slot`).
+        """
+        jobs: List[ResampleJobSet] = []
+        for group_id in group_ids:
+            job = self._collect_one(group_id, slot_state)
+            if job is not None:
+                jobs.append(job)
+        return jobs
+
+    def _collect_one(
+        self,
+        group_id: str,
+        slot_state: "ScheduleBatchSMC",
+    ) -> Optional[ResampleJobSet]:
+        """Single-group Python collect.  Preserves legacy behaviour: all
+        particles (including finished) participate; `finished_mask` is
+        propagated downstream via `resample_copy_slot`.
+        """
+        iw = slot_state.group_interval_weights.get(group_id)
+        if iw is None:
+            return None
+        slots = slot_state.group_slot_lists.get(group_id, [])
+        if len(slots) <= 1:
+            return None
+
+        pidx_gpu = slot_state.particle_indices[slots]
+        resample_pidxs = pidx_gpu.tolist()
+        pidx_to_slot = dict(zip(resample_pidxs, slots))
+
+        normalized_weights = normalize_log_weights(
+            iw[resample_pidxs], device=self.device,
+        )
+        if not should_resample(
+            normalized_weights,
+            len(resample_pidxs),
+            self.resample_threshold,
+            device=self.device,
+        ):
+            return None
+
+        if self.resample_method == "multinomial":
+            ancestors_t = multinomial_resample(normalized_weights, device=self.device)
+        else:
+            ancestors_t = systematic_resample(normalized_weights, device=self.device)
+
+        # Reset cumulative weights (writes through the group_log_weights view
+        # into the stacked storage).
+        pidx_t = pidx_gpu.to(torch.int64)
+        slot_state.group_log_weights[group_id][pidx_t] = 0.0
+        iw[pidx_t] = 0.0
+
+        ancestor_pidxs = [resample_pidxs[idx] for idx in ancestors_t.tolist()]
+
+        keep_counts: Counter[int] = Counter()
+        target_counts = Counter(ancestor_pidxs)
+        dst_pidxs: List[int] = []
+        src_pidxs: List[int] = []
+        for pidx in resample_pidxs:
+            if keep_counts[pidx] < target_counts[pidx]:
+                keep_counts[pidx] += 1
+                continue
+            dst_pidxs.append(pidx)
+        for pidx in resample_pidxs:
+            remaining = target_counts[pidx] - keep_counts[pidx]
+            if remaining > 0:
+                src_pidxs.extend([pidx] * remaining)
+        if not dst_pidxs:
+            return None
+
+        dst_slots = [pidx_to_slot[p] for p in dst_pidxs]
+        src_slots = [pidx_to_slot[p] for p in src_pidxs]
+        return ResampleJobSet(
+            group_id=group_id, dst_slots=dst_slots, src_slots=src_slots,
+        )
+
+    def _dispatch_slow(
+        self,
+        jobs: List[ResampleJobSet],
+        slot_state: "ScheduleBatchSMC",
+    ) -> None:
+        """No-fusion dispatch: per-slot `resample_copy_slot` inside one
+        free_group_begin/end wrapper."""
+        if __debug__:
+            all_dst: set = set()
+            all_src: set = set()
+            for job in jobs:
+                all_dst.update(job.dst_slots)
+                all_src.update(job.src_slots)
+            assert all_dst.isdisjoint(all_src), (
+                "Cross-group dst/src slot overlap detected (slow path)"
+            )
+        slot_state.token_to_kv_pool_allocator.free_group_begin()
+        try:
+            for job in jobs:
+                for dst_slot, src_slot in zip(job.dst_slots, job.src_slots):
+                    slot_state.resample_copy_slot(dst_slot, src_slot)
+        finally:
+            slot_state.token_to_kv_pool_allocator.free_group_end()
+
+    # ── Fast path ───────────────────────────────────────────
+
+    def _collect_fast(self, slot_state: "ScheduleBatchSMC"):
+        """One fused kernel launch.  Returns `BatchedResampleResult`.
+
+        Seeds are drawn inside the kernel via Philox (`tl.rand`), keyed by a
+        monotonic host-side step counter so consecutive calls produce
+        independent stratified u ~ U[0,1/n_active) values without any
+        per-step host allocation or device sync.
+        """
+        from smcsd.core.kernels.fused_collect import batched_collect_fused
+
+        stacked = slot_state.stacked
+        self._fast_step_counter += 1
+        return batched_collect_fused(
+            stacked,
+            self.resample_threshold,
+            step_counter=self._fast_step_counter,
+            scratch_dst=stacked.scratch_dst_flat,
+            scratch_src=stacked.scratch_src_flat,
+            scratch_row=stacked.scratch_row_of_job,
+            scratch_counter=stacked.scratch_counter,
+            scratch_mask=stacked.scratch_resample_mask,
+        )
+
+    def _dispatch_fast(self, plan, slot_state: "ScheduleBatchSMC") -> None:
+        """Fused KV copy + vectorised slot-tensor copies + req metadata loop."""
         from smcsd.core.kernels.fused_resample_kv import batched_resample_kv
 
         dst_idx = plan.dst_slots.to(torch.int64)
@@ -166,7 +350,7 @@ class SMCCoordinator:
 
         if __debug__:
             assert not torch.isin(dst_idx, src_idx).any().item(), (
-                "Cross-group dst/src slot overlap detected"
+                "Cross-group dst/src slot overlap detected (fast path)"
             )
 
         dst_pool_indices = slot_state.req_pool_indices[dst_idx].to(torch.int32)
@@ -185,30 +369,39 @@ class SMCCoordinator:
         if to_free.numel() > 0:
             slot_state.token_to_kv_pool_allocator.free(to_free)
 
-        # Vector-copy the per-slot tensors dst ← src.
+        # Batch-copy slot tensors on device.
         slot_state.seq_lens[dst_idx] = slot_state.seq_lens[src_idx]
         slot_state.kv_allocated_lens[dst_idx] = slot_state.kv_allocated_lens[src_idx]
         slot_state.verified_ids[dst_idx] = slot_state.verified_ids[src_idx]
         slot_state.finished_mask[dst_idx] = slot_state.finished_mask[src_idx]
         slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
         slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
+        if slot_state.target_hidden_states is not None:
+            slot_state.target_hidden_states[dst_idx] = slot_state.target_hidden_states[
+                src_idx
+            ]
+        if slot_state.first_draft_token_ids is not None:
+            slot_state.first_draft_token_ids[dst_idx] = (
+                slot_state.first_draft_token_ids[src_idx]
+            )
+        if slot_state.first_draft_logprobs is not None:
+            slot_state.first_draft_logprobs[dst_idx] = (
+                slot_state.first_draft_logprobs[src_idx]
+            )
 
-        # Req-level metadata is Python-only (output_ids list, finished_reason
-        # object, etc.) — unavoidable per-copy loop.
+        # Req metadata loop — accepted unavoidable Python-side cost.
         for dst_slot, src_slot in zip(
             dst_idx.tolist(), src_idx.tolist(), strict=True
         ):
             slot_state.copy_req_metadata(dst_slot, src_slot)
 
-        # Resampling can copy finished ancestors into previously active
-        # slots, flipping the live set.
-        if rebuild_active:
-            slot_state.rebuild_active_slots()
-
 
 class SMCScheduler(Scheduler):
-    """Slot-based SMC scheduler.  The decode loop uses ``ScheduleBatchSMC``;
-    prefill still goes through upstream ``ScheduleBatch``."""
+    """Slot-based SMC scheduler. Decode loop uses ScheduleBatchSMC instead of
+    ScheduleGroupBatch. Prefill still uses ScheduleBatch (upstream code).
+
+    Coexists with SMCScheduler — switch via run_smc_scheduler_process.
+    """
 
     def __init__(
         self,
@@ -250,18 +443,13 @@ class SMCScheduler(Scheduler):
             enable_overlap=self.enable_overlap,
             n_particles=n_particles,
         )
-        # Only the fused systematic kernel is wired up today; keep the
-        # ServerArgs option for future variants (multinomial / async SIS)
-        # but fail fast instead of silently coercing.
-        if server_args.smc_resample_method != "systematic":
-            raise ValueError(
-                f"smc_resample_method={server_args.smc_resample_method!r} is "
-                "not supported; only 'systematic' is currently implemented."
-            )
         self.coordinator = SMCCoordinator(
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
+            resample_method=server_args.smc_resample_method,
+            fast_resample=server_args.smc_fast_resample,
         )
+        self._group_idx_counter = 0
 
     def _make_runtime_tracking_batch(
         self,
@@ -302,8 +490,7 @@ class SMCScheduler(Scheduler):
     def maybe_init_draft_worker(self):
         # Upstream's Scheduler.maybe_init_draft_worker initializes
         # external_corpus_manager (used only by ngram speculative decoding).
-        # Our override replaces the body, so we must set it ourselves; SMC
-        # speculative decoding does not use external corpora.
+        # Our override replaces the body, so we must set it ourselves.
         self.external_corpus_manager = None
         from smcsd.core.worker import SMCWorker
 
@@ -353,7 +540,7 @@ class SMCScheduler(Scheduler):
                     self._process_decode_result(result)
             else:
                 # self_check_during_idle was removed in upstream sglang;
-                # only self_check_during_busy remains (called inline elsewhere).
+                # only self_check_during_busy remains.
                 pass
 
             self.last_batch = tracking_batch
@@ -362,16 +549,16 @@ class SMCScheduler(Scheduler):
 
     # ── Runtime Memory Checks (override base mixin) ──
     #
-    # SMC keeps its decode KV slots inside ScheduleBatchSMC, which the base
+    # SMC v2 keeps its decode KV slots inside ScheduleBatchSMC, which the base
     # SchedulerRuntimeCheckerMixin doesn't know about.  We override the two
     # idle-path leak checks so slot-held tokens/reqs are folded into the
     # conservation formulas — without leaking SMC concepts into core scheduler
     # code.  Refcount state is already reflected via available_size (a shared
     # page stays out of free_pages until its last refcount drops).
     #
-    # self_check_during_busy is intentionally NOT overridden: our event loop
+    # self_check_during_busy is intentionally NOT overridden: _event_loop
     # never dispatches it (matching the PP / disagg / multiplex loops, which
-    # also omit the busy check).  Re-add it here if this loop is ever wired
+    # also omit the busy check).  Re-add it here if the v2 loop is ever wired
     # to call self_check_during_busy.
 
     def _check_radix_cache_memory(self):
@@ -423,10 +610,10 @@ class SMCScheduler(Scheduler):
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if is_retracted:
-            # SMC has no retraction path: particle groups are atomic and
+            # SMC v2 has no retraction path: particle groups are atomic and
             # cannot be partially retracted, and there is no group-aware
             # re-admission protocol.  ScheduleBatch.retract_decode is also
-            # unreachable here (decode runs through ScheduleBatchSMC).
+            # unreachable in v2 (decode runs through ScheduleBatchSMC).
             raise NotImplementedError(
                 "SMCScheduler does not support re-admitting retracted reqs."
             )
@@ -547,7 +734,27 @@ class SMCScheduler(Scheduler):
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
-        for group, req, next_token_id in zip(groups, batch.reqs, next_token_ids):
+        # EAGLE3: per-parent prefill hidden state (num_parents, aux_dim) and
+        # the full draft-prefill log-prob row per parent (num_parents,
+        # draft_vocab). The scheduler samples N DISTINCT x1 draws per parent
+        # for particle diversity — same order as batch.reqs. None in dense mode.
+        prefill_hidden = None
+        prefill_first_draft_logprobs_full = None
+        prefill_hidden_contexts = None
+        if result.next_draft_input is not None:
+            prefill_hidden = getattr(
+                result.next_draft_input, "target_hidden_state", None
+            )
+            prefill_first_draft_logprobs_full = getattr(
+                result.next_draft_input, "first_draft_logprobs", None
+            )
+            prefill_hidden_contexts = getattr(
+                result.next_draft_input, "target_hidden_contexts", None
+            )
+
+        for i, (group, req, next_token_id) in enumerate(
+            zip(groups, batch.reqs, next_token_ids)
+        ):
             assert req is group.parent_req
 
             req.output_ids.append(next_token_id)
@@ -559,21 +766,53 @@ class SMCScheduler(Scheduler):
                 self.stream_output([req], False)
                 continue
 
-            error_msg = self._materialize_group(group)
+            h_i = prefill_hidden[i] if prefill_hidden is not None else None
+            hctx_i = (
+                prefill_hidden_contexts[i]
+                if prefill_hidden_contexts is not None
+                else None
+            )
+
+            # Fan out the parent's prefill log-probs into n_particles
+            # DISTINCT x1 samples (one per particle slot). This is the
+            # correctness fix that prevents all particles in a group from
+            # starting the first decode cycle with the same token.
+            fd_id_i = None
+            fd_lp_i = None
+            if prefill_first_draft_logprobs_full is not None:
+                fd_id_i, fd_lp_i = self.model_worker.sample_per_particle_x1(
+                    prefill_first_draft_logprobs_full[i],
+                    n_particles=group.n_particles,
+                )
+
+            error_msg = self._materialize_group(
+                group,
+                prefill_hidden=h_i,
+                first_draft_token_id=fd_id_i,
+                first_draft_logprob=fd_lp_i,
+                prefill_hidden_context=hctx_i,
+            )
             if error_msg is not None:
                 self._abort_group(group, error_msg)
                 continue
 
             self.running_groups.append(group)
 
-    def _materialize_group(self, group: SequenceGroup) -> Optional[str]:
+    def _materialize_group(
+        self,
+        group: SequenceGroup,
+        prefill_hidden: Optional[torch.Tensor] = None,
+        first_draft_token_id: Optional[torch.Tensor] = None,
+        first_draft_logprob: Optional[torch.Tensor] = None,
+        prefill_hidden_context: Optional[torch.Tensor] = None,
+    ) -> Optional[str]:
         parent_req = group.parent_req
         try:
             self.model_worker.materialize_smc_parent_draft_prefix(parent_req)
         except Exception as exc:
             return f"SMC parent draft prefill failed: {exc}"
 
-        group.materialize_particles()
+        group.materialize_particles(device=self.device)
         particle_reqs = list(group.particle_reqs.values())
         if self.req_to_token_pool.alloc(particle_reqs) is None:
             group.clear_particles()
@@ -596,6 +835,9 @@ class SMCScheduler(Scheduler):
                     particle_req.req_pool_idx, :shared_seq_len
                 ].to(dtype=torch.int64, copy=True)
                 particle_req.cache_protected_len = shared_seq_len
+            self.model_worker.fanout_smc_parent_hybrid_state(
+                parent_req, particle_reqs
+            )
         except Exception as exc:
             for particle_req in particle_reqs:
                 _release_internal_req(
@@ -614,12 +856,31 @@ class SMCScheduler(Scheduler):
         )
 
         # Populate slot state
+        group_idx = self._group_idx_counter
+        self._group_idx_counter += 1
         try:
-            self.slot_state.allocate_slots(
+            slots = self.slot_state.allocate_slots(
                 group_id=group.group_id,
+                group_idx=group_idx,
                 particle_reqs=particle_reqs,
                 shared_seq_len=shared_seq_len,
             )
+            # EAGLE3: seed particle slots with the parent's prefill hidden state
+            # and pre-sampled first-draft token (both come from the draft's
+            # prefill of the bootstrap prefix).
+            if (
+                prefill_hidden is not None
+                or first_draft_token_id is not None
+                or first_draft_logprob is not None
+                or prefill_hidden_context is not None
+            ):
+                self.slot_state.set_prefill_hidden(
+                    slots,
+                    prefill_hidden,
+                    first_draft_token_id=first_draft_token_id,
+                    first_draft_logprob=first_draft_logprob,
+                    prefill_hidden_context=prefill_hidden_context,
+                )
         except Exception as exc:
             for particle_req in particle_reqs:
                 _release_internal_req(
@@ -679,25 +940,61 @@ class SMCScheduler(Scheduler):
             raise RuntimeError("SMCScheduler: result missing next_draft_input.verified_id")
 
         # Write results back to slot state (defer rebuild to end of cycle)
+        next_hidden = (
+            next_draft.target_hidden_state
+            if next_draft is not None
+            else None
+        )
+        next_first_draft_id = (
+            next_draft.first_draft_token_id
+            if next_draft is not None
+            else None
+        )
+        next_first_draft_lp = (
+            next_draft.first_draft_logprob
+            if next_draft is not None
+            else None
+        )
+        next_hidden_contexts = (
+            next_draft.target_hidden_contexts
+            if next_draft is not None
+            else None
+        )
         newly_finished = self.slot_state.process_batch_result(
             next_token_ids=result.next_token_ids,
             accept_lens=result.accept_lens,
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
+            next_hidden_state=next_hidden,
+            next_first_draft_token_id=next_first_draft_id,
+            next_first_draft_logprob=next_first_draft_lp,
+            next_hidden_contexts=next_hidden_contexts,
             rebuild_active=False,
         )
 
-        # One fused collect over every in-use group row, then dispatch the
-        # resulting dst/src plan.  The kernel gates on row_in_use, so we
-        # don't need to filter the group list on the Python side.
-        plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
-        did_resample = plan.n_jobs > 0
+        # Resample all groups.  Either the slow path (List[ResampleJobSet],
+        # golden truth) or the fast path (BatchedResampleResult, one fused
+        # kernel) depending on `server_args.smc_fast_resample`.
+        active_group_ids = [
+            group.group_id
+            for group in self.running_groups
+            if self.slot_state.group_has_active(group.group_id)
+        ]
+        plan = self.coordinator.collect_resample_jobs_batch(
+            active_group_ids, self.slot_state
+        )
+        did_resample = (
+            bool(plan) if isinstance(plan, list) else plan.n_jobs > 0
+        )
         if did_resample:
             self.coordinator.dispatch_resample_batch(
                 plan, self.slot_state, rebuild_active=False,
             )
+            self.model_worker.copy_smc_resampled_hybrid_state(
+                self.slot_state, plan
+            )
 
-        # Single rebuild per decode cycle if membership changed.
+        # Single rebuild per decode cycle if membership changed
         if newly_finished or did_resample:
             self.slot_state.rebuild_active_slots()
 
@@ -715,7 +1012,7 @@ class SMCScheduler(Scheduler):
 
     def _finalize_group(self, group: SequenceGroup) -> None:
         if not group.has_materialized_particles():
-            # Shouldn't happen in normal operation — handle gracefully
+            # Shouldn't happen in v2 — but handle gracefully
             parent_req = group.parent_req
             release_kv_cache(parent_req, self.tree_cache)
             parent_req.time_stats.set_completion_time()

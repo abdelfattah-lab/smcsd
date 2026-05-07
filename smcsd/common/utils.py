@@ -128,6 +128,11 @@ def _release_internal_req(
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(indices)
 
+    if (
+        hasattr(req_to_token_pool, "free_mamba_cache")
+        and req.mamba_pool_idx is not None
+    ):
+        req_to_token_pool.free_mamba_cache(req)
     req_to_token_pool.free(req)
     req.prefix_indices = _empty_prefix_indices()
     req.kv_committed_len = 0
@@ -168,6 +173,11 @@ def _release_smc_parent_req(
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(overalloc_indices)
 
+    if (
+        hasattr(req_to_token_pool, "free_mamba_cache")
+        and req.mamba_pool_idx is not None
+    ):
+        req_to_token_pool.free_mamba_cache(req)
     req_to_token_pool.free(req)
     if req.last_node is not None:
         tree_cache.dec_lock_ref(req.last_node)
@@ -228,3 +238,16 @@ def systematic_resample(
         device=weights_t.device,
     )
     return torch.searchsorted(cdf, positions, right=False)
+
+
+def multinomial_resample(
+    weights: Sequence[float] | torch.Tensor,
+    device: Optional[torch.device | str] = None,
+) -> torch.Tensor:
+    """Returns ancestor indices as a GPU tensor (no GPU→CPU sync)."""
+    weights_t = torch.as_tensor(weights, dtype=torch.float64, device=device)
+    if weights_t.numel() == 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    return torch.multinomial(
+        weights_t, num_samples=weights_t.numel(), replacement=True
+    )

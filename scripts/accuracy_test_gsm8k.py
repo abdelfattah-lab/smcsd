@@ -59,7 +59,7 @@ def format_instruction(question: str) -> str:
     )
 
 
-def load_gsm8k(tokenizer, num_questions: int):
+def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False):
     """Load GSM8K and build chat-template prompts + gold labels."""
     print("Loading GSM8K dataset...")
     dataset = load_dataset("gsm8k", "main", split="test")
@@ -68,10 +68,14 @@ def load_gsm8k(tokenizer, num_questions: int):
     labels = []
     for sample in dataset.select(range(num_questions)):
         instruction = format_instruction(sample["question"])
+        chat_template_kwargs = {}
+        if disable_thinking:
+            chat_template_kwargs["enable_thinking"] = False
         prompt = tokenizer.apply_chat_template(
             [{"role": "user", "content": instruction}],
             tokenize=False,
             add_generation_prompt=True,
+            **chat_template_kwargs,
         )
         prompts.append(prompt)
         labels.append(extract_answer(sample["answer"]))
@@ -96,6 +100,8 @@ def run_smc_engine_eval(args, prompts, labels):
         gamma=args.gamma,
         draft_temperature=args.temperature,
         target_temperature=args.temperature,
+        smc_draft_mode=args.smc_draft_mode,
+        eagle3_residual_alpha=args.eagle3_residual_alpha,
         trust_remote_code=True,
         page_size=1,
         attention_backend=args.attention_backend,
@@ -104,6 +110,8 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["random_seed"] = args.seed
     if args.resample_threshold is not None:
         engine_kwargs["resample_threshold"] = args.resample_threshold
+    if args.smc_fast_resample:
+        engine_kwargs["smc_fast_resample"] = True
     if args.mem_fraction_static is not None:
         engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
     if args.cuda_graph_max_bs is not None:
@@ -112,9 +120,18 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_running_requests"] = args.max_running_requests
     else:
         engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
+    if args.max_total_tokens is not None:
+        engine_kwargs["max_total_tokens"] = args.max_total_tokens
+    if getattr(args, "dtype", None):
+        engine_kwargs["dtype"] = args.dtype
+    if getattr(args, "disable_cuda_graph", False):
+        engine_kwargs["disable_cuda_graph"] = True
+    if getattr(args, "tp_size", 1) and args.tp_size > 1:
+        engine_kwargs["tp_size"] = args.tp_size
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
+        "temperature": args.temperature,
     }
 
     with SMCEngine(**engine_kwargs) as engine:
@@ -167,6 +184,10 @@ def run_baseline_eval(args, prompts, labels):
         engine_kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
+    if args.max_total_tokens is not None:
+        engine_kwargs["max_total_tokens"] = args.max_total_tokens
+    if getattr(args, "disable_cuda_graph", False):
+        engine_kwargs["disable_cuda_graph"] = True
 
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
@@ -222,12 +243,15 @@ def main(args):
         draft = args.draft_model or DEFAULT_DRAFT_MODEL
         print(
             f"  particles={args.particles}, gamma={args.gamma}, "
-            f"temperature={args.temperature}, draft={draft}"
+            f"temperature={args.temperature}, draft={draft}, "
+            f"smc_draft_mode={args.smc_draft_mode}"
         )
     print(
         f"  num_questions={args.num_questions}, max_new_tokens={args.max_new_tokens}, "
         f"ignore_eos={args.ignore_eos}"
     )
+    if args.disable_thinking:
+        print("  chat_template: enable_thinking=False")
     print()
 
     if args.seed is not None:
@@ -235,7 +259,11 @@ def main(args):
 
     # Load tokenizer and data (shared across all modes)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    prompts, labels = load_gsm8k(tokenizer, args.num_questions)
+    prompts, labels = load_gsm8k(
+        tokenizer,
+        args.num_questions,
+        disable_thinking=args.disable_thinking,
+    )
 
     # Run evaluation
     if args.mode == "smc_engine":
@@ -304,6 +332,38 @@ if __name__ == "__main__":
         "--resample-threshold", type=float, default=None,
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
     )
+    smc_grp.add_argument(
+        "--smc-fast-resample",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the fused SMC resample path (single Triton kernel for "
+            "normalize + ESS + systematic resample + dst/src compaction, "
+            "feeding the fused KV-copy kernel directly). "
+            "Requires systematic resampling + CUDA.  "
+            "Default (off) is the slow per-group Python path (golden truth)."
+        ),
+    )
+    smc_grp.add_argument(
+        "--smc-draft-mode",
+        type=str,
+        choices=["dense", "eagle3", "dflash"],
+        default="dense",
+        help=(
+            "SMC draft mode. 'dense' (default) = separate draft model "
+            "(e.g. Llama-3.2-1B). 'eagle3' = EAGLE3 head that uses the "
+            "target model's hidden states; --draft-model should be the "
+            "matching EAGLE3 checkpoint "
+            "(e.g. lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B). "
+            "'dflash' = SpecForge DFlash draft head."
+        ),
+    )
+    smc_grp.add_argument(
+        "--eagle3-residual-alpha",
+        type=float,
+        default=0.0,
+        help="Blend target hidden state into draft recurrence at each step (0=off, 0.5=half)",
+    )
     # Benchmark
     bench = parser.add_argument_group("benchmark")
     bench.add_argument("--num-questions", type=int, default=80)
@@ -315,15 +375,41 @@ if __name__ == "__main__":
         default=False,
         help="pass ignore_eos through engine sampling_params for throughput comparisons",
     )
+    bench.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        default=False,
+        help="Pass enable_thinking=False to Qwen-style chat templates.",
+    )
 
     # Engine overrides (smc_engine / baseline modes)
     eng = parser.add_argument_group("engine overrides (smc_engine/baseline)")
+    eng.add_argument("--dtype", type=str, default=None,
+                     help="model dtype override (e.g. bfloat16, float16)")
     eng.add_argument("--attention-backend", type=str, default="triton",
                       choices=["triton", "fa3"],
                       help="attention backend for smc_engine mode (default: triton)")
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=16)
+    eng.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        help="Cap the KV-token memory pool size (useful for dense hybrid draft smoke tests).",
+    )
+    eng.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        default=False,
+        help="Disable CUDA graphs (faster startup, slower decode; useful for smoke tests).",
+    )
+    eng.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor-parallel size for the target (and draft, if shared).",
+    )
 
     args = parser.parse_args()
     main(args)
