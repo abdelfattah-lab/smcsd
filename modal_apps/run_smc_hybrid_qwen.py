@@ -84,6 +84,8 @@ def _run_eval(
     tp_size: int = 1,
     disable_cuda_graph: bool = False,
     batch_size: int = 1,
+    enable_timing: bool = False,
+    timing_every: int = 50,
     label: str = "smc-hybrid",
 ) -> None:
     import os
@@ -104,6 +106,10 @@ def _run_eval(
     # Hybrid Qwen3.5/3.6 declares max_position_embeddings beyond what rope actually
     # supports — let SGLang cap context_length to the rope-derived effective length.
     os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+
+    if enable_timing:
+        os.environ["SMCSD_TIMING"] = "1"
+        os.environ["SMCSD_TIMING_EVERY"] = str(timing_every)
 
     print("Upgrading torch + sglang-kernel ...", flush=True)
     subprocess.run(
@@ -222,6 +228,8 @@ def run_smc_hybrid_medium(
     tp_size: int = 2,
     disable_cuda_graph: bool = True,
     batch_size: int = 1,
+    enable_timing: bool = False,
+    timing_every: int = 50,
 ) -> None:
     _run_eval(
         target_model=target_model, draft_model=draft_model,
@@ -236,6 +244,7 @@ def run_smc_hybrid_medium(
         cuda_graph_max_bs=cuda_graph_max_bs, mode=mode,
         tp_size=tp_size, disable_cuda_graph=disable_cuda_graph,
         batch_size=batch_size,
+        enable_timing=enable_timing, timing_every=timing_every,
         label="smc-hybrid-medium",
     )
 
@@ -303,6 +312,8 @@ def medium(
     tp_size: int = 2,
     disable_cuda_graph: bool = True,
     batch_size: int = 1,
+    enable_timing: bool = False,
+    timing_every: int = 50,
 ):
     run_smc_hybrid_medium.remote(
         target_model=target_model,
@@ -325,4 +336,6 @@ def medium(
         tp_size=tp_size,
         disable_cuda_graph=disable_cuda_graph,
         batch_size=batch_size,
+        enable_timing=enable_timing,
+        timing_every=timing_every,
     )
