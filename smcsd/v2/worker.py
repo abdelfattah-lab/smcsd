@@ -272,15 +272,21 @@ class SMCWorkerV2(BaseSpecWorker):
         # DraftBackendFactory.create_decode_backend() returns a flat-attention
         # multi-step backend that doesn't implement the linear-attn forward
         # signature radix_linear_attention.py expects (mixed_qkv/a/b kwargs).
-        # For hybrid (Mamba+attention) drafts, skip the multi-step backend and
-        # leave draft_attn_backend=None so _forward_decode falls through to
-        # self.draft_runner.forward(...) using the runner's HybridLinearAttn
-        # backend on every step (eager + cuda-graph paths agree).
+        # For hybrid (Mamba+attention) drafts, build a custom multi-step
+        # backend whose per-step backends are HybridLinearAttnBackend
+        # instances that delegate full-attn vs linear-attn per layer_id.
         draft_is_hybrid = (
             getattr(self.draft_runner, "hybrid_gdn_config", None) is not None
         )
         if draft_is_hybrid:
-            self.draft_attn_backend = None
+            from smcsd.v2.hybrid_multistep_backend import (
+                HybridLinearAttnMultiStepBackend,
+            )
+            self.draft_attn_backend = HybridLinearAttnMultiStepBackend(
+                self.draft_runner,
+                topk=1,
+                speculative_num_steps=self.gamma + 2,
+            )
         else:
             from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
