@@ -146,7 +146,11 @@ class ScheduleBatchSMC:
         self.min_ps = torch.zeros(self.max_slots, dtype=torch.float32, device=device)
 
         # ── Active batch index ──
+        # `_active_slots_list` mirrors `active_slots` on CPU so hot-path
+        # callers (`build_model_worker_batch`) can resolve slot → Req without
+        # per-element `.item()` syncs.
         self.active_slots = torch.empty(0, dtype=torch.int64, device=device)
+        self._active_slots_list: List[int] = []
         self.num_active: int = 0
 
         # ── Group tracking ──
@@ -376,21 +380,23 @@ class ScheduleBatchSMC:
         (zero-copy, no dict building). Only called when membership changes:
         allocate_slots, free_group_slots, or after a particle finishes.
         """
+        # One batched D→H of the full finished mask — replaces the
+        # per-slot `.item()` sync that used to run inside the group loop.
+        finished_cpu = self.finished_mask.cpu().tolist()
+
         self._sorted_group_ids = sorted(self.group_slot_lists.keys())
         active_list: List[int] = []
         indptr = [0]
         for group_id in self._sorted_group_ids:
-            group_active = [
-                s
-                for s in self.group_slot_lists[group_id]
-                if not self.finished_mask[s].item()
-            ]
-            active_list.extend(group_active)
+            for s in self.group_slot_lists[group_id]:
+                if not finished_cpu[s]:
+                    active_list.append(s)
             indptr.append(len(active_list))
 
         self.active_slots = torch.tensor(
             active_list, dtype=torch.int64, device=self.device
         )
+        self._active_slots_list = active_list
         self.num_active = len(active_list)
         self.group_active_indptr = indptr
 
@@ -497,7 +503,7 @@ class ScheduleBatchSMC:
         seq_lens_sum = int(seq_lens_cpu.sum().item())
 
         # Gather Req objects for ForwardBatch.init_new (needs rids)
-        reqs = [self.slot_to_req[int(s.item())] for s in active]
+        reqs = [self.slot_to_req[s] for s in self._active_slots_list]
 
         # Minimal SamplingBatchInfo — SMC worker does its own sampling
         sampling_info = SamplingBatchInfo(

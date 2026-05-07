@@ -421,7 +421,6 @@ class SMCWorker(BaseSpecWorker):
             self.draft_runner.attn_backend, "linear_attn_backend", None
         )
         if linear_backend is not None:
-            linear_backend = self.draft_runner.attn_backend.linear_attn_backend
             linear_backend.req_to_token_pool = draft_pool
             linear_backend.conv_states_shape = draft_pool.mamba_pool.mamba_cache.conv[
                 0
