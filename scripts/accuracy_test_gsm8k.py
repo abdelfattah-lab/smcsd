@@ -126,6 +126,8 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["dtype"] = args.dtype
     if getattr(args, "disable_cuda_graph", False):
         engine_kwargs["disable_cuda_graph"] = True
+    if getattr(args, "tp_size", 1) and args.tp_size > 1:
+        engine_kwargs["tp_size"] = args.tp_size
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
@@ -401,6 +403,12 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Disable CUDA graphs (faster startup, slower decode; useful for smoke tests).",
+    )
+    eng.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor-parallel size for the target (and draft, if shared).",
     )
 
     args = parser.parse_args()

@@ -62,30 +62,29 @@ app = modal.App(APP_NAME, image=image)
 hf_cache = modal.Volume.from_name("smcsd-hf-cache", create_if_missing=True)
 
 
-@app.function(
-    gpu="H200:1",
-    timeout=60 * 60,
-    secrets=[modal.Secret.from_name("hf-llama-token")],
-    volumes={HF_HOME: hf_cache},
-)
-def run_smc_hybrid(
-    target_model: str = "Qwen/Qwen3.5-9B",
-    draft_model: str = "Qwen/Qwen3.5-2B",
-    num_questions: int = 100,
-    max_new_tokens: int = 512,
-    particles: int = 12,
-    gamma: int = 8,
-    temperature: float = 0.7,
-    seed: int = 123,
-    smc_draft_mode: str = "dense",
-    disable_thinking: bool = True,
-    smc_fast_resample: bool = True,
-    attention_backend: str = "fa3",
-    mem_fraction_static: float = 0.9,
-    max_running_requests: int = 1,
-    max_total_tokens: int = 8192,
-    cuda_graph_max_bs: int = 16,
-    mode: str = "smc_engine",
+def _run_eval(
+    *,
+    target_model: str,
+    draft_model: str,
+    num_questions: int,
+    max_new_tokens: int,
+    particles: int,
+    gamma: int,
+    temperature: float,
+    seed: int,
+    smc_draft_mode: str,
+    disable_thinking: bool,
+    smc_fast_resample: bool,
+    attention_backend: str,
+    mem_fraction_static: float,
+    max_running_requests: int,
+    max_total_tokens: int,
+    cuda_graph_max_bs: int,
+    mode: str,
+    tp_size: int = 1,
+    disable_cuda_graph: bool = False,
+    batch_size: int = 1,
+    label: str = "smc-hybrid",
 ) -> None:
     import os
     import shlex
@@ -93,11 +92,8 @@ def run_smc_hybrid(
     import sys
 
     for k in (
-        "HF_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
-        "HUGGINGFACE_HUB_TOKEN",
-        "HUGGINGFACE_TOKEN",
-        "HF_HUB_TOKEN",
+        "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN",
+        "HUGGINGFACE_TOKEN", "HF_HUB_TOKEN",
     ):
         token = os.environ.get(k)
         if token:
@@ -105,7 +101,7 @@ def run_smc_hybrid(
             os.environ["HUGGING_FACE_HUB_TOKEN"] = token
             break
 
-    # Hybrid Qwen3.5 declares max_position_embeddings beyond what rope actually
+    # Hybrid Qwen3.5/3.6 declares max_position_embeddings beyond what rope actually
     # supports — let SGLang cap context_length to the rope-derived effective length.
     os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
@@ -139,17 +135,109 @@ def run_smc_hybrid(
         "--cuda-graph-max-bs", str(cuda_graph_max_bs),
         "--num-questions", str(num_questions),
         "--max-new-tokens", str(max_new_tokens),
+        "--tp-size", str(tp_size),
+        "--batch-size", str(batch_size),
     ]
     if disable_thinking:
         cmd.append("--disable-thinking")
     if smc_fast_resample:
         cmd.append("--smc-fast-resample")
+    if disable_cuda_graph:
+        cmd.append("--disable-cuda-graph")
 
     print("Running:", " ".join(shlex.quote(p) for p in cmd), flush=True)
     rc = subprocess.run(cmd, cwd=SMCSD_DIR)
-    print(f"smc-hybrid rc={rc.returncode}", flush=True)
+    print(f"{label} rc={rc.returncode}", flush=True)
     if rc.returncode != 0:
         sys.exit(rc.returncode)
+
+
+@app.function(
+    gpu="H200:1",
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name("hf-llama-token")],
+    volumes={HF_HOME: hf_cache},
+)
+def run_smc_hybrid(
+    target_model: str = "Qwen/Qwen3.5-9B",
+    draft_model: str = "Qwen/Qwen3.5-2B",
+    num_questions: int = 100,
+    max_new_tokens: int = 512,
+    particles: int = 12,
+    gamma: int = 8,
+    temperature: float = 0.7,
+    seed: int = 123,
+    smc_draft_mode: str = "dense",
+    disable_thinking: bool = True,
+    smc_fast_resample: bool = True,
+    attention_backend: str = "fa3",
+    mem_fraction_static: float = 0.9,
+    max_running_requests: int = 1,
+    max_total_tokens: int = 8192,
+    cuda_graph_max_bs: int = 16,
+    mode: str = "smc_engine",
+) -> None:
+    _run_eval(
+        target_model=target_model, draft_model=draft_model,
+        num_questions=num_questions, max_new_tokens=max_new_tokens,
+        particles=particles, gamma=gamma, temperature=temperature,
+        seed=seed, smc_draft_mode=smc_draft_mode,
+        disable_thinking=disable_thinking, smc_fast_resample=smc_fast_resample,
+        attention_backend=attention_backend,
+        mem_fraction_static=mem_fraction_static,
+        max_running_requests=max_running_requests,
+        max_total_tokens=max_total_tokens,
+        cuda_graph_max_bs=cuda_graph_max_bs, mode=mode,
+        tp_size=1, disable_cuda_graph=False, label="smc-hybrid",
+    )
+
+
+# 27B target + 2B draft on 2×H200. Both hybrid (Mamba+attention) with
+# different state shapes — needs --disable-cuda-graph (per per-worker
+# MambaPool constraint) and tp_size=2 to fit the 27B target.
+@app.function(
+    gpu="H200:2",
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name("hf-llama-token")],
+    volumes={HF_HOME: hf_cache},
+)
+def run_smc_hybrid_medium(
+    target_model: str = "Qwen/Qwen3.6-27B",
+    draft_model: str = "Qwen/Qwen3.5-2B",
+    num_questions: int = 100,
+    max_new_tokens: int = 512,
+    particles: int = 12,
+    gamma: int = 8,
+    temperature: float = 0.7,
+    seed: int = 123,
+    smc_draft_mode: str = "dense",
+    disable_thinking: bool = True,
+    smc_fast_resample: bool = True,
+    attention_backend: str = "fa3",
+    mem_fraction_static: float = 0.4,
+    max_running_requests: int = 1,
+    max_total_tokens: int = 8192,
+    cuda_graph_max_bs: int = 16,
+    mode: str = "smc_engine",
+    tp_size: int = 2,
+    disable_cuda_graph: bool = True,
+    batch_size: int = 1,
+) -> None:
+    _run_eval(
+        target_model=target_model, draft_model=draft_model,
+        num_questions=num_questions, max_new_tokens=max_new_tokens,
+        particles=particles, gamma=gamma, temperature=temperature,
+        seed=seed, smc_draft_mode=smc_draft_mode,
+        disable_thinking=disable_thinking, smc_fast_resample=smc_fast_resample,
+        attention_backend=attention_backend,
+        mem_fraction_static=mem_fraction_static,
+        max_running_requests=max_running_requests,
+        max_total_tokens=max_total_tokens,
+        cuda_graph_max_bs=cuda_graph_max_bs, mode=mode,
+        tp_size=tp_size, disable_cuda_graph=disable_cuda_graph,
+        batch_size=batch_size,
+        label="smc-hybrid-medium",
+    )
 
 
 @app.local_entrypoint()
@@ -190,4 +278,51 @@ def main(
         max_total_tokens=max_total_tokens,
         cuda_graph_max_bs=cuda_graph_max_bs,
         mode=mode,
+    )
+
+
+@app.local_entrypoint()
+def medium(
+    target_model: str = "Qwen/Qwen3.6-27B",
+    draft_model: str = "Qwen/Qwen3.5-2B",
+    num_questions: int = 100,
+    max_new_tokens: int = 512,
+    particles: int = 12,
+    gamma: int = 8,
+    temperature: float = 0.7,
+    seed: int = 123,
+    smc_draft_mode: str = "dense",
+    disable_thinking: bool = True,
+    smc_fast_resample: bool = True,
+    attention_backend: str = "fa3",
+    mem_fraction_static: float = 0.4,
+    max_running_requests: int = 1,
+    max_total_tokens: int = 8192,
+    cuda_graph_max_bs: int = 16,
+    mode: str = "smc_engine",
+    tp_size: int = 2,
+    disable_cuda_graph: bool = True,
+    batch_size: int = 1,
+):
+    run_smc_hybrid_medium.remote(
+        target_model=target_model,
+        draft_model=draft_model,
+        num_questions=num_questions,
+        max_new_tokens=max_new_tokens,
+        particles=particles,
+        gamma=gamma,
+        temperature=temperature,
+        seed=seed,
+        smc_draft_mode=smc_draft_mode,
+        disable_thinking=disable_thinking,
+        smc_fast_resample=smc_fast_resample,
+        attention_backend=attention_backend,
+        mem_fraction_static=mem_fraction_static,
+        max_running_requests=max_running_requests,
+        max_total_tokens=max_total_tokens,
+        cuda_graph_max_bs=cuda_graph_max_bs,
+        mode=mode,
+        tp_size=tp_size,
+        disable_cuda_graph=disable_cuda_graph,
+        batch_size=batch_size,
     )
