@@ -100,8 +100,6 @@ def run_smc_engine_eval(args, prompts, labels):
         gamma=args.gamma,
         draft_temperature=args.temperature,
         target_temperature=args.temperature,
-        smc_draft_mode=args.smc_draft_mode,
-        eagle3_residual_alpha=args.eagle3_residual_alpha,
         trust_remote_code=True,
         page_size=1,
         attention_backend=args.attention_backend,
@@ -241,8 +239,7 @@ def main(args):
         draft = args.draft_model or DEFAULT_DRAFT_MODEL
         print(
             f"  particles={args.particles}, gamma={args.gamma}, "
-            f"temperature={args.temperature}, draft={draft}, "
-            f"smc_draft_mode={args.smc_draft_mode}"
+            f"temperature={args.temperature}, draft={draft}"
         )
     print(
         f"  num_questions={args.num_questions}, max_new_tokens={args.max_new_tokens}, "
@@ -329,26 +326,6 @@ if __name__ == "__main__":
     smc_grp.add_argument(
         "--resample-threshold", type=float, default=None,
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
-    )
-    smc_grp.add_argument(
-        "--smc-draft-mode",
-        type=str,
-        choices=["dense", "eagle3", "dflash"],
-        default="dense",
-        help=(
-            "SMC draft mode. 'dense' (default) = separate draft model "
-            "(e.g. Llama-3.2-1B). 'eagle3' = EAGLE3 head that uses the "
-            "target model's hidden states; --draft-model should be the "
-            "matching EAGLE3 checkpoint "
-            "(e.g. lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B). "
-            "'dflash' = SpecForge DFlash draft head."
-        ),
-    )
-    smc_grp.add_argument(
-        "--eagle3-residual-alpha",
-        type=float,
-        default=0.0,
-        help="Blend target hidden state into draft recurrence at each step (0=off, 0.5=half)",
     )
     # Benchmark
     bench = parser.add_argument_group("benchmark")

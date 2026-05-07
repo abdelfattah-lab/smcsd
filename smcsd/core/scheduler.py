@@ -243,18 +243,6 @@ class SMCCoordinator:
         slot_state.finished_mask[dst_idx] = slot_state.finished_mask[src_idx]
         slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
         slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
-        if slot_state.target_hidden_states is not None:
-            slot_state.target_hidden_states[dst_idx] = slot_state.target_hidden_states[
-                src_idx
-            ]
-        if slot_state.first_draft_token_ids is not None:
-            slot_state.first_draft_token_ids[dst_idx] = (
-                slot_state.first_draft_token_ids[src_idx]
-            )
-        if slot_state.first_draft_logprobs is not None:
-            slot_state.first_draft_logprobs[dst_idx] = (
-                slot_state.first_draft_logprobs[src_idx]
-            )
 
         # Req metadata loop — accepted unavoidable Python-side cost.
         for dst_slot, src_slot in zip(
@@ -600,24 +588,6 @@ class SMCScheduler(Scheduler):
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
-        # EAGLE3: per-parent prefill hidden state (num_parents, aux_dim) and
-        # the full draft-prefill log-prob row per parent (num_parents,
-        # draft_vocab). The scheduler samples N DISTINCT x1 draws per parent
-        # for particle diversity — same order as batch.reqs. None in dense mode.
-        prefill_hidden = None
-        prefill_first_draft_logprobs_full = None
-        prefill_hidden_contexts = None
-        if result.next_draft_input is not None:
-            prefill_hidden = getattr(
-                result.next_draft_input, "target_hidden_state", None
-            )
-            prefill_first_draft_logprobs_full = getattr(
-                result.next_draft_input, "first_draft_logprobs", None
-            )
-            prefill_hidden_contexts = getattr(
-                result.next_draft_input, "target_hidden_contexts", None
-            )
-
         for i, (group, req, next_token_id) in enumerate(
             zip(groups, batch.reqs, next_token_ids)
         ):
@@ -632,32 +602,7 @@ class SMCScheduler(Scheduler):
                 self.stream_output([req], False)
                 continue
 
-            h_i = prefill_hidden[i] if prefill_hidden is not None else None
-            hctx_i = (
-                prefill_hidden_contexts[i]
-                if prefill_hidden_contexts is not None
-                else None
-            )
-
-            # Fan out the parent's prefill log-probs into n_particles
-            # DISTINCT x1 samples (one per particle slot). This is the
-            # correctness fix that prevents all particles in a group from
-            # starting the first decode cycle with the same token.
-            fd_id_i = None
-            fd_lp_i = None
-            if prefill_first_draft_logprobs_full is not None:
-                fd_id_i, fd_lp_i = self.model_worker.sample_per_particle_x1(
-                    prefill_first_draft_logprobs_full[i],
-                    n_particles=group.n_particles,
-                )
-
-            error_msg = self._materialize_group(
-                group,
-                prefill_hidden=h_i,
-                first_draft_token_id=fd_id_i,
-                first_draft_logprob=fd_lp_i,
-                prefill_hidden_context=hctx_i,
-            )
+            error_msg = self._materialize_group(group)
             if error_msg is not None:
                 self._abort_group(group, error_msg)
                 continue
@@ -667,10 +612,6 @@ class SMCScheduler(Scheduler):
     def _materialize_group(
         self,
         group: SequenceGroup,
-        prefill_hidden: Optional[torch.Tensor] = None,
-        first_draft_token_id: Optional[torch.Tensor] = None,
-        first_draft_logprob: Optional[torch.Tensor] = None,
-        prefill_hidden_context: Optional[torch.Tensor] = None,
     ) -> Optional[str]:
         parent_req = group.parent_req
         try:
@@ -731,22 +672,6 @@ class SMCScheduler(Scheduler):
                 particle_reqs=particle_reqs,
                 shared_seq_len=shared_seq_len,
             )
-            # EAGLE3: seed particle slots with the parent's prefill hidden state
-            # and pre-sampled first-draft token (both come from the draft's
-            # prefill of the bootstrap prefix).
-            if (
-                prefill_hidden is not None
-                or first_draft_token_id is not None
-                or first_draft_logprob is not None
-                or prefill_hidden_context is not None
-            ):
-                self.slot_state.set_prefill_hidden(
-                    slots,
-                    prefill_hidden,
-                    first_draft_token_id=first_draft_token_id,
-                    first_draft_logprob=first_draft_logprob,
-                    prefill_hidden_context=prefill_hidden_context,
-                )
         except Exception as exc:
             for particle_req in particle_reqs:
                 _release_internal_req(
@@ -805,36 +730,12 @@ class SMCScheduler(Scheduler):
         if bonus_ids is None:
             raise RuntimeError("SMCScheduler: result missing next_draft_input.verified_id")
 
-        # Write results back to slot state (defer rebuild to end of cycle)
-        next_hidden = (
-            next_draft.target_hidden_state
-            if next_draft is not None
-            else None
-        )
-        next_first_draft_id = (
-            next_draft.first_draft_token_id
-            if next_draft is not None
-            else None
-        )
-        next_first_draft_lp = (
-            next_draft.first_draft_logprob
-            if next_draft is not None
-            else None
-        )
-        next_hidden_contexts = (
-            next_draft.target_hidden_contexts
-            if next_draft is not None
-            else None
-        )
+        # Write results back to slot state (defer rebuild to end of cycle).
         newly_finished = self.slot_state.process_batch_result(
             next_token_ids=result.next_token_ids,
             accept_lens=result.accept_lens,
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
-            next_hidden_state=next_hidden,
-            next_first_draft_token_id=next_first_draft_id,
-            next_first_draft_logprob=next_first_draft_lp,
-            next_hidden_contexts=next_hidden_contexts,
             rebuild_active=False,
         )
 

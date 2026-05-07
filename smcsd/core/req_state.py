@@ -116,25 +116,6 @@ class ScheduleBatchSMC:
             (self.max_slots, max_output_len), dtype=torch.int32, device=device
         )
 
-        # ── EAGLE3: per-slot target hidden states [max_slots, aux_hidden_dim] ──
-        # Allocated lazily on first eagle3 use to avoid memory cost in dense mode.
-        # aux_hidden_dim = 3*hidden_dim (use_aux_hidden_state=True) or hidden_dim.
-        self.target_hidden_states: Optional[torch.Tensor] = None
-        # DFlash: variable-length full target-hidden context per slot.
-        # Stored as Python tensors because sequence length grows per particle and
-        # can differ across active groups. Hot tensor state remains in the dense
-        # per-slot arrays above; this path is eager and correctness-first.
-        self.target_hidden_contexts: Dict[int, torch.Tensor] = {}
-
-        # ── EAGLE3: per-slot carry of the pre-sampled "first draft token" ──
-        # Allocated lazily. These are the draft's own prediction of the next
-        # token (in target-vocab space) sampled from the previous cycle's
-        # last-position logits (prefill or rewrite). At decode step 0, this
-        # is the token fed into the draft (NOT the verified_id, which was
-        # already consumed by the draft during prefill / rewrite).
-        self.first_draft_token_ids: Optional[torch.Tensor] = None  # (max_slots,) int64
-        self.first_draft_logprobs: Optional[torch.Tensor] = None  # (max_slots,) float32
-
         # ── Sampling params [max_slots], static after allocation ──
         self.temperatures = torch.ones(
             self.max_slots, 1, dtype=torch.float32, device=device
@@ -252,76 +233,6 @@ class ScheduleBatchSMC:
         self.rebuild_active_slots()
         return slots
 
-    def set_prefill_hidden(
-        self,
-        slots: List[int],
-        prefill_hidden: torch.Tensor,
-        first_draft_token_id: Optional[torch.Tensor] = None,
-        first_draft_logprob: Optional[torch.Tensor] = None,
-        prefill_hidden_context: Optional[torch.Tensor] = None,
-    ) -> None:
-        """EAGLE3: seed particle slots for one parent.
-
-        ``prefill_hidden`` is shared across all particles of the group (same
-        target-hidden-state seed after the shared prefill). ``first_draft_token_id``
-        and ``first_draft_logprob`` are PER-PARTICLE — one distinct x1 draw per
-        slot — to preserve SMC diversity in the first decode cycle.
-
-        Accepted shapes:
-          prefill_hidden:        (hidden_dim,) — broadcast to all slots.
-          first_draft_token_id:  (len(slots),) — scatter 1:1 with slots.
-          first_draft_logprob:   (len(slots),) — scatter 1:1 with slots.
-        """
-        if not slots:
-            return
-        slot_idx = torch.tensor(slots, dtype=torch.long, device=self.device)
-        n = len(slots)
-
-        if prefill_hidden is not None:
-            new_dim = prefill_hidden.shape[-1]
-            if (
-                self.target_hidden_states is None
-                or self.target_hidden_states.shape[-1] != new_dim
-            ):
-                self.target_hidden_states = torch.zeros(
-                    (self.max_slots, new_dim),
-                    dtype=prefill_hidden.dtype,
-                    device=self.device,
-                )
-            self.target_hidden_states[slot_idx] = prefill_hidden.unsqueeze(0).expand(
-                n, -1
-            )
-
-        if first_draft_token_id is not None:
-            assert first_draft_token_id.shape[0] == n, (
-                f"first_draft_token_id must have one entry per slot: "
-                f"got {tuple(first_draft_token_id.shape)} for {n} slots."
-            )
-            if self.first_draft_token_ids is None:
-                self.first_draft_token_ids = torch.zeros(
-                    self.max_slots, dtype=torch.int64, device=self.device,
-                )
-            self.first_draft_token_ids[slot_idx] = first_draft_token_id.to(
-                dtype=torch.int64
-            )
-
-        if first_draft_logprob is not None:
-            assert first_draft_logprob.shape[0] == n, (
-                f"first_draft_logprob must have one entry per slot: "
-                f"got {tuple(first_draft_logprob.shape)} for {n} slots."
-            )
-            if self.first_draft_logprobs is None:
-                self.first_draft_logprobs = torch.zeros(
-                    self.max_slots, dtype=torch.float32, device=self.device,
-                )
-            self.first_draft_logprobs[slot_idx] = first_draft_logprob.to(
-                dtype=torch.float32
-            )
-
-        if prefill_hidden_context is not None:
-            for slot in slots:
-                self.target_hidden_contexts[int(slot)] = prefill_hidden_context
-
     def free_group_slots(self, group_id: str) -> None:
         """Free all slots for a finalized group."""
         slots = self.group_slot_lists.pop(group_id, [])
@@ -363,7 +274,6 @@ class ScheduleBatchSMC:
 
             self.slot_to_req.pop(slot, None)
             self.slot_to_group_id.pop(slot, None)
-            self.target_hidden_contexts.pop(slot, None)
             self.free_slots.append(slot)
 
         self.group_log_weights.pop(group_id, None)
@@ -440,36 +350,10 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
 
-        hidden_g = (
-            self.target_hidden_states[active].clone()
-            if self.target_hidden_states is not None
-            else None
-        )
-        fd_ids_g = (
-            self.first_draft_token_ids[active].clone()
-            if self.first_draft_token_ids is not None
-            else None
-        )
-        fd_logp_g = (
-            self.first_draft_logprobs[active].clone()
-            if self.first_draft_logprobs is not None
-            else None
-        )
-        active_list = active.tolist()
-        hidden_contexts_g = None
-        if self.target_hidden_contexts:
-            hidden_contexts_g = [
-                self.target_hidden_contexts[int(slot)] for slot in active_list
-            ]
-
         return SMCDraftInput(
             verified_id=verified_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
-            target_hidden_state=hidden_g,
-            first_draft_token_id=fd_ids_g,
-            first_draft_logprob=fd_logp_g,
-            target_hidden_contexts=hidden_contexts_g,
         )
 
     # ────────────────────────────────────────────────────────
@@ -565,10 +449,6 @@ class ScheduleBatchSMC:
         logprob_diff: torch.Tensor,
         bonus_ids: torch.Tensor,
         *,
-        next_hidden_state: Optional[torch.Tensor] = None,
-        next_first_draft_token_id: Optional[torch.Tensor] = None,
-        next_first_draft_logprob: Optional[torch.Tensor] = None,
-        next_hidden_contexts: Optional[List[torch.Tensor]] = None,
         rebuild_active: bool = True,
     ) -> List[int]:
         """Write forward results back to slot state. Returns newly finished slots.
@@ -597,48 +477,6 @@ class ScheduleBatchSMC:
 
         # b. Update verified_ids
         self.verified_ids[active] = bonus_ids.to(dtype=torch.int32)
-
-        # b2. EAGLE3: scatter new target hidden states back to slot storage.
-        # Dim can change across cycles (hidden_dim seed at prefill vs
-        # 3*hidden_dim aux after verify) — reallocate on mismatch.
-        if next_hidden_state is not None:
-            new_dim = next_hidden_state.shape[-1]
-            if (
-                self.target_hidden_states is None
-                or self.target_hidden_states.shape[-1] != new_dim
-            ):
-                self.target_hidden_states = torch.zeros(
-                    (self.max_slots, new_dim),
-                    dtype=next_hidden_state.dtype,
-                    device=self.device,
-                )
-            self.target_hidden_states[active] = next_hidden_state
-
-        # b3. EAGLE3: write back the next-cycle first-draft token / logprob.
-        if next_first_draft_token_id is not None:
-            if self.first_draft_token_ids is None:
-                self.first_draft_token_ids = torch.zeros(
-                    self.max_slots, dtype=torch.int64, device=self.device,
-                )
-            self.first_draft_token_ids[active] = next_first_draft_token_id.to(
-                dtype=torch.int64
-            )
-        if next_first_draft_logprob is not None:
-            if self.first_draft_logprobs is None:
-                self.first_draft_logprobs = torch.zeros(
-                    self.max_slots, dtype=torch.float32, device=self.device,
-                )
-            self.first_draft_logprobs[active] = next_first_draft_logprob.to(
-                dtype=torch.float32
-            )
-
-        if next_hidden_contexts is not None:
-            assert len(next_hidden_contexts) == bs, (
-                f"next_hidden_contexts must have one tensor per active slot: "
-                f"got {len(next_hidden_contexts)} for {bs} slots."
-            )
-            for slot, hidden_context in zip(active.tolist(), next_hidden_contexts):
-                self.target_hidden_contexts[int(slot)] = hidden_context
 
         # c. Batched finish check
         newly_finished: List[int] = []
@@ -740,16 +578,6 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[dst_slot] = self.kv_allocated_lens[src_slot]
         self.verified_ids[dst_slot] = self.verified_ids[src_slot]
         self.finished_mask[dst_slot] = self.finished_mask[src_slot]
-        if self.target_hidden_states is not None:
-            self.target_hidden_states[dst_slot] = self.target_hidden_states[src_slot]
-        if self.first_draft_token_ids is not None:
-            self.first_draft_token_ids[dst_slot] = self.first_draft_token_ids[src_slot]
-        if self.first_draft_logprobs is not None:
-            self.first_draft_logprobs[dst_slot] = self.first_draft_logprobs[src_slot]
-        if src_slot in self.target_hidden_contexts:
-            self.target_hidden_contexts[dst_slot] = self.target_hidden_contexts[src_slot]
-        else:
-            self.target_hidden_contexts.pop(dst_slot, None)
 
         src_count = int(self.token_counts[src_slot].item())
         self.token_counts[dst_slot] = src_count
@@ -793,10 +621,6 @@ class ScheduleBatchSMC:
         dst_req.decoded_text = src_req.decoded_text
         dst_req.surr_offset = src_req.surr_offset
         dst_req.read_offset = src_req.read_offset
-        if src_slot in self.target_hidden_contexts:
-            self.target_hidden_contexts[dst_slot] = self.target_hidden_contexts[src_slot]
-        else:
-            self.target_hidden_contexts.pop(dst_slot, None)
 
     def copy_req_metadata(self, dst_slot: int, src_slot: int) -> None:
         """Copy req-side state from src to dst after fused tensor/KV copies."""
