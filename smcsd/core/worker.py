@@ -1,7 +1,4 @@
-"""SMC Worker v2: standalone worker using SMCDecodeContext API.
-
-Fully self-contained — no inheritance from SMCWorker.
-Can replace SMCWorker entirely once the dedicated scheduler adopts v2.
+"""SMC Worker: hybrid Qwen3.5/3.6 dense-AR draft path.
 
 Draft model performs gamma+1 autoregressive decode steps.
 Score model performs one extend forward pass on the drafted tokens.
@@ -54,7 +51,7 @@ class SMCDenseDraftTpModelWorker(TpModelWorker):
 
 
 class SMCWorker(BaseSpecWorker):
-    """Standalone SMC worker using v2 API (SMCDecodeContext + SMCDraftInput)."""
+    """Standalone SMC worker (SMCDecodeContext + SMCDraftInput)."""
 
     def __init__(
         self,
@@ -196,10 +193,20 @@ class SMCWorker(BaseSpecWorker):
     def _maybe_isolate_dense_hybrid_draft_state(self) -> None:
         """Give dense hybrid drafts their own recurrent state and KV layout.
 
-        Dense SMC still shares request/token slot indices so target and draft KV
-        caches stay aligned. For hybrid GDN drafts, the recurrent state shape is
-        model-specific, and normal AR drafts need every full-attention layer in
-        their KV pool rather than SGLang's one-layer MTP draft layout.
+        Unlike vanilla speculative decoding, SMC accepts every drafted token
+        (no rejection / rollback), so a separate draft pool is NOT needed for
+        recovery. We share what we can: the request→token block-table
+        (req_to_token), the req_pool_idx allocator, and the identity-mapped
+        req_index→mamba_index mapping.
+
+        What we cannot share for an asymmetric hybrid pair (e.g. Qwen3.5-9B
+        target + Qwen3.5-2B draft):
+          * MambaPool — recurrent state shape (num_heads, ssm_state_size, …)
+            differs between target and draft, so each model needs its own
+            buffers sized to its own config.
+          * HybridLinearKVPool — head_dim / num_kv_heads / number of full-attn
+            layers differ, so KV layout is model-specific. AR drafts also need
+            every full-attn layer (vs SGLang's one-layer MTP draft layout).
         """
         shapes = self._dense_hybrid_state_shape()
         target_shape, draft_shape = shapes or (None, None)

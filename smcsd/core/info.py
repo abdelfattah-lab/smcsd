@@ -1,14 +1,12 @@
-"""v2 SMC spec info: clean separation of concerns.
+"""SMC spec info: clean separation of concerns.
 
 - SMCDecodeContext: per-cycle state created by scheduler, consumed by worker.
-  Owns prepare_for_draft / prepare_for_verify (moved from SMCDraftInput).
+  Owns prepare_for_draft / prepare_for_verify.
   Factory method from_slot_gather does vectorized KV allocation.
 
 - SMCDraftInput: pure data carrier on batch.spec_info (no prepare methods).
 
 - SMCVerifyInput: reused from smc_info.py (unchanged).
-
-Legacy smc_info.py is NOT modified — the non-dedicated scheduler still uses it.
 """
 
 from __future__ import annotations

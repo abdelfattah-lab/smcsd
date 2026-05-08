@@ -403,7 +403,7 @@ class SMCScheduler(Scheduler):
 
     # ── Runtime Memory Checks (override base mixin) ──
     #
-    # SMC v2 keeps its decode KV slots inside ScheduleBatchSMC, which the base
+    # SMC keeps its decode KV slots inside ScheduleBatchSMC, which the base
     # SchedulerRuntimeCheckerMixin doesn't know about.  We override the two
     # idle-path leak checks so slot-held tokens/reqs are folded into the
     # conservation formulas — without leaking SMC concepts into core scheduler
@@ -412,8 +412,7 @@ class SMCScheduler(Scheduler):
     #
     # self_check_during_busy is intentionally NOT overridden: _event_loop
     # never dispatches it (matching the PP / disagg / multiplex loops, which
-    # also omit the busy check).  Re-add it here if the v2 loop is ever wired
-    # to call self_check_during_busy.
+    # also omit the busy check).
 
     def _check_radix_cache_memory(self):
         _, _, available_size, evictable_size = self._get_token_info()
@@ -464,10 +463,10 @@ class SMCScheduler(Scheduler):
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if is_retracted:
-            # SMC v2 has no retraction path: particle groups are atomic and
+            # SMC has no retraction path: particle groups are atomic and
             # cannot be partially retracted, and there is no group-aware
             # re-admission protocol.  ScheduleBatch.retract_decode is also
-            # unreachable in v2 (decode runs through ScheduleBatchSMC).
+            # unreachable here (decode runs through ScheduleBatchSMC).
             raise NotImplementedError(
                 "SMCScheduler does not support re-admitting retracted reqs."
             )
@@ -777,7 +776,7 @@ class SMCScheduler(Scheduler):
 
     def _finalize_group(self, group: SequenceGroup) -> None:
         if not group.has_materialized_particles():
-            # Shouldn't happen in v2 — but handle gracefully
+            # Shouldn't happen — but handle gracefully
             parent_req = group.parent_req
             release_kv_cache(parent_req, self.tree_cache)
             parent_req.time_stats.set_completion_time()

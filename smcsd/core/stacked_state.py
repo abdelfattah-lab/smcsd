@@ -1,10 +1,9 @@
 """Primary per-group SMC state, contiguous on GPU.
 
-Replaces the three legacy dicts — `group_log_weights`, `group_interval_weights`,
-and the per-group slot lists — with `(max_G, N)` tensors on a single object.
-Hot-path ops (weight accumulation, fused collect) read/write only contiguous
-tensors; the legacy dicts are kept as thin views into the same storage so
-existing callers keep working.
+Backs `group_log_weights`, `group_interval_weights`, and the per-group slot
+lists with `(max_G, N)` tensors on a single object. Hot-path ops (weight
+accumulation, fused collect) read/write only contiguous tensors; the dict-style
+accessors are thin views into the same storage so callers keep working.
 
 Layout
 ------
@@ -31,15 +30,14 @@ column ≡ particle index
 -----------------------
 Each particle's index inside its group (the `smc_particle_idx` assigned at
 materialisation time) IS the column number in its row — stable for the entire
-group lifetime.  `particle_indices[slot]` in the legacy slot-major layout
-equals the stacked column, so `log_weights[row, particle_indices[slot]]`
-points to that particle's cumulative weight.
+group lifetime.  `particle_indices[slot]` is the stacked column, so
+`log_weights[row, particle_indices[slot]]` points to that particle's cumulative
+weight.
 
 `active_cell_mask` is a STATIC "col is an allocated particle slot" mask —
 it flips True at `register_group` and False at `unregister_group`.  Particle
-finish does NOT flip it (matching the legacy `collect_resample_jobs` which
-includes finished particles in the resample candidate set and relies on the
-copy-propagation of `finished_mask` through `resample_copy_slot`).
+finish does NOT flip it (the resample candidate set includes finished particles
+and relies on copy-propagation of `finished_mask` through `resample_copy_slot`).
 
 Invariants
 ----------
@@ -179,12 +177,12 @@ class StackedGroupState:
         self.interval_weights[row].zero_()
         self._free_rows.append(row)
 
-    # ── views for legacy dict callers ───────────────────────────────────
+    # ── views for dict-style callers ───────────────────────────────────
 
     def log_weights_view(self, group_id: str, n_particles: int) -> torch.Tensor:
         """Return a length-`n_particles` view into this group's row of
         `log_weights`.  Writes through to the stacked storage — this is the
-        backing store for the legacy `group_log_weights[gid]` dict entry.
+        backing store for the `group_log_weights[gid]` dict entry.
         """
         row = self.group_id_to_row[group_id]
         return self.log_weights[row, :n_particles]
