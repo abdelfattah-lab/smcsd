@@ -1,11 +1,12 @@
-"""Compare SMCVLLMEngine output quality vs vLLM draft model directly.
+"""Compare draft-only SMC vLLM vs normal vLLM on the same draft model.
 
-SMC (target-guided): SMCVLLMEngine uses the draft model (1B) proposals
-  weighted by the target model (8B), producing outputs that reflect the
-  target distribution.
+This checkpoint compares:
 
-Draft-only baseline: vLLM LLM runs the draft model (1B) unguided, showing
-  raw 1B quality without target correction.
+- SMCVLLMEngine in draft-only mode (currently no target verify/resampling),
+  using `n_particles=1`
+- a normal vLLM `LLM` using the same draft model
+
+Both engines are driven from the same tokenized prompts rather than raw text.
 
 Each engine runs in its own subprocess for CUDA context isolation.
 
@@ -20,8 +21,11 @@ Usage:
 
 import argparse
 import multiprocessing as mp
+import traceback
 
-DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+from transformers import AutoTokenizer
+
+DEFAULT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
 PROMPTS = [
@@ -34,33 +38,34 @@ PROMPTS = [
     "What are the main causes of the French Revolution?",
 ]
 
-def _smc_worker(prompts, args, queue):
+def _smc_worker(prompt_token_ids, args, queue):
     try:
         from smcsd.vllm_backend.engine import SMCVLLMEngine
 
         engine = SMCVLLMEngine(
             model_path=args.model,
             draft_model_path=args.draft_model,
-            n_particles=args.particles,
+            n_particles=1,
             gamma=args.gamma,
             tp_size=1,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_mem,
+            enable_prefix_caching=False
         )
         sampling_params = {
             "draft_temperature": args.temperature,
             "target_temperature": args.temperature,
             "max_tokens": args.max_tokens,
         }
-        outputs = engine.generate(prompt=prompts, sampling_params=sampling_params)
+        outputs = engine.generate(input_ids=prompt_token_ids, sampling_params=sampling_params)
         engine.shutdown()
         results = [outputs] if isinstance(outputs, dict) else outputs
         queue.put(("ok", [{"text": r["text"], "n_particles": len(r.get("particles", []))} for r in results]))
     except Exception as e:
-        queue.put(("err", str(e)))
+        queue.put(("err", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
 
 
-def _draft_worker(prompts, args, queue):
+def _draft_worker(prompt_token_ids, args, queue):
     try:
         from vllm import LLM, SamplingParams
 
@@ -70,19 +75,21 @@ def _draft_worker(prompts, args, queue):
             gpu_memory_utilization=args.gpu_mem,
             enforce_eager=True,
             async_scheduling=False,
+            enable_prefix_caching=False
         )
         sp = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
+        prompts = [{"prompt_token_ids": ids} for ids in prompt_token_ids]
         raw_outputs = llm.generate(prompts, sp)
         results = [{"text": out.outputs[0].text} for out in raw_outputs]
         queue.put(("ok", results))
     except Exception as e:
-        queue.put(("err", str(e)))
+        queue.put(("err", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
 
 
-def _run_in_subprocess(worker_fn, prompts, args) -> list[dict]:
+def _run_in_subprocess(worker_fn, prompt_token_ids, args) -> list[dict]:
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
-    proc = ctx.Process(target=worker_fn, args=(prompts, args, queue))
+    proc = ctx.Process(target=worker_fn, args=(prompt_token_ids, args, queue))
     proc.start()
     proc.join()
     status, payload = queue.get()
@@ -143,22 +150,36 @@ def main():
     parser.add_argument("--mode", choices=["smc", "draft", "both"], default="both")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=128)
-    parser.add_argument("--particles", "-N", type=int, default=8)
+    parser.add_argument("--particles", "-N", type=int, default=1)
     parser.add_argument("--gamma", "-g", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=1024)
-    parser.add_argument("--gpu-mem", type=float, default=0.5)
+    parser.add_argument("--gpu-mem", type=float, default=0.2)
     parser.add_argument("--max-display-chars", type=int, default=300)
     args = parser.parse_args()
 
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.draft_model, trust_remote_code=True
+    )
+    prompt_token_ids = []
+    for prompt in PROMPTS:
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        rendered = dict(rendered)
+        prompt_token_ids.append(rendered["input_ids"])
+
+    print("prompt token ids: ", prompt_token_ids)
     smc_results = None
     draft_results = None
 
     if args.mode in ("smc", "both"):
-        smc_results = _run_in_subprocess(_smc_worker, PROMPTS, args)
+        smc_results = _run_in_subprocess(_smc_worker, prompt_token_ids, args)
         print_smc(PROMPTS, smc_results, args)
 
     if args.mode in ("draft", "both"):
-        draft_results = _run_in_subprocess(_draft_worker, PROMPTS, args)
+        draft_results = _run_in_subprocess(_draft_worker, prompt_token_ids, args)
         print_draft(PROMPTS, draft_results, args)
 
     if args.mode == "both" and smc_results and draft_results:

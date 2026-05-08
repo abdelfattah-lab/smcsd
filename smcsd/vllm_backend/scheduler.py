@@ -4,9 +4,9 @@ import math
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-
 import torch
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -20,13 +20,14 @@ if TYPE_CHECKING:
 class SMCParticleGroupState:
     parent_req: Request
     n_particles: int
-    num_computed_tokens: int               # advances by gamma+1 after each draft cycle
+    num_computed_tokens: int               
     draft_temperature: float
-    seed_token_ids: list[int]              # per particle; updated after each cycle
+    seed_token_ids: list[int]             
     shared_prefix_block_ids: tuple[list[int], ...]   # [kv_group][block]
     decode_block_ids: list[tuple[list[int], ...]]    # [particle][kv_group][block]
-    particle_req_ids: list[str] = field(default_factory=list)  # needed for KV block free
+    particle_req_ids: list[str] = field(default_factory=list)  
     accumulated_tokens: list[list[int]] = field(default_factory=list)  # [N][tokens]
+    particle_finished: list[bool] = field(default_factory=list)  
 
 
 # Scheduler Output
@@ -38,6 +39,7 @@ class NewParticleGroupData:
     particle_req_ids: list[str]
     prompt_token_ids: list[int]
     num_computed_tokens: int
+    sampling_params: SamplingParams | None
     prefix_block_ids: tuple[list[int], ...]        # [kv_group][block]
     decode_block_ids: list[tuple[list[int], ...]]  # [particle][kv_group][block]
     seed_token_ids: torch.Tensor   # [N]
@@ -54,6 +56,7 @@ class SMCGroupBatch:
     seq_lens: torch.Tensor         # [N]
     gamma: int
     temperature: float
+    particle_finished: list[bool] = field(default_factory=list)  # [N]
 
 
 @dataclass
@@ -145,6 +148,7 @@ class SMCVLLMScheduler(Scheduler):
             decode_block_ids=decode_block_ids,
             particle_req_ids=particle_req_ids,
             accumulated_tokens=[[] for _ in range(n_particles)],
+            particle_finished=[False] * n_particles,
         )
         self.smc_groups[group_id] = state
 
@@ -153,6 +157,7 @@ class SMCVLLMScheduler(Scheduler):
             particle_req_ids=particle_req_ids,
             prompt_token_ids=prompt_token_ids,
             num_computed_tokens=num_computed_tokens,
+            sampling_params=sp,
             prefix_block_ids=shared_prefix_block_ids,
             decode_block_ids=decode_block_ids,
             seed_token_ids=seed_token_ids_tensor,
@@ -174,6 +179,7 @@ class SMCVLLMScheduler(Scheduler):
             seq_lens=seq_lens,
             gamma=self.smc_gamma,
             temperature=state.draft_temperature,
+            particle_finished=list(state.particle_finished),
         )
 
     def finish_particle_group(self, group_id: str) -> None:
@@ -264,39 +270,42 @@ class SMCVLLMScheduler(Scheduler):
             if state is None:
                 continue
 
-            # draft_token_ids: [N, gamma+1]; [:, 0] is the carried seed input.
-            # TODO: In the draft-only checkpoint we commit all newly sampled tokens:
+            # draft_token_ids: [A, gamma+1]; [:, 0] is the carried seed input.
+            # A = number of active (unfinished) particles this cycle.
+            # TODO: Currently we commit all newly sampled tokens:
             # x_1..x_gamma from draft_token_ids[:, 1:] plus next_seed_ids,
             # which is x_{gamma+1} and also seeds the next cycle.
+            active_ps = [p for p, f in enumerate(state.particle_finished) if not f]
             new_tokens = torch.cat(
                 (draft_token_ids[:, 1:], next_seed_ids.unsqueeze(1)),
                 dim=1,
-            )  # [N, gamma+1]
+            )  # [A, gamma+1]
 
-            # Accumulate per-particle visible output tokens for this cycle.
-            for p in range(state.n_particles):
-                state.accumulated_tokens[p].extend(new_tokens[p].tolist())
-
-            # Detect EOS in any particle.
             sp = state.parent_req.sampling_params
-            eos_id = sp.eos_token_id if sp is not None else None
-            eos_hit = (
-                bool((new_tokens == eos_id).any().item())
-                if eos_id is not None
-                else False
-            )
-
-            # Check generation budget.
+            stop_ids: set[int] = sp._all_stop_token_ids if sp is not None else set()
             max_tokens = sp.max_tokens if sp is not None else None
-            budget_hit = (
-                max_tokens is not None
-                and len(state.accumulated_tokens[0]) >= max_tokens
-            )
 
-            if eos_hit or budget_hit:
+            for i, p in enumerate(active_ps):
+                particle_tokens = new_tokens[i].tolist()
+                # Trim at first stop token
+                if stop_ids:
+                    stop_pos = next(
+                        (j for j, t in enumerate(particle_tokens) if t in stop_ids),
+                        -1,
+                    )
+                    if stop_pos >= 0:
+                        particle_tokens = particle_tokens[: stop_pos + 1]
+                        state.particle_finished[p] = True
+                state.accumulated_tokens[p].extend(particle_tokens)
+                # Budget check per particle.
+                if max_tokens is not None and len(state.accumulated_tokens[p]) >= max_tokens:
+                    state.particle_finished[p] = True
+
+            if all(state.particle_finished):
                 self._finish_group(group_id, state, result)
             else:
-                state.seed_token_ids = next_seed_ids.tolist()
+                for i, p in enumerate(active_ps):
+                    state.seed_token_ids[p] = int(next_seed_ids[i].item())
                 state.num_computed_tokens += self.smc_gamma + 1
 
         return result

@@ -95,7 +95,16 @@ class SMCVLLMEngine:
             vllm_config.model_config.tokenizer,
             trust_remote_code=vllm_config.model_config.trust_remote_code,
         )
-        self._eos_token_id: int | None = self.tokenizer.eos_token_id
+
+        raw_eos = vllm_config.model_config.hf_config.eos_token_id
+        if isinstance(raw_eos, int):
+            self._model_stop_token_ids: list[int] = [raw_eos]
+        elif isinstance(raw_eos, (list, tuple)):
+            self._model_stop_token_ids = list(raw_eos)
+        elif self.tokenizer.eos_token_id is not None:
+            self._model_stop_token_ids = [self.tokenizer.eos_token_id]
+        else:
+            self._model_stop_token_ids = []
 
     def generate(
         self,
@@ -108,9 +117,10 @@ class SMCVLLMEngine:
         Args:
             prompt: A single string or list of strings.
             sampling_params: Sampling config dict(s) with keys accepted by
-                vllm.SamplingParams plus SMC-specific ``draft_temperature`` and
-                ``target_temperature``. ``target_temperature`` is translated to
-                the normal vLLM ``temperature`` field for the parent request.
+                vllm.SamplingParams plus required SMC-specific
+                ``draft_temperature`` and ``target_temperature``.
+                ``target_temperature`` is translated to the normal vLLM
+                ``temperature`` field for the parent request.
             input_ids: Pre-tokenized input(s). Mutually exclusive with *prompt*.
 
         Returns:
@@ -150,22 +160,21 @@ class SMCVLLMEngine:
             rid = uuid.uuid4().hex
             rids.append(rid)
             prompt_token_counts[rid] = len(ids)
-            if isinstance(sp_dict, dict):
-                sp_dict = dict(sp_dict)
-                target_temperature = sp_dict.pop(
-                    "target_temperature",
-                    sp_dict.get("temperature", 1.0),
+            sp_dict = dict(sp_dict)
+            if "target_temperature" not in sp_dict:
+                raise ValueError(
+                    "sampling_params must include target_temperature"
                 )
-                draft_temperature = sp_dict.pop(
-                    "draft_temperature",
-                    target_temperature,
+            if "draft_temperature" not in sp_dict:
+                raise ValueError(
+                    "sampling_params must include draft_temperature"
                 )
-                sp_dict["temperature"] = target_temperature
-                sp = SamplingParams(**sp_dict)
-            else:
-                sp = sp_dict
-                target_temperature = sp.temperature
-                draft_temperature = target_temperature
+            target_temperature = sp_dict.pop("target_temperature")
+            draft_temperature = sp_dict.pop("draft_temperature")
+            sp_dict["temperature"] = target_temperature
+            existing_stop = list(sp_dict.pop("stop_token_ids", None) or [])
+            sp_dict["stop_token_ids"] = list(set(self._model_stop_token_ids + existing_stop))
+            sp = SamplingParams(**sp_dict)
             request = Request(
                 request_id=rid,
                 prompt_token_ids=ids,
