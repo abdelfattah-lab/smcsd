@@ -2,165 +2,286 @@
 
 ## 1. Overview
 
-The vLLM backend runs SMC inference entirely in-process — no subprocesses, no ZMQ.
-All components (engine, scheduler, model runner) live in the same Python process and
-communicate via direct method calls.
+The vLLM backend runs SMC inference entirely in-process. The engine, scheduler,
+worker, and model runner all live in the same Python process and communicate by
+direct method calls.
 
-This contrasts with the sglang backend, where `SMCEngine` launches the scheduler in a
-separate subprocess and communicates over ZMQ sockets.
+SMCVLLMEngine talks to EngineCore and injects its own scheduler and gpu model runner.
+This backend does not use vLLM's built-in speculative decoding pipeline. 
 
----
+## 2. Main Components
 
-## 2. Component Hierarchy
+### 2.1 High-Level Architecture Graph
 
-```
+```text
 SMCVLLMEngine.generate()
-  │
-  │  builds Request objects, calls self._engine.add_request(request)
-  │  then loops self._engine.step() until all requests finish
-  ▼
-EngineCore                              ← same process, same thread
-  │
-  ├── self.scheduler                    ← SMCVLLMScheduler instance, same process
-  │     schedule() → SMCSchedulerOutput
-  │
-  └── self.model_executor               ← UniProcExecutor, same process
-        execute_model(scheduler_output)
-          └── WorkerWrapperBase
-                └── SMCGPUWorker        ← same process (UniProc = no subprocess)
-                      └── SMCGPUModelRunner
-                            execute_model() → runs draft cycle on GPU
+    |
+    v
+EngineCore
+    |
+    v
+SMCVLLMScheduler.schedule()
+    |
+    +--> Normal vLLM prefill path
+    |       |
+    |       v
+    |   Base Scheduler Output
+    |       |
+    |       v
+    |   GPUModelRunner via super().execute_model()
+    |       |
+    |       v
+    |   Upstream sample_tokens()
+    |
+    +--> SMC draft path after fork
+            |
+            v
+        NewParticleGroupData / Ongoing SMCGroupBatch
+            |
+            v
+        UniProcExecutor / SMCGPUWorker
+            |
+            v
+        SMCGPUModelRunner.execute_model()
+            |
+            +--> Draft prefill
+            |
+            +--> Draft decode cycles
+            |       |
+            |       v
+            |   Upstream sampler component
+            |
+            +--> Target model + target KV cache
+            |
+            +--> Draft model + draft KV cache
+            |
+            +--> Runner-side particle rows / block tables / sampler state
+            |
+            v
+        SMCModelRunnerOutput
+            |
+            v
+SMCVLLMScheduler.update_from_output()
+    |
+    |
+    v
+EngineCore
 ```
 
-Each `EngineCore.step()` call does one full iteration:
-1. `scheduler.schedule()` → produces `SMCSchedulerOutput`
-2. `model_executor.execute_model(scheduler_output)` → GPU forward passes
-3. `scheduler.update_from_output(scheduler_output, model_output)` → returns
-   `EngineCoreOutputs` with `new_token_ids` per request
+- `SMCVLLMEngine` drives the normal `EngineCore.step()` loop.
+- `SMCVLLMScheduler` lets ordinary prefill requests flow through the normal
+  vLLM path.
+- once a parent request is forked into particles, SMC-specific work is carried
+  through `SMCSchedulerOutput` into `SMCGPUModelRunner`.
+- the scheduler and runner then stay in sync through
+  `schedule() -> execute_model() -> update_from_output()`.
 
----
 
 ## 3. Files
 
 | File | Class | Role |
 |---|---|---|
-| `smcsd/vllm_backend/engine.py` | `SMCVLLMEngine` | Public entry point; tokenization, request construction, step loop |
-| `smcsd/vllm_backend/scheduler.py` | `SMCVLLMScheduler` | Extends vllm `Scheduler`; KV block allocation, particle group lifecycle |
-| `smcsd/vllm_backend/worker.py` | `SMCGPUWorker` | Extends `GPUWorker`; swaps in `SMCGPUModelRunner` at `init_device` |
-| `smcsd/vllm_backend/model_runner.py` | `SMCGPUModelRunner` | Extends v2 `GPUModelRunner`; particle row management, draft cycle |
+| `smcsd/vllm_backend/engine.py` | `SMCVLLMEngine` | Public API; tokenization, request creation, `EngineCore.step()` loop |
+| `smcsd/vllm_backend/scheduler.py` | `SMCVLLMScheduler` | Forks parent requests into particle groups, tracks SMC state, consumes custom runner output |
+| `smcsd/vllm_backend/worker.py` | `SMCGPUWorker` | Swaps in `SMCGPUModelRunner` |
+| `smcsd/vllm_backend/model_runner.py` | `SMCGPUModelRunner` | Draft model loading, draft KV cache, batched draft prefill, batched draft decode |
 
----
+## 4. End-to-End Control Flow
 
-## 4. Injection Points
+### 4.1 Parent request path
 
-vLLM selects the scheduler and worker class via two fields on `VllmConfig`.
-`SMCVLLMEngine.__init__` sets both after `EngineArgs.create_engine_config()`:
+Each prompt starts as an ordinary vLLM request:
+
+1. `SMCVLLMEngine.generate()` builds `Request(...)`
+2. `EngineCore.step()` runs normal vLLM schedule/execute/sample for prefill
+
+At this point:
+
+- prompt KV is already materialized
+- the first sampled token ID exists
+- the sampled token's KV has not yet been written into cache
+
+### 4.2 Fork into particles
+
+On the next scheduler step, `SMCVLLMScheduler.schedule()` detects a request whose
+`output_token_ids` has length 1 and which has not yet been converted into an SMC
+group.
+
+It then:
+
+1. removes the parent request from `self.running`
+2. allocates particle request IDs
+3. calls `kv_cache_manager.fork_blocks(...)`
+4. shares only full prefix blocks across particles
+5. gives each particle private decode blocks
+6. stores `SMCParticleGroupState`
+7. returns `NewParticleGroupData` inside `SMCSchedulerOutput`
+
+## 5. GPU Runner Flow
+
+### 5.1 `SMCGPUModelRunner.execute_model()`
+
+`SMCGPUModelRunner.execute_model()` first calls:
 
 ```python
-# Scheduler: EngineCore reads this via scheduler_config.get_scheduler_cls()
-vllm_config.scheduler_config.scheduler_cls = SMCVLLMScheduler
-
-# Worker: WorkerWrapperBase.init_worker() resolves this string to a class
-vllm_config.parallel_config.worker_cls = "smcsd.vllm_backend.worker.SMCGPUWorker"
+base_output = super().execute_model(...)
 ```
+This preserves the normal vLLM path for prefill requests.
 
-There is no `model_runner_cls` config field in vLLM. Runner injection is done by
-`SMCGPUWorker.init_device()`, which calls `super().init_device()` then replaces
-`self.model_runner` with `SMCGPUModelRunner`.
+Then it handles SMC work:
 
----
+- for each `new_particle_group`:
+  - `add_particle_group(...)`
+  - `_run_draft_and_verify(new_group)`
+- for each `ongoing_smc_group`:
+  - `_run_draft_and_verify(batch)`
 
-## 5. SMC Parameters
+### 5.2 `add_particle_group(...)`
 
-SMC hyper-parameters (`n_particles`, `gamma`, `temperature`) are server-level settings,
-not per-request. They are passed to `EngineArgs` as a `speculative_config` dict and
-land in `vllm_config.speculative_config` (`SpeculativeConfig`):
+This method:
 
-| Field | Source |
-|---|---|
-| `smc_n_particles` | `SpeculativeConfig.smc_n_particles` |
-| `smc_gamma` | `SpeculativeConfig.num_speculative_tokens` |
-| `smc_temperature` | `SpeculativeConfig.smc_temperature` |
+1. adds each particle request to `req_states`
+2. writes each particle's block table
+3. applies staged writes
+4. registers each particle with the upstream sampler state
+5. runs batched draft prefill
 
-`SMCVLLMScheduler.__init__` reads these from `self.vllm_config.speculative_config`.
+## 6. Batched Draft Prefill
 
----
+Draft prefill is batched across all particles and uses upstream vLLM machinery:
 
-## 6. Request Flow
+1. gather particle block tables with `BlockTables.gather_block_tables(...)`
+2. compute slot mappings with `BlockTables.compute_slot_mappings(...)`
+3. build attention metadata with `model_state.prepare_attn(...)`
+4. run one batched draft-model forward pass over the prompt
 
-### Prefill (no SMC-specific changes)
+## 7. Batched Draft Decode
 
-Prefill requests flow through vLLM's base scheduler and base `execute_model`
-implementation unchanged.
+`smc_draft_cycle()` runs `gamma + 1` autoregressive draft steps over all particles.
 
-### Fork (cycle N+1 after prefill completes)
+For each draft step:
 
-```
-Cycle N:   parent request finishes prefill → output_token_ids has 1 token
+1. build one real `InputBatch` for the particle batch
+2. compute slot mappings with `BlockTables.compute_slot_mappings(...)`
+3. build attention metadata from the same `InputBatch`
+4. run the draft model forward pass
+5. compute draft logits
+6. reuse the upstream sampler component:
+   - `self.sampler(logits, input_batch)`
+7. call upstream `post_update(...)` so sampler penalty state and request token
+   state stay in sync across draft steps
 
-Cycle N+1:
-  SMCVLLMScheduler.schedule()
-    → detects: len(req.output_token_ids) == 1 and req.request_id not in smc_groups
-    → removes req from self.running
-    → calls fork_to_particles():
-        kv_cache_manager.fork_blocks(parent_req_id, particle_req_ids, n_decode_blocks)
-          prefix blocks: ref_cnt 1 → N (parent relinquishes ownership)
-          each particle registered with prefix_blocks + fresh decode_blocks
-        builds NewParticleGroupData (block IDs, kv_slots, seed_token_ids, seq_lens)
-        stores SMCParticleGroupState in self.smc_groups
-    → returns SMCSchedulerOutput(new_particle_groups=[...], ongoing_smc_groups=[])
 
-  SMCGPUModelRunner.execute_model()
-    → super().execute_model()              # normal prefill/decode requests
-    → for new_group in new_particle_groups:
-          add_particle_group(...)          # assigns particle rows in RequestState + BlockTables
-          _run_draft_and_verify(new_group) # first draft cycle runs immediately
-```
+## 8. Sampling 
 
-### Ongoing SMC decode
+There are two different sampling paths in the current backend:
 
-```
-Cycle N+K (particles already registered):
-  SMCVLLMScheduler.schedule()
-    → returns SMCSchedulerOutput(new_particle_groups=[], ongoing_smc_groups=[SMCGroupBatch(...)])
+### Normal vLLM sampling
 
-  SMCGPUModelRunner.execute_model()
-    → super().execute_model()
-    → for batch in ongoing_smc_groups:
-          _run_draft_and_verify(batch)     # looks up particle_rows locally, runs draft cycle
-```
+Used for prefill requests before fork:
 
-### Draft cycle (`smc_draft_cycle`)
+- driven by upstream `sample_tokens()`
+- owned by the normal `EngineCore.step()` lifecycle
 
-Runs γ+1 autoregressive decode steps over all N particles in a single loop:
+### SMC draft sampling
 
-```
-block_tables = _gather_block_tables(particle_rows)   # once before loop
+Used after the parent request is forked into particles.
 
-for step in 0 .. gamma:
-    input_ids  = draft_token_ids[:, step]            # [N]
-    positions  = seq_lens_cur                        # [N]
-    slot_ids   = kv_slots[:, :, step]               # [num_kv_groups, N]
+- driven inside `SMCGPUModelRunner.smc_draft_cycle()`
+- reuses upstream sampler components (`self.sampler(...)`)
+- does not use the full normal `sample_tokens()` lifecycle
 
-    attn_metadata        = _build_draft_attn_metadata(block_tables, seq_lens_cur+1, slot_ids)
-    slot_mappings_by_layer = build_slot_mappings_by_layer(slot_ids, kv_cache_config)
+## 9. `update_from_output()`
 
-    with set_forward_context(...):
-        hidden_states = model(input_ids, positions)  # [N, hidden_dim]
+`SMCVLLMScheduler.update_from_output(...)` does two things:
 
-    logits     = model.compute_logits(hidden_states) # [N, vocab_size]
-    log_probs  = log_softmax(logits / temperature)   # [N, vocab_size]
-    next_token = multinomial(log_probs.exp())        # [N]
+1. calls `super().update_from_output(...)` to let normal vLLM update ordinary
+   requests
+2. processes `model_runner_output.smc_draft_results`
 
-    seq_lens_cur += 1
+For each SMC group it:
 
-returns draft_token_ids [N, γ+1], draft_log_probs [N, γ+1, V]
-```
+- appends newly committed draft tokens to each particle's accumulated output
+- updates `seed_token_ids`
+- advances `num_computed_tokens`
+- or finishes the group and emits a final `EngineCoreOutput` for the parent request
 
----
+## 10. State Synchronization
 
-## 7. Out of Scope (this doc)
+The backend intentionally keeps some related state in both the scheduler and the
+GPU model runner. They stay in sync through the normal engine step protocol:
 
-- Target scoring (`smc_target_score`) — batched target model pass over draft tokens
-- Resampling (`process_decode_result`) — importance weights, particle resampling
-- Ongoing SMC group population in `schedule()` — depends on resampling output
+1. `scheduler.schedule()`
+2. `model_runner.execute_model(scheduler_output)`
+3. `scheduler.update_from_output(scheduler_output, model_runner_output)`
+
+### 10.1 What lives on the scheduler side
+
+The scheduler owns the high-level logical SMC state:
+
+- which parent requests have become SMC groups
+- `SMCParticleGroupState`
+  - `parent_req`
+  - `n_particles`
+  - `num_computed_tokens`
+  - `seed_token_ids`
+  - `shared_prefix_block_ids`
+  - `decode_block_ids`
+  - `particle_req_ids`
+  - `accumulated_tokens`
+- KV allocation / ownership through `kv_cache_manager`
+- final per-group completion bookkeeping in `_completed_groups`
+
+This is the source of truth for:
+
+- logical sequence progress
+- logical block ownership
+- per-particle accumulated output tokens
+
+### 10.2 What lives on the runner side
+
+The runner owns the GPU-execution-facing state:
+
+- `req_states`
+  - request rows
+  - `all_token_ids`
+  - `num_computed_tokens`
+  - `last_sampled_tokens`
+  - etc.
+- `block_tables`
+  - dense block-table rows indexed by runner request row
+- sampler state
+  - temperature / top-k / top-p
+  - penalty state
+  - bad-words / logit-bias state
+- `particle_groups`
+  - mapping from `group_id` to runner-local particle rows and req ids
+- physical draft KV cache tensors
+- physical target KV cache tensors
+
+This is the source of truth for:
+
+- GPU row indices
+- actual gathered block tables used by kernels
+- per-request sampler state on device
+- physical KV contents
+
+### 10.3 What is duplicated logically
+
+The same logical request/group is represented in two places:
+
+- Scheduler knows a group by `group_id` and `particle_req_ids`
+- Runner knows the same group by `group_id`, `particle_req_ids`, and
+  `particle_rows`
+
+The same logical decode progress also appears in two forms:
+
+- Scheduler tracks `num_computed_tokens` and `seed_token_ids`
+- Runner tracks request-row state in `req_states.num_computed_tokens`,
+  `req_states.all_token_ids`, and sampler penalty history
+
+The same logical KV layout also appears in two forms:
+
+- Scheduler tracks block ids as Python lists/tuples in
+  `shared_prefix_block_ids` and `decode_block_ids`
+- Runner tracks the same layout in GPU `block_tables` rows
