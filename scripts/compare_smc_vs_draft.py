@@ -170,7 +170,6 @@ def main():
         rendered = dict(rendered)
         prompt_token_ids.append(rendered["input_ids"])
 
-    print("prompt token ids: ", prompt_token_ids)
     smc_results = None
     draft_results = None
 

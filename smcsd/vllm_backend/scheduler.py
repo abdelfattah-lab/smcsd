@@ -74,11 +74,15 @@ class SMCVLLMScheduler(Scheduler):
         self.smc_n_particles: int = smc.n_particles
         self.smc_gamma: int = smc.gamma
         self.smc_groups: dict[str, SMCParticleGroupState] = {}  # group_id -> state
-        # Stores final per-particle token sequences after a group finishes
-        self._completed_groups: dict[str, list[list[int]]] = {} # key: parent_req_id
+        self._completed_groups: dict[str, list[list[int]]] = {}  # key: parent_req_id
+        # Requests that finished prefill but are waiting for particle-group capacity.
+        self._fork_waitlist: list[Request] = []
+        self.max_concurrent_groups: int = (
+            self.scheduler_config.max_num_seqs // self.smc_n_particles
+        )
 
     def has_requests(self) -> bool:
-        return super().has_requests() or bool(self.smc_groups)
+        return super().has_requests() or bool(self.smc_groups) or bool(self._fork_waitlist)
 
 
     def fork_to_particles(
@@ -166,7 +170,7 @@ class SMCVLLMScheduler(Scheduler):
             temperature=temperature,
         )
 
-    def update_particle_group(self, group_id: str) -> SMCGroupBatch:
+    def build_particle_group(self, group_id: str) -> SMCGroupBatch:
         """Build an SMCGroupBatch from current group state."""
         state = self.smc_groups[group_id]
         seq_lens = torch.full(
@@ -204,17 +208,24 @@ class SMCVLLMScheduler(Scheduler):
 
     def schedule(self) -> SMCSchedulerOutput:
         ongoing_smc_groups: list[SMCGroupBatch] = [
-            self.update_particle_group(gid)
+            self.build_particle_group(gid)
             for gid in list(self.smc_groups)
         ]
 
-        pending_fork: list[Request] = []
         for req in list(self.running):
-            # Detect requests that completed prefill last cycle: output_token_ids has exactly 1 token and not yet forked
             if (len(req.output_token_ids) == 1
                     and req.request_id not in self.smc_groups):
                 self.running.remove(req)
-                pending_fork.append(req)
+                self._fork_waitlist.append(req)
+
+        pending_fork: list[Request] = []
+        available = self.max_concurrent_groups - len(self.smc_groups)
+        for req in list(self._fork_waitlist):
+            if available <= 0:
+                break
+            self._fork_waitlist.remove(req)
+            pending_fork.append(req)
+            available -= 1
 
         # Prefill requests flow through vllm's base scheduler and execute_model
         base_output = super().schedule()
