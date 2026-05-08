@@ -4,9 +4,7 @@
 
 # SMC Speculative Decoding
 
-> **Warning:** This repository is under active development. APIs, configuration flags, and internal interfaces may go through breaking changes.
-
-This repository implements **Sequential Monte Carlo Speculative Decoding (SMC-SD)** on top of [SGLang](https://github.com/sgl-project/sglang). SMC-SD is a population-based alternative to rejection-based speculative decoding: N particles maintain parallel generation paths, weighted by target/draft likelihood ratios, and resampled when effective sample size drops. All drafted tokens are accepted (no rejection), and throughput scales with batch size by increasing arithmetic intensity toward the GPU compute bound.
+This repository implements **Sequential Monte Carlo Speculative Decoding (SMC-SD)** on top of [vllm](https://github.com/vllm-project/vllm). SMC-SD is a population-based alternative to rejection-based speculative decoding: N particles maintain parallel generation paths, weighted by target/draft likelihood ratios, and resampled when effective sample size drops. All drafted tokens are accepted (no rejection), and throughput scales with batch size by increasing arithmetic intensity toward the GPU compute bound.
 
 Paper: [*Faster LLM Inference via Sequential Monte Carlo*](https://arxiv.org/abs/2604.15672)
 
@@ -27,13 +25,8 @@ For a CUDA 12 / `torch ~2.9` build, point the submodule at the older `smc_v2_cle
 
 **Host requirements:** CUDA 13 toolkit installed (provides `libnvrtc.so.13`). On CUDA 12 systems the prebuilt `sglang-kernel` wheel will fail to load with an undefined-symbol or `libnvrtc.so.13: cannot open shared object file` error. The Python deps (`torch==2.11.0`, `sglang-kernel==0.4.2`) are pinned by the SGLang submodule's `pyproject.toml` and will be resolved automatically.
 
-`SMCEngine` will not import until the patched SGLang submodule is both checked out and installed. If you hit `ModuleNotFoundError: No module named 'sglang'`, run:
+A vllm backend is also available on the `vllm-backend` branch, which vendors a patched vllm as a git submodule at `3rdparty/vllm` (branch `vllm-smc` cut from vllm release branch `releases/v0.20.0`). Install both in editable mode.
 
-```bash
-git submodule update --init --recursive
-uv pip install -e 3rdparty/sglang/python
-uv pip install -e .
-```
 
 ```bash
 # 1. Clone with submodules — pick the branch you want
@@ -49,81 +42,54 @@ cd smcsd
 uv venv --python 3.12
 source .venv/bin/activate
 
-# 3. Install the patched SGLang (from the submodule), then this package
-uv pip install -e 3rdparty/sglang/python
+# 3. Install the patched vllm from source in editable mode using prebuilt wheels
+VLLM_USE_PRECOMPILED=1 uv pip install -e 3rdparty/vllm --torch-backend=auto
+
+# 4. Install smc from source in editable mode
 uv pip install -e .
 ```
 
 ## Quick Start
 
-```bash
-# SMC-SD throughput on ShareGPT
-python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
-  --backend smc_engine \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --speculative-draft-model-path meta-llama/Llama-3.2-1B-Instruct \
-  --smc-n-particles 8 --smc-gamma 8 \
-  --smc-draft-temperature 0.7 --smc-target-temperature 0.7 \
-  --attention-backend fa3 \
-  --mem-fraction-static 0.60 \
-  --max-running-requests 1 \
-  --cuda-graph-max-bs 8 \
-  --dataset-name sharegpt \
-  --num-prompts 200
-```
+### Smoke test 
 
 ```bash
-# SMC-SD accuracy on GSM8K (N=12 particles, gamma=8)
-python scripts/accuracy_test_gsm8k.py \
-  --mode smc_engine \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --draft-model meta-llama/Llama-3.2-1B-Instruct \
-  --particles 12 --gamma 8 \
-  --temperature 0.7 \
-  --attention-backend fa3 \
-  --num-questions 400
+python scripts/smc_vllm_engine.py
 ```
 
-
-
-> [!NOTE] 
-> When using non-Hopper GPU (such as A100, A6000), specify `--attention-backend` to be `triton`
-
-### Performance flags (fastest known config)
-
-The decode hot path has three opt-in, env-gated optimizations (all require `--attention-backend triton`):
-
-| Flag | What it does |
-| --- | --- |
-| `SMC_CYCLE_GRAPH=1` | One CUDA graph per decode cycle: draft AR + target verify + weight diff + bonus |
-| `SMC_ENABLE_OVERLAP=1` | Overlapped scheduler loop: CPU postprocessing of step *t* runs while the GPU executes *t+1* |
-| `SMC_DEFER_BONUS=1` | Deferred-bonus draft schedule — γ draft forwards per cycle instead of γ+1 (captured in the cycle graph when both flags are set) |
+### GSM8K accuracy — SMC vLLM engine
 
 ```bash
-# Fastest N=12, gamma=8 GSM8K config (single B300, Llama-3.1-8B + 3.2-1B)
-SMC_CYCLE_GRAPH=1 SMC_ENABLE_OVERLAP=1 SMC_DEFER_BONUS=1 \
-python scripts/accuracy_test_gsm8k.py \
-  --mode smc_engine \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --draft-model meta-llama/Llama-3.2-1B-Instruct \
-  --particles 12 --gamma 8 \
-  --temperature 0.7 \
-  --attention-backend triton \
-  --num-questions 400
+python scripts/accuracy_test_gsm8k_vllm.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --draft-model meta-llama/Llama-3.2-1B-Instruct \
+    --particles 1 \
+    --gamma 4 \
+    --temperature 0.0 \
+    --num-questions 200 \
+    --max-tokens 512 \
+    --batch-size 1 \
+    --max-model-len 2048 \
+    --gpu-mem 0.5
 ```
 
-Measured on GSM8K (200q, T=0.7, batch-size 1, B300; accuracy differences are within per-run noise):
+### GSM8K accuracy — plain vLLM baseline 
 
-| Config (all with cycle graph + overlap) | tok/s | accuracy |
-| --- | --- | --- |
-| N=4, γ=4 | 485 | 68.5% |
-| N=8, γ=8 | **542** | 70.0% |
-| N=12, γ=8 | 500 | 71.0% |
-| N=12, γ=8 + `SMC_DEFER_BONUS=1` | 524 | 70.5% |
+```bash
+python scripts/accuracy_test_gsm8k_vllm_baseline.py \
+    --draft-model meta-llama/Llama-3.1-8B-Instruct \
+    --temperature 0.0 \
+    --num-questions 200 \
+    --max-tokens 512 \
+    --batch-size 1 \
+    --max-model-len 2048 \
+    --gpu-mem 0.5
+```
 
-At batch size 1 decode is weight-read-bound, so extra particles are nearly free up to N≈8 (use the headroom to raise γ); beyond that KV/attention traffic starts to cost — N=8 γ=8 is the fastest measured setting, N=12 γ=8 the most accurate. `SMC_DEFER_BONUS` helps short/medium generations (+5–9%) but can cost ~1–2% on very long (3k+ token) single streams.
-
-See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
+### SMC Draft vs Plain vllm engine
+```bash
+python scripts/compare_smc_vs_draft.py
+```
 
 ## SMC-SD Parameters
 
@@ -137,24 +103,18 @@ See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
 ## Architecture
 
-SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via a handful of extension points (`ModelRunner._init_pools`, `ModelRunner._build_dummy_run_spec_info`, `ModelRunner._get_graph_runner_class`, `CudaGraphRunner.get_spec_info`, `Scheduler.init_tp_model_worker`, `TpModelWorker._init_model_runner`).
+SMC lives in the top-level `smcsd/` package. The SGLang backend is layered over patched SGLang extension points; the vLLM backend is layered over an in-process vLLM `EngineCore` with an SMC scheduler and GPU model runner.
 
 | Path | Description |
 | --- | --- |
-| `smcsd/engine.py` | `SMCEngine` — standalone offline engine (bypasses Tokenizer/Detokenizer managers) |
+| `smcsd/engine.py` | `SMCEngine` — standalone offline SGLang-backed engine |
 | `smcsd/core/scheduler.py` | `SMCScheduler` + `SMCCoordinator` — slot-based decode loop and resampler |
 | `smcsd/core/worker.py` | `SMCWorker` — draft AR loop + target scoring + importance weights |
-| `smcsd/core/req_state.py` | `ScheduleBatchSMC` — per-slot decode state, flat slot-major weights, and group lookup |
-| `smcsd/core/info.py` | `SMCDraftInput`, `SMCDecodeContext` — spec-info wiring |
-| `smcsd/core/kernels/` | Fused Triton kernels (`fused_collect`, `fused_resample_kv`) |
-| `smcsd/managers/smc_tp_worker.py` | `SMCTpModelWorker` — wires `SMCModelRunner` into the target TP worker |
-| `smcsd/model_executor/smc_model_runner.py` | `SMCModelRunner` — installs refcounted allocator + SMC warmup spec-info |
-| `smcsd/model_executor/smc_cuda_graph_runner.py` | `SMCCudaGraphRunner` — `SMCVerifyInput` during CUDA graph capture |
-| `smcsd/mem_cache/allocator.py` | `SMCRefCountedTokenAllocator` + `copy_block_table` |
-| `smcsd/common/verify.py` | `SMCVerifyInput` + Triton cache-assignment kernel |
-| `smcsd/common/utils.py` | Particle cloning, weight normalization, ESS / resample helpers |
+| `smcsd/vllm_backend/engine.py` | `SMCVLLMEngine` — offline vLLM-backed SMC engine |
+| `smcsd/vllm_backend/scheduler.py` | `SMCVLLMScheduler` — particle-group scheduling and KV block ownership |
+| `smcsd/vllm_backend/model_runner.py` | `SMCGPUModelRunner` — draft model, target scoring, and resampling on vLLM |
 
-See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design overview.
+See [docs/smc/architecture.md](docs/smc/architecture.md) and [docs/smc/vllm_architecture.md](docs/smc/vllm_architecture.md) for detailed design overviews.
 
 ## Citation
 
@@ -171,13 +131,3 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design
   url           = {https://arxiv.org/abs/2604.15672},
 }
 ```
-
-## Roadmap
-
-- [ ] EAGLE support
-- [ ] vLLM support
-- [ ] Async/Delayed resampling (CPU/GPU overlap for KV cache rewrites)
-- [ ] Async SMC-SD at resample threshold 0 (overlap draft and target for SIS)
-- [ ] Disaggregation (draft/target separation)
-
-PRs welcome!
