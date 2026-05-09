@@ -14,7 +14,6 @@ import os
 from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch

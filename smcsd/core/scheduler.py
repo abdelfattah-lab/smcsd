@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import copy
 import logging
 import signal
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
@@ -28,7 +26,6 @@ from smcsd.common.utils import (
     validate_smc_parent_req,
 )
 from smcsd.mem_cache.allocator import copy_block_table
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
 
@@ -53,8 +50,6 @@ class SequenceGroup:
     n_particles: int
     particle_temperature: float
     particle_reqs: Dict[int, Req] = field(default_factory=dict)
-    log_weights: Optional[torch.Tensor] = None
-    interval_log_weights: Optional[torch.Tensor] = None
 
     @property
     def group_id(self) -> str:
@@ -63,27 +58,7 @@ class SequenceGroup:
     def has_materialized_particles(self) -> bool:
         return bool(self.particle_reqs)
 
-    def active_particle_indices(self) -> List[int]:
-        return [
-            idx for idx, req in self.particle_reqs.items() if not req.finished()
-        ]
-
-    def active_particle_reqs(self) -> List[Req]:
-        return [
-            self.particle_reqs[idx] for idx in sorted(self.active_particle_indices())
-        ]
-
-    def active_slot_keys(self) -> List[Tuple[str, int]]:
-        return [(self.group_id, idx) for idx in self.active_particle_indices()]
-
-    def all_particle_indices(self) -> List[int]:
-        return sorted(self.particle_reqs)
-
-    def materialize_particles(
-        self,
-        *,
-        device: torch.device | str,
-    ) -> None:
+    def materialize_particles(self) -> None:
         if self.particle_reqs:
             return
         parent_req = self.parent_req
@@ -98,17 +73,9 @@ class SequenceGroup:
             particle_reqs.append(particle_req)
 
         self.particle_reqs = {req.smc_particle_idx: req for req in particle_reqs}
-        self.log_weights = torch.zeros(
-            self.n_particles,
-            dtype=torch.float64,
-            device=device,
-        )
-        self.interval_log_weights = torch.zeros_like(self.log_weights)
 
     def clear_particles(self) -> None:
         self.particle_reqs = {}
-        self.log_weights = None
-        self.interval_log_weights = None
 
 
 class SMCCoordinator:
@@ -607,7 +574,7 @@ class SMCScheduler(Scheduler):
         except Exception as exc:
             return f"SMC parent draft prefill failed: {exc}"
 
-        group.materialize_particles(device=self.device)
+        group.materialize_particles()
         particle_reqs = list(group.particle_reqs.values())
         if self.req_to_token_pool.alloc(particle_reqs) is None:
             group.clear_particles()
