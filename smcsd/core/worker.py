@@ -1,9 +1,15 @@
-"""SMC Worker: hybrid Qwen3.5/3.6 dense-AR draft path.
+"""SMC worker: dense-AR draft path.
 
 Draft model performs gamma+1 autoregressive decode steps.
 Score model performs one extend forward pass on the drafted tokens.
 Computes logprob difference between the two models per request.
 No rejection — all drafted tokens are accepted.
+
+Supports any (target, draft) pair where the draft can be loaded as a
+standalone autoregressive LM. The optional ``_maybe_isolate_dense_hybrid_
+draft_state`` path additionally handles hybrid (Mamba+attention) targets
+whose draft has a different recurrent-state shape (e.g. Qwen3.6-27B target
++ Qwen3.5-2B / 4B draft, or Qwen3.6-35B-A3B MoE draft).
 """
 
 from __future__ import annotations
@@ -76,9 +82,9 @@ class SMCWorker(BaseSpecWorker):
         self.smc_target_temperature = max(
             float(server_args.smc_target_temperature), 1e-5
         )
-        # Hybrid-only branch: only the dense-draft path is supported.
-        # eagle3/dflash code paths have been stripped out — see
-        # hybrid-models-on-main if you want those.
+        # Only the dense-AR draft path is supported. Eagle3 + DFlash code
+        # paths were stripped from this branch; see PR #7 (commit 5c00bc9f5
+        # on the closed hybrid-models-on-main branch) if those are needed.
         self._dense_draft_hybrid_req_to_token_pool = None
 
         # Share req_to_token_pool, separate KV caches
@@ -324,8 +330,8 @@ class SMCWorker(BaseSpecWorker):
 
         Official SGLang speculative paths run hybrid/GDN target verification with
         deferred state updates, then scatter the accepted intermediate state back
-        into the live mamba cache. Dense SMC also uses TARGET_VERIFY, so it must
-        perform the same commit for Qwen3.5-style hybrid targets.
+        into the live mamba cache. The dense-AR SMC path also uses TARGET_VERIFY,
+        so it must perform the same commit for hybrid (Mamba+attention) targets.
         """
         attn_backend = self._target_worker.model_runner.attn_backend
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):

@@ -119,11 +119,7 @@ class SMCCoordinator:
 
     # ── Public API ──────────────────────────────────────────
 
-    def collect_resample_jobs_batch(
-        self,
-        group_ids: List[str],
-        slot_state: "ScheduleBatchSMC",
-    ):
+    def collect_resample_jobs_batch(self, slot_state: "ScheduleBatchSMC"):
         """Collect resample jobs for all active groups.
 
         Returns a ``BatchedResampleResult`` consumed by
@@ -259,7 +255,6 @@ class SMCScheduler(Scheduler):
             resample_threshold=server_args.smc_resample_threshold,
             resample_method=server_args.smc_resample_method,
         )
-        self._group_idx_counter = 0
 
     def _make_runtime_tracking_batch(
         self,
@@ -626,12 +621,9 @@ class SMCScheduler(Scheduler):
         )
 
         # Populate slot state
-        group_idx = self._group_idx_counter
-        self._group_idx_counter += 1
         try:
             slots = self.slot_state.allocate_slots(
                 group_id=group.group_id,
-                group_idx=group_idx,
                 particle_reqs=particle_reqs,
                 shared_seq_len=shared_seq_len,
             )
@@ -703,14 +695,7 @@ class SMCScheduler(Scheduler):
         )
 
         # Resample all groups via the fused systematic kernel.
-        active_group_ids = [
-            group.group_id
-            for group in self.running_groups
-            if self.slot_state.group_has_active(group.group_id)
-        ]
-        plan = self.coordinator.collect_resample_jobs_batch(
-            active_group_ids, self.slot_state
-        )
+        plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
         did_resample = (
             bool(plan) if isinstance(plan, list) else plan.n_jobs > 0
         )

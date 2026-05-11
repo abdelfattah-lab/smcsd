@@ -203,7 +203,6 @@ class ScheduleBatchSMC:
         group_id: str,
         particle_reqs: List[Req],
         shared_seq_len: int,
-        group_idx: int = 0,  # accepted but unused (scheduler-side counter)
     ) -> List[int]:
         """Claim N slots + one group row for a freshly materialised group.
 
