@@ -109,21 +109,10 @@ def copy_smc_resampled_hybrid_state(
     device: torch.device | str,
 ) -> None:
     """Copy hybrid recurrent state after SMC resampling clones particles."""
-    if isinstance(plan, list):
-        dst_slots: List[int] = []
-        src_slots: List[int] = []
-        for job in plan:
-            dst_slots.extend(job.dst_slots)
-            src_slots.extend(job.src_slots)
-        if not dst_slots:
-            return
-        dst_slots_t = torch.tensor(dst_slots, dtype=torch.long, device=device)
-        src_slots_t = torch.tensor(src_slots, dtype=torch.long, device=device)
-    else:
-        if plan.n_jobs == 0:
-            return
-        dst_slots_t = plan.dst_slots.to(torch.long)
-        src_slots_t = plan.src_slots.to(torch.long)
+    if plan.n_jobs == 0:
+        return
+    dst_slots_t = plan.dst_slots.to(torch.long)
+    src_slots_t = plan.src_slots.to(torch.long)
 
     dst_req_pool = slot_state.req_pool_indices[dst_slots_t]
     src_req_pool = slot_state.req_pool_indices[src_slots_t]

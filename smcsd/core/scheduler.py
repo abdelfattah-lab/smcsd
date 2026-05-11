@@ -687,9 +687,7 @@ class SMCScheduler(Scheduler):
 
         # Resample all groups via the fused systematic kernel.
         plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
-        did_resample = (
-            bool(plan) if isinstance(plan, list) else plan.n_jobs > 0
-        )
+        did_resample = plan.n_jobs > 0
         if did_resample:
             self.coordinator.dispatch_resample_batch(
                 plan, self.slot_state, rebuild_active=False,
