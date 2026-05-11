@@ -6,10 +6,9 @@ Computes logprob difference between the two models per request.
 No rejection — all drafted tokens are accepted.
 
 Supports any (target, draft) pair where the draft can be loaded as a
-standalone autoregressive LM. The optional ``_maybe_isolate_dense_hybrid_
-draft_state`` path additionally handles hybrid (Mamba+attention) targets
-whose draft has a different recurrent-state shape (e.g. Qwen3.6-27B target
-+ Qwen3.5-2B / 4B draft, or Qwen3.6-35B-A3B MoE draft).
+standalone autoregressive LM. Hybrid (Mamba+attention) targets whose draft
+has a different recurrent-state shape get an isolated draft Mamba pool via
+``_maybe_isolate_dense_hybrid_draft_state``.
 """
 
 from __future__ import annotations
@@ -82,9 +81,7 @@ class SMCWorker(BaseSpecWorker):
         self.smc_target_temperature = max(
             float(server_args.smc_target_temperature), 1e-5
         )
-        # Only the dense-AR draft path is supported. Eagle3 + DFlash code
-        # paths were stripped from this branch; see PR #7 (commit 5c00bc9f5
-        # on the closed hybrid-models-on-main branch) if those are needed.
+        # Only the dense-AR draft path is supported here.
         self._dense_draft_hybrid_req_to_token_pool = None
 
         # Share req_to_token_pool, separate KV caches

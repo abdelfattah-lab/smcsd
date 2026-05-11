@@ -90,8 +90,7 @@ class SMCCoordinator:
        KV block-table copy + refcount update) plus a per-pair
        ``copy_req_metadata`` Python loop (inherent unavoidable cost).
 
-    Only the fused systematic path is supported. The legacy per-group Python
-    "slow" path was removed when the fused kernel became the validated default.
+    Only the fused systematic path is supported.
     """
 
     def __init__(
@@ -120,34 +119,11 @@ class SMCCoordinator:
     # ── Public API ──────────────────────────────────────────
 
     def collect_resample_jobs_batch(self, slot_state: "ScheduleBatchSMC"):
-        """Collect resample jobs for all active groups.
+        """One fused-kernel launch over all in-use group rows.
 
         Returns a ``BatchedResampleResult`` consumed by
         ``dispatch_resample_batch``.
         """
-        return self._collect_fast(slot_state)
-
-    def dispatch_resample_batch(
-        self,
-        plan,
-        slot_state: "ScheduleBatchSMC",
-        *,
-        rebuild_active: bool = True,
-    ) -> None:
-        """Dispatch a collect plan via the fused KV copy. No-op on empty plans."""
-        if plan.n_jobs == 0:
-            return
-        self._dispatch_fast(plan, slot_state)
-
-        # Resampling can copy finished ancestors into previously active slots.
-        # Caller may defer rebuild to batch with other membership changes.
-        if rebuild_active:
-            slot_state.rebuild_active_slots()
-
-    # ── Fused systematic kernel ─────────────────────────────
-
-    def _collect_fast(self, slot_state: "ScheduleBatchSMC"):
-        """One fused kernel launch.  Returns `BatchedResampleResult`."""
         from smcsd.core.kernels.fused_collect import batched_collect_fused
 
         self._fast_step_counter += 1
@@ -160,8 +136,19 @@ class SMCCoordinator:
             step_counter=self._fast_step_counter,
         )
 
-    def _dispatch_fast(self, plan, slot_state: "ScheduleBatchSMC") -> None:
-        """Fused KV copy + vectorised slot-tensor copies + req metadata loop."""
+    def dispatch_resample_batch(
+        self,
+        plan,
+        slot_state: "ScheduleBatchSMC",
+        *,
+        rebuild_active: bool = True,
+    ) -> None:
+        """Apply a resample plan: fused KV copy + per-slot tensor copies +
+        per-pair req metadata loop. No-op on empty plans.
+        """
+        if plan.n_jobs == 0:
+            return
+
         from smcsd.core.kernels.fused_resample_kv import batched_resample_kv
 
         dst_idx = plan.dst_slots.to(torch.int64)
@@ -169,7 +156,7 @@ class SMCCoordinator:
 
         if __debug__:
             assert not torch.isin(dst_idx, src_idx).any().item(), (
-                "Cross-group dst/src slot overlap detected (fast path)"
+                "Cross-group dst/src slot overlap detected"
             )
 
         dst_pool_indices = slot_state.req_pool_indices[dst_idx].to(torch.int32)
@@ -196,11 +183,15 @@ class SMCCoordinator:
         slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
         slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
 
-        # Req metadata loop — accepted unavoidable Python-side cost.
+        # Per-pair req-level metadata copy (Python; output_ids list,
+        # finished_reason object, etc.).
         for dst_slot, src_slot in zip(
             dst_idx.tolist(), src_idx.tolist(), strict=True
         ):
             slot_state.copy_req_metadata(dst_slot, src_slot)
+
+        if rebuild_active:
+            slot_state.rebuild_active_slots()
 
 
 class SMCScheduler(Scheduler):

@@ -244,7 +244,7 @@ class ScheduleBatchSMC:
             self.max_new_tokens_t[slot] = req.sampling_params.max_new_tokens
 
             # EOS token ids: gather from req.eos_token_ids, sampling_params
-            # stop_token_ids, and the tokenizer (matches v1 check_finished).
+            # stop_token_ids, and the tokenizer.
             eos_ids = list(req.eos_token_ids or [])
             if req.sampling_params.stop_token_ids:
                 eos_ids.extend(req.sampling_params.stop_token_ids)
@@ -311,9 +311,10 @@ class ScheduleBatchSMC:
                 self.token_to_kv_pool_allocator.dec_ref_and_free(indices)
                 req = self.slot_to_req.get(slot)
                 if req is not None:
-                    # Hybrid+hybrid mamba-state cleanup (leak fix from
-                    # 9dfd27611): clear the draft pool's mamba slot before
-                    # freeing the target req.
+                    # For hybrid (Mamba+attention) targets with an isolated
+                    # draft Mamba pool, clear the draft slot before freeing
+                    # the target req — otherwise the next request to reuse
+                    # this req_pool_idx would inherit stale Mamba state.
                     if (
                         hasattr(self.req_to_token_pool, "free_mamba_cache")
                         and req.mamba_pool_idx is not None
