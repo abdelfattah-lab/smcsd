@@ -200,19 +200,19 @@ class SMCGPUModelRunner(GPUModelRunner):
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
 
-        if particle_req_ids:
-            debug_particles = min(2, len(particle_req_ids))
-            print(f"[smc-debug] register_particle_group group_id={group_id} prompt_len={prompt_len} num_computed_tokens={num_computed_tokens}")
-            print(f"[smc-debug] shared_prefix_block_ids={tuple(list(x) for x in prefix_block_ids)}")
-            for i in range(debug_particles):
-                combined_block_ids = tuple(
-                    list(prefix_block_ids[g]) + list(decode_block_ids[i][g])
-                    for g in range(len(prefix_block_ids))
-                )
-                print(
-                    f"[smc-debug] particle[{i}] req_id={particle_req_ids[i]} "
-                    f"row={particle_rows[i]} combined_block_ids={combined_block_ids}"
-                )
+        # if particle_req_ids:
+        #     debug_particles = min(2, len(particle_req_ids))
+        #     print(f"[smc-debug] register_particle_group group_id={group_id} prompt_len={prompt_len} num_computed_tokens={num_computed_tokens}")
+        #     print(f"[smc-debug] shared_prefix_block_ids={tuple(list(x) for x in prefix_block_ids)}")
+        #     for i in range(debug_particles):
+        #         combined_block_ids = tuple(
+        #             list(prefix_block_ids[g]) + list(decode_block_ids[i][g])
+        #             for g in range(len(prefix_block_ids))
+        #         )
+        #         print(
+        #             f"[smc-debug] particle[{i}] req_id={particle_req_ids[i]} "
+        #             f"row={particle_rows[i]} combined_block_ids={combined_block_ids}"
+        #         )
 
         self.particle_groups[group_id] = ParticleGroup(
             group_id=group_id,
