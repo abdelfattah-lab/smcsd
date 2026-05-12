@@ -108,7 +108,7 @@ def main():
     )
     parser.add_argument("--draft-model", default=DEFAULT_DRAFT_MODEL)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--num-questions", type=int, default=1000)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=2048)
