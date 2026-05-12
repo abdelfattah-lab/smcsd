@@ -22,7 +22,10 @@ from transformers import AutoTokenizer
 from smcsd.vllm_backend.engine import SMCVLLMEngine
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+# DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+# DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
 
 # ---------------------------------------------------------------------------
@@ -141,11 +144,11 @@ def main():
     parser.add_argument("--particles", "-N", type=int, default=1)
     parser.add_argument("--gamma", "-g", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--num-questions", type=int, default=1000)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=2048)
-    parser.add_argument("--gpu-mem", type=float, default=0.5)
+    parser.add_argument("--gpu-mem", type=float, default=0.4)
     args = parser.parse_args()
 
     print(f"Model:       {args.model}")
@@ -154,8 +157,7 @@ def main():
     print(f"num_questions={args.num_questions}  max_tokens={args.max_tokens}")
     print()
 
-    # Use target model tokenizer for chat template (same as engine internals)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.draft_model)
     prompts, labels = load_gsm8k(tokenizer, args.num_questions)
 
     preds, total_tokens, latency = run_eval(args, prompts, labels)
