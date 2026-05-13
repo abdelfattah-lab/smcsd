@@ -960,6 +960,11 @@ class SMCSchedulerV2(Scheduler):
             if next_draft is not None
             else None
         )
+        next_dflash_draft_caches = (
+            next_draft.dflash_draft_caches
+            if next_draft is not None
+            else None
+        )
         newly_finished = self.slot_state.process_batch_result(
             next_token_ids=result.next_token_ids,
             accept_lens=result.accept_lens,
@@ -969,6 +974,7 @@ class SMCSchedulerV2(Scheduler):
             next_first_draft_token_id=next_first_draft_id,
             next_first_draft_logprob=next_first_draft_lp,
             next_hidden_contexts=next_hidden_contexts,
+            next_dflash_draft_caches=next_dflash_draft_caches,
             rebuild_active=False,
         )
 

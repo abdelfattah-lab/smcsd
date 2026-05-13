@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import logging
 from collections import deque
-from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple
 
 import torch
 
@@ -125,6 +125,7 @@ class ScheduleBatchSMC:
         # can differ across active groups. Hot tensor state remains in the dense
         # per-slot arrays above; this path is eager and correctness-first.
         self.target_hidden_contexts: Dict[int, torch.Tensor] = {}
+        self.dflash_draft_caches: Dict[int, Any] = {}
 
         # ── EAGLE3: per-slot carry of the pre-sampled "first draft token" ──
         # Allocated lazily. These are the draft's own prediction of the next
@@ -315,8 +316,11 @@ class ScheduleBatchSMC:
             )
 
         if prefill_hidden_context is not None:
+            from transformers import DynamicCache
+
             for slot in slots:
                 self.target_hidden_contexts[int(slot)] = prefill_hidden_context
+                self.dflash_draft_caches[int(slot)] = DynamicCache()
 
     def free_group_slots(self, group_id: str) -> None:
         """Free all slots for a finalized group."""
@@ -352,6 +356,7 @@ class ScheduleBatchSMC:
             self.slot_to_req.pop(slot, None)
             self.slot_to_group_id.pop(slot, None)
             self.target_hidden_contexts.pop(slot, None)
+            self.dflash_draft_caches.pop(slot, None)
             self.free_slots.append(slot)
 
         self.group_log_weights.pop(group_id, None)
@@ -447,6 +452,11 @@ class ScheduleBatchSMC:
             hidden_contexts_g = [
                 self.target_hidden_contexts[int(slot)] for slot in active_list
             ]
+        dflash_caches_g = None
+        if self.dflash_draft_caches:
+            dflash_caches_g = [
+                self.dflash_draft_caches.get(int(slot)) for slot in active_list
+            ]
 
         return SMCDraftInputV2(
             verified_id=verified_g,
@@ -456,6 +466,7 @@ class ScheduleBatchSMC:
             first_draft_token_id=fd_ids_g,
             first_draft_logprob=fd_logp_g,
             target_hidden_contexts=hidden_contexts_g,
+            dflash_draft_caches=dflash_caches_g,
         )
 
     # ────────────────────────────────────────────────────────
@@ -555,6 +566,7 @@ class ScheduleBatchSMC:
         next_first_draft_token_id: Optional[torch.Tensor] = None,
         next_first_draft_logprob: Optional[torch.Tensor] = None,
         next_hidden_contexts: Optional[List[torch.Tensor]] = None,
+        next_dflash_draft_caches: Optional[List[Any]] = None,
         rebuild_active: bool = True,
     ) -> List[int]:
         """Write forward results back to slot state. Returns newly finished slots.
@@ -569,17 +581,46 @@ class ScheduleBatchSMC:
         bs = self.num_active
         stride = self.gamma_plus_1
 
-        # a. Write accepted tokens to all_token_ids
-        # Reshape to (bs, stride) and scatter into sparse 2D tensor
+        # a. Write accepted tokens to all_token_ids. Most SMC draft modes commit
+        # the full stride, but DFlash-style verification can commit a shorter
+        # prefix plus the target bonus token.
         accepted_2d = next_token_ids.reshape(bs, stride)
+        accept_lens_i64 = accept_lens.to(device=self.device, dtype=torch.int64)
+        valid_accept_mask = (
+            torch.arange(stride, dtype=torch.int64, device=self.device).unsqueeze(0)
+            < accept_lens_i64.unsqueeze(1)
+        )
         offsets = self.token_counts[active].to(torch.int64)  # (bs,)
         # Vectorized scatter: build (bs, stride) index grids, write in one shot
         row_idx = active.unsqueeze(1).expand(-1, stride)  # (bs, stride)
         col_idx = offsets.unsqueeze(1) + torch.arange(
             stride, dtype=torch.int64, device=self.device,
         )  # (bs, stride)
-        self.all_token_ids[row_idx, col_idx] = accepted_2d.to(self.all_token_ids.dtype)
-        self.token_counts[active] += stride
+        if valid_accept_mask.any():
+            self.all_token_ids[row_idx[valid_accept_mask], col_idx[valid_accept_mask]] = (
+                accepted_2d[valid_accept_mask].to(self.all_token_ids.dtype)
+            )
+        self.token_counts[active] += accept_lens_i64.to(self.token_counts.dtype)
+
+        # b0. If a draft mode committed fewer than stride tokens, release the
+        # uncommitted target KV slots that were reserved during prepare_for_decode.
+        # For dense/EAGLE this branch is skipped because accept_lens == stride.
+        if not torch.all(accept_lens_i64 == stride).item():
+            old_seq_lens = self.seq_lens[active] - stride
+            new_seq_lens = old_seq_lens + accept_lens_i64
+            for row, slot in enumerate(active.tolist()):
+                old_len = int(old_seq_lens[row].item())
+                new_len = int(new_seq_lens[row].item())
+                alloc_len = old_len + stride
+                if new_len < alloc_len:
+                    pool_idx = int(self.req_pool_indices[slot].item())
+                    to_free = self.req_to_token_pool.req_to_token[
+                        pool_idx, new_len:alloc_len
+                    ].to(dtype=torch.int64, copy=True)
+                    if to_free.numel() > 0:
+                        self.token_to_kv_pool_allocator.dec_ref_and_free(to_free)
+            self.seq_lens[active] = new_seq_lens
+            self.kv_allocated_lens[active] = new_seq_lens
 
         # b. Update verified_ids
         self.verified_ids[active] = bonus_ids.to(dtype=torch.int32)
@@ -625,6 +666,13 @@ class ScheduleBatchSMC:
             )
             for slot, hidden_context in zip(active.tolist(), next_hidden_contexts):
                 self.target_hidden_contexts[int(slot)] = hidden_context
+        if next_dflash_draft_caches is not None:
+            assert len(next_dflash_draft_caches) == bs, (
+                f"next_dflash_draft_caches must have one cache per active slot: "
+                f"got {len(next_dflash_draft_caches)} for {bs} slots."
+            )
+            for slot, draft_cache in zip(active.tolist(), next_dflash_draft_caches):
+                self.dflash_draft_caches[int(slot)] = draft_cache
 
         # c. Batched finish check
         newly_finished: List[int] = []
@@ -638,10 +686,8 @@ class ScheduleBatchSMC:
         # Suppressed for slots with ignore_eos=True (matches v1's
         # _check_token_based_finish which skips all token-based checks).
         eos_ids = self.eos_token_ids_t[active]  # (bs, max_eos_count)
-        eos_hit = (
-            accepted_2d.unsqueeze(2).to(torch.int64)
-            == eos_ids.unsqueeze(1)
-        ).any(dim=2).any(dim=1)  # (bs,)
+        eos_match = accepted_2d.unsqueeze(2).to(torch.int64) == eos_ids.unsqueeze(1)
+        eos_hit = (eos_match & valid_accept_mask.unsqueeze(2)).any(dim=2).any(dim=1)
         eos_hit = eos_hit & ~self.ignore_eos_t[active]
 
         newly_finished_mask = (length_hit | eos_hit) & ~self.finished_mask[active]
@@ -684,7 +730,7 @@ class ScheduleBatchSMC:
                     req.finished_reason = FINISH_MATCHED_TOKEN(matched=matched_tok)
                     # finished_len = tokens before this stride + EOS position + 1
                     # (matches v1: output_ids[:finished_len] includes EOS, excludes post-EOS)
-                    old_count = count - stride
+                    old_count = count - int(accept_lens_i64[idx].item())
                     req.finished_len = old_count + eos_pos_in_stride + 1
                 # Set output_ids truncated at finished_len (excludes post-EOS tokens)
                 req.output_ids = self.all_token_ids[
@@ -717,6 +763,23 @@ class ScheduleBatchSMC:
     #  Resampling
     # ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _clone_dflash_cache(cache: Any) -> Any:
+        """Clone a HF DynamicCache so resampled particles can diverge safely."""
+        if cache is None:
+            return None
+        from transformers import DynamicCache
+
+        cache_data = []
+        for key, value, sliding_window in cache:
+            if key is None or value is None:
+                cache_data.append((key, value))
+            elif sliding_window is None:
+                cache_data.append((key.clone(), value.clone()))
+            else:
+                cache_data.append((key.clone(), value.clone(), sliding_window.clone()))
+        return DynamicCache(ddp_cache_data=cache_data)
+
     def resample_copy_slot(self, dst_slot: int, src_slot: int) -> None:
         """Copy all state from src_slot to dst_slot for resampling."""
         old_dst_alloc = int(self.kv_allocated_lens[dst_slot].item())
@@ -736,6 +799,12 @@ class ScheduleBatchSMC:
             self.target_hidden_contexts[dst_slot] = self.target_hidden_contexts[src_slot]
         else:
             self.target_hidden_contexts.pop(dst_slot, None)
+        if src_slot in self.dflash_draft_caches:
+            self.dflash_draft_caches[dst_slot] = self._clone_dflash_cache(
+                self.dflash_draft_caches[src_slot]
+            )
+        else:
+            self.dflash_draft_caches.pop(dst_slot, None)
 
         src_count = int(self.token_counts[src_slot].item())
         self.token_counts[dst_slot] = src_count
@@ -783,6 +852,12 @@ class ScheduleBatchSMC:
             self.target_hidden_contexts[dst_slot] = self.target_hidden_contexts[src_slot]
         else:
             self.target_hidden_contexts.pop(dst_slot, None)
+        if src_slot in self.dflash_draft_caches:
+            self.dflash_draft_caches[dst_slot] = self._clone_dflash_cache(
+                self.dflash_draft_caches[src_slot]
+            )
+        else:
+            self.dflash_draft_caches.pop(dst_slot, None)
 
     def copy_req_metadata(self, dst_slot: int, src_slot: int) -> None:
         """Copy req-side state from src to dst after fused tensor/KV copies."""
@@ -798,6 +873,16 @@ class ScheduleBatchSMC:
         dst_req.decoded_text = src_req.decoded_text
         dst_req.surr_offset = src_req.surr_offset
         dst_req.read_offset = src_req.read_offset
+        if src_slot in self.target_hidden_contexts:
+            self.target_hidden_contexts[dst_slot] = self.target_hidden_contexts[src_slot]
+        else:
+            self.target_hidden_contexts.pop(dst_slot, None)
+        if src_slot in self.dflash_draft_caches:
+            self.dflash_draft_caches[dst_slot] = self._clone_dflash_cache(
+                self.dflash_draft_caches[src_slot]
+            )
+        else:
+            self.dflash_draft_caches.pop(dst_slot, None)
 
     # ────────────────────────────────────────────────────────
     #  Finalization

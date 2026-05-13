@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, List, Optional, Tuple
 
 import torch
 
@@ -294,6 +294,7 @@ class SMCDraftInputV2(SpecInput):
     # verified bonus token is intentionally not included because it has no target KV
     # or hidden state until the next verify pass consumes it.
     target_hidden_contexts: Optional[List[torch.Tensor]] = None
+    dflash_draft_caches: Optional[List[Any]] = None
 
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1
