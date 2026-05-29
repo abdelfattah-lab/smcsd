@@ -25,6 +25,7 @@ from smcsd.common.utils import (
     fanout_smc_parent_hybrid_state,
     validate_smc_parent_req,
 )
+from smcsd.core.info import SMCParticleOutput
 from smcsd.mem_cache.allocator import copy_block_table
 from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
@@ -179,6 +180,9 @@ class SMCCoordinator:
         slot_state.seq_lens[dst_idx] = slot_state.seq_lens[src_idx]
         slot_state.kv_allocated_lens[dst_idx] = slot_state.kv_allocated_lens[src_idx]
         slot_state.verified_ids[dst_idx] = slot_state.verified_ids[src_idx]
+        slot_state.prev_last_draft_ids[dst_idx] = slot_state.prev_last_draft_ids[
+            src_idx
+        ]
         slot_state.finished_mask[dst_idx] = slot_state.finished_mask[src_idx]
         slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
         slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
@@ -675,6 +679,11 @@ class SMCScheduler(Scheduler):
         bonus_ids = next_draft.verified_id if next_draft is not None else None
         if bonus_ids is None:
             raise RuntimeError("SMCScheduler: result missing next_draft_input.verified_id")
+        # This step's last drafted token, deferred into next step's leading
+        # 2-token draft forward.  Carried but not yet consumed (Step 2).
+        prev_last_draft_ids = (
+            next_draft.prev_last_draft_id if next_draft is not None else None
+        )
 
         # Write results back to slot state (defer rebuild to end of cycle).
         newly_finished = self.slot_state.process_batch_result(
@@ -682,12 +691,21 @@ class SMCScheduler(Scheduler):
             accept_lens=result.accept_lens,
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
+            prev_last_draft_ids=prev_last_draft_ids,
             rebuild_active=False,
         )
+
+        # Snapshot the per-row log Z_hat increment BEFORE the resample kernel
+        # zeroes weights, then fold it into group_log_Z_hat for the rows that
+        # actually resample (unbiased-estimator product over resample steps).
+        logZ_inc = self.slot_state.resample_logZ_increment()
 
         # Resample all groups via the fused systematic kernel.
         plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
         did_resample = plan.n_jobs > 0
+        self.slot_state.group_log_Z_hat += torch.where(
+            plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
+        )
         if did_resample:
             self.coordinator.dispatch_resample_batch(
                 plan, self.slot_state, rebuild_active=False,
@@ -731,6 +749,18 @@ class SMCScheduler(Scheduler):
 
         parent_req = self.slot_state.finalize_group(group.group_id, group.parent_req)
         parent_req.time_stats.set_completion_time()
+        # Emit the full particle collection + unbiased log Z_hat on the same
+        # scheduler->engine socket, BEFORE the token output.  FIFO delivery
+        # guarantees the engine sees this while the rid is still pending (the
+        # finish signal rides on the BatchTokenIDOutput that follows).
+        self.send_to_detokenizer.send_output(
+            SMCParticleOutput(
+                rid=parent_req.rid,
+                log_Z_hat=parent_req.smc_log_Z_hat,
+                log_w_tilde=parent_req.smc_log_w_tilde,
+                particle_output_ids=parent_req.smc_particle_output_ids,
+            )
+        )
         self.stream_output([parent_req], False)
 
 

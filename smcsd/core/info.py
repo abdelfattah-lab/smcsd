@@ -33,6 +33,23 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+@dataclass
+class SMCParticleOutput:
+    """Side-channel message: the full particle collection for one finalized SMC
+    group, sent scheduler -> engine alongside the normal token output.
+
+    Plain-Python fields only, so it pickles cleanly over ZMQ.  ``log_Z_hat`` is
+    the unbiased log normalizing-constant estimate for the group;
+    ``log_w_tilde`` are the final per-particle log-weights; ``particle_output_ids``
+    holds every particle's generated token ids.
+    """
+
+    rid: str
+    log_Z_hat: float
+    log_w_tilde: List[float]
+    particle_output_ids: List[List[int]]
+
+
 # ──────────────────────────────────────────────────────────────
 #  SMCDecodeContext — bridge between scheduler and worker
 # ──────────────────────────────────────────────────────────────
@@ -256,7 +273,14 @@ class SMCDraftInput(SpecInput):
     """
 
     verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token
-    logprob_diff: Optional[torch.Tensor] = None  # (bs,) from last step
+    # (bs,) this group's last *drafted* token d_{gamma-1} from the previous
+    # step, deferred into the next step's leading 2-token draft forward
+    # [prev_last_draft_id, verified_id].  None on the first decode step of a
+    # group (no predecessor) → that step uses a plain single-token head.
+    # Carried but NOT yet consumed by the draft loop (Step 2 wires the
+    # consumer); inert scaffolding for now.
+    prev_last_draft_id: Optional[torch.Tensor] = None
+    logprob_diff: Optional[torch.Tensor] = None  # (bs, gamma) per-position, last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
 

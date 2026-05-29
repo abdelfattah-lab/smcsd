@@ -81,6 +81,7 @@ class SMCWorker(BaseSpecWorker):
         self.smc_target_temperature = max(
             float(server_args.smc_target_temperature), 1e-5
         )
+        self.smc_power_alpha = float(server_args.smc_power_alpha)
         # Only the dense-AR draft path is supported here.
         self._dense_draft_hybrid_req_to_token_pool = None
 
@@ -525,7 +526,9 @@ class SMCWorker(BaseSpecWorker):
             f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
             f"cuda_graph={can_run_cuda_graph})"
         )
-        score_log_probs = torch.log_softmax(score_logits, dim=-1)
+        score_log_probs = torch.log_softmax(
+            score_logits / self.smc_target_temperature, dim=-1
+        )
         score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
         target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
         score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
@@ -533,12 +536,26 @@ class SMCWorker(BaseSpecWorker):
         ).squeeze(2)
 
         # ---- 5. Logprob diff ----
-        logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
+        # Per-position (bs, gamma) importance-weight increment, NOT summed
+        # over the block.  process_batch_result masks out positions at/after
+        # an EOS before summing, so a particle that terminates mid-block does
+        # not accrue weight from the draft's post-EOS continuation tokens
+        # (those are not part of the sequence — EOS is an absorbing state with
+        # incremental weight 1).
+        # Targets the (unnormalized) sequence-wise tempered-power distribution
+        # p_{T_t}^alpha where p_{T_t}(x) = softmax(logits / T_t):
+        #   log w = alpha * log p_{T_t}(x_t | x_{<t}) - log q(x_t | x_{<t}).
+        logprob_diff = (
+            self.smc_power_alpha * score_logprobs_stacked - draft_logprobs_stacked
+        )
 
         # ---- 6. Bonus token ----
+        # Sample from the same p_{T_t}^alpha distribution targeted above so the
+        # bonus and per-step draws come from one consistent target.
         bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
         bonus_log_probs = torch.log_softmax(
-            bonus_logits / self.smc_target_temperature, dim=-1
+            self.smc_power_alpha * bonus_logits / self.smc_target_temperature,
+            dim=-1,
         )
         bonus = torch.multinomial(bonus_log_probs.exp(), num_samples=1).squeeze(-1)
 
@@ -553,13 +570,23 @@ class SMCWorker(BaseSpecWorker):
             (bs,), gamma + 1, dtype=torch.int32, device=self.device
         )
 
+        # This step's last *drafted* token d_{gamma-1} (= all_tokens[gamma];
+        # all_tokens is [x0, d_0, ..., d_gamma], so index gamma is the last
+        # kept draft token, index gamma+1 the discarded over-draft).  Deferred
+        # into next step's leading 2-token draft forward.  Carried on
+        # next_draft_input but NOT yet consumed by the draft loop — Step 2
+        # wires the consumer and drops the over-draft.
+        prev_last_draft_id = all_tokens[gamma]
+
         next_token_ids.record_stream(current_stream)
         accept_lens.record_stream(current_stream)
         next_verified_id.record_stream(current_stream)
+        prev_last_draft_id.record_stream(current_stream)
         logprob_diff.record_stream(current_stream)
 
         next_draft_input = SMCDraftInput(
             verified_id=next_verified_id,
+            prev_last_draft_id=prev_last_draft_id,
             logprob_diff=logprob_diff,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
