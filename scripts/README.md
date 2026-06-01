@@ -5,9 +5,14 @@ experiments on top of the standalone `smcsd/` implementation.
 
 ## Scripts
 
-- **`accuracy_test_gsm8k.py`** — GSM8K accuracy benchmark. Supports
+- **`accuracy_test_gsm8k.py`** — GSM8K accuracy benchmark (offline). Supports
   `smc_engine` (dedicated offline SMCEngine) and `baseline`
   (no speculative decoding).
+- **`accuracy_test_gsm8k_http.py`** — GSM8K accuracy benchmark over an HTTP
+  server (online serving). Launches the SMC HTTP server (`smcsd.http_server`)
+  or connects to a running one (`--base-url`), then evals via concurrent native
+  `/generate`. Same `#### <number>` scoring as the offline test, so results are
+  directly comparable.
 - **`quick_quality_check.py`** — Quick output quality sanity check
   (vanilla vs SMC) on a handful of hardcoded prompts.
 - **`smc_profile_engine.py`** — Offline profiler harness for SMC. Use
@@ -51,6 +56,55 @@ Key flags for `accuracy_test_gsm8k.py`:
 | `--mem-fraction-static` | `0.4` | GPU memory fraction (engine modes) |
 | `--seed` | `None` | NumPy seed for reproducibility (question order only — GPU sampling is not seeded) |
 
+## SMC Online Serving (HTTP)
+
+SMC serves over HTTP via `smcsd/http_server.py`, which reuses sglang's standard
+serving stack (TokenizerManager + DetokenizerManager + FastAPI) with the SMC
+scheduler injected — no SMC source changes. Unlike the offline `SMCEngine`, the
+HTTP server multiplexes concurrent requests.
+
+```bash
+source .venv/bin/activate
+export FLASHINFER_WORKSPACE_BASE=/tmp/$USER-flashinfer   # shared-machine JIT cache
+
+# Standard sglang endpoints become available (/generate, /v1/...)
+python -m smcsd.http_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --draft-model meta-llama/Llama-3.2-1B-Instruct \
+    -N 8 -g 8 --max-running-requests 16 --port 30000 --trust-remote-code
+```
+
+`--max-running-requests` is the number of concurrent SMC *groups*; it is expanded
+by `(N+1)` internally (each group needs N+1 Req slots). Keep it modest relative to
+`--mem-fraction-static` — CUDA-graph capture scales with the expanded value and can
+OOM if set too high.
+
+`--mem-fraction-static` defaults to `0.4` for SMC (not sglang's ~0.88): the server
+runs two model runners (target + draft), each sizing its own KV-cache pool, so the
+fraction is effectively counted twice and a larger value OOMs at draft KV-pool init
+on a single GPU. Raise it only if you have headroom.
+
+### GSM8K over HTTP
+
+```bash
+# Self-contained: launches the SMC server, evals, tears it down
+python scripts/accuracy_test_gsm8k_http.py -N 8 -g 8 --num-questions 200 --parallel 16
+
+# Against an already-running server (launched separately)
+python scripts/accuracy_test_gsm8k_http.py --base-url http://127.0.0.1:30000
+
+# Baseline (no spec) reference
+python scripts/accuracy_test_gsm8k_http.py --mode baseline --num-questions 200
+```
+
+- Uses the zero-shot `#### <number>` format (no stop strings): SMC does not support
+  stop strings, so sglang's few-shot `Question:/Answer:` harness can't drive it.
+  Scoring matches `accuracy_test_gsm8k.py`, so HTTP and offline numbers are
+  directly comparable (verified: offline 11/20 vs HTTP 9/20 on the same 20 GSM8K
+  questions at temperature 0.7 — within sampling noise).
+- SMC does not populate the EAGLE-style `avg_spec_accept_length` in `/server_info`,
+  so accept length shows `n/a`; use output throughput as the speed metric.
+
 ## Throughput Sweeps
 
 See `tps_benchmark_scripts/` for shell-based sweeps across batch sizes
@@ -77,8 +131,9 @@ python scripts/smc_profile_engine.py --engine-kind smc_engine \
 
 ## Notes
 
-- SMC runs through `SMCEngine` (dedicated offline path) + `SMCScheduler`
-  (subclass of the base `Scheduler`). There is no "engine-level" SMC via
-  the regular `sgl.Engine` factory anymore.
+- SMC runs through `SMCEngine` (dedicated offline path) or `smcsd.http_server`
+  (online HTTP serving), both backed by `SMCScheduler` (subclass of the base
+  `Scheduler`). There is no "engine-level" SMC via the regular `sgl.Engine`
+  factory anymore.
 - `FLASHINFER_WORKSPACE_BASE=/tmp/<user>-flashinfer` is often needed on
   shared machines when running GPU-backed experiments.
