@@ -476,7 +476,6 @@ class SMCGPUModelRunner(GPUModelRunner):
         ).reshape(-1)                                              # [A_total * (gamma+1)]
 
         # After writing all gamma+1 new tokens the total KV length is L_i + gamma + 1.
-        # Target KV at 0..L_i-1 is already present in shared prefix blocks.
         seq_lens_full = start_seq_lens + gamma + 1                # [A_total]
 
         total_tokens = A_total * (gamma + 1)
@@ -552,23 +551,20 @@ class SMCGPUModelRunner(GPUModelRunner):
         sampler_output = self.target_sampler(logits, bonus_input_batch)
         bonus_tokens = sampler_output.sampled_token_ids.squeeze(-1).to(torch.int32)
 
-        # Draft decode wrote next_seeds into last_sampled_tokens at step gamma;
-        # overwrite with the correct bonus token.
-        self.req_states.last_sampled_tokens[rows] = bonus_tokens.long().unsqueeze(-1)
-
-        # Fix all_token_ids: replace the draft next_seed with the bonus token at L+gamma.
-        positions_to_fix = (start_seq_lens + gamma).long()  # [A_total]
-        self.req_states.all_token_ids.gpu[rows.long(), positions_to_fix] = bonus_tokens
-
-        if self.sampler.penalties_state.output_bin_counts is not None:
-            draft_next_seeds = torch.cat([
-                draft_results[batch.group_id][2]
-                for batch in batches
-                if (group_slices[batch.group_id][1] > group_slices[batch.group_id][0])
-            ])  # [A_total]
-            bin_counts = self.sampler.penalties_state.output_bin_counts
-            bin_counts[rows.long(), draft_next_seeds.long()] -= 1
-            bin_counts[rows.long(), bonus_tokens.long()] += 1
+        # Commit step gamma with the bonus token
+        post_update(
+            rows,
+            self.req_states.num_computed_tokens.gpu,
+            self.req_states.last_sampled_tokens,
+            self.sampler.penalties_state.output_bin_counts,
+            sampler_output.sampled_token_ids,
+            sampler_output.num_sampled,
+            torch.zeros_like(sampler_output.num_sampled),
+            torch.arange(A_total + 1, dtype=torch.int32, device=self.device),
+            self.req_states.all_token_ids.gpu,
+            self.req_states.total_len.gpu,
+        )
+        self.req_states.num_computed_tokens_np[rows.cpu().numpy()] += 1
 
         return {
             batch.group_id: bonus_tokens[s:e]
@@ -758,30 +754,29 @@ class SMCGPUModelRunner(GPUModelRunner):
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
             next_tokens = sampler_output.sampled_token_ids.squeeze(-1).to(torch.int32)
-            num_sampled = sampler_output.num_sampled
-            num_rejected = torch.zeros_like(num_sampled)
-            post_update(
-                rows,
-                self.req_states.num_computed_tokens.gpu,
-                self.req_states.last_sampled_tokens,
-                self.sampler.penalties_state.output_bin_counts,
-                sampler_output.sampled_token_ids,
-                num_sampled,
-                num_rejected,
-                query_start_loc,
-                self.req_states.all_token_ids.gpu,
-                self.req_states.total_len.gpu,
-            )
-            self.req_states.num_computed_tokens_np[rows.cpu().numpy()] += 1
 
             if step < gamma:
+                # Commit draft token t_{step+1}
+                post_update(
+                    rows,
+                    self.req_states.num_computed_tokens.gpu,
+                    self.req_states.last_sampled_tokens,
+                    self.sampler.penalties_state.output_bin_counts,
+                    sampler_output.sampled_token_ids,
+                    sampler_output.num_sampled,
+                    torch.zeros_like(sampler_output.num_sampled),
+                    query_start_loc,
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.total_len.gpu,
+                )
+                self.req_states.num_computed_tokens_np[rows.cpu().numpy()] += 1
                 draft_ids[:, step + 1] = next_tokens
             else:
+                # Step gamma fills draft KV at L+gamma but its token is discarded
                 next_seeds = next_tokens
 
             seq_lens_cur = seq_lens_cur + 1
 
-        # Slice results back per group 
         results: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         for batch in batches:
             s, e = group_slices[batch.group_id]
