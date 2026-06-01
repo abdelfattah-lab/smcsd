@@ -62,7 +62,7 @@ def format_instruction(question: str) -> str:
 def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False):
     """Load GSM8K and build chat-template prompts + gold labels."""
     print("Loading GSM8K dataset...")
-    dataset = load_dataset("gsm8k", "main", split="test")
+    dataset = load_dataset("openai/gsm8k", "main", split="test")
 
     prompts = []
     labels = []
@@ -90,7 +90,15 @@ def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False)
 
 def run_smc_engine_eval(args, prompts, labels):
     """Evaluation using the dedicated SMCEngine (offline, no tokenizer manager)."""
+    import os as _os
+
     from smcsd.engine import SMCEngine
+
+    # Nested hierarchy: the score model path is passed to the scheduler
+    # subprocess via an env var (inherited on spawn) and read in SMCWorkerV2.
+    if getattr(args, "smc_score_model", None):
+        _os.environ["SMCSD_SCORE_MODEL"] = args.smc_score_model
+        print(f"[nested] SMCSD_SCORE_MODEL = {args.smc_score_model}")
 
     draft_model = args.draft_model or DEFAULT_DRAFT_MODEL
     engine_kwargs = dict(
@@ -354,6 +362,17 @@ if __name__ == "__main__":
             "matching EAGLE3 checkpoint "
             "(e.g. lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B). "
             "'dflash' = SpecForge DFlash draft head."
+        ),
+    )
+    smc_grp.add_argument(
+        "--smc-score-model",
+        type=str,
+        default=None,
+        help=(
+            "Nested hierarchy: path to a larger SCORE model (e.g. Qwen/Qwen3-32B-FP8). "
+            "With --smc-draft-mode eagle3, --model is the EAGLE *base* (provides the "
+            "head's hidden states + KV) and this model is the SMC importance-weight "
+            "target p (and bonus). Implements target->8B->EAGLE3 hierarchical SMC."
         ),
     )
     smc_grp.add_argument(

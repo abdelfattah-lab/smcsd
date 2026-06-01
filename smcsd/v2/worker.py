@@ -148,7 +148,6 @@ class SMCWorkerV2(BaseSpecWorker):
         # in its config, but it operates within the target's full context window.
         # We set the env var to suppress the validation error before constructing
         # the draft TpModelWorker.
-        import os
         _eagle3_mode = self.is_eagle3
         _prev_allow_overwrite = os.environ.get("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
         _prev_dtype = server_args.dtype
@@ -306,6 +305,50 @@ class SMCWorkerV2(BaseSpecWorker):
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         if not backup_disable_cuda_graph:
             self.draft_runner.init_device_graphs()
+
+        # --- Hierarchical (nested) SMC: separate larger SCORE model ----------
+        # In nested mode the eagle3 ``target_worker`` above is the small EAGLE
+        # *base* (e.g. Qwen3-8B): it supplies the head's fused hidden states and
+        # its own KV/rewrite. A separate, larger SCORE model (e.g. Qwen3-32B)
+        # supplies the SMC importance-weight target ``p`` and the bonus token.
+        # The EAGLE head only has to be a fast proposer of the 8B's
+        # distribution; SMC reweights its proposals toward the 32B target.
+        # Enabled via the SMCSD_SCORE_MODEL env var (path to the score model).
+        # Requires the base and score models to share a tokenizer/vocab.
+        self._score_worker = None
+        self._score_runner = None
+        self._has_score_model = False
+        score_model_path = os.environ.get("SMCSD_SCORE_MODEL")
+        if score_model_path and self.is_eagle3:
+            score_server_args = deepcopy(server_args)
+            # SMCDenseDraftTpModelWorker loads speculative_draft_model_path as a
+            # plain autoregressive LM (no MTP/EAGLE rewrite) sharing the slot pool.
+            score_server_args.speculative_draft_model_path = score_model_path
+            score_server_args.disable_cuda_graph = backup_disable_cuda_graph
+            self._score_worker = SMCDenseDraftTpModelWorker(
+                server_args=score_server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                pp_rank=0,
+                dp_rank=dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
+            )
+            self._score_runner = self._score_worker.model_runner
+            self._has_score_model = True
+            logging.getLogger(__name__).warning(
+                "[SMC NESTED] hierarchical: EAGLE base=%s + head=%s, "
+                "SCORE target=%s",
+                server_args.model_path,
+                server_args.speculative_draft_model_path,
+                score_model_path,
+            )
 
     def _dense_hybrid_state_shape(self) -> Optional[Tuple[Tuple, Tuple]]:
         target_cfg = getattr(self.score_runner, "hybrid_gdn_config", None)
@@ -1187,6 +1230,14 @@ class SMCWorkerV2(BaseSpecWorker):
             return score_result
 
         if self.is_eagle3:
+            # Nested mode: snapshot the prompt batch BEFORE mutation so the
+            # larger SCORE model can prefill its own KV over the same slots.
+            # Without this the score model would verify with empty prompt
+            # context and produce meaningless importance weights.
+            score_prefill_batch = (
+                self._make_clean_batch(batch) if self._has_score_model else None
+            )
+
             # Target prefill — request aux hidden states for EAGLE3 head input
             chm = (
                 CaptureHiddenMode.FULL if self.eagle_use_aux
@@ -1194,6 +1245,11 @@ class SMCWorkerV2(BaseSpecWorker):
             )
             batch.capture_hidden_mode = chm
             score_result = self._target_worker.forward_batch_generation(batch)
+
+            # Nested SCORE model prefill: build the score model's KV over the
+            # prompt slots (same req_to_token slots; separate KV tensor).
+            if score_prefill_batch is not None:
+                self._score_worker.forward_batch_generation(score_prefill_batch)
 
             # target_h: (total_tokens, 3*hidden_dim) or (total_tokens, hidden_dim)
             # Cast to fc layer dtype (EAGLE3 fc weights may differ from target)
@@ -1980,7 +2036,31 @@ class SMCWorkerV2(BaseSpecWorker):
         if self._timing_enabled:
             ev_verify_end.record()
 
-        score_logits = score_result.logits_output.next_token_logits  # (bs*(gamma+1), V)
+        # ---- 4b. Hierarchical SMC score pass ----
+        # The 8B verify above (score_result) supplies the aux hidden states used
+        # by the head rewrite below. When a separate larger SCORE model is set
+        # (nested mode), run it over the same gamma+1 block and use ITS logits as
+        # the SMC importance-weight target p (and for the bonus). The block was
+        # proposed by the EAGLE head (q); SMC reweights p_score / q_head. Base
+        # and score models must share a vocabulary.
+        if self._has_score_model:
+            score_verify_fb, _ = ctx.prepare_for_verify(
+                self.req_to_token_pool,
+                batch,
+                self._score_worker,
+                all_tokens,
+                cache_locs,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+            score_big_result = self._score_worker.forward_batch_generation(
+                model_worker_batch=None,
+                forward_batch=score_verify_fb,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
+            score_logits = score_big_result.logits_output.next_token_logits
+        else:
+            score_logits = score_result.logits_output.next_token_logits  # (bs*(gamma+1), V)
         expected_rows = bs * (gamma + 1)
         assert score_logits.shape[0] == expected_rows, (
             f"TARGET_VERIFY logits truncated: got {score_logits.shape[0]}, "
