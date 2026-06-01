@@ -2059,6 +2059,17 @@ class SMCWorkerV2(BaseSpecWorker):
                 skip_attn_backend_init=True,
             )
             score_logits = score_big_result.logits_output.next_token_logits
+            if os.environ.get("SMCSD_NESTED_DEBUG"):
+                with torch.no_grad():
+                    _tl = score_result.logits_output.next_token_logits
+                    _linf = (
+                        score_logits.float() - _tl.float()
+                    ).abs().max().item()
+                print(
+                    f"[NESTED DBG] bs={bs} score-vs-base verify logits "
+                    f"Linf={_linf:.4f}",
+                    flush=True,
+                )
         else:
             score_logits = score_result.logits_output.next_token_logits  # (bs*(gamma+1), V)
         expected_rows = bs * (gamma + 1)
