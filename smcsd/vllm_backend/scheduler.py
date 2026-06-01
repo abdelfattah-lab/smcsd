@@ -45,7 +45,7 @@ class NewParticleGroupData:
     seed_token_ids: torch.Tensor   # [N]
     seq_lens: torch.Tensor         # [N]
     gamma: int
-    temperature: float
+    temperature: float        # draft temperature
 
 
 @dataclass

@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 from smcsd.vllm_backend.engine import SMCVLLMEngine
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
 # DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 # DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--particles", "-N", type=int, default=1)
     parser.add_argument("--gamma", "-g", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--num-questions", type=int, default=1000)
+    parser.add_argument("--num-questions", type=int, default=200)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=2048)
