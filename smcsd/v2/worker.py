@@ -2089,14 +2089,39 @@ class SMCWorkerV2(BaseSpecWorker):
         # ============================================================
         if self._has_score_model and os.environ.get("SMCSD_EAGLE_VERIFY"):
             base_logits = score_result.logits_output.next_token_logits
-            base_pred = base_logits.argmax(dim=-1).reshape(bs, gamma + 1)
-            candidates = torch.stack(all_tokens[: gamma + 1], dim=1)  # [x0,h1..h_g]
-            accept_len, bonus8 = compute_dflash_accept_len_and_bonus(
-                candidates=candidates, target_predict=base_pred
+            base_lp = torch.log_softmax(
+                base_logits.reshape(bs, gamma + 1, -1), dim=-1
             )
-            accept_len = accept_len.to(torch.long).clamp(max=gamma)  # accepted head toks
-            accept_lens = (accept_len + 1).to(torch.int32)            # +1 for 8B bonus
+            base_pred = base_logits.argmax(dim=-1).reshape(bs, gamma + 1)
+            head_toks = torch.stack(all_tokens[1 : gamma + 1], dim=1)  # h1..h_g
             ar = torch.arange(bs, device=self.device)
+            # Acceptance against the 8B base. Greedy (threshold>=1.0) accepts only
+            # exact-argmax matches (short, conservative). Typical acceptance
+            # (default 0.05) accepts any head token the 8B gives >= threshold
+            # probability — truncating the block only when the head derails —
+            # giving much longer accepts (fewer 32B verifies per committed token)
+            # while still committing 8B-plausible tokens.
+            accept_thr = float(os.environ.get("SMCSD_EAGLE_ACCEPT_THRESHOLD", "0.05"))
+            if accept_thr >= 1.0:
+                candidates = torch.stack(all_tokens[: gamma + 1], dim=1)  # [x0,h1..h_g]
+                accept_len, bonus8 = compute_dflash_accept_len_and_bonus(
+                    candidates=candidates, target_predict=base_pred
+                )
+                accept_len = accept_len.to(torch.long).clamp(max=gamma)
+            else:
+                base_p_head = base_lp[:, :gamma, :].gather(
+                    2, head_toks.long().unsqueeze(2)
+                ).squeeze(2).exp()  # (bs, gamma) 8B prob of each head token
+                accept_len = (
+                    (base_p_head >= accept_thr)
+                    .to(torch.int32)
+                    .cumprod(dim=1)
+                    .sum(dim=1)
+                    .to(torch.long)
+                    .clamp(max=gamma)
+                )
+                bonus8 = base_pred[ar, accept_len]  # 8B token at first reject
+            accept_lens = (accept_len + 1).to(torch.int32)  # +1 for 8B bonus
 
             # committed = head[1:accept_len+1] (== 8B greedy) then 8B bonus at accept_len
             proposed = torch.stack(all_tokens[1 : gamma + 1], dim=1)  # (bs, gamma)
