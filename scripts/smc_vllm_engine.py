@@ -1,3 +1,5 @@
+from vllm.config import ProfilerConfig
+
 from smcsd.vllm_backend.engine import SMCVLLMEngine
 
 
@@ -17,9 +19,14 @@ engine = SMCVLLMEngine(
     tp_size=1,
     max_model_len=1024,
     gpu_memory_utilization=0.5,
-    #enable_prefix_caching=False
+    enable_prefix_caching=False,
+    # profiler_config=ProfilerConfig(
+    #     profiler="torch",
+    #     torch_profiler_dir="/home/xq88/smcsd/tmp/smc_traces",
+    # ),
 )
 
+# engine._engine.profile(is_start=True, profile_prefix="smc_trace")
 out = engine.generate(
     prompt=PROMPTS,
     sampling_params={
@@ -27,6 +34,7 @@ out = engine.generate(
         "target_temperature": 0,
     },
 )
+# engine._engine.profile(is_start=False)
 
 results = [out] if isinstance(out, dict) else out
 

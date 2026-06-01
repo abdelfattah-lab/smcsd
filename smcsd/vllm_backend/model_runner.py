@@ -28,6 +28,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_kv_cache,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, post_update
+from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from smcsd.vllm_backend.scheduler import (
     NewParticleGroupData,
@@ -69,6 +70,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         self.draft_attn_groups: list[list[Any]] = []
         self.draft_kv_caches: list[torch.Tensor] = []
         self.particle_groups: dict[str, ParticleGroup] = {}  # group_id -> ParticleGroup
+        self.target_sampler: Sampler | None = None
         self._draft_attn_metadata_debugged = False
 
     def load_model(self, *args, **kwargs) -> None:
@@ -158,6 +160,16 @@ class SMCGPUModelRunner(GPUModelRunner):
         self.draft_attn_backends = draft_attn_backends
         self.draft_attn_groups = draft_attn_groups
 
+        if self.is_last_pp_rank and not self.is_pooling_model:
+            self.target_sampler = Sampler(
+                max_num_reqs=self.max_num_reqs,
+                vocab_size=self.vocab_size,
+                device=self.device,
+                req_states=self.req_states,
+                logprobs_mode=self.model_config.logprobs_mode,
+                num_speculative_tokens=self.num_speculative_steps + 1,
+            )
+
     def register_particle_group(
         self,
         group_id: str,
@@ -194,11 +206,17 @@ class SMCGPUModelRunner(GPUModelRunner):
                 self.sampler.add_request(
                     req_index, prompt_len, draft_sampling_params
                 )
+            if self.is_last_pp_rank and self.target_sampler is not None:
+                self.target_sampler.add_request(
+                    req_index, prompt_len, sampling_params
+                )
 
         self.req_states.apply_staged_writes()
         self.block_tables.apply_staged_writes()
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
+        if self.target_sampler is not None:
+            self.target_sampler.apply_staged_writes()
 
         # if particle_req_ids:
         #     debug_particles = min(2, len(particle_req_ids))
@@ -303,24 +321,261 @@ class SMCGPUModelRunner(GPUModelRunner):
                 inputs_embeds=None,
             )
 
+    def _run_batched_target_prefill_tail(
+        self,
+        groups: list[NewParticleGroupData],
+    ) -> None:
+        """Fill target KV for the prompt tail per particle."""
+        block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+
+        all_particle_rows: list[int] = []
+        all_input_ids: list[int] = []
+        all_positions: list[int] = []
+        all_seq_lens: list[int] = []
+        all_num_scheduled: list[int] = []
+        query_start_loc_list: list[int] = [0]
+
+        for group in groups:
+            L = group.num_computed_tokens
+            num_shared_tokens = (L // block_size) * block_size
+            tail_len = L - num_shared_tokens
+            if tail_len == 0:
+                continue
+
+            particle_rows = self.particle_groups[group.group_id].particle_rows
+            N = len(particle_rows)
+            tail_tokens = group.prompt_token_ids[num_shared_tokens:]
+            tail_positions = list(range(num_shared_tokens, L))
+
+            all_particle_rows.extend(particle_rows)
+            all_input_ids.extend(tail_tokens * N)
+            all_positions.extend(tail_positions * N)
+            all_seq_lens.extend([L] * N)
+            all_num_scheduled.extend([tail_len] * N)
+            for _ in range(N):
+                query_start_loc_list.append(query_start_loc_list[-1] + tail_len)
+
+        if not all_particle_rows:
+            return
+
+        total_N = len(all_particle_rows)
+        total_tokens = query_start_loc_list[-1]
+
+        particle_rows_t = torch.tensor(all_particle_rows, dtype=torch.int32, device=self.device)
+        input_ids = torch.tensor(all_input_ids, dtype=torch.int32, device=self.device)
+        positions = torch.tensor(all_positions, dtype=torch.long, device=self.device)
+        seq_lens = torch.tensor(all_seq_lens, dtype=torch.int32, device=self.device)
+        query_start_loc = torch.tensor(query_start_loc_list, dtype=torch.int32, device=self.device)
+        query_start_loc_np = np.array(query_start_loc_list, dtype=np.int32)
+
+        block_tables = self._gather_block_tables(particle_rows_t)
+        slot_ids = self.block_tables.compute_slot_mappings(
+            particle_rows_t,
+            query_start_loc,
+            positions,
+            num_tokens_padded=total_tokens,
+        )
+
+        input_batch = SimpleNamespace(
+            num_reqs=total_N,
+            num_tokens=total_tokens,
+            num_reqs_after_padding=total_N,
+            num_tokens_after_padding=total_tokens,
+            query_start_loc=query_start_loc,
+            query_start_loc_np=query_start_loc_np,
+            num_scheduled_tokens=np.array(all_num_scheduled, dtype=np.int32),
+            seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=seq_lens.cpu(),
+            dcp_local_seq_lens=None,
+            positions=positions,
+        )
+        attn_metadata = self.model_state.prepare_attn(
+            input_batch,
+            CUDAGraphMode.NONE,
+            block_tables,
+            slot_ids,
+            self.attn_groups,
+            self.kv_cache_config,
+        )
+        slot_mappings_by_layer = build_slot_mappings_by_layer(slot_ids, self.kv_cache_config)
+
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=total_tokens,
+            slot_mapping=slot_mappings_by_layer,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=BatchDescriptor(num_tokens=total_tokens, has_lora=False),
+        ):
+            self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=None,
+            )
+
     def remove_particle_group(self, group_id: str) -> None:
         """Return all particle rows to req_states.free_indices."""
         group = self.particle_groups.pop(group_id)
         for p_id in group.particle_req_ids:
             self.req_states.remove_request(p_id)
 
-    def smc_target_score(
+    @torch.inference_mode()
+    def _run_batched_target_verify(
         self,
-        particle_rows: torch.Tensor,    # [N]
-        draft_token_ids: torch.Tensor,  # [N, gamma+1]
-        seq_lens: torch.Tensor,         # [N] — num_computed_tokens at draft start
-    ) -> torch.Tensor:
-        """Score all draft tokens with the target model in one batched pass.
+        batches: list[SMCGroupBatch | NewParticleGroupData],
+        draft_results: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Run target model on [seed, t1..t_gamma] per particle, return bonus tokens.
+
+        Fills target KV at the draft positions and samples one bonus token per
+        particle from the target logit at the last draft position (L+gamma).
 
         Returns:
-            target_log_probs  [P, gamma+1, V]
+            dict group_id -> bonus_tokens [A_i]  (int32 on device)
         """
-        raise NotImplementedError
+        gamma = batches[0].gamma
+
+        # Collect active particles across all groups
+        group_slices: dict[str, tuple[int, int]] = {}
+        all_rows: list[int] = []
+        all_start_seq_lens: list[int] = []
+        all_draft_ids: list[torch.Tensor] = []
+
+        offset = 0
+        for batch in batches:
+            group = self.particle_groups[batch.group_id]
+            finished = getattr(batch, "particle_finished", None) or [False] * len(group.particle_rows)
+            active_local = [i for i, f in enumerate(finished) if not f]
+            A_i = len(active_local)
+            if A_i > 0:
+                seq_lens_i = batch.seq_lens[active_local]
+                all_rows.extend(group.particle_rows[i] for i in active_local)
+                all_start_seq_lens.extend(seq_lens_i.tolist())
+                all_draft_ids.append(draft_results[batch.group_id][0])  # [A_i, gamma+1]
+            group_slices[batch.group_id] = (offset, offset + A_i)
+            offset += A_i
+
+        A_total = offset
+        if A_total == 0:
+            return {}
+
+        rows = torch.tensor(all_rows, dtype=torch.int32, device=self.device)
+        # L_i: seq_len at the start of this draft cycle for each particle
+        start_seq_lens = torch.tensor(all_start_seq_lens, dtype=torch.int32, device=self.device)
+
+        # Input ids: [seed, t1..t_gamma] per particle, flattened
+        # draft_results[group_id][0] shape: [A_i, gamma+1], [:, 0] is seed
+        draft_ids = torch.cat(all_draft_ids, dim=0)               # [A_total, gamma+1]
+        input_ids = draft_ids.reshape(-1).to(torch.int32)         # [A_total * (gamma+1)]
+
+        # Positions: [L_i, L_i+1, ..., L_i+gamma] per particle.
+        step_offsets = torch.arange(gamma + 1, dtype=torch.long, device=self.device)
+        positions = (
+            start_seq_lens.long().unsqueeze(1) + step_offsets.unsqueeze(0)
+        ).reshape(-1)                                              # [A_total * (gamma+1)]
+
+        # After writing all gamma+1 new tokens the total KV length is L_i + gamma + 1.
+        # Target KV at 0..L_i-1 is already present in shared prefix blocks.
+        seq_lens_full = start_seq_lens + gamma + 1                # [A_total]
+
+        total_tokens = A_total * (gamma + 1)
+        query_start_loc = torch.arange(
+            0, total_tokens + 1, gamma + 1, dtype=torch.int32, device=self.device
+        )                                                          # [A_total + 1]
+        query_start_loc_np = query_start_loc.cpu().numpy()
+
+        # Last token index (position L_i+gamma) in the flat token layout.
+        last_token_indices = query_start_loc[1:].long() - 1       # [A_total]
+
+        block_tables = self._gather_block_tables(rows)
+        slot_ids = self.block_tables.compute_slot_mappings(
+            rows,
+            query_start_loc,
+            positions,
+            num_tokens_padded=total_tokens,
+        )
+
+        input_batch_ns = SimpleNamespace(
+            num_reqs=A_total,
+            num_tokens=total_tokens,
+            num_reqs_after_padding=A_total,
+            num_tokens_after_padding=total_tokens,
+            query_start_loc=query_start_loc,
+            query_start_loc_np=query_start_loc_np,
+            num_scheduled_tokens=np.full(A_total, gamma + 1, dtype=np.int32),
+            seq_lens=seq_lens_full,
+            seq_lens_cpu_upper_bound=seq_lens_full.cpu(),
+            dcp_local_seq_lens=None,
+            positions=positions,
+        )
+
+        attn_metadata = self.model_state.prepare_attn(
+            input_batch_ns,
+            CUDAGraphMode.NONE,
+            block_tables,
+            slot_ids,
+            self.attn_groups,
+            self.kv_cache_config,
+        )
+        slot_mappings_by_layer = build_slot_mappings_by_layer(slot_ids, self.kv_cache_config)
+
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=total_tokens,
+            slot_mapping=slot_mappings_by_layer,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=BatchDescriptor(num_tokens=total_tokens, has_lora=False),
+        ):
+            model_output = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=None,
+            )
+
+        # Support models that return (hidden_states, aux) tuples (e.g. Eagle3 target).
+        hidden_states = model_output[0] if isinstance(model_output, tuple) else model_output
+
+        # Logits at position L_i+gamma for each particle.
+        logits = self.model.compute_logits(hidden_states[last_token_indices])  # [A_total, V]
+
+        bonus_input_batch = self._build_draft_input_batch(
+            particle_rows=rows,
+            input_ids=input_ids[last_token_indices],
+            positions=positions[last_token_indices],
+            seq_lens=seq_lens_full,
+            query_start_loc=torch.arange(A_total + 1, dtype=torch.int32, device=self.device),
+            query_start_loc_np=np.arange(A_total + 1, dtype=np.int32),
+        )
+        sampler_output = self.target_sampler(logits, bonus_input_batch)
+        bonus_tokens = sampler_output.sampled_token_ids.squeeze(-1).to(torch.int32)
+
+        # Draft decode wrote next_seeds into last_sampled_tokens at step gamma;
+        # overwrite with the correct bonus token.
+        self.req_states.last_sampled_tokens[rows] = bonus_tokens.long().unsqueeze(-1)
+
+        # Fix all_token_ids: replace the draft next_seed with the bonus token at L+gamma.
+        positions_to_fix = (start_seq_lens + gamma).long()  # [A_total]
+        self.req_states.all_token_ids.gpu[rows.long(), positions_to_fix] = bonus_tokens
+
+        if self.sampler.penalties_state.output_bin_counts is not None:
+            draft_next_seeds = torch.cat([
+                draft_results[batch.group_id][2]
+                for batch in batches
+                if (group_slices[batch.group_id][1] > group_slices[batch.group_id][0])
+            ])  # [A_total]
+            bin_counts = self.sampler.penalties_state.output_bin_counts
+            bin_counts[rows.long(), draft_next_seeds.long()] -= 1
+            bin_counts[rows.long(), bonus_tokens.long()] += 1
+
+        return {
+            batch.group_id: bonus_tokens[s:e]
+            for batch in batches
+            for s, e in [group_slices[batch.group_id]]
+            if e > s
+        }
     
     def _build_draft_input_batch(
         self,
@@ -555,7 +810,7 @@ class SMCGPUModelRunner(GPUModelRunner):
 
         smc_draft_results: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
-        # Register all new groups (req_states, block_tables, sampler — no forward pass yet).
+        # Register all new groups (req_states, block_tables, sampler).
         for new_group in scheduler_output.new_particle_groups:
             self.register_particle_group(
                 group_id=new_group.group_id,
@@ -570,6 +825,7 @@ class SMCGPUModelRunner(GPUModelRunner):
 
         if scheduler_output.new_particle_groups:
             self._run_batched_draft_prefill(scheduler_output.new_particle_groups)
+            self._run_batched_target_prefill_tail(scheduler_output.new_particle_groups)
 
         all_batches: list[SMCGroupBatch | NewParticleGroupData] = (
             list(scheduler_output.new_particle_groups)
@@ -577,6 +833,10 @@ class SMCGPUModelRunner(GPUModelRunner):
         )
         if all_batches:
             smc_draft_results = self._run_batched_draft_decode(all_batches)
+            bonus_tokens_per_group = self._run_batched_target_verify(all_batches, smc_draft_results)
+            for group_id, bonus in bonus_tokens_per_group.items():
+                draft_ids, log_probs, _ = smc_draft_results[group_id]
+                smc_draft_results[group_id] = (draft_ids, log_probs, bonus)
 
         # Free rows for any groups the scheduler finished this step.
         active_ids = (
