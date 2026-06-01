@@ -2078,6 +2078,128 @@ class SMCWorkerV2(BaseSpecWorker):
             f"expected {expected_rows}"
         )
 
+        # ============================================================
+        #  LOSSLESS nested path (SMCSD_EAGLE_VERIFY): verify the head's
+        #  proposals against the 8B EAGLE base with greedy prefix
+        #  acceptance, so the committed block is the 8B's own greedy
+        #  continuation (q == 8B, the strong proposer that gives dense
+        #  SMC its accuracy) rather than the raw 1-layer head proposals.
+        #  EAGLE only makes that 8B block cheap. The 32B then reweights.
+        #  Variable accept length per particle (like the DFlash path).
+        # ============================================================
+        if self._has_score_model and os.environ.get("SMCSD_EAGLE_VERIFY"):
+            base_logits = score_result.logits_output.next_token_logits
+            base_pred = base_logits.argmax(dim=-1).reshape(bs, gamma + 1)
+            candidates = torch.stack(all_tokens[: gamma + 1], dim=1)  # [x0,h1..h_g]
+            accept_len, bonus8 = compute_dflash_accept_len_and_bonus(
+                candidates=candidates, target_predict=base_pred
+            )
+            accept_len = accept_len.to(torch.long).clamp(max=gamma)  # accepted head toks
+            accept_lens = (accept_len + 1).to(torch.int32)            # +1 for 8B bonus
+            ar = torch.arange(bs, device=self.device)
+
+            # committed = head[1:accept_len+1] (== 8B greedy) then 8B bonus at accept_len
+            proposed = torch.stack(all_tokens[1 : gamma + 1], dim=1)  # (bs, gamma)
+            output_token_ids = torch.cat(
+                [proposed, bonus8.to(proposed.dtype).unsqueeze(1)], dim=1
+            )
+            output_token_ids[ar, accept_len] = bonus8.to(output_token_ids.dtype)
+            next_token_ids = output_token_ids.reshape(-1)
+            next_verified_id = bonus8.to(torch.long)
+
+            # SMC weight: greedy proposal q is a point mass on the 8B block, so
+            # logprob_diff = sum of log p_32B over the committed tokens (matches
+            # the DFlash greedy-proposal convention). Pulls particles toward the
+            # 8B-greedy blocks the 32B target most likes.
+            commit_mask = (
+                torch.arange(gamma + 1, device=self.device).unsqueeze(0)
+                < accept_lens.long().unsqueeze(1)
+            )
+            score_lp = torch.log_softmax(
+                score_logits.reshape(bs, gamma + 1, -1), dim=-1
+            )
+            p32 = score_lp.gather(2, output_token_ids.long().unsqueeze(2)).squeeze(2)
+            logprob_diff = (p32 * commit_mask.to(p32.dtype)).sum(dim=1)
+
+            # Rewrite head KV over the gamma+1 positions (uncommitted slots are
+            # freed by the scheduler via accept_lens); collect per-step head
+            # hidden/logits and gather each particle's next-x1 at its accept_len.
+            h_all = score_result.logits_output.hidden_states
+            assert h_all is not None
+            target_h_steps = h_all.reshape(bs, gamma + 1, -1).to(
+                self._eagle3_hidden_dtype
+            )
+            rewrite_fb = draft_fb
+            step_hidden, step_logits = [], []
+            for step in range(gamma + 1):
+                tok = output_token_ids[:, step].contiguous()
+                rewrite_fb.input_ids = tok
+                rewrite_fb.positions = all_positions[:, step].contiguous()
+                rewrite_fb.out_cache_loc = cache_locs[:, step].contiguous()
+                rewrite_fb.seq_lens = all_seq_lens[:, step].contiguous()
+                rewrite_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
+                rewrite_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
+                rewrite_fb.spec_info = None
+                self.draft_runner.attn_backend.init_forward_metadata(rewrite_fb)
+                rewrite_fb.spec_info = EagleDraftInput(
+                    hidden_states=target_h_steps[:, step, :].contiguous(),
+                    verified_id=tok,
+                    num_tokens_per_req=1,
+                    num_tokens_for_logprob_per_req=1,
+                )
+                rewrite_fb.capture_hidden_mode = CaptureHiddenMode.LAST
+                out = self.draft_runner.forward(
+                    rewrite_fb, skip_attn_backend_init=True
+                ).logits_output
+                step_hidden.append(out.hidden_states)
+                step_logits.append(out.next_token_logits)
+
+            sh = torch.stack(step_hidden, dim=1)  # (bs, gamma+1, hid)
+            sl = torch.stack(step_logits, dim=1)  # (bs, gamma+1, dvocab)
+            next_hidden = sh[ar, accept_len].contiguous().to(self._eagle3_hidden_dtype)
+            next_logits = sl[ar, accept_len]
+            nxt_lp = torch.log_softmax(
+                next_logits / self.smc_draft_temperature, dim=-1
+            )
+            if self.smc_draft_temperature > 0:
+                nxt_idx = torch.multinomial(nxt_lp.exp(), num_samples=1).squeeze(-1)
+            else:
+                nxt_idx = torch.argmax(next_logits, dim=-1)
+            nxt_x1_logprob = nxt_lp.gather(1, nxt_idx.unsqueeze(1)).squeeze(1)
+            nxt_x1 = (
+                self.hot_token_id[nxt_idx]
+                if self.hot_token_id is not None
+                else nxt_idx
+            )
+
+            if os.environ.get("SMCSD_NESTED_DEBUG"):
+                print(
+                    f"[EAGLE-VERIFY] mean accept_len={accept_len.float().mean():.2f} "
+                    f"(of {gamma})",
+                    flush=True,
+                )
+
+            next_token_ids.record_stream(current_stream)
+            accept_lens.record_stream(current_stream)
+            next_verified_id.record_stream(current_stream)
+            logprob_diff.record_stream(current_stream)
+            next_draft_input = SMCDraftInputV2(
+                verified_id=next_verified_id,
+                logprob_diff=logprob_diff,
+                num_tokens_per_req=self.speculative_num_draft_tokens,
+                target_hidden_state=next_hidden,
+                first_draft_token_id=nxt_x1,
+                first_draft_logprob=nxt_x1_logprob,
+            )
+            return GenerationBatchResult(
+                logits_output=score_big_result.logits_output,
+                next_token_ids=next_token_ids,
+                accept_lens=accept_lens,
+                next_draft_input=next_draft_input,
+                logprob_diff=logprob_diff,
+                can_run_cuda_graph=False,
+            )
+
         # Match the dense path: compute target log-probs at T=1 so that
         # logprob_diff = log p_target(y) - log q_draft(y) is a well-formed
         # importance weight on the same scale as the dense SMC path.
