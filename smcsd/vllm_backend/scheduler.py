@@ -20,8 +20,7 @@ if TYPE_CHECKING:
 class SMCParticleGroupState:
     parent_req: Request
     n_particles: int
-    num_computed_tokens: int               
-    draft_temperature: float
+    num_computed_tokens: int
     seed_token_ids: list[int]             
     shared_prefix_block_ids: tuple[list[int], ...]   # [kv_group][block]
     decode_block_ids: list[tuple[list[int], ...]]    # [particle][kv_group][block]
@@ -55,7 +54,6 @@ class SMCGroupBatch:
     seed_token_ids: torch.Tensor   # [N]
     seq_lens: torch.Tensor         # [N]
     gamma: int
-    temperature: float
     particle_finished: list[bool] = field(default_factory=list)  # [N]
 
 
@@ -146,7 +144,6 @@ class SMCVLLMScheduler(Scheduler):
             parent_req=parent_req,
             n_particles=n_particles,
             num_computed_tokens=num_computed_tokens,
-            draft_temperature=temperature,
             seed_token_ids=[seed_token_id] * n_particles,
             shared_prefix_block_ids=shared_prefix_block_ids,
             decode_block_ids=decode_block_ids,
@@ -182,7 +179,6 @@ class SMCVLLMScheduler(Scheduler):
             seed_token_ids=seed_tensor,
             seq_lens=seq_lens,
             gamma=self.smc_gamma,
-            temperature=state.draft_temperature,
             particle_finished=list(state.particle_finished),
         )
 
@@ -283,9 +279,8 @@ class SMCVLLMScheduler(Scheduler):
 
             # draft_token_ids: [A, gamma+1]; [:, 0] is the carried seed input.
             # A = number of active (unfinished) particles this cycle.
-            # TODO: Currently we commit all newly sampled tokens:
-            # x_1..x_gamma from draft_token_ids[:, 1:] plus next_seed_ids,
-            # which is x_{gamma+1} and also seeds the next cycle.
+            # Commits gamma+1 tokens per particle: x_1..x_gamma from draft
+            # plus next_seed_ids (the target bonus token), which seeds the next cycle.
             active_ps = [p for p, f in enumerate(state.particle_finished) if not f]
             new_tokens = torch.cat(
                 (draft_token_ids[:, 1:], next_seed_ids.unsqueeze(1)),
