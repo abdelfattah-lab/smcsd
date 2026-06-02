@@ -2088,6 +2088,8 @@ class SMCWorkerV2(BaseSpecWorker):
         #  Variable accept length per particle (like the DFlash path).
         # ============================================================
         if self._has_score_model and os.environ.get("SMCSD_EAGLE_VERIFY"):
+            if self._timing_enabled:
+                ev_verify_end.record()  # head-draft + 8B verify + 32B verify done
             base_logits = score_result.logits_output.next_token_logits
             base_lp = torch.log_softmax(
                 base_logits.reshape(bs, gamma + 1, -1), dim=-1
@@ -2216,6 +2218,12 @@ class SMCWorkerV2(BaseSpecWorker):
                 first_draft_token_id=nxt_x1,
                 first_draft_logprob=nxt_x1_logprob,
             )
+            if self._timing_enabled:
+                ev_other_end.record()
+                self._record_decode_timing(
+                    "eagle3v", ev_t0, ev_draft_end, ev_verify_end,
+                    ev_other_end, accept_lens,
+                )
             return GenerationBatchResult(
                 logits_output=score_big_result.logits_output,
                 next_token_ids=next_token_ids,
