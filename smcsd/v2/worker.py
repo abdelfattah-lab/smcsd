@@ -67,6 +67,51 @@ class SMCDenseDraftTpModelWorker(TpModelWorker):
         )
 
 
+class SMCScoreTpModelWorker(TpModelWorker):
+    """Score-model worker for nested (hierarchical) SMC.
+
+    Loads the SCORE model (from ``speculative_draft_model_path``) on an
+    ``SMCModelRunner`` so its TARGET_VERIFY forward is captured as a CUDA
+    graph (like the real target) instead of running eagerly. The score
+    model's ``smc_draft_mode`` is forced to ``dense`` so SMCCudaGraphRunner
+    captures plain verify graphs (CaptureHiddenMode.NULL) without the eagle3
+    aux-hidden output path. Shares the target's slot pool.
+    """
+
+    def _init_model_config(self):
+        from sglang.srt.configs.model_config import ModelConfig
+
+        self.model_config = ModelConfig.from_server_args(
+            self.server_args,
+            model_path=self.server_args.speculative_draft_model_path,
+            model_revision=self.server_args.speculative_draft_model_revision,
+            is_draft_model=False,
+        )
+
+    def _init_model_runner(self):
+        from smcsd.model_executor.smc_model_runner import SMCModelRunner
+
+        self._model_runner = SMCModelRunner(
+            model_config=self.model_config,
+            mem_fraction_static=self.server_args.mem_fraction_static,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            moe_ep_rank=self.moe_ep_rank,
+            moe_ep_size=self.ep_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            nccl_port=self.nccl_port,
+            dp_rank=self.dp_rank,
+            server_args=self.server_args,
+            is_draft_worker=False,  # capture SMC *verify* graphs, not draft
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
+            draft_model_idx=None,
+        )
+
+
 class SMCWorkerV2(BaseSpecWorker):
     """Standalone SMC worker using v2 API (SMCDecodeContext + SMCDraftInputV2)."""
 
@@ -168,6 +213,10 @@ class SMCWorkerV2(BaseSpecWorker):
         # Do not capture cuda graph during TpModelWorker init —
         # we capture manually after the draft model is fully set up
         backup_disable_cuda_graph = server_args.disable_cuda_graph
+        # Remember the user's real cuda-graph preference (eagle3 forces the
+        # head eager below). The nested SCORE model wants graphs unless the
+        # user globally disabled them.
+        self._user_disable_cuda_graph = bool(server_args.disable_cuda_graph)
         server_args.disable_cuda_graph = True
 
         # Create draft TpModelWorker — fully independent, no shared lm_head/embed.
@@ -321,10 +370,23 @@ class SMCWorkerV2(BaseSpecWorker):
         score_model_path = os.environ.get("SMCSD_SCORE_MODEL")
         if score_model_path and self.is_eagle3:
             score_server_args = deepcopy(server_args)
-            # SMCDenseDraftTpModelWorker loads speculative_draft_model_path as a
-            # plain autoregressive LM (no MTP/EAGLE rewrite) sharing the slot pool.
+            # SMCScoreTpModelWorker loads speculative_draft_model_path as a plain
+            # LM on an SMCModelRunner so its TARGET_VERIFY forward is CUDA-graphed
+            # (the eager 32B verify is ~77% of decode time otherwise). Force
+            # smc_draft_mode=dense so the graph runner captures plain verify
+            # graphs (no eagle aux output) for the score model.
             score_server_args.speculative_draft_model_path = score_model_path
-            score_server_args.disable_cuda_graph = backup_disable_cuda_graph
+            # NOTE: the 32B score verify currently runs EAGER (the decode
+            # bottleneck, ~77% of step time). Graphing it cleanly needs the
+            # score model to own/share the slot pool AND capture TARGET_VERIFY
+            # graphs, but SGLang's SMC integration ties verify-graph capture to
+            # is_draft_worker=False while pool-sharing + skipping TP init both
+            # require is_draft_worker=True (model_runner_kv_cache_mixin:281,
+            # model_runner:1147). A 3rd verify-graphed worker isn't expressible
+            # without relaxing those guards or restructuring so the 32B is THE
+            # target (is_draft_worker=False) and 8B+head is the draft. Until
+            # then keep the working eager path (is_draft_worker=True).
+            score_server_args.disable_cuda_graph = True
             self._score_worker = SMCDenseDraftTpModelWorker(
                 server_args=score_server_args,
                 gpu_id=gpu_id,
@@ -2230,7 +2292,7 @@ class SMCWorkerV2(BaseSpecWorker):
                 accept_lens=accept_lens,
                 next_draft_input=next_draft_input,
                 logprob_diff=logprob_diff,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=can_run_cuda_graph,
             )
 
         # Match the dense path: compute target log-probs at T=1 so that
