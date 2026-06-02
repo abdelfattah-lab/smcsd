@@ -98,6 +98,36 @@ python scripts/accuracy_test_gsm8k.py --mode smc_engine --model Qwen/Qwen3-32B-F
 Profiling: add `SMCSD_TIMING=1 SMCSD_TIMING_EVERY=40` for the per-phase
 draft/verify/other split.
 
+## Matched comparison + latency-vs-throughput (the important nuance)
+
+The headline "1.16×" compared hier@N=4 to dense@N=8. Matched (γ=4, N=4, 20q):
+
+| batch size | Dense tok/s | Hierarchical tok/s | hier vs dense |
+|---:|---:|---:|---:|
+| 1 (latency) | 90.5 | 99.4 | **+10%** |
+| 4 | 229.7 | 241.9 | +5% |
+| 8 | 341.8 | 336.9 | **−1.5%** |
+
+(matched N: at bs=1, dense N=8=85.9 vs hier N=8 γ=4=94.9, also ~+10%.)
+
+**The hierarchical's win is a LATENCY (memory-bound) effect that vanishes under
+concurrency.** At bs=1 each model forward is memory-bandwidth-bound, so cost is
+dominated by the *number of forwards* (weight reads). EAGLE replaces dense's γ+1
+sequential 8B draft forwards (γ+1 weight reads) with ~1 8B verify + a cheap head
+→ fewer 8B weight reads → ~10% faster. At high concurrency the forwards become
+*compute*-bound, where cost tracks *total tokens*, not forward count: dense's
+(γ+1) small 8B forwards and the hierarchical's single large 8B verify process
+the same total 8B tokens, so the advantage disappears (and the hierarchical's
+extra accept-verify + 3rd-model memory footprint slightly hurt). Net: use the
+hierarchy for **latency**; for **throughput**, plain dense SMC + concurrency is
+as good and simpler.
+
+The ~10% bs=1 ceiling is Amdahl: the 32B score verify (graphed, ~82% of step) is
+shared by both methods and dominates; the hierarchy only accelerates the draft.
+Biggest lever for either method is **longer accepts** (mean accept ≈ 3.4 here):
+one 32B verify per round regardless of accept, so more accepted tokens/round =
+fewer 32B verifies/token. accept is capped by head quality + temperature.
+
 ## Follow-ups
 
 - N=4 is the throughput sweet spot here (N=8 = bigger verify batch → 85.2). Sweep
