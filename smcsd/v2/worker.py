@@ -2236,6 +2236,9 @@ class SMCWorkerV2(BaseSpecWorker):
             )
             rewrite_fb = draft_fb
             step_hidden, step_logits = [], []
+            # NB: capping this loop at accept_lens.max() was tried but a
+            # per-step .item() GPU->CPU sync cost more than the saved head
+            # forwards (net slower). Keep the fixed gamma+1 loop (no sync).
             for step in range(gamma + 1):
                 tok = output_token_ids[:, step].contiguous()
                 rewrite_fb.input_ids = tok
