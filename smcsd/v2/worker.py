@@ -89,9 +89,9 @@ class SMCScoreTpModelWorker(TpModelWorker):
         )
 
     def _init_model_runner(self):
-        from smcsd.model_executor.smc_model_runner import SMCModelRunner
+        from smcsd.model_executor.smc_model_runner import ScoreModelRunner
 
-        self._model_runner = SMCModelRunner(
+        self._model_runner = ScoreModelRunner(
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,
@@ -376,18 +376,34 @@ class SMCWorkerV2(BaseSpecWorker):
             # smc_draft_mode=dense so the graph runner captures plain verify
             # graphs (no eagle aux output) for the score model.
             score_server_args.speculative_draft_model_path = score_model_path
-            # NOTE: the 32B score verify currently runs EAGER (the decode
-            # bottleneck, ~77% of step time). Graphing it cleanly needs the
-            # score model to own/share the slot pool AND capture TARGET_VERIFY
-            # graphs, but SGLang's SMC integration ties verify-graph capture to
-            # is_draft_worker=False while pool-sharing + skipping TP init both
-            # require is_draft_worker=True (model_runner_kv_cache_mixin:281,
-            # model_runner:1147). A 3rd verify-graphed worker isn't expressible
-            # without relaxing those guards or restructuring so the 32B is THE
-            # target (is_draft_worker=False) and 8B+head is the draft. Until
-            # then keep the working eager path (is_draft_worker=True).
-            score_server_args.disable_cuda_graph = True
-            self._score_worker = SMCDenseDraftTpModelWorker(
+            # Graph the score (32B) TARGET_VERIFY — the eager verify was ~77% of
+            # decode time. SMCScoreTpModelWorker uses ScoreModelRunner so it is
+            # is_draft_worker=False (-> SMCCudaGraphRunner captures verify
+            # graphs) while still sharing the slot pool (ScoreModelRunner masks
+            # the is_draft_worker pool-share assert). Force smc_draft_mode=dense
+            # so the captured verify graph emits no eagle aux (CaptureHiddenMode
+            # .NULL). Enable graphs unless the user globally disabled them.
+            score_server_args.smc_draft_mode = "dense"
+            score_server_args.disable_cuda_graph = self._user_disable_cuda_graph
+            # A 2nd is_draft_worker=False worker would re-run
+            # initialize_model_parallel and trip its "already initialized"
+            # assert. tp_size==1 here so the TP group is trivial and safe to
+            # reuse: skip the re-init when the group already exists.
+            import sglang.srt.model_executor.model_runner as _mr
+            from sglang.srt.distributed.parallel_state import (
+                model_parallel_is_initialized as _mp_init,
+            )
+            if not getattr(_mr, "_smc_score_mp_patched", False):
+                _orig_imp = _mr.initialize_model_parallel
+
+                def _imp_skip_if_init(*a, **k):
+                    if _mp_init():
+                        return
+                    return _orig_imp(*a, **k)
+
+                _mr.initialize_model_parallel = _imp_skip_if_init
+                _mr._smc_score_mp_patched = True
+            self._score_worker = SMCScoreTpModelWorker(
                 server_args=score_server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
@@ -397,7 +413,7 @@ class SMCWorkerV2(BaseSpecWorker):
                 attn_cp_rank=attn_cp_rank,
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
-                is_draft_worker=True,
+                is_draft_worker=False,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,

@@ -59,3 +59,26 @@ class SMCModelRunner(ModelRunner):
 
             return SMCCudaGraphRunner
         return super()._get_graph_runner_class()
+
+
+class ScoreModelRunner(SMCModelRunner):
+    """SMCModelRunner for the nested-SMC SCORE model (e.g. Qwen3-32B).
+
+    The score model must be ``is_draft_worker=False`` so SMCCudaGraphRunner
+    captures TARGET_VERIFY cuda graphs (the eager score verify is the decode
+    bottleneck). But it also *shares* the target's slot pool + refcounted
+    allocator like a draft. The base ``_init_pools`` asserts ``is_draft_worker``
+    whenever a ``req_to_token_pool`` is passed in; present as a draft only for
+    that call so the assert passes. The SMC allocator swap is correctly skipped
+    because the passed allocator is already an ``SMCRefCountedTokenAllocator``
+    (not the plain type), so the score model keeps the *shared* allocator and
+    block tables while owning its own (score-sized) KV tensor.
+    """
+
+    def _init_pools(self):
+        real_is_draft = self.is_draft_worker
+        self.is_draft_worker = True
+        try:
+            super()._init_pools()
+        finally:
+            self.is_draft_worker = real_is_draft
