@@ -58,6 +58,7 @@ class SMCVLLMEngine:
         *,
         n_particles: int = 4,
         gamma: int = 4,
+        resample_threshold: float = 0.5,
         tp_size: int = 1,
         max_model_len: int | None = None,
         **kwargs,
@@ -66,6 +67,7 @@ class SMCVLLMEngine:
             draft_model_path=draft_model_path,
             n_particles=n_particles,
             gamma=gamma,
+            resample_threshold=resample_threshold,
         )
 
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"

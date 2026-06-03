@@ -314,6 +314,26 @@ class SMCVLLMScheduler(Scheduler):
                     state.seed_token_ids[p] = int(next_seed_ids[i].item())
                 state.num_computed_tokens += self.smc_gamma + 1
 
+        # Apply resampling ancestry: remap active particles' scheduler-side state.
+        for group_id, ancestors in model_runner_output.resampled_groups.items():
+            state = self.smc_groups.get(group_id)
+            if state is None:
+                continue
+            active_ps = [p for p, f in enumerate(state.particle_finished) if not f]
+            ancestors_list = ancestors.tolist()  # length == len(active_ps)
+
+            # Materialise all new values before writing to avoid aliasing.
+            new_accumulated = [state.accumulated_tokens[active_ps[a]] for a in ancestors_list]
+            new_finished    = [state.particle_finished[active_ps[a]]  for a in ancestors_list]
+            new_req_ids     = [state.particle_req_ids[active_ps[a]]   for a in ancestors_list]
+            new_seed_ids    = [state.seed_token_ids[active_ps[a]]     for a in ancestors_list]
+
+            for local_i, p in enumerate(active_ps):
+                state.accumulated_tokens[p] = new_accumulated[local_i]
+                state.particle_finished[p]  = new_finished[local_i]
+                state.particle_req_ids[p]   = new_req_ids[local_i]
+                state.seed_token_ids[p]     = new_seed_ids[local_i]
+
         return result
 
     def _finish_group(
