@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from pprint import pformat
@@ -52,6 +53,7 @@ class ParticleGroup:
     particle_rows: list[int]   # row indices into RequestState / BlockTables
     particle_req_ids: list[str]
     n_particles: int
+    num_full_shared_blocks: int = 0  # prefix blocks shared by all particles; decode blocks start after
     debug_dumped: bool = False
 
 
@@ -71,6 +73,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         self.draft_kv_caches: list[torch.Tensor] = []
         self.particle_groups: dict[str, ParticleGroup] = {}  # group_id -> ParticleGroup
         self.target_sampler: Sampler | None = None
+        self.log_weights: torch.Tensor  # allocated in initialize_kv_cache
         self._draft_attn_metadata_debugged = False
 
     def load_model(self, *args, **kwargs) -> None:
@@ -170,6 +173,10 @@ class SMCGPUModelRunner(GPUModelRunner):
                 num_speculative_tokens=self.num_speculative_steps + 1,
             )
 
+        self.log_weights = torch.zeros(
+            self.max_num_reqs, dtype=torch.float32, device=self.device
+        )
+
     def register_particle_group(
         self,
         group_id: str,
@@ -232,11 +239,17 @@ class SMCGPUModelRunner(GPUModelRunner):
         #             f"row={particle_rows[i]} combined_block_ids={combined_block_ids}"
         #         )
 
+        block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        num_full_shared_blocks = num_computed_tokens // block_size
+
+        self.log_weights[particle_rows] = 0.0
+
         self.particle_groups[group_id] = ParticleGroup(
             group_id=group_id,
             particle_rows=particle_rows,
             particle_req_ids=list(particle_req_ids),
             n_particles=len(particle_req_ids),
+            num_full_shared_blocks=num_full_shared_blocks,
         )
 
     def _run_batched_draft_prefill(
@@ -425,14 +438,16 @@ class SMCGPUModelRunner(GPUModelRunner):
         self,
         batches: list[SMCGroupBatch | NewParticleGroupData],
         draft_results: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    ) -> dict[str, torch.Tensor]:
-        """Run target model on [seed, t1..t_gamma] per particle, return bonus tokens.
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Run target model on [seed, t1..t_gamma] per particle.
 
-        Fills target KV at the draft positions and samples one bonus token per
-        particle from the target logit at the last draft position (L+gamma).
+        Fills target KV at the draft positions, samples a bonus token from the
+        target logit at position L+gamma, and computes logprob_diff.
 
         Returns:
-            dict group_id -> bonus_tokens [A_i]  (int32 on device)
+            bonus_tokens:  dict group_id -> [A_i]  int32
+            logprob_diff:  dict group_id -> [A_i]  float32
+                           sum_k( log p_target(t_k) - log p_draft(t_k) ) for k=1..gamma
         """
         gamma = batches[0].gamma
 
@@ -537,8 +552,38 @@ class SMCGPUModelRunner(GPUModelRunner):
         # Support models that return (hidden_states, aux) tuples (e.g. Eagle3 target).
         hidden_states = model_output[0] if isinstance(model_output, tuple) else model_output
 
-        # Logits at position L_i+gamma for each particle.
-        logits = self.model.compute_logits(hidden_states[last_token_indices])  # [A_total, V]
+        # Compute logits for all gamma+1 positions in one call.
+        all_logits = self.model.compute_logits(hidden_states)           # [A_total*(gamma+1), V]
+        all_logits_2d = all_logits.reshape(A_total, gamma + 1, -1)     # [A_total, gamma+1, V]
+
+        # Bonus logits from the last position (L_i+gamma) for sampling.
+        bonus_logits = all_logits_2d[:, -1, :]                         # [A_total, V]
+
+        # ---- logprob_diff computation ----
+        # Target log-probs at positions 0..gamma-1 predict tokens t_1..t_gamma.
+        target_log_probs = torch.log_softmax(
+            all_logits_2d[:, :gamma, :], dim=-1
+        )                                                               # [A_total, gamma, V]
+
+        # draft_token_ids: t_1..t_gamma = draft_ids[:, 1:gamma+1]
+        draft_token_ids = draft_ids[:, 1:gamma + 1].long()             # [A_total, gamma]
+
+        target_lp = target_log_probs.gather(
+            2, draft_token_ids.unsqueeze(2)
+        ).squeeze(2)                                                    # [A_total, gamma]
+
+        # Gather draft log-probs for the same tokens (draft_results[group_id][1]: [A_i, gamma, V]).
+        all_draft_lp = torch.cat(
+            [draft_results[batch.group_id][1]
+             for batch in batches
+             if group_slices[batch.group_id][1] > group_slices[batch.group_id][0]],
+            dim=0,
+        )                                                               # [A_total, gamma, V]
+        draft_lp = all_draft_lp.gather(
+            2, draft_token_ids.unsqueeze(2)
+        ).squeeze(2)                                                    # [A_total, gamma]
+
+        logprob_diff_flat = (target_lp - draft_lp).sum(dim=1)         # [A_total]
 
         bonus_input_batch = self._build_draft_input_batch(
             particle_rows=rows,
@@ -548,7 +593,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             query_start_loc=torch.arange(A_total + 1, dtype=torch.int32, device=self.device),
             query_start_loc_np=np.arange(A_total + 1, dtype=np.int32),
         )
-        sampler_output = self.target_sampler(logits, bonus_input_batch)
+        sampler_output = self.target_sampler(bonus_logits, bonus_input_batch)
         bonus_tokens = sampler_output.sampled_token_ids.squeeze(-1).to(torch.int32)
 
         # Commit step gamma with the bonus token
@@ -556,7 +601,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             rows,
             self.req_states.num_computed_tokens.gpu,
             self.req_states.last_sampled_tokens,
-            self.sampler.penalties_state.output_bin_counts,
+            self.target_sampler.penalties_state.output_bin_counts,
             sampler_output.sampled_token_ids,
             sampler_output.num_sampled,
             torch.zeros_like(sampler_output.num_sampled),
@@ -566,12 +611,16 @@ class SMCGPUModelRunner(GPUModelRunner):
         )
         self.req_states.num_computed_tokens_np[rows.cpu().numpy()] += 1
 
-        return {
-            batch.group_id: bonus_tokens[s:e]
+        active = {
+            batch.group_id: (s, e)
             for batch in batches
             for s, e in [group_slices[batch.group_id]]
             if e > s
         }
+        return (
+            {gid: bonus_tokens[s:e]     for gid, (s, e) in active.items()},
+            {gid: logprob_diff_flat[s:e] for gid, (s, e) in active.items()},
+        )
     
     def _build_draft_input_batch(
         self,
@@ -671,9 +720,10 @@ class SMCGPUModelRunner(GPUModelRunner):
 
         Returns:
             dict group_id -> (draft_token_ids [A_i, gamma+1],
-                              draft_log_probs  [A_i, gamma+1, V],
+                              draft_log_probs  [A_i, gamma, V],
                               next_seed_ids    [A_i])
-            where A_i is the number of active (unfinished) particles for that group.
+            draft_log_probs covers steps 0..gamma-1 (the gamma committed tokens).
+            Step gamma's log_probs are not computed (that token is discarded).
         """
         assert self.draft_kv_cache_config is not None
         gamma = batches[0].gamma
@@ -705,7 +755,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         rows = torch.tensor(all_rows, dtype=torch.int32, device=self.device)
         seq_lens_cur = torch.tensor(all_seq_lens, dtype=torch.int32, device=self.device)
         draft_ids = torch.zeros(A_total, gamma + 1, dtype=torch.int32, device=self.device)
-        log_probs = torch.zeros(A_total, gamma + 1, self.vocab_size, dtype=torch.float32, device=self.device)
+        log_probs = torch.zeros(A_total, gamma, self.vocab_size, dtype=torch.float32, device=self.device)
         draft_ids[:, 0] = torch.tensor(all_seeds, dtype=torch.int32, device=self.device)
         next_seeds = torch.zeros(A_total, dtype=torch.int32, device=self.device)
 
@@ -749,7 +799,8 @@ class SMCGPUModelRunner(GPUModelRunner):
                 )
 
             logits = self.draft_model.compute_logits(hidden_states)
-            log_probs[:, step] = torch.log_softmax(logits, dim=-1)
+            if step < gamma:
+                log_probs[:, step] = torch.log_softmax(logits, dim=-1)
 
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
@@ -786,6 +837,120 @@ class SMCGPUModelRunner(GPUModelRunner):
                 next_seeds[s:e],
             )
         return results
+
+    @torch.inference_mode()
+    def _run_batched_resample(
+        self,
+        batches: list[SMCGroupBatch | NewParticleGroupData],
+        logprob_diff_per_group: dict[str, torch.Tensor],
+        resample_threshold: float,
+    ) -> dict[str, torch.Tensor]:
+        """Accumulate importance weights; resample groups whose ESS < threshold * N.
+
+        For resampled groups:
+          - Runs systematic resampling on GPU → ancestor_indices [N]
+          - Copies KV data (draft + target) from src decode blocks to dst decode blocks
+          - Copies req_states fields (token history, sampler penalty state)
+          - Resets log_weights to 0
+
+        Returns:
+            dict group_id -> ancestor_indices [N_i] (CPU int64, resampled groups only)
+        """
+        block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        resampled: dict[str, torch.Tensor] = {}
+
+        for batch in batches:
+            group_id = batch.group_id
+            group = self.particle_groups[group_id]
+
+            finished = getattr(batch, "particle_finished", None) or [False] * len(group.particle_rows)
+            active_local = [i for i, f in enumerate(finished) if not f]
+            N = len(active_local)
+            if N == 0:
+                continue
+
+            rows = torch.tensor(
+                [group.particle_rows[i] for i in active_local],
+                dtype=torch.int32, device=self.device,
+            )  # [N]
+
+            # Accumulate log-weight increment for this cycle.
+            if group_id in logprob_diff_per_group:
+                self.log_weights[rows] += logprob_diff_per_group[group_id]
+
+            # ESS = 1 / sum(w_i^2) where w_i are normalized weights.
+            # In log space: log_ESS = -logsumexp(2 * log_w_norm).
+            lw = self.log_weights[rows]  # [N]
+            log_Z = torch.logsumexp(lw, dim=0)
+            log_w_norm = lw - log_Z
+            ess = (-torch.logsumexp(2.0 * log_w_norm, dim=0)).exp()
+
+            if ess.item() >= resample_threshold * N:
+                continue
+
+            # Systematic resampling: one uniform draw, N evenly-spaced points.
+            w = log_w_norm.exp()                                        # [N] normalized
+            cumw = torch.cumsum(w, dim=0)                               # [N] CDF
+            u = torch.rand(1, device=self.device, dtype=torch.float32) / N
+            points = u + torch.arange(N, device=self.device, dtype=torch.float32) / N
+            ancestor_indices = torch.searchsorted(
+                cumw.contiguous(), points.contiguous()
+            ).clamp(0, N - 1)                                           # [N]
+
+            src_rows = rows[ancestor_indices]                           # [N]
+
+            # KV data copy: copy src's decode blocks into dst's decode blocks.
+            # Prefix blocks are shared by all particles — skip them.
+            seq_len = int(self.req_states.num_computed_tokens_np[int(rows[0].cpu())])
+            n_shared = group.num_full_shared_blocks
+            n_written = max(0, math.ceil((seq_len - n_shared * block_size) / block_size))
+
+            if n_written > 0:
+                copy_mask = ancestor_indices != torch.arange(N, device=self.device)
+                dst_local = copy_mask.nonzero(as_tuple=False).squeeze(1)   # [n_copies]
+                src_local = ancestor_indices[dst_local]                     # [n_copies]
+
+                bt_tuple = self._gather_block_tables(rows)  # tuple([N, max_blocks]) per kv_group
+
+                for g, bt in enumerate(bt_tuple):
+                    dst_blks = bt[dst_local, n_shared : n_shared + n_written]  # [n_copies, n_written]
+                    src_blks = bt[src_local, n_shared : n_shared + n_written]  # [n_copies, n_written]
+                    dst_flat = dst_blks.reshape(-1).long()
+                    src_flat = src_blks.reshape(-1).long()
+
+                    # For standard single-KV-group models all layers share the same block IDs.
+                    # TODO: for multi-group models build a per-group layer-tensor mapping.
+                    if g == 0:
+                        for kv in self.draft_kv_caches:
+                            kv[dst_flat] = kv[src_flat]
+                        for kv in self.kv_caches:
+                            kv[dst_flat] = kv[src_flat]
+
+            # Copy req_states fields: dst rows take on src rows' state.
+            # Advanced indexing reads all src values before writing, so no aliasing issues.
+            rows_l = rows.long()
+            src_rows_l = src_rows.long()
+            self.req_states.last_sampled_tokens[rows_l] = (
+                self.req_states.last_sampled_tokens[src_rows_l]
+            )
+            self.req_states.all_token_ids.gpu[rows_l] = (
+                self.req_states.all_token_ids.gpu[src_rows_l]
+            )
+            if self.sampler is not None:
+                bc = self.sampler.penalties_state.output_bin_counts
+                if bc is not None:
+                    bc[rows_l] = bc[src_rows_l]
+            if self.target_sampler is not None:
+                bc = self.target_sampler.penalties_state.output_bin_counts
+                if bc is not None:
+                    bc[rows_l] = bc[src_rows_l]
+
+            # Reset weights for next accumulation cycle.
+            self.log_weights[rows] = 0.0
+
+            resampled[group_id] = ancestor_indices.cpu()
+
+        return resampled
 
     def execute_model(
         self,
@@ -826,12 +991,19 @@ class SMCGPUModelRunner(GPUModelRunner):
             list(scheduler_output.new_particle_groups)
             + list(scheduler_output.ongoing_smc_groups)
         )
+        resampled_groups: dict[str, torch.Tensor] = {}
         if all_batches:
             smc_draft_results = self._run_batched_draft_decode(all_batches)
-            bonus_tokens_per_group = self._run_batched_target_verify(all_batches, smc_draft_results)
+            bonus_tokens_per_group, logprob_diff_per_group = self._run_batched_target_verify(
+                all_batches, smc_draft_results
+            )
             for group_id, bonus in bonus_tokens_per_group.items():
                 draft_ids, log_probs, _ = smc_draft_results[group_id]
                 smc_draft_results[group_id] = (draft_ids, log_probs, bonus)
+            resample_threshold = self.vllm_config.smc_config.resample_threshold
+            resampled_groups = self._run_batched_resample(
+                all_batches, logprob_diff_per_group, resample_threshold
+            )
 
         # Free rows for any groups the scheduler finished this step.
         active_ids = (
@@ -854,6 +1026,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             num_nans_in_logits=base_output.num_nans_in_logits,
             cudagraph_stats=base_output.cudagraph_stats,
             smc_draft_results=smc_draft_results,
+            resampled_groups=resampled_groups,
         )
 
     def shutdown(self) -> None:
