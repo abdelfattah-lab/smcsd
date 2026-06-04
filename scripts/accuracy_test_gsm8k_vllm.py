@@ -55,7 +55,7 @@ def format_instruction(question: str) -> str:
 
 def load_gsm8k(tokenizer, num_questions: int):
     print("Loading GSM8K dataset...")
-    dataset = load_dataset("gsm8k", "main", split="test")
+    dataset = load_dataset("openai/gsm8k", "main", split="test")
     prompts, labels = [], []
     for sample in dataset.select(range(num_questions)):
         instruction = format_instruction(sample["question"])
@@ -143,8 +143,8 @@ def main():
     parser.add_argument("--draft-model", default=DEFAULT_DRAFT_MODEL)
     parser.add_argument("--particles", "-N", type=int, default=1)
     parser.add_argument("--gamma", "-g", type=int, default=4)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--num-questions", type=int, default=1000)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--num-questions", type=int, default=300)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=2048)

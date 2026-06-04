@@ -148,7 +148,7 @@ def main():
     parser.add_argument("--draft-model", default=DEFAULT_DRAFT_MODEL,
                         help="draft model path (SMC draft and standalone baseline)")
     parser.add_argument("--mode", choices=["smc", "draft", "both"], default="both")
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--particles", "-N", type=int, default=1)
     parser.add_argument("--gamma", "-g", type=int, default=8)

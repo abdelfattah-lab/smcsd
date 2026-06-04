@@ -205,12 +205,27 @@ class SMCVLLMEngine:
         scheduler = self._engine.scheduler
         results = []
         for rid in rids:
-            # Per-particle draft token sequences accumulated during draft cycles.
-            draft_particles: list[list[int]] = scheduler._completed_groups.pop(rid, [])
+            # Per-particle draft token sequences and cumulative log-weights accumulated
+            # during draft cycles.
+            completed = scheduler._completed_groups.pop(rid, ([], []))
+            draft_particles, particle_log_weights = completed
             seed = seed_tokens[rid]
             particles = [seed + p for p in draft_particles]
-            # Particle 0 as the primary output (placeholder until resampling).
-            all_tokens = particles[0] if particles else seed
+            # Pick the best particle by cumulative log-weight (primary) and output
+            # length (tiebreaker), mirroring finalize_group in the sglang backend.
+            # Log-weights are 0 until target log-probs at draft positions are
+            # accumulated; selection then falls back to the longest particle.
+            if particles:
+                best_idx = max(
+                    range(len(particles)),
+                    key=lambda i: (
+                        particle_log_weights[i] if i < len(particle_log_weights) else 0.0,
+                        len(particles[i]),
+                    ),
+                )
+                all_tokens = particles[best_idx]
+            else:
+                all_tokens = seed
             results.append({
                 "text": self.tokenizer.decode(all_tokens, skip_special_tokens=True),
                 "output_ids": all_tokens,
