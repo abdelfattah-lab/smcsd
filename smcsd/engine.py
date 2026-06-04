@@ -103,7 +103,6 @@ class SMCEngine:
             smc_gamma=gamma,
             smc_draft_temperature=draft_temperature,
             smc_target_temperature=target_temperature,
-            smc_power_alpha=power_alpha,
             smc_resample_threshold=resample_threshold,
             smc_resample_method=resample_method,
             tp_size=tp_size,
@@ -118,6 +117,15 @@ class SMCEngine:
 
         server_args = ServerArgs(**merged)
         self.server_args = server_args
+
+        # power_alpha rides the ServerArgs *instance* as a dynamic attribute
+        # (plain dataclass, no __slots__ — extra attrs live in __dict__ and
+        # survive pickling into the scheduler subprocess).  This keeps the
+        # vendored ServerArgs class unmodified; SMCWorker reads it via getattr
+        # with a 1.0 default so non-SMCEngine launches are unaffected.
+        if power_alpha <= 0:
+            raise ValueError("power_alpha must be > 0.")
+        server_args.smc_power_alpha = float(power_alpha)
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
         configure_logger(server_args)

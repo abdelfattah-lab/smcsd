@@ -109,10 +109,13 @@ interval_weights  float64   [max_slots]             since-last-resample accumula
 
 all_token_ids     int32     [max_slots, max_output_len]   complete history
 
-temperatures      float32   [max_slots, 1]          sampling params
-top_ps            float32   [max_slots]             (static after alloc —
-top_ks            int32     [max_slots]              SMC worker does its
-min_ps            float32   [max_slots]              own temp adjust)
+_stub_temperatures  float32  [max_slots, 1]   constant stubs for
+_stub_top_ps        float32  [max_slots]      SamplingBatchInfo (the SMC
+_stub_top_ks        int32    [max_slots]      worker does its own draft +
+_stub_min_ps        float32  [max_slots]      bonus sampling under
+                                              engine-wide smc_* params —
+                                              per-request sampling params
+                                              are not honored on this path)
 ```
 
 `EMPTY_SLOT` (= -1) marks a free slot in `req_pool_indices`.

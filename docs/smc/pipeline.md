@@ -274,17 +274,19 @@ tokens per particle (`bs·(γ+1)` rows total):
   verify_batch.spec_info     = SMCVerifyInput(γ+1 tokens, positions, ...)
 
   score_out = target_worker.forward(verify_batch)           # bs·(γ+1) logits
-  score_log_probs = log_softmax(score_out).reshape(bs, γ+1, vocab)
+  # Tempered-power target p_{T_t}^α with p_{T_t}(x) = softmax(score_logits / T_t).
+  score_log_probs = log_softmax(score_out / smc_target_temperature).reshape(bs, γ+1, vocab)
 
   # score logprob of the draft's xₖ (for k = 1..γ):
   target_tokens = stack(all_tokens[1:γ+1], dim=1)           # [bs, γ]
   score_logprobs = score_log_probs[:, :γ, :].gather(-1, target_tokens)
 
-  # per-particle log-weight delta (γ terms summed):
-  logprob_diff = (score_logprobs - draft_logprobs_stacked).sum(dim=1)     # [bs]
+  # per-position log-weight delta (NOT summed — process_batch_result masks
+  # past-EOS positions before summing):
+  logprob_diff = α · score_logprobs − draft_logprobs_stacked                # [bs, γ]
 
-  # bonus token sampled from the score model at position γ:
-  bonus = multinomial( softmax( score_logits[:, γ] / smc_target_temperature ) )
+  # bonus token sampled from the same p_{T_t}^α target:
+  bonus = multinomial( softmax( α · score_logits[:, γ] / smc_target_temperature ) )
 ```
 
 Returned as `GenerationBatchResult` with:

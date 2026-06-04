@@ -263,9 +263,11 @@ class ScheduleBatchSMC:
             self.seq_lens[slot] = shared_seq_len
             self.kv_allocated_lens[slot] = shared_seq_len
             self.verified_ids[slot] = req.output_ids[-1] if req.output_ids else 0
-            # No deferred draft token at group start; first step uses a plain
-            # single-token head.
-            self.prev_last_draft_ids[slot] = 0
+            # -1 sentinel = "no deferred draft token yet" (group's first decode
+            # step).  The deferred-bonus path keys on this to use a 1-token head
+            # for step 0 (never touching the prompt's S-1 slot) and a 2-token
+            # head from step 1 on.  -1 is unambiguous since token ids are >= 0.
+            self.prev_last_draft_ids[slot] = -1
             self.token_counts[slot] = len(req.output_ids)
             self.finished_mask[slot] = False
             self.ignore_eos_t[slot] = bool(req.sampling_params.ignore_eos)

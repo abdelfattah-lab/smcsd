@@ -258,6 +258,87 @@ class SMCDecodeContext:
 
         return verify_forward_batch, can_run_cuda_graph
 
+    def prepare_for_draft_head(
+        self,
+        prev_last_draft_id: torch.Tensor,
+        verified_id: torch.Tensor,
+        cache_locs: torch.Tensor,
+        req_to_token_pool: ReqToTokenPool,
+        batch: ModelWorkerBatch,
+        draft_model_runner: "ModelRunner",
+    ) -> ForwardBatch:
+        """Build the deferred-bonus 2-token draft head (eager, no CUDA graph).
+
+        Mirrors ``prepare_for_verify`` but on the DRAFT runner with
+        ``draft_token_num=2``: a linear (EXTEND-style) causal pass over
+        ``[prev_last_draft_id, verified_id]`` at positions ``[S-1, S]`` with
+        prefix length ``S-1``.  The draft KV is valid through ``S-2``; this head
+        writes positions ``S-1`` and ``S``.  The ``S-1`` slot is the one the
+        previous step deferred (its over-draft) — it may hold stale bytes (its
+        own unwritten content, duplicated by the resample KV-copy), which this
+        head overwrites before any read: within this forward the ``S`` token
+        attends to the ``S-1`` token's freshly-computed KV, and later decodes
+        run only after the head completes.  The slot is looked up live from
+        ``req_to_token`` so it is correct after resampling.
+
+        The last-position (``S`` / bonus column) logits give the proposal for
+        ``d_0``.  Step ≥1 only — step 0 has no deferred token and uses the
+        1-token head.
+        """
+        device = batch.seq_lens.device
+        head_num = 2
+
+        orig_seq_lens = self.orig_seq_lens
+        # Prefix the head attends to: positions 0..S-2 (length S-1).
+        prefix_lens = orig_seq_lens - 1
+
+        # Tokens [prev, verified] per req, interleaved (req-major).
+        head_token_ids = torch.stack(
+            [prev_last_draft_id.to(torch.int64), verified_id.to(torch.int64)],
+            dim=1,
+        ).reshape(-1)
+
+        # Positions [S-1, S] per req.
+        step_offsets = torch.arange(head_num, device=device)
+        positions = (prefix_lens.unsqueeze(1) + step_offsets).reshape(-1)
+
+        # out_cache_loc [slot(S-1), slot(S)] per req.  slot(S-1) looked up live
+        # from req_to_token (post-resample correct); slot(S) is this step's
+        # first freshly-allocated slot (cache_locs[:, 0]).
+        rp = batch.req_pool_indices
+        r2t = req_to_token_pool.req_to_token
+        slot_sm1 = r2t[rp, (orig_seq_lens - 1).to(torch.int64)]
+        slot_s = cache_locs[:, 0]
+        out_cache_loc = torch.stack(
+            [slot_sm1.to(cache_locs.dtype), slot_s], dim=1
+        ).reshape(-1)
+
+        prefix_lens_cpu = prefix_lens.cpu()
+        head_spec = SMCVerifyInput(
+            draft_token_num=head_num,
+            positions=positions,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            seq_lens_sum=int(prefix_lens_cpu.sum().item()),
+            seq_lens_cpu=prefix_lens_cpu,
+            num_tokens_per_req=head_num,
+        )
+
+        head_batch = copy.copy(batch)
+        head_batch.input_ids = head_token_ids
+        head_batch.out_cache_loc = out_cache_loc
+        head_batch.seq_lens = prefix_lens
+        head_batch.seq_lens_cpu = prefix_lens_cpu
+        head_batch.seq_lens_sum = head_spec.seq_lens_sum
+        head_batch.spec_info = head_spec
+        head_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        head_batch.forward_mode = ForwardMode.TARGET_VERIFY
+
+        forward_batch = ForwardBatch.init_new(head_batch, draft_model_runner)
+        head_spec.populate_linear_verify_metadata(forward_batch)
+        # Attention metadata is set up by the caller: replay_prepare (graph
+        # path) or attn_backend.init_forward_metadata (eager fallback).
+        return forward_batch
+
 
 # ──────────────────────────────────────────────────────────────
 #  SMCDraftInput — pure data carrier
