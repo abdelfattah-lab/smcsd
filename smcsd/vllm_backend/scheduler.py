@@ -21,12 +21,16 @@ class SMCParticleGroupState:
     parent_req: Request
     n_particles: int
     num_computed_tokens: int
-    seed_token_ids: list[int]             
+    seed_token_ids: list[int]
     shared_prefix_block_ids: tuple[list[int], ...]   # [kv_group][block]
     decode_block_ids: list[tuple[list[int], ...]]    # [particle][kv_group][block]
-    particle_req_ids: list[str] = field(default_factory=list)  
+    particle_req_ids: list[str] = field(default_factory=list)
     accumulated_tokens: list[list[int]] = field(default_factory=list)  # [N][tokens]
-    particle_finished: list[bool] = field(default_factory=list)  
+    particle_finished: list[bool] = field(default_factory=list)
+    draft_temperature: float = 1.0
+    # Cumulative log-weight per particle: sum_t log(p_target(x_t)/p_draft(x_t)).
+    # Updated each cycle once target log-probs at draft positions are available.
+    log_weights: list[float] = field(default_factory=list)  # [N]
 
 
 # Scheduler Output
@@ -55,6 +59,7 @@ class SMCGroupBatch:
     seq_lens: torch.Tensor         # [N]
     gamma: int
     particle_finished: list[bool] = field(default_factory=list)  # [N]
+    temperature: float = 1.0
 
 
 @dataclass
@@ -72,7 +77,8 @@ class SMCVLLMScheduler(Scheduler):
         self.smc_n_particles: int = smc.n_particles
         self.smc_gamma: int = smc.gamma
         self.smc_groups: dict[str, SMCParticleGroupState] = {}  # group_id -> state
-        self._completed_groups: dict[str, list[list[int]]] = {}  # key: parent_req_id
+        # key: parent_req_id -> (accumulated_tokens[N][T], log_weights[N])
+        self._completed_groups: dict[str, tuple[list[list[int]], list[float]]] = {}
         # Requests that finished prefill but are waiting for particle-group capacity.
         self._fork_waitlist: list[Request] = []
         self.max_concurrent_groups: int = (
@@ -150,6 +156,8 @@ class SMCVLLMScheduler(Scheduler):
             particle_req_ids=particle_req_ids,
             accumulated_tokens=[[] for _ in range(n_particles)],
             particle_finished=[False] * n_particles,
+            draft_temperature=temperature,
+            log_weights=[0.0] * n_particles,
         )
         self.smc_groups[group_id] = state
 
@@ -180,6 +188,7 @@ class SMCVLLMScheduler(Scheduler):
             seq_lens=seq_lens,
             gamma=self.smc_gamma,
             particle_finished=list(state.particle_finished),
+            temperature=state.draft_temperature,
         )
 
     def finish_particle_group(self, group_id: str) -> None:
@@ -272,7 +281,7 @@ class SMCVLLMScheduler(Scheduler):
         if not isinstance(model_runner_output, SMCModelRunnerOutput):
             return result
 
-        for group_id, (draft_token_ids, _, next_seed_ids) in model_runner_output.smc_draft_results.items():
+        for group_id, (draft_token_ids, log_probs, next_seed_ids) in model_runner_output.smc_draft_results.items():
             state = self.smc_groups.get(group_id)
             if state is None:
                 continue
@@ -307,32 +316,43 @@ class SMCVLLMScheduler(Scheduler):
                 if max_tokens is not None and len(state.accumulated_tokens[p]) >= max_tokens:
                     state.particle_finished[p] = True
 
+            # Accumulate log-weight increments: delta_w^n = sum_t log(p_target/p_draft).
+            # logprob_diff[i] corresponds to active_ps[i] (same ordering).
+            logprob_diff = model_runner_output.smc_logprob_diffs.get(group_id)
+            if logprob_diff is not None:
+                for i, p in enumerate(active_ps):
+                    state.log_weights[p] += float(logprob_diff[i].item())
+
+            # Apply resampling ancestry over all N particles.
+            # ancestor_indices_t[p] = global source particle index for particle p.
+            ancestor_indices_t = model_runner_output.resampled_groups.get(group_id)
+            if ancestor_indices_t is not None:
+                anc = ancestor_indices_t.tolist()  # [N], indices into 0..N-1
+                # Snapshot sources first to avoid aliasing.
+                new_weights  = [state.log_weights[anc[p]]              for p in range(state.n_particles)]
+                new_tokens   = [list(state.accumulated_tokens[anc[p]]) for p in range(state.n_particles)]
+                new_finished = [state.particle_finished[anc[p]]        for p in range(state.n_particles)]
+                for p in range(state.n_particles):
+                    state.log_weights[p]        = new_weights[p]
+                    state.accumulated_tokens[p] = new_tokens[p]
+                    state.particle_finished[p]  = new_finished[p]
+
             if all(state.particle_finished):
                 self._finish_group(group_id, state, result)
             else:
+                # Build per-particle seeds for this cycle: active particles get the new
+                # bonus token; finished particles keep their previous seed.
+                full_seeds = list(state.seed_token_ids)
                 for i, p in enumerate(active_ps):
-                    state.seed_token_ids[p] = int(next_seed_ids[i].item())
+                    full_seeds[p] = int(next_seed_ids[i].item())
+                # Apply ancestry so each particle uses its ancestor's seed.
+                if ancestor_indices_t is not None:
+                    anc = ancestor_indices_t.tolist()
+                    for p in range(state.n_particles):
+                        state.seed_token_ids[p] = full_seeds[anc[p]]
+                else:
+                    state.seed_token_ids = full_seeds
                 state.num_computed_tokens += self.smc_gamma + 1
-
-        # Apply resampling ancestry: remap active particles' scheduler-side state.
-        for group_id, ancestors in model_runner_output.resampled_groups.items():
-            state = self.smc_groups.get(group_id)
-            if state is None:
-                continue
-            active_ps = [p for p, f in enumerate(state.particle_finished) if not f]
-            ancestors_list = ancestors.tolist()  # length == len(active_ps)
-
-            # Materialise all new values before writing to avoid aliasing.
-            new_accumulated = [state.accumulated_tokens[active_ps[a]] for a in ancestors_list]
-            new_finished    = [state.particle_finished[active_ps[a]]  for a in ancestors_list]
-            new_req_ids     = [state.particle_req_ids[active_ps[a]]   for a in ancestors_list]
-            new_seed_ids    = [state.seed_token_ids[active_ps[a]]     for a in ancestors_list]
-
-            for local_i, p in enumerate(active_ps):
-                state.accumulated_tokens[p] = new_accumulated[local_i]
-                state.particle_finished[p]  = new_finished[local_i]
-                state.particle_req_ids[p]   = new_req_ids[local_i]
-                state.seed_token_ids[p]     = new_seed_ids[local_i]
 
         return result
 
@@ -343,7 +363,10 @@ class SMCVLLMScheduler(Scheduler):
         result: dict[int, EngineCoreOutputs],
     ) -> None:
         """Emit a finish signal for the parent request and clean up."""
-        self._completed_groups[group_id] = state.accumulated_tokens
+        self._completed_groups[group_id] = (
+            state.accumulated_tokens,
+            list(state.log_weights),
+        )
 
         parent_req = state.parent_req
         finish_out = EngineCoreOutput(

@@ -447,7 +447,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         Returns:
             bonus_tokens:  dict group_id -> [A_i]  int32
             logprob_diff:  dict group_id -> [A_i]  float32
-                           sum_k( log p_target(t_k) - log p_draft(t_k) ) for k=1..gamma
+                           sum_t( log p_target(t_t) - log q_draft(t_t) ) for t=1..gamma
         """
         gamma = batches[0].gamma
 
@@ -456,6 +456,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         all_rows: list[int] = []
         all_start_seq_lens: list[int] = []
         all_draft_ids: list[torch.Tensor] = []
+        all_draft_log_probs: list[torch.Tensor] = []
 
         offset = 0
         for batch in batches:
@@ -467,7 +468,8 @@ class SMCGPUModelRunner(GPUModelRunner):
                 seq_lens_i = batch.seq_lens[active_local]
                 all_rows.extend(group.particle_rows[i] for i in active_local)
                 all_start_seq_lens.extend(seq_lens_i.tolist())
-                all_draft_ids.append(draft_results[batch.group_id][0])  # [A_i, gamma+1]
+                all_draft_ids.append(draft_results[batch.group_id][0])       # [A_i, gamma+1]
+                all_draft_log_probs.append(draft_results[batch.group_id][1]) # [A_i, gamma+1, V]
             group_slices[batch.group_id] = (offset, offset + A_i)
             offset += A_i
 
@@ -551,6 +553,8 @@ class SMCGPUModelRunner(GPUModelRunner):
 
         # Support models that return (hidden_states, aux) tuples (e.g. Eagle3 target).
         hidden_states = model_output[0] if isinstance(model_output, tuple) else model_output
+        # hidden_states: [A_total * (gamma+1), H] — tokens are laid out sequentially,
+        # gamma+1 tokens per particle, so we can safely reshape.
 
         # Compute logits for all gamma+1 positions in one call.
         all_logits = self.model.compute_logits(hidden_states)           # [A_total*(gamma+1), V]
@@ -559,31 +563,22 @@ class SMCGPUModelRunner(GPUModelRunner):
         # Bonus logits from the last position (L_i+gamma) for sampling.
         bonus_logits = all_logits_2d[:, -1, :]                         # [A_total, V]
 
-        # ---- logprob_diff computation ----
-        # Target log-probs at positions 0..gamma-1 predict tokens t_1..t_gamma.
-        target_log_probs = torch.log_softmax(
-            all_logits_2d[:, :gamma, :], dim=-1
-        )                                                               # [A_total, gamma, V]
-
-        # draft_token_ids: t_1..t_gamma = draft_ids[:, 1:gamma+1]
-        draft_token_ids = draft_ids[:, 1:gamma + 1].long()             # [A_total, gamma]
-
-        target_lp = target_log_probs.gather(
-            2, draft_token_ids.unsqueeze(2)
-        ).squeeze(2)                                                    # [A_total, gamma]
-
-        # Gather draft log-probs for the same tokens (draft_results[group_id][1]: [A_i, gamma, V]).
-        all_draft_lp = torch.cat(
-            [draft_results[batch.group_id][1]
-             for batch in batches
-             if group_slices[batch.group_id][1] > group_slices[batch.group_id][0]],
-            dim=0,
-        )                                                               # [A_total, gamma, V]
-        draft_lp = all_draft_lp.gather(
-            2, draft_token_ids.unsqueeze(2)
-        ).squeeze(2)                                                    # [A_total, gamma]
-
-        logprob_diff_flat = (target_lp - draft_lp).sum(dim=1)         # [A_total]
+        # ---- log-weight increment: sum_t log(p_target(x_t) / p_draft(x_t)) ----
+        draft_ids = torch.cat(all_draft_ids, dim=0)                     # [A_total, gamma+1]
+        draft_log_probs = torch.cat(all_draft_log_probs, dim=0)         # [A_total, gamma] scalars
+        if gamma > 0:
+            # Target log-probs at positions 0..gamma-1 predict tokens t_1..t_gamma.
+            target_log_probs = torch.log_softmax(
+                all_logits_2d[:, :gamma, :], dim=-1
+            )                                                           # [A_total, gamma, V]
+            draft_token_ids = draft_ids[:, 1:gamma + 1].long()         # [A_total, gamma]
+            log_p_target = target_log_probs.gather(
+                2, draft_token_ids.unsqueeze(2)
+            ).squeeze(2)                                                # [A_total, gamma]
+            # draft_log_probs is already [A_total, gamma] scalars gathered at sampling time.
+            logprob_diff_flat = (log_p_target - draft_log_probs).sum(dim=1)  # [A_total]
+        else:
+            logprob_diff_flat = torch.zeros(A_total, dtype=torch.float32, device=self.device)
 
         bonus_input_batch = self._build_draft_input_batch(
             particle_rows=rows,
@@ -733,6 +728,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         all_rows: list[int] = []
         all_seeds: list[int] = []
         all_seq_lens: list[int] = []
+        all_temperatures: list[float] = []
 
         offset = 0
         for batch in batches:
@@ -746,18 +742,22 @@ class SMCGPUModelRunner(GPUModelRunner):
                 all_rows.extend(group.particle_rows[i] for i in active_local)
                 all_seeds.extend(seeds_i.tolist())
                 all_seq_lens.extend(seq_lens_i.tolist())
+                all_temperatures.extend([batch.temperature] * A_i)
             group_slices[batch.group_id] = (offset, offset + A_i)
             offset += A_i
 
         A_total = offset
 
-        # Run gamma+1 decode steps over all A_total particles 
+        # Run gamma+1 decode steps over all A_total particles
         rows = torch.tensor(all_rows, dtype=torch.int32, device=self.device)
         seq_lens_cur = torch.tensor(all_seq_lens, dtype=torch.int32, device=self.device)
         draft_ids = torch.zeros(A_total, gamma + 1, dtype=torch.int32, device=self.device)
-        log_probs = torch.zeros(A_total, gamma, self.vocab_size, dtype=torch.float32, device=self.device)
+        draft_log_probs = torch.zeros(A_total, gamma, dtype=torch.float32, device=self.device)
         draft_ids[:, 0] = torch.tensor(all_seeds, dtype=torch.int32, device=self.device)
         next_seeds = torch.zeros(A_total, dtype=torch.int32, device=self.device)
+        temps = torch.tensor(
+            all_temperatures, dtype=torch.float32, device=self.device,
+        ).unsqueeze(1)  # [A_total, 1]
 
         for step in range(gamma + 1):
             input_ids = draft_ids[:, step]
@@ -799,14 +799,16 @@ class SMCGPUModelRunner(GPUModelRunner):
                 )
 
             logits = self.draft_model.compute_logits(hidden_states)
-            if step < gamma:
-                log_probs[:, step] = torch.log_softmax(logits, dim=-1)
 
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
             next_tokens = sampler_output.sampled_token_ids.squeeze(-1).to(torch.int32)
 
             if step < gamma:
+                # Gather scalar log q_draft(t_{step+1}) at the sampled token.
+                draft_log_probs[:, step] = torch.log_softmax(logits / temps, dim=-1).gather(
+                    1, next_tokens.unsqueeze(1).long()
+                ).squeeze(1)
                 # Commit draft token t_{step+1}
                 post_update(
                     rows,
@@ -833,7 +835,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             s, e = group_slices[batch.group_id]
             results[batch.group_id] = (
                 draft_ids[s:e],
-                log_probs[s:e],
+                draft_log_probs[s:e],
                 next_seeds[s:e],
             )
         return results
@@ -862,25 +864,23 @@ class SMCGPUModelRunner(GPUModelRunner):
         for batch in batches:
             group_id = batch.group_id
             group = self.particle_groups[group_id]
+            N = len(group.particle_rows)  # total particles including finished
 
-            finished = getattr(batch, "particle_finished", None) or [False] * len(group.particle_rows)
+            # All-particle rows for ESS, resampling, KV copy, and weight reset.
+            all_rows = torch.tensor(group.particle_rows, dtype=torch.int32, device=self.device)
+
+            # Scatter logprob_diff only into rows that were forwarded this cycle.
+            finished = getattr(batch, "particle_finished", None) or [False] * N
             active_local = [i for i, f in enumerate(finished) if not f]
-            N = len(active_local)
-            if N == 0:
-                continue
+            if active_local and group_id in logprob_diff_per_group:
+                active_rows = torch.tensor(
+                    [group.particle_rows[i] for i in active_local],
+                    dtype=torch.int32, device=self.device,
+                )
+                self.log_weights[active_rows] += logprob_diff_per_group[group_id]
 
-            rows = torch.tensor(
-                [group.particle_rows[i] for i in active_local],
-                dtype=torch.int32, device=self.device,
-            )  # [N]
-
-            # Accumulate log-weight increment for this cycle.
-            if group_id in logprob_diff_per_group:
-                self.log_weights[rows] += logprob_diff_per_group[group_id]
-
-            # ESS = 1 / sum(w_i^2) where w_i are normalized weights.
-            # In log space: log_ESS = -logsumexp(2 * log_w_norm).
-            lw = self.log_weights[rows]  # [N]
+            # ESS over ALL N particles (including finished ones).
+            lw = self.log_weights[all_rows]                             # [N]
             log_Z = torch.logsumexp(lw, dim=0)
             log_w_norm = lw - log_Z
             ess = (-torch.logsumexp(2.0 * log_w_norm, dim=0)).exp()
@@ -888,67 +888,85 @@ class SMCGPUModelRunner(GPUModelRunner):
             if ess.item() >= resample_threshold * N:
                 continue
 
-            # Systematic resampling: one uniform draw, N evenly-spaced points.
-            w = log_w_norm.exp()                                        # [N] normalized
+            # Systematic resampling over ALL N particles.
+            w = log_w_norm.exp()                                        # [N] normalised
             cumw = torch.cumsum(w, dim=0)                               # [N] CDF
             u = torch.rand(1, device=self.device, dtype=torch.float32) / N
             points = u + torch.arange(N, device=self.device, dtype=torch.float32) / N
             ancestor_indices = torch.searchsorted(
                 cumw.contiguous(), points.contiguous()
-            ).clamp(0, N - 1)                                           # [N]
+            ).clamp(0, N - 1)                                           # [N] in 0..N-1
 
-            src_rows = rows[ancestor_indices]                           # [N]
+            src_rows = all_rows[ancestor_indices]                       # [N]
 
-            # KV data copy: copy src's decode blocks into dst's decode blocks.
-            # Prefix blocks are shared by all particles — skip them.
-            seq_len = int(self.req_states.num_computed_tokens_np[int(rows[0].cpu())])
+            # KV copy: per-pair block count bounded by each source's actual written length.
             n_shared = group.num_full_shared_blocks
-            n_written = max(0, math.ceil((seq_len - n_shared * block_size) / block_size))
+            n_shared_tokens = n_shared * block_size
+            all_seq_lens_np = self.req_states.num_computed_tokens_np[all_rows.cpu().numpy()]
+            src_seq_lens = all_seq_lens_np[ancestor_indices.cpu().numpy()]  # [N]
 
-            if n_written > 0:
-                copy_mask = ancestor_indices != torch.arange(N, device=self.device)
-                dst_local = copy_mask.nonzero(as_tuple=False).squeeze(1)   # [n_copies]
-                src_local = ancestor_indices[dst_local]                     # [n_copies]
+            copy_mask = ancestor_indices != torch.arange(N, device=self.device)
+            if copy_mask.any():
+                dst_local = copy_mask.nonzero(as_tuple=False).squeeze(1)
+                src_local = ancestor_indices[dst_local]
+                bt_tuple = self._gather_block_tables(all_rows)
+                kv_all = list(self.draft_kv_caches) + list(self.kv_caches)
 
-                bt_tuple = self._gather_block_tables(rows)  # tuple([N, max_blocks]) per kv_group
+                # Two-phase copy to avoid read-after-write aliasing in cycles
+                # (e.g. 0←1 and 1←0).  Phase 1 snapshots all source blocks;
+                # phase 2 applies the writes.  Only g==0 is handled since
+                # all layers share the same logical block IDs for single-group models.
+                plan: list[tuple[torch.Tensor, list[torch.Tensor]]] = []
+                for di, si in zip(dst_local.cpu().tolist(), src_local.cpu().tolist()):
+                    n_written_i = max(0, math.ceil(
+                        (int(all_seq_lens_np[si]) - n_shared_tokens) / block_size
+                    ))
+                    if n_written_i == 0:
+                        continue
+                    bt = bt_tuple[0]
+                    dst_flat = bt[di, n_shared : n_shared + n_written_i].reshape(-1).long()
+                    src_flat = bt[si, n_shared : n_shared + n_written_i].reshape(-1).long()
+                    plan.append((dst_flat, [kv[src_flat].clone() for kv in kv_all]))
 
-                for g, bt in enumerate(bt_tuple):
-                    dst_blks = bt[dst_local, n_shared : n_shared + n_written]  # [n_copies, n_written]
-                    src_blks = bt[src_local, n_shared : n_shared + n_written]  # [n_copies, n_written]
-                    dst_flat = dst_blks.reshape(-1).long()
-                    src_flat = src_blks.reshape(-1).long()
+                for dst_flat, snapshots in plan:
+                    for kv, snapshot in zip(kv_all, snapshots):
+                        kv[dst_flat] = snapshot
 
-                    # For standard single-KV-group models all layers share the same block IDs.
-                    # TODO: for multi-group models build a per-group layer-tensor mapping.
-                    if g == 0:
-                        for kv in self.draft_kv_caches:
-                            kv[dst_flat] = kv[src_flat]
-                        for kv in self.kv_caches:
-                            kv[dst_flat] = kv[src_flat]
-
-            # Copy req_states fields: dst rows take on src rows' state.
-            # Advanced indexing reads all src values before writing, so no aliasing issues.
-            rows_l = rows.long()
+            # Copy req_states for all N particles.  Use .clone() on the RHS to
+            # materialise source values before any destination writes, guarding
+            # against potential alias when src_rows and rows overlap.
+            rows_l = all_rows.long()
             src_rows_l = src_rows.long()
             self.req_states.last_sampled_tokens[rows_l] = (
-                self.req_states.last_sampled_tokens[src_rows_l]
+                self.req_states.last_sampled_tokens[src_rows_l].clone()
             )
             self.req_states.all_token_ids.gpu[rows_l] = (
-                self.req_states.all_token_ids.gpu[src_rows_l]
+                self.req_states.all_token_ids.gpu[src_rows_l].clone()
+            )
+            self.req_states.num_computed_tokens.gpu[rows_l] = (
+                self.req_states.num_computed_tokens.gpu[src_rows_l].clone()
+            )
+            self.req_states.total_len.gpu[rows_l] = (
+                self.req_states.total_len.gpu[src_rows_l].clone()
+            )
+            dst_np = all_rows.cpu().numpy()
+            src_np = src_rows.cpu().numpy()
+            self.req_states.num_computed_tokens_np[dst_np] = (
+                self.req_states.num_computed_tokens_np[src_np].copy()
             )
             if self.sampler is not None:
                 bc = self.sampler.penalties_state.output_bin_counts
                 if bc is not None:
-                    bc[rows_l] = bc[src_rows_l]
+                    bc[rows_l] = bc[src_rows_l].clone()
             if self.target_sampler is not None:
                 bc = self.target_sampler.penalties_state.output_bin_counts
                 if bc is not None:
-                    bc[rows_l] = bc[src_rows_l]
+                    bc[rows_l] = bc[src_rows_l].clone()
 
-            # Reset weights for next accumulation cycle.
-            self.log_weights[rows] = 0.0
+            # Reset weights for all N particles.
+            self.log_weights[all_rows] = 0.0
 
-            resampled[group_id] = ancestor_indices.cpu()
+            resampled[group_id] = ancestor_indices.cpu()               # [N] in 0..N-1
 
         return resampled
 
@@ -992,6 +1010,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             + list(scheduler_output.ongoing_smc_groups)
         )
         resampled_groups: dict[str, torch.Tensor] = {}
+        smc_logprob_diffs: dict[str, torch.Tensor] = {}
         if all_batches:
             smc_draft_results = self._run_batched_draft_decode(all_batches)
             bonus_tokens_per_group, logprob_diff_per_group = self._run_batched_target_verify(
@@ -1000,6 +1019,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             for group_id, bonus in bonus_tokens_per_group.items():
                 draft_ids, log_probs, _ = smc_draft_results[group_id]
                 smc_draft_results[group_id] = (draft_ids, log_probs, bonus)
+            smc_logprob_diffs = logprob_diff_per_group
             resample_threshold = self.vllm_config.smc_config.resample_threshold
             resampled_groups = self._run_batched_resample(
                 all_batches, logprob_diff_per_group, resample_threshold
@@ -1027,6 +1047,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             cudagraph_stats=base_output.cudagraph_stats,
             smc_draft_results=smc_draft_results,
             resampled_groups=resampled_groups,
+            smc_logprob_diffs=smc_logprob_diffs,
         )
 
     def shutdown(self) -> None:
