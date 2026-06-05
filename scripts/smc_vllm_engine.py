@@ -30,8 +30,8 @@ engine = SMCVLLMEngine(
 out = engine.generate(
     prompt=PROMPTS,
     sampling_params={
-        "draft_temperature": 0,
-        "target_temperature": 0,
+        "draft_temperature": 0.7,
+        "target_temperature": 0.7,
     },
 )
 # engine._engine.profile(is_start=False)
