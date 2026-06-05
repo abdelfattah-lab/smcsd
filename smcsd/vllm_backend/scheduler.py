@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 class SMCParticleGroupState:
     parent_req: Request
     n_particles: int
-    num_computed_tokens: int
+    num_computed_tokens: int  # initial prompt length; kept for group registration
     seed_token_ids: list[int]
     shared_prefix_block_ids: tuple[list[int], ...]   # [kv_group][block]
     decode_block_ids: list[tuple[list[int], ...]]    # [particle][kv_group][block]
@@ -31,6 +31,11 @@ class SMCParticleGroupState:
     # Cumulative log-weight per particle: sum_t log(p_target(x_t)/p_draft(x_t)).
     # Updated each cycle once target log-probs at draft positions are available.
     log_weights: list[float] = field(default_factory=list)  # [N]
+    # Per-particle sequence lengths: only active particles advance each cycle.
+    # After resampling, remapped from ancestors so the runner always gets the
+    # correct starting position for each particle's KV context.
+    particle_num_computed_tokens: list[int] = field(default_factory=list)  # [N]
+    target_temperature: float = 1.0
 
 
 # Scheduler Output
@@ -59,7 +64,8 @@ class SMCGroupBatch:
     seq_lens: torch.Tensor         # [N]
     gamma: int
     particle_finished: list[bool] = field(default_factory=list)  # [N]
-    temperature: float = 1.0
+    temperature: float = 1.0        # draft temperature
+    target_temperature: float = 1.0
 
 
 @dataclass
@@ -146,6 +152,9 @@ class SMCVLLMScheduler(Scheduler):
         )
 
         group_id = parent_req_id
+        target_temperature = (
+            sp.temperature if sp is not None and sp.temperature is not None else 1.0
+        )
         state = SMCParticleGroupState(
             parent_req=parent_req,
             n_particles=n_particles,
@@ -158,6 +167,8 @@ class SMCVLLMScheduler(Scheduler):
             particle_finished=[False] * n_particles,
             draft_temperature=temperature,
             log_weights=[0.0] * n_particles,
+            particle_num_computed_tokens=[num_computed_tokens] * n_particles,
+            target_temperature=target_temperature,
         )
         self.smc_groups[group_id] = state
 
@@ -178,8 +189,8 @@ class SMCVLLMScheduler(Scheduler):
     def build_particle_group(self, group_id: str) -> SMCGroupBatch:
         """Build an SMCGroupBatch from current group state."""
         state = self.smc_groups[group_id]
-        seq_lens = torch.full(
-            (state.n_particles,), state.num_computed_tokens, dtype=torch.int32
+        seq_lens = torch.tensor(
+            state.particle_num_computed_tokens, dtype=torch.int32
         )
         seed_tensor = torch.tensor(state.seed_token_ids, dtype=torch.long)
         return SMCGroupBatch(
@@ -189,6 +200,7 @@ class SMCVLLMScheduler(Scheduler):
             gamma=self.smc_gamma,
             particle_finished=list(state.particle_finished),
             temperature=state.draft_temperature,
+            target_temperature=state.target_temperature,
         )
 
     def finish_particle_group(self, group_id: str) -> None:
@@ -302,7 +314,14 @@ class SMCVLLMScheduler(Scheduler):
 
             for i, p in enumerate(active_ps):
                 particle_tokens = new_tokens[i].tolist()
-                # Trim at first stop token
+                if max_tokens is not None:
+                    remaining = max_tokens - len(state.accumulated_tokens[p])
+                    if remaining <= 0:
+                        state.particle_finished[p] = True
+                        continue
+                    particle_tokens = particle_tokens[:remaining]
+
+                # Trim at first stop token within the visible committed tokens.
                 if stop_ids:
                     stop_pos = next(
                         (j for j, t in enumerate(particle_tokens) if t in stop_ids),
@@ -312,7 +331,6 @@ class SMCVLLMScheduler(Scheduler):
                         particle_tokens = particle_tokens[: stop_pos + 1]
                         state.particle_finished[p] = True
                 state.accumulated_tokens[p].extend(particle_tokens)
-                # Budget check per particle.
                 if max_tokens is not None and len(state.accumulated_tokens[p]) >= max_tokens:
                     state.particle_finished[p] = True
 
@@ -323,19 +341,28 @@ class SMCVLLMScheduler(Scheduler):
                 for i, p in enumerate(active_ps):
                     state.log_weights[p] += float(logprob_diff[i].item())
 
+            # Advance per-particle seq_lens for active particles only.
+            # Finished particles keep their last length so that if they later
+            # become ancestors after resampling, the correct (shorter) length
+            # propagates to the destination particle.
+            for p in active_ps:
+                state.particle_num_computed_tokens[p] += self.smc_gamma + 1
+
             # Apply resampling ancestry over all N particles.
             # ancestor_indices_t[p] = global source particle index for particle p.
             ancestor_indices_t = model_runner_output.resampled_groups.get(group_id)
             if ancestor_indices_t is not None:
                 anc = ancestor_indices_t.tolist()  # [N], indices into 0..N-1
                 # Snapshot sources first to avoid aliasing.
-                new_weights  = [state.log_weights[anc[p]]              for p in range(state.n_particles)]
-                new_tokens   = [list(state.accumulated_tokens[anc[p]]) for p in range(state.n_particles)]
-                new_finished = [state.particle_finished[anc[p]]        for p in range(state.n_particles)]
+                new_weights   = [state.log_weights[anc[p]]                    for p in range(state.n_particles)]
+                new_tokens    = [list(state.accumulated_tokens[anc[p]])        for p in range(state.n_particles)]
+                new_finished  = [state.particle_finished[anc[p]]              for p in range(state.n_particles)]
+                new_seq_lens  = [state.particle_num_computed_tokens[anc[p]]   for p in range(state.n_particles)]
                 for p in range(state.n_particles):
-                    state.log_weights[p]        = new_weights[p]
-                    state.accumulated_tokens[p] = new_tokens[p]
-                    state.particle_finished[p]  = new_finished[p]
+                    state.log_weights[p]                    = new_weights[p]
+                    state.accumulated_tokens[p]             = new_tokens[p]
+                    state.particle_finished[p]              = new_finished[p]
+                    state.particle_num_computed_tokens[p]   = new_seq_lens[p]
 
             if all(state.particle_finished):
                 self._finish_group(group_id, state, result)
@@ -352,7 +379,6 @@ class SMCVLLMScheduler(Scheduler):
                         state.seed_token_ids[p] = full_seeds[anc[p]]
                 else:
                     state.seed_token_ids = full_seeds
-                state.num_computed_tokens += self.smc_gamma + 1
 
         return result
 

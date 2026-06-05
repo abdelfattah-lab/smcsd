@@ -76,6 +76,25 @@ class SMCGPUModelRunner(GPUModelRunner):
         self.log_weights: torch.Tensor  # allocated in initialize_kv_cache
         self._draft_attn_metadata_debugged = False
 
+    @staticmethod
+    def _copy_kv_blocks(kv_cache: torch.Tensor, block_ids: torch.Tensor) -> torch.Tensor:
+        """Snapshot physical KV blocks across supported vLLM cache layouts."""
+        if kv_cache.dim() >= 2 and kv_cache.shape[0] == 2:
+            return kv_cache[:, block_ids].clone()
+        return kv_cache[block_ids].clone()
+
+    @staticmethod
+    def _write_kv_blocks(
+        kv_cache: torch.Tensor,
+        block_ids: torch.Tensor,
+        snapshot: torch.Tensor,
+    ) -> None:
+        """Write physical KV block snapshots across supported vLLM layouts."""
+        if kv_cache.dim() >= 2 and kv_cache.shape[0] == 2:
+            kv_cache[:, block_ids] = snapshot
+        else:
+            kv_cache[block_ids] = snapshot
+
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         smc = self.vllm_config.smc_config
@@ -208,8 +227,13 @@ class SMCGPUModelRunner(GPUModelRunner):
             )
             self.block_tables.append_block_ids(req_index, combined_block_ids, overwrite=True)
             if self.is_last_pp_rank and self.sampler is not None:
-                draft_sampling_params = copy.copy(sampling_params)
-                draft_sampling_params.temperature = temperature
+                # Draft must be pure temperature-sampling so that
+                # log_softmax(logits/T)[x_t] is the exact log q_draft.
+                # Copying target SamplingParams and propagating top-p/k/min-p/
+                # penalties would make the actual proposal a truncated/penalized
+                # distribution that does not match the log_softmax formula used
+                # in _run_batched_draft_decode, biasing importance weights.
+                draft_sampling_params = SamplingParams(temperature=temperature)
                 self.sampler.add_request(
                     req_index, prompt_len, draft_sampling_params
                 )
@@ -469,7 +493,7 @@ class SMCGPUModelRunner(GPUModelRunner):
                 all_rows.extend(group.particle_rows[i] for i in active_local)
                 all_start_seq_lens.extend(seq_lens_i.tolist())
                 all_draft_ids.append(draft_results[batch.group_id][0])       # [A_i, gamma+1]
-                all_draft_log_probs.append(draft_results[batch.group_id][1]) # [A_i, gamma+1, V]
+                all_draft_log_probs.append(draft_results[batch.group_id][1]) # [A_i, gamma]
             group_slices[batch.group_id] = (offset, offset + A_i)
             offset += A_i
 
@@ -568,6 +592,10 @@ class SMCGPUModelRunner(GPUModelRunner):
         draft_log_probs = torch.cat(all_draft_log_probs, dim=0)         # [A_total, gamma] scalars
         if gamma > 0:
             # Target log-probs at positions 0..gamma-1 predict tokens t_1..t_gamma.
+            # Use temperature 1.0 (untempered) for the target side of the weight,
+            # matching sglang's design: the importance weight log(p_T1_target/q_T_draft)
+            # measures alignment with the target mode rather than a specific temperature
+            # slice, and avoids premature weight collapse when T_target < 1.
             target_log_probs = torch.log_softmax(
                 all_logits_2d[:, :gamma, :], dim=-1
             )                                                           # [A_total, gamma, V]
@@ -926,11 +954,14 @@ class SMCGPUModelRunner(GPUModelRunner):
                     bt = bt_tuple[0]
                     dst_flat = bt[di, n_shared : n_shared + n_written_i].reshape(-1).long()
                     src_flat = bt[si, n_shared : n_shared + n_written_i].reshape(-1).long()
-                    plan.append((dst_flat, [kv[src_flat].clone() for kv in kv_all]))
+                    plan.append((
+                        dst_flat,
+                        [self._copy_kv_blocks(kv, src_flat) for kv in kv_all],
+                    ))
 
                 for dst_flat, snapshots in plan:
                     for kv, snapshot in zip(kv_all, snapshots):
-                        kv[dst_flat] = snapshot
+                        self._write_kv_blocks(kv, dst_flat, snapshot)
 
             # Copy req_states for all N particles.  Use .clone() on the RHS to
             # materialise source values before any destination writes, guarding
