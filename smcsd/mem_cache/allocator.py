@@ -27,12 +27,18 @@ class SMCRefCountedTokenAllocator(TokenToKVPoolAllocator):
     def alloc(self, need_size: int):
         select_index = super().alloc(need_size)
         if select_index is not None and select_index.numel() > 0:
-            self.slot_ref_count[select_index] = 1
+            # index_fill_ keeps the scalar inside the kernel launch.  The
+            # `tensor[idx] = 1` form wraps the scalar into a CPU tensor and
+            # issues a BLOCKING H2D copy (cudaStreamSynchronize) — a
+            # per-step stream drain on the decode hot path that serializes
+            # overlapped scheduling.
+            self.slot_ref_count.index_fill_(0, select_index, 1)
         return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() > 0:
-            self.slot_ref_count[free_index] = 0
+            # index_fill_, not `[...] = 0` — see alloc.
+            self.slot_ref_count.index_fill_(0, free_index.to(torch.int64), 0)
         super().free(free_index)
 
     def inc_ref(self, indices: torch.Tensor):

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
@@ -31,6 +32,7 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 
 @dataclass
@@ -70,17 +72,21 @@ class SMCDecodeContext:
     @staticmethod
     def from_slot_gather(
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         kv_allocated_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         gamma_plus_1: int,
         req_to_token_pool: ReqToTokenPool,
         tree_cache,
     ) -> Tuple["SMCDecodeContext", torch.Tensor]:
-        """Vectorized KV allocation — replaces the Python loop in
-        SMCDraftInput.prepare_for_decode (smc_info.py L203-217).
+        """Vectorized KV allocation, sync-free.
 
         Args:
             seq_lens: (bs,) int64, gathered contiguously from slot state.
+            seq_lens_cpu: (bs,) int64 CPU host-shadow gather of the same
+                values (see ``ScheduleBatchSMC.seq_lens_host``).  Trusted
+                without a device read so this whole prepare can be enqueued
+                before earlier GPU work has produced ``seq_lens``.
             kv_allocated_lens: (bs,) int64, gathered contiguously from slot state.
             req_pool_indices: (bs,) int64, gathered contiguously from slot state.
             gamma_plus_1: number of tokens per request (gamma + 1).
@@ -94,15 +100,19 @@ class SMCDecodeContext:
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = len(seq_lens)
-        seq_lens_cpu = seq_lens.cpu()
         orig_seq_lens = seq_lens.clone()
-        orig_seq_lens_sum = int(seq_lens_cpu.sum().item())
+        orig_seq_lens_sum = int(seq_lens_cpu.sum().item())  # CPU tensor — no sync
 
-        # Vectorized allocation (replaces per-req Python loop)
+        # Vectorized allocation (replaces per-req Python loop).  The device
+        # math handles the general alloc_start >= seq case for the block
+        # table writes; the host alloc COUNT relies on the maintained
+        # invariant kv_allocated_lens == seq_lens at prepare time (set at
+        # allocate, both advanced to seq + gamma+1 here, both copied
+        # together on resample), so every row needs exactly gamma+1 pages.
         alloc_start = torch.maximum(kv_allocated_lens, seq_lens)
         needed_len = seq_lens + gamma_plus_1
         new_alloc = torch.clamp(needed_len - alloc_start, min=0)
-        num_needed = int(new_alloc.sum().item())  # single GPU→CPU sync
+        num_needed = bs * gamma_plus_1
 
         nxt_kv_lens = alloc_start + new_alloc
 
@@ -313,12 +323,14 @@ class SMCDecodeContext:
             [slot_sm1.to(cache_locs.dtype), slot_s], dim=1
         ).reshape(-1)
 
-        prefix_lens_cpu = prefix_lens.cpu()
+        # Derived from the host-shadow CPU copy — no device read (this runs
+        # inside the worker's draft launch, on the sync-free hot path).
+        prefix_lens_cpu = self.orig_seq_lens_cpu - 1
         head_spec = SMCVerifyInput(
             draft_token_num=head_num,
             positions=positions,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            seq_lens_sum=int(prefix_lens_cpu.sum().item()),
+            seq_lens_sum=self.orig_seq_lens_sum - len(prefix_lens_cpu),
             seq_lens_cpu=prefix_lens_cpu,
             num_tokens_per_req=head_num,
         )
@@ -361,6 +373,12 @@ class SMCDraftInput(SpecInput):
     # Carried but NOT yet consumed by the draft loop (Step 2 wires the
     # consumer); inert scaffolding for now.
     prev_last_draft_id: Optional[torch.Tensor] = None
+    # True iff NO group in this batch has completed a decode step yet —
+    # i.e. every row's prev_last_draft_id is the -1 sentinel.  Computed on
+    # the CPU by the scheduler (group bookkeeping) so the worker's
+    # deferred-bonus head selection does not need a device read on
+    # prev_last_draft_id at draft-launch time.
+    all_first_decode_step: bool = False
     logprob_diff: Optional[torch.Tensor] = None  # (bs, gamma) per-position, last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode

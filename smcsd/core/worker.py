@@ -516,7 +516,12 @@ class SMCWorker(BaseSpecWorker):
         """
         x0 = draft_input.verified_id
         prev = draft_input.prev_last_draft_id
-        is_step0 = prev is None or bool((prev < 0).all().item())
+        # CPU flag from the scheduler's group bookkeeping — replaces the
+        # old device read `(prev < 0).all().item()`, which would block the
+        # draft launch on the previous step's write-back under overlapped
+        # scheduling.  Same semantics: 2-token head only once every group
+        # in the batch has a deferred draft token.
+        is_step0 = prev is None or draft_input.all_first_decode_step
 
         all_tokens = [x0]
         draft_logprobs = []
@@ -771,7 +776,7 @@ class SMCWorker(BaseSpecWorker):
 
         # ---- 5. Logprob diff ----
         # Per-position (bs, gamma) importance-weight increment, NOT summed
-        # over the block.  process_batch_result masks out positions at/after
+        # over the block.  write_back_gpu masks out positions at/after
         # an EOS before summing, so a particle that terminates mid-block does
         # not accrue weight from the draft's post-EOS continuation tokens
         # (those are not part of the sequence — EOS is an absorbing state with
