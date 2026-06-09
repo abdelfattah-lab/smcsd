@@ -471,21 +471,39 @@ class SMCWorker(BaseSpecWorker):
 
             logits = draft_out.logits_output.next_token_logits
 
-            scaled_logits = logits / self.smc_draft_temperature
-            log_probs = torch.log_softmax(scaled_logits, dim=-1)
+            # Gumbel-max sampling: argmax(logits/T + g) with g ~ Gumbel(0,1)
+            # is exactly equivalent to sampling from softmax(logits/T), but
+            # avoids materializing the full-vocab probability tensor and the
+            # multi-kernel torch.multinomial. The Gumbel noise drives only the
+            # *selection*; the token's logprob is still taken from the
+            # noise-free temperature-scaled distribution (see below), which is
+            # what the importance weight requires.
             if self.smc_draft_temperature > 0:
-                draft_idx = torch.multinomial(
-                    log_probs.exp(), num_samples=1
-                ).squeeze(-1)
+                scaled_logits = logits / self.smc_draft_temperature
+                gumbel = -torch.log(
+                    -torch.log(
+                        torch.rand_like(scaled_logits).clamp_min_(
+                            torch.finfo(scaled_logits.dtype).tiny
+                        )
+                    )
+                )
+                draft_idx = torch.argmax(scaled_logits + gumbel, dim=-1)
             else:
+                # Greedy: temperature 0 ignores noise entirely. Use the raw
+                # logits (argmax is scale-invariant for positive T anyway).
+                scaled_logits = logits
                 draft_idx = torch.argmax(logits, dim=-1)
 
             next_token = draft_idx
 
             if step < gamma:
-                token_logprob = log_probs.gather(
+                # logprob of the chosen token under softmax(logits/T):
+                #   logp = (logits/T)[idx] - logsumexp(logits/T)
+                # One gather + one reduction, no full-vocab softmax tensor.
+                chosen = scaled_logits.gather(
                     1, draft_idx.unsqueeze(1)
                 ).squeeze(1)
+                token_logprob = chosen - torch.logsumexp(scaled_logits, dim=-1)
                 draft_logprobs.append(token_logprob)
 
             all_tokens.append(next_token)
@@ -525,22 +543,38 @@ class SMCWorker(BaseSpecWorker):
             f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
             f"cuda_graph={can_run_cuda_graph})"
         )
-        score_log_probs = torch.log_softmax(score_logits, dim=-1)
-        score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
+        # Avoid materializing log_softmax over the full (bs*(gamma+1), vocab)
+        # tensor. We only need, per row, the logprob of one already-chosen
+        # token: logp = logit[token] - logsumexp(logits). That's one reduction
+        # plus one gather, versus writing and re-reading a ~vocab-wide
+        # probability tensor twice.
+        score_logits_3d = score_logits.reshape(bs, gamma + 1, -1)
         target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
-        score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
+
+        verify_logits = score_logits_3d[:, :gamma, :]
+        chosen_logits = verify_logits.gather(
             2, target_tokens.unsqueeze(2)
         ).squeeze(2)
+        score_logprobs_stacked = chosen_logits - torch.logsumexp(
+            verify_logits, dim=-1
+        )
 
         # ---- 5. Logprob diff ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
 
         # ---- 6. Bonus token ----
-        bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
-        bonus_log_probs = torch.log_softmax(
-            bonus_logits / self.smc_target_temperature, dim=-1
+        # Gumbel-max sampling from softmax(bonus_logits / target_temperature),
+        # matching the draft-loop path. target_temperature is clamped >= 1e-5
+        # in __init__, so the division is always safe.
+        bonus_logits = score_logits_3d[:, -1, :] / self.smc_target_temperature
+        bonus_gumbel = -torch.log(
+            -torch.log(
+                torch.rand_like(bonus_logits).clamp_min_(
+                    torch.finfo(bonus_logits.dtype).tiny
+                )
+            )
         )
-        bonus = torch.multinomial(bonus_log_probs.exp(), num_samples=1).squeeze(-1)
+        bonus = torch.argmax(bonus_logits + bonus_gumbel, dim=-1)
 
         # ---- 7. Output ----
         output_token_ids = torch.stack(
