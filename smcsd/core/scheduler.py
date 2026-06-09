@@ -971,14 +971,22 @@ class SMCScheduler(Scheduler):
         # scheduler->engine socket, BEFORE the token output.  FIFO delivery
         # guarantees the engine sees this while the rid is still pending (the
         # finish signal rides on the BatchTokenIDOutput that follows).
-        self.send_to_detokenizer.send_output(
-            SMCParticleOutput(
-                rid=parent_req.rid,
-                log_Z_hat=parent_req.smc_log_Z_hat,
-                log_w_tilde=parent_req.smc_log_w_tilde,
-                particle_output_ids=parent_req.smc_particle_output_ids,
+        #
+        # Gated on smc_emit_particle_output (a dynamic ServerArgs attribute
+        # set only by the offline SMCEngine, like smc_power_alpha): in HTTP
+        # mode this socket feeds a real DetokenizerManager, whose
+        # TypeBasedDispatcher raises ValueError on unknown message types —
+        # an ungated send kills the detokenizer on the first finalized
+        # group.  parent_req.smc_* stay populated either way.
+        if getattr(self.server_args, "smc_emit_particle_output", False):
+            self.send_to_detokenizer.send_output(
+                SMCParticleOutput(
+                    rid=parent_req.rid,
+                    log_Z_hat=parent_req.smc_log_Z_hat,
+                    log_w_tilde=parent_req.smc_log_w_tilde,
+                    particle_output_ids=parent_req.smc_particle_output_ids,
+                )
             )
-        )
         self.stream_output([parent_req], False)
 
 
