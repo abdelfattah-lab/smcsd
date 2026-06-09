@@ -345,6 +345,9 @@ class SMCWorker(BaseSpecWorker):
         u_samples_t = None
         if not draft_fb.forward_mode.is_idle():
             if self.sampling_method == "qmc":
+                # Continuous Sobol sequence across the whole batch.
+                # Drawing N*M points ensures each request group gets a unique 
+                # low-discrepancy set without artificial correlations or identity.
                 u_samples_t = self.sobol_engine.draw(bs).to(self.device)
             elif self.use_antithetic:
                 u_samples = np.random.uniform(0, 1, size=(bs, gamma + 1))

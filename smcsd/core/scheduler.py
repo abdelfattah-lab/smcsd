@@ -230,6 +230,19 @@ class SMCCoordinator:
         slot_state.finished_mask[dst_idx] = slot_state.finished_mask[src_idx]
         slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
         slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
+        
+        # Phase 3a: Lineage Tracking & Divergence Point Updates
+        # Cloned particles branch from their source at the CURRENT sequence length.
+        if self.use_prefix_tagging:
+            slot_state.divergence_points[dst_idx] = slot_state.seq_lens[src_idx]
+            # Unique tags for the new semantic branches
+            new_tags = torch.arange(
+                int(slot_state._next_lineage_tag), 
+                int(slot_state._next_lineage_tag + len(dst_idx)),
+                device=self.device
+            )
+            slot_state.lineage_tags[dst_idx] = new_tags
+            slot_state._next_lineage_tag += len(dst_idx)
 
         # Per-pair req-level metadata copy (Python; output_ids list,
         # finished_reason object, etc.).
