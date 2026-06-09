@@ -8,83 +8,71 @@ core call sites don't have to import the scheduler package.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+import dataclasses
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.managers.tp_worker import TpModelWorker
 
 
-@triton.jit
-def assign_smc_cache_locs_kernel(
-    req_pool_indices,
-    req_to_token,
-    seq_lens,
-    out_cache_loc,
-    pool_len: tl.constexpr,
-    num_tokens: tl.constexpr,
+@torch.library.custom_op("smcsd::assign_smc_cache_locs", mutates_args=())
+def assign_smc_cache_locs(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    max_context_len: int,
+    draft_token_num: int,
+) -> None:
+    """Vectorized assignment of cache locations for SMC draft tokens."""
+    bs = req_pool_indices.shape[0]
+    for i in range(bs):
+        req_idx = req_pool_indices[i]
+        start_pos = seq_lens[i]
+        for j in range(draft_token_num):
+            out_cache_loc[i * draft_token_num + j] = req_to_token[
+                req_idx, start_pos + j
+            ]
+
+
+@assign_smc_cache_locs.register_fake
+def _(
+    req_pool_indices, req_to_token, seq_lens, out_cache_loc, max_context_len, draft_token_num
 ):
-    """Assign cache locations for SMC decode: ``num_tokens`` slots per request."""
-    BLOCK_SIZE: tl.constexpr = 128
-    pid = tl.program_id(axis=0)
-
-    out_ptr = out_cache_loc + pid * num_tokens
-    kv_start = tl.load(seq_lens + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-
-    num_loop = tl.cdiv(num_tokens, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < num_tokens
-        data = tl.load(token_pool + kv_start + offset, mask=mask)
-        tl.store(out_ptr + offset, data, mask=mask)
+    return
 
 
-@dataclass
+@dataclasses.dataclass
 class SMCVerifyInput(SpecInput):
-    """Spec info for SMC verify (TARGET_VERIFY mode with CUDA graph support).
+    """Metadata for the score model verification pass."""
 
-    Uses linear (EXTEND-style) causal attention — no custom_mask needed.
-    The triton backend recognizes use_linear_target_verify() and uses
-    standard prefix_lens-based causal masking instead of custom_mask.
-    """
-
-    custom_mask: torch.Tensor = None  # Always None for SMC linear verify
     draft_token_num: int = -1
     positions: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     seq_lens_sum: int = None
     seq_lens_cpu: torch.Tensor = None
     num_tokens_per_req: int = -1
+    out_cache_loc: torch.Tensor = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.SMC_VERIFY)
 
-    def get_spec_adjust_token_coefficient(self):
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return (self.draft_token_num, self.draft_token_num)
 
-    def use_linear_target_verify(self) -> bool:
-        """Signal triton backend to use EXTEND-style causal attention."""
-        return True
+    def populate_linear_verify_metadata(self, forward_batch: ForwardBatch):
+        """Populate ForwardBatch fields for the score forward pass."""
+        device = forward_batch.input_ids.device
+        batch_size = forward_batch.batch_size // self.draft_token_num
 
-    def populate_linear_verify_metadata(self, forward_batch: "ForwardBatch") -> None:
-        """Set EXTEND-style fields on ForwardBatch for linear causal attention."""
-        batch_size = forward_batch.batch_size
-        device = forward_batch.seq_lens.device
-        prefix_lens = forward_batch.seq_lens.to(dtype=torch.int32)
-        extend_seq_lens = torch.full(
-            (batch_size,), self.draft_token_num, dtype=torch.int32, device=device,
-        )
-        forward_batch.extend_prefix_lens = prefix_lens
-        forward_batch.extend_seq_lens = extend_seq_lens
-        forward_batch.extend_num_tokens = batch_size * self.draft_token_num
+        forward_batch.seq_lens_sum = self.seq_lens_sum
+        forward_batch.extend_num_tokens = forward_batch.input_ids.shape[0]
         forward_batch.extend_start_loc = torch.arange(
             0, forward_batch.extend_num_tokens, step=self.draft_token_num,
             dtype=torch.int32, device=device,
@@ -95,4 +83,13 @@ class SMCVerifyInput(SpecInput):
         forward_batch.extend_prefix_lens_cpu = seq_lens_cpu
         forward_batch.extend_seq_lens_cpu = torch.full(
             (batch_size,), self.draft_token_num, dtype=torch.int32,
+        )
+        if self.out_cache_loc is not None:
+            forward_batch.out_cache_loc = self.out_cache_loc
+
+    @classmethod
+    def create_idle_input(cls, device: torch.device) -> "SMCVerifyInput":
+        return cls(
+            draft_token_num=1,
+            positions=torch.empty((0,), dtype=torch.int32, device=device),
         )

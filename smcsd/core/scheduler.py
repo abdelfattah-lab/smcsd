@@ -111,6 +111,22 @@ class SMCCoordinator:
         self.resample_threshold = resample_threshold
         self.resample_method = resample_method
         self._fast_step_counter = 0
+        
+        # Phase 2b: Adaptive Parameter Scaling
+        self.use_adaptive_threshold = os.environ.get("SMCSD_ADAPTIVE_THRESHOLD", "false").lower() == "true"
+        if self.use_adaptive_threshold:
+            logger.info("SMCCoordinator: Adaptive resample threshold enabled")
+
+        # Phase 3a: Common Prefix Tagging (IBM)
+        self.use_prefix_tagging = os.environ.get("SMCSD_USE_PREFIX_TAGGING", "false").lower() == "true"
+        if self.use_prefix_tagging:
+            logger.info("SMCCoordinator: Common Prefix Tagging enabled")
+
+        # Phase 4: Dynamic Parameter Scaling (Siemens)
+        self.use_dynamic_temp = os.environ.get("SMCSD_USE_DYNAMIC_TEMP", "false").lower() == "true"
+        if self.use_dynamic_temp:
+            logger.info("SMCCoordinator: Dynamic temperature scaling enabled")
+
         logger.info(
             "SMCCoordinator: resample_method=%s (fused systematic kernel)",
             resample_method,
@@ -125,14 +141,39 @@ class SMCCoordinator:
         ``dispatch_resample_batch``.
         """
         from smcsd.core.kernels.fused_collect import batched_collect_fused
+        from smcsd.core.kernels.kle_variance import compute_kle_variance
 
         self._fast_step_counter += 1
+        
+        current_thresholds = torch.full(
+            (slot_state.max_groups,), self.resample_threshold, 
+            dtype=torch.float64, device=self.device
+        )
+        
+        if self.use_adaptive_threshold:
+            # Phase 2b: Karhunen-Loève Expansion (KLE) Variance Sensing
+            # Compute variance of log-weights across particles for each group
+            variances = compute_kle_variance(
+                slot_state.interval_weights,
+                slot_state.group_to_slots,
+                slot_state.row_in_use
+            )
+            
+            # Adaptive logic: increase threshold where variance is high 
+            # (indicating a complex semantic junction).
+            # Heuristic: threshold' = threshold * (1 + log1p(variance))
+            # This ensures we resample more aggressively when paths are diverging.
+            adaptive_boost = torch.log1p(variances)
+            current_thresholds = current_thresholds * (1.0 + adaptive_boost)
+            # Clip to prevent excessive resampling (max 0.9)
+            current_thresholds = torch.clamp(current_thresholds, max=0.9)
+
         return batched_collect_fused(
             slot_state.log_weights,
             slot_state.interval_weights,
             slot_state.group_to_slots,
             slot_state.row_in_use,
-            self.resample_threshold,
+            current_thresholds, # Now passing a tensor of thresholds
             step_counter=self._fast_step_counter,
         )
 
@@ -163,6 +204,12 @@ class SMCCoordinator:
         src_pool_indices = slot_state.req_pool_indices[src_idx].to(torch.int32)
         dst_alloc_lens = slot_state.kv_allocated_lens[dst_idx].to(torch.int32)
         src_seq_lens = slot_state.seq_lens[src_idx].to(torch.int32)
+        
+        if self.use_prefix_tagging:
+            src_start_indices = slot_state.divergence_points[src_idx].to(torch.int32)
+        else:
+            # Baseline: copy entire KV cache (start from 0)
+            src_start_indices = torch.zeros_like(src_seq_lens)
 
         to_free = batched_resample_kv(
             slot_state.req_to_token_pool.req_to_token,
@@ -171,6 +218,7 @@ class SMCCoordinator:
             src_pool_indices,
             dst_alloc_lens,
             src_seq_lens,
+            src_start_indices,
         )
         if to_free.numel() > 0:
             slot_state.token_to_kv_pool_allocator.free(to_free)

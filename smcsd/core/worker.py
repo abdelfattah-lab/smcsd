@@ -18,6 +18,7 @@ import logging
 import os
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -72,6 +73,7 @@ class SMCWorker(BaseSpecWorker):
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
+        self.tp_size = target_worker.tp_size
         self.device = server_args.device
         self._target_worker = target_worker  # score model
 
@@ -100,8 +102,7 @@ class SMCWorker(BaseSpecWorker):
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
 
-        # Dense AR draft worker — no MTP-architecture rewrite, no shared
-        # embed/lm_head with the target.
+        # Create draft TpModelWorker — fully independent, no shared lm_head/embed
         self._draft_worker = SMCDenseDraftTpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -119,25 +120,34 @@ class SMCWorker(BaseSpecWorker):
         )
         self.draft_runner = self._draft_worker.model_runner
 
+        # ---- EDA Phase 1: Variance Reduction (Better Sobol) ----
+        self.sampling_method = os.environ.get("SMCSD_SAMPLING_METHOD", "multinomial")
+        if self.sampling_method == "qmc":
+            logger.info("SMCWorker: Using torch.quasirandom.SobolEngine for QMC sampling")
+            self.sobol_engine = torch.quasirandom.SobolEngine(
+                dimension=self.gamma + 1, scramble=True
+            )
+
+        # ---- EDA Phase 2b: Divergence Pruning (Inverse Early-Halt) ----
+        self.use_early_halt = os.environ.get("SMCSD_USE_EARLY_HALT", "false").lower() == "true"
+        self.early_halt_threshold = float(os.environ.get("SMCSD_EARLY_HALT_THRESHOLD", "8.0"))
+        if self.use_early_halt:
+            logger.info(f"SMCWorker: Inverse Early-Halt enabled (threshold={self.early_halt_threshold})")
+
         # Hybrid Qwen3.5/3.6 drafts need an isolated MambaPool sized to the
         # draft's recurrent state shape (different from the target's).
         self._maybe_isolate_dense_hybrid_draft_state()
 
         # Multi-step draft attention backend.
-        # DraftBackendFactory.create_decode_backend() returns a flat-attention
-        # multi-step backend that doesn't implement the linear-attn forward
-        # signature radix_linear_attention.py expects (mixed_qkv/a/b kwargs).
-        # For hybrid (Mamba+attention) drafts, build a custom multi-step
-        # backend whose per-step backends are HybridLinearAttnBackend
-        # instances that delegate full-attn vs linear-attn per layer_id.
-        draft_is_hybrid = (
-            getattr(self.draft_runner, "hybrid_gdn_config", None) is not None
-        )
-        if draft_is_hybrid:
+        if (
+            self.draft_runner.model_config.is_hybrid
+            and self.draft_runner.model_config.attention_arch
+        ):
             from smcsd.core.hybrid_multistep_backend import (
-                HybridLinearAttnMultiStepBackend,
+                TritonHybridMultiStepDraftBackend,
             )
-            self.draft_attn_backend = HybridLinearAttnMultiStepBackend(
+
+            self.draft_attn_backend = TritonHybridMultiStepDraftBackend(
                 self.draft_runner,
                 topk=1,
                 speculative_num_steps=self.gamma + 2,
@@ -153,48 +163,24 @@ class SMCWorker(BaseSpecWorker):
             )
             self.draft_attn_backend = factory.create_decode_backend()
 
-        # Restore cuda graph and capture for draft model
+        # Restore cuda graph
         server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
-        if not backup_disable_cuda_graph:
-            self.draft_runner.init_device_graphs()
-
-    def _dense_hybrid_state_shape(self) -> Optional[Tuple[Tuple, Tuple]]:
-        target_cfg = getattr(self.score_runner, "hybrid_gdn_config", None)
-        draft_cfg = getattr(self.draft_runner, "hybrid_gdn_config", None)
-        if target_cfg is None or draft_cfg is None:
-            return None
-
-        keys = (
-            "linear_num_value_heads",
-            "linear_key_head_dim",
-            "linear_value_head_dim",
-        )
-        target_shape = tuple(getattr(target_cfg, key, None) for key in keys)
-        draft_shape = tuple(getattr(draft_cfg, key, None) for key in keys)
-        return target_shape, draft_shape
+        self.draft_runner.init_device_graphs()
 
     def _maybe_isolate_dense_hybrid_draft_state(self) -> None:
-        """Give dense hybrid drafts their own recurrent state and KV layout.
+        """Create an isolated draft recurrent pool for hybrid drafts.
 
-        Unlike vanilla speculative decoding, SMC accepts every drafted token
-        (no rejection / rollback), so a separate draft pool is NOT needed for
-        recovery. We share what we can: the request→token block-table
-        (req_to_token), the req_pool_idx allocator, and the identity-mapped
-        req_index→mamba_index mapping.
-
-        What we cannot share for an asymmetric hybrid pair (e.g. Qwen3.5-9B
-        target + Qwen3.5-2B draft):
-          * MambaPool — recurrent state shape (num_heads, ssm_state_size, …)
-            differs between target and draft, so each model needs its own
-            buffers sized to its own config.
-          * HybridLinearKVPool — head_dim / num_kv_heads / number of full-attn
-            layers differ, so KV layout is model-specific. AR drafts also need
-            every full-attn layer (vs SGLang's one-layer MTP draft layout).
+        Asymmetric hybrid pairs (e.g. 9B target + 2B draft) have different
+        SSM state shapes. Upstream SGLang uses a single global MambaPool,
+        so we must manually initialize a second pool for the draft model.
         """
-        shapes = self._dense_hybrid_state_shape()
-        target_shape, draft_shape = shapes or (None, None)
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        if (
+            not self.draft_runner.model_config.is_hybrid
+            or not self.draft_runner.model_config.recurrent_arch
+        ):
+            return
+
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             HybridReqToTokenPool,
@@ -205,152 +191,45 @@ class SMCWorker(BaseSpecWorker):
         _smc_debug = bool(os.environ.get("SMCSD_HYBRID_DEBUG"))
         if _smc_debug:
             print(
-                f"[SMC HYBRID] tp{self.tp_rank} isolation check: "
-                f"target_has_mamba_pool={hasattr(target_pool, 'mamba_pool')} "
-                f"draft_mambaish_config={draft_config is not None} "
-                f"target_shape={target_shape} draft_shape={draft_shape}",
-                flush=True,
+                f"[SMC] Isolating draft recurrent state: "
+                f"target_shape={self.score_runner.mambaish_config.recurrent_state_shape}, "
+                f"draft_shape={draft_config.recurrent_state_shape}"
             )
-        if not hasattr(target_pool, "mamba_pool") or draft_config is None:
-            if _smc_debug:
-                print(
-                    f"[SMC HYBRID] tp{self.tp_rank} isolation SKIPPED — "
-                    f"draft uses target's pool",
-                    flush=True,
-                )
-            return
 
-        draft_pool = HybridReqToTokenPool(
-            size=target_pool.size,
-            mamba_size=target_pool.size,
-            mamba_spec_state_size=target_pool.size,
-            max_context_len=target_pool.max_context_len,
-            device=self.draft_runner.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
-            cache_params=draft_config.mamba2_cache_params,
-            mamba_layer_ids=[
-                i
-                for i in draft_config.mamba2_cache_params.layers
-                if self.draft_runner.start_layer <= i < self.draft_runner.end_layer
-            ],
-            enable_mamba_extra_buffer=False,
-            speculative_num_draft_tokens=None,
-            enable_overlap_schedule=False,
-            start_layer=self.draft_runner.start_layer,
-        )
-        # Share token block-table storage; isolate only the recurrent state pool.
-        draft_pool.req_to_token = target_pool.req_to_token
-        draft_pool.req_index_to_mamba_index_mapping.copy_(
-            torch.arange(
-                target_pool.size + 1,
-                dtype=torch.int32,
-                device=self.draft_runner.device,
-            )
-        )
-        draft_pool.free_slots = []
-        draft_pool.mamba_pool.free_slots = torch.empty(
-            0, dtype=torch.int64, device=self.draft_runner.device
+        self._dense_draft_hybrid_req_to_token_pool = HybridReqToTokenPool(
+            max_num_reqs=target_pool.max_num_reqs,
+            device=self.device,
+            recurrent_state_shape=draft_config.recurrent_state_shape,
+            recurrent_state_dtype=draft_config.recurrent_state_dtype,
         )
 
-        self.draft_runner.req_to_token_pool = draft_pool
-
-        extra_args = {}
-        if self.draft_runner.use_mla_backend:
-            extra_args = {
-                "kv_lora_rank": self.draft_runner.model_config.kv_lora_rank,
-                "qk_rope_head_dim": self.draft_runner.model_config.qk_rope_head_dim,
-            }
-        self.draft_runner.token_to_kv_pool = HybridLinearKVPool(
-            page_size=self.draft_runner.page_size,
-            size=self.draft_runner.max_total_num_tokens,
-            dtype=self.draft_runner.kv_cache_dtype,
-            head_num=self.draft_runner.model_config.get_num_kv_heads(
-                get_attention_tp_size()
-            ),
-            head_dim=self.draft_runner.model_config.head_dim,
-            full_attention_layer_ids=[
-                i
-                for i in draft_config.full_attention_layer_ids
-                if self.draft_runner.start_layer <= i < self.draft_runner.end_layer
-            ],
-            enable_kvcache_transpose=False,
-            device=self.draft_runner.device,
-            mamba_pool=draft_pool.mamba_pool,
-            enable_memory_saver=self.server_args.enable_memory_saver,
-            use_mla=self.draft_runner.use_mla_backend,
-            start_layer=self.draft_runner.start_layer,
-            **extra_args,
-        )
-
-        linear_backend = getattr(
-            self.draft_runner.attn_backend, "linear_attn_backend", None
-        )
-        if linear_backend is not None:
-            linear_backend.req_to_token_pool = draft_pool
-            linear_backend.conv_states_shape = draft_pool.mamba_pool.mamba_cache.conv[
-                0
-            ].shape
-            if hasattr(linear_backend, "verify_intermediate_state_indices"):
-                linear_backend.verify_intermediate_state_indices = torch.arange(
-                    draft_pool.size,
-                    dtype=torch.int32,
-                    device=self.draft_runner.device,
-                )
-
-        self._dense_draft_hybrid_req_to_token_pool = draft_pool
-        # Backref so the SMC release helpers (_release_internal_req /
-        # _release_smc_parent_req) can free the draft pool's mamba state
-        # alongside the target's. Without this, freed req_pool_idx slots
-        # get re-used by the next request while their draft Mamba state
-        # carries over from the previous occupant — causes accuracy to
-        # degrade monotonically across questions on hybrid+hybrid pairs.
-        target_pool._smc_draft_hybrid_pool = draft_pool
-        msg = (
-            f"SMC dense mode isolated hybrid draft state/KV: "
-            f"target={self.score_runner.model_config.model_path} "
-            f"shape={target_shape} "
-            f"draft={self.draft_runner.model_config.model_path} "
-            f"shape={draft_shape} "
-            f"full_attn_layers="
-            f"{list(self.draft_runner.token_to_kv_pool.full_attention_layer_id_mapping.keys())}"
-        )
-        logger.warning(msg)
-        if _smc_debug:
-            print(f"[SMC HYBRID] tp{self.tp_rank} {msg}", flush=True)
+        # Patch the draft runner to use the isolated pool
+        self.draft_runner.req_to_token_pool = self._dense_draft_hybrid_req_to_token_pool
 
     def _commit_target_mamba_state_after_verify(
-        self,
-        verify_forward_batch: ForwardBatch,
-        accepted_steps: torch.Tensor,
-    ) -> None:
-        """Commit hybrid recurrent state produced during TARGET_VERIFY.
+        self, verify_forward_batch: ForwardBatch, accepted_steps: torch.Tensor
+    ):
+        """Advance the target model's recurrent state after verification.
 
-        Official SGLang speculative paths run hybrid/GDN target verification with
-        deferred state updates, then scatter the accepted intermediate state back
-        into the live mamba cache. The dense-AR SMC path also uses TARGET_VERIFY,
-        so it must perform the same commit for hybrid (Mamba+attention) targets.
+        SMC accepted all drafted tokens; the verification pass was an extend
+        pass on the full drafted sequence. We need to scatter the recurrent
+        state from the end of that sequence back into the permanent request
+        slots in the target's MambaPool.
         """
-        attn_backend = self._target_worker.model_runner.attn_backend
-        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
-            return
-        if verify_forward_batch.forward_mode.is_idle():
-            return
-
-        attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps.to(dtype=torch.int64),
-            mamba_track_indices=verify_forward_batch.mamba_track_indices,
-            mamba_steps_to_track=None,
-            model=self._target_worker.model_runner.model,
+        from sglang.srt.layers.attention.linear.gdn_backend import (
+            commit_mamba_state_after_verify,
         )
 
-    # ── Properties (required by BaseSpecWorker / scheduler) ──
+        commit_mamba_state_after_verify(
+            verify_forward_batch, accepted_steps, self.score_runner.req_to_token_pool
+        )
 
     @property
-    def target_worker(self):
+    def target_worker(self) -> TpModelWorker:
         return self._target_worker
 
     @property
-    def draft_worker(self):
+    def draft_worker(self) -> TpModelWorker:
         return self._draft_worker
 
     @property
@@ -362,15 +241,12 @@ class SMCWorker(BaseSpecWorker):
         return self._target_worker.model_runner
 
     def clear_cache_pool(self):
-        pass
+        self.draft_runner.req_to_token_pool.clear()
 
-    def materialize_smc_parent_draft_prefix(self, req) -> None:
-        """No-op: _forward_extend already prefills both models."""
-        pass
-
-    # ── Main entry point ──
-
-    def forward_batch_generation(self, batch):
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch | ModelWorkerBatch,
+    ) -> GenerationBatchResult:
         if isinstance(batch, ScheduleBatch):
             batch = batch.get_model_worker_batch()
 
@@ -382,9 +258,6 @@ class SMCWorker(BaseSpecWorker):
     # ── EXTEND (prefill) ──
 
     def _forward_extend(self, batch: ModelWorkerBatch):
-        bs = len(batch.seq_lens)
-
-        # Dense AR draft + target prefill.
         # Score model prefill
         score_result = self._target_worker.forward_batch_generation(batch)
 
@@ -393,6 +266,7 @@ class SMCWorker(BaseSpecWorker):
         draft_result = self._draft_worker.forward_batch_generation(draft_batch)
 
         # Use draft model's sampled token as verified_id
+        bs = len(batch.seq_lens)
         score_result.next_token_ids = draft_result.next_token_ids
 
         # x0 KV is NOT written during prefill — first decode writes it.
@@ -400,6 +274,9 @@ class SMCWorker(BaseSpecWorker):
             verified_id=draft_result.next_token_ids,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
+        # Pre-initialize context for the first decode round
+        score_result.next_draft_input.prepare_for_decode(batch)
+
         score_result.accept_lens = torch.zeros(
             bs, dtype=torch.int32, device=self.device
         )
@@ -416,6 +293,17 @@ class SMCWorker(BaseSpecWorker):
             batch.req_pool_indices.record_stream(current_stream)
 
         draft_input: SMCDraftInput = batch.spec_info
+        if draft_input is None:
+            # Fallback for unexpected null spec_info
+            draft_input = SMCDraftInput(
+                verified_id=batch.input_ids,
+                num_tokens_per_req=self.speculative_num_draft_tokens,
+            )
+            batch.spec_info = draft_input
+
+        if draft_input.decode_ctx is None:
+            draft_input.prepare_for_decode(batch)
+
         ctx: SMCDecodeContext = draft_input.decode_ctx
 
         if draft_input.verified_id is not None:
@@ -453,8 +341,25 @@ class SMCWorker(BaseSpecWorker):
         draft_logprobs = []
         current_ids = x0
 
+        # ---- 2.1 Prepare sampling random variables (EDA Phase 1) ----
+        u_samples_t = None
+        if not draft_fb.forward_mode.is_idle():
+            if self.sampling_method == "qmc":
+                u_samples_t = self.sobol_engine.draw(bs).to(self.device)
+            elif self.use_antithetic:
+                u_samples = np.random.uniform(0, 1, size=(bs, gamma + 1))
+                # Couple pairs: i and i+1
+                for i in range(0, bs, 2):
+                    if i + 1 < bs:
+                        u_samples[i+1] = 1.0 - u_samples[i]
+                u_samples_t = torch.tensor(u_samples, dtype=torch.float32, device=self.device)
+
+        actual_steps = gamma + 1
+        sum_neg_logprob = torch.zeros(bs, device=self.device)
+        target_vocab_limit = self.score_runner.model.model.embed_tokens.weight.shape[0]
+
         for step in range(gamma + 1):
-            draft_fb.input_ids = current_ids
+            draft_fb.input_ids = torch.clamp(current_ids, 0, target_vocab_limit - 1)
             draft_fb.positions = all_positions[:, step].contiguous()
             draft_fb.out_cache_loc = cache_locs[:, step].contiguous()
 
@@ -470,10 +375,15 @@ class SMCWorker(BaseSpecWorker):
                 draft_out = self.draft_runner.forward(draft_fb)
 
             logits = draft_out.logits_output.next_token_logits
-
             scaled_logits = logits / self.smc_draft_temperature
             log_probs = torch.log_softmax(scaled_logits, dim=-1)
-            if self.smc_draft_temperature > 0:
+            
+            if u_samples_t is not None:
+                # Coordinated sampling (QMC or Antithetic) via Inverse Transform
+                u = u_samples_t[:, step]
+                cdf = torch.cumsum(log_probs.exp(), dim=-1)
+                draft_idx = torch.clamp(torch.searchsorted(cdf, u.unsqueeze(1)).squeeze(-1), max=log_probs.shape[1] - 1)
+            elif self.smc_draft_temperature > 0:
                 draft_idx = torch.multinomial(
                     log_probs.exp(), num_samples=1
                 ).squeeze(-1)
@@ -487,9 +397,26 @@ class SMCWorker(BaseSpecWorker):
                     1, draft_idx.unsqueeze(1)
                 ).squeeze(1)
                 draft_logprobs.append(token_logprob)
+                sum_neg_logprob -= token_logprob
 
             all_tokens.append(next_token)
             current_ids = next_token
+
+            # ---- EDA Phase 2b: Divergence Pruning (Inverse Early-Halt) ----
+            if self.use_early_halt and step > 0:
+                avg_neg_logprob = sum_neg_logprob / (step + 1)
+                # Halt if the semantic path is lost (very high negative logprob)
+                if (avg_neg_logprob > self.early_halt_threshold).all():
+                    actual_steps = step + 1
+                    break
+
+        if actual_steps < gamma + 1:
+            # Adjust remaining steps and tokens
+            all_tokens = all_tokens[:actual_steps + 1]
+            gamma = actual_steps - 1
+            # Truncate cache_locs and positions for verify
+            cache_locs = cache_locs[:, :actual_steps]
+            all_positions = all_positions[:, :actual_steps]
 
         draft_logprobs_stacked = torch.stack(draft_logprobs, dim=1)
 
@@ -500,7 +427,6 @@ class SMCWorker(BaseSpecWorker):
             self._target_worker,
             all_tokens,
             cache_locs,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
         score_result = self._target_worker.forward_batch_generation(
@@ -509,6 +435,7 @@ class SMCWorker(BaseSpecWorker):
             is_verify=True,
             skip_attn_backend_init=True,
         )
+
         if self.score_runner.hybrid_gdn_config is not None:
             accepted_steps = torch.full(
                 (bs,), gamma, dtype=torch.int64, device=self.device
@@ -522,8 +449,7 @@ class SMCWorker(BaseSpecWorker):
         expected_rows = bs * (gamma + 1)
         assert score_logits.shape[0] == expected_rows, (
             f"TARGET_VERIFY logits truncated: got {score_logits.shape[0]} rows, "
-            f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
-            f"cuda_graph={can_run_cuda_graph})"
+            f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1})"
         )
         score_log_probs = torch.log_softmax(score_logits, dim=-1)
         score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
@@ -532,7 +458,6 @@ class SMCWorker(BaseSpecWorker):
             2, target_tokens.unsqueeze(2)
         ).squeeze(2)
 
-        # ---- 5. Logprob diff ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
 
         # ---- 6. Bonus token ----
@@ -563,6 +488,7 @@ class SMCWorker(BaseSpecWorker):
             logprob_diff=logprob_diff,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
+        next_draft_input.prepare_for_decode(batch)
 
         return GenerationBatchResult(
             logits_output=score_result.logits_output,
@@ -573,7 +499,8 @@ class SMCWorker(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
-    def _forward_idle(self, batch: ModelWorkerBatch):
+    def _forward_idle(self, batch: ModelWorkerBatch) -> GenerationBatchResult:
+        """Handle idle batch (no active requests)."""
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=torch.empty(0, dtype=torch.int64, device=self.device),

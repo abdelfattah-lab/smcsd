@@ -50,6 +50,24 @@ class SMCDecodeContext:
     new_seq_lens: torch.Tensor  # (bs,) AFTER advance by gamma+1
     gamma: int  # speculative steps (gamma, NOT gamma+1)
 
+    def filter_batch(self, new_indices: torch.Tensor):
+        return SMCDecodeContext(
+            orig_seq_lens=self.orig_seq_lens[new_indices],
+            orig_seq_lens_cpu=self.orig_seq_lens_cpu[new_indices.cpu()],
+            orig_seq_lens_sum=int(self.orig_seq_lens[new_indices].sum()),
+            new_seq_lens=self.new_seq_lens[new_indices],
+            gamma=self.gamma,
+        )
+
+    def merge_batch(self, other: "SMCDecodeContext"):
+        return SMCDecodeContext(
+            orig_seq_lens=torch.cat([self.orig_seq_lens, other.orig_seq_lens]),
+            orig_seq_lens_cpu=torch.cat([self.orig_seq_lens_cpu, other.orig_seq_lens_cpu]),
+            orig_seq_lens_sum=self.orig_seq_lens_sum + other.orig_seq_lens_sum,
+            new_seq_lens=torch.cat([self.new_seq_lens, other.new_seq_lens]),
+            gamma=self.gamma,
+        )
+
     @staticmethod
     def from_slot_gather(
         seq_lens: torch.Tensor,
@@ -62,14 +80,6 @@ class SMCDecodeContext:
         """Vectorized KV allocation — replaces the Python loop in
         SMCDraftInput.prepare_for_decode (smc_info.py L203-217).
 
-        Args:
-            seq_lens: (bs,) int64, gathered contiguously from slot state.
-            kv_allocated_lens: (bs,) int64, gathered contiguously from slot state.
-            req_pool_indices: (bs,) int64, gathered contiguously from slot state.
-            gamma_plus_1: number of tokens per request (gamma + 1).
-            req_to_token_pool: shared KV pool.
-            tree_cache: for alloc_token_slots.
-
         Returns:
             (ctx, new_kv_allocated_lens) where new_kv_allocated_lens should be
             scattered back to the slot state.
@@ -81,11 +91,11 @@ class SMCDecodeContext:
         orig_seq_lens = seq_lens.clone()
         orig_seq_lens_sum = int(seq_lens_cpu.sum().item())
 
-        # Vectorized allocation (replaces per-req Python loop)
+        # Vectorized allocation
         alloc_start = torch.maximum(kv_allocated_lens, seq_lens)
         needed_len = seq_lens + gamma_plus_1
         new_alloc = torch.clamp(needed_len - alloc_start, min=0)
-        num_needed = int(new_alloc.sum().item())  # single GPU→CPU sync
+        num_needed = int(new_alloc.sum().item())
 
         nxt_kv_lens = alloc_start + new_alloc
 
@@ -120,11 +130,7 @@ class SMCDecodeContext:
         cuda_graph_runner,
         draft_model_runner: "ModelRunner",
     ) -> Tuple[ForwardBatch, bool, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare batch and create ForwardBatch for draft AR decoding.
-
-        Returns (forward_batch, can_cuda_graph, cache_locs, all_positions, all_seq_lens).
-        The caller updates forward_batch fields in-place per AR step.
-        """
+        """Prepare batch and create ForwardBatch for draft AR decoding."""
         orig_seq_lens = self.orig_seq_lens
         bs = len(orig_seq_lens)
         device = orig_seq_lens.device
@@ -144,12 +150,11 @@ class SMCDecodeContext:
         )
         cache_locs = out_cache_loc.reshape(bs, gamma + 1)
 
-        # Pre-compute all positions and seq_lens on GPU — no CPU sync
+        # Pre-compute all positions and seq_lens on GPU
         step_offsets = torch.arange(gamma + 1, device=device)
-        all_positions = orig_seq_lens.unsqueeze(1) + step_offsets  # (bs, gamma+1)
-        all_seq_lens = all_positions + 1  # (bs, gamma+1)
+        all_positions = orig_seq_lens.unsqueeze(1) + step_offsets
+        all_seq_lens = all_positions + 1
 
-        # Shallow copy to avoid mutating scheduler's batch state
         draft_batch = copy.copy(batch)
         draft_batch.input_ids = verified_id
         draft_batch.out_cache_loc = cache_locs[:, 0].contiguous()
@@ -158,8 +163,6 @@ class SMCDecodeContext:
         draft_batch.seq_lens_cpu = self.orig_seq_lens_cpu + 1
         draft_batch.capture_hidden_mode = CaptureHiddenMode.NULL
 
-        # Clear spec_info for ForwardBatch creation and CUDA graph compatibility.
-        # Positions are derived from seq_lens via clamp_position() in init_new.
         draft_batch.spec_info = None
         forward_batch = ForwardBatch.init_new(draft_batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
@@ -170,38 +173,33 @@ class SMCDecodeContext:
         self,
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
-        target_worker: "TpModelWorker",
+        target_worker: TpModelWorker,
         all_tokens: list,
         cache_locs: torch.Tensor,
-        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
     ) -> Tuple[ForwardBatch, bool]:
-        """Prepare batch and create ForwardBatch for score model verification.
-
-        Returns (forward_batch, can_run_cuda_graph).
-        """
+        """Prepare batch and create ForwardBatch for score model verification."""
         gamma = self.gamma
         bs = len(batch.req_pool_indices)
         device = batch.seq_lens.device
         draft_token_num = gamma + 1
 
-        # Build score input: [x0, ..., x(gamma)]
-        score_token_ids = torch.stack(all_tokens[: gamma + 1], dim=1)  # (bs, gamma+1)
+        score_token_ids = torch.stack(all_tokens[: gamma + 1], dim=1)
         score_input_ids = score_token_ids.reshape(-1)
 
         orig_seq_lens = self.orig_seq_lens
         orig_seq_lens_cpu = self.orig_seq_lens_cpu
 
-        # Positions: [seq_len, seq_len+1, ..., seq_len+gamma] per request
         step_offsets = torch.arange(draft_token_num, device=device)
         positions = (orig_seq_lens.unsqueeze(1) + step_offsets).reshape(-1)
 
         verify_spec_info = SMCVerifyInput(
             draft_token_num=draft_token_num,
             positions=positions,
-            capture_hidden_mode=capture_hidden_mode,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
             seq_lens_sum=self.orig_seq_lens_sum,
             seq_lens_cpu=orig_seq_lens_cpu,
             num_tokens_per_req=draft_token_num,
+            out_cache_loc=cache_locs.reshape(-1),
         )
 
         verify_batch = copy.copy(batch)
@@ -211,17 +209,16 @@ class SMCDecodeContext:
         verify_batch.seq_lens_cpu = orig_seq_lens_cpu
         verify_batch.seq_lens_sum = verify_spec_info.seq_lens_sum
         verify_batch.spec_info = verify_spec_info
-        verify_batch.capture_hidden_mode = capture_hidden_mode
-        batch = verify_batch
+        verify_batch.capture_hidden_mode = CaptureHiddenMode.NULL
 
-        is_idle = batch.forward_mode.is_idle()
-        batch.forward_mode = (
+        is_idle = verify_batch.forward_mode.is_idle()
+        verify_batch.forward_mode = (
             ForwardMode.IDLE if is_idle else ForwardMode.TARGET_VERIFY
         )
 
         graph_runner = target_worker.model_runner.graph_runner
         verify_forward_batch = ForwardBatch.init_new(
-            batch, target_worker.model_runner
+            verify_batch, target_worker.model_runner
         )
 
         can_run_cuda_graph = bool(
@@ -249,19 +246,53 @@ class SMCDecodeContext:
 
 @dataclass
 class SMCDraftInput(SpecInput):
-    """Lightweight carrier between scheduler and worker via batch.spec_info.
-
-    Has no prepare_for_decode / prepare_for_draft / prepare_for_verify methods —
-    those live on SMCDecodeContext.
-    """
+    """Lightweight carrier between scheduler and worker via batch.spec_info."""
 
     verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token
     logprob_diff: Optional[torch.Tensor] = None  # (bs,) from last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
 
-    # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1
+
+    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if self.verified_id is not None:
+            self.verified_id = self.verified_id[new_indices]
+        if self.logprob_diff is not None:
+            self.logprob_diff = self.logprob_diff[new_indices]
+        if self.decode_ctx is not None:
+            self.decode_ctx = self.decode_ctx.filter_batch(new_indices)
+
+    def merge_batch(self, other: "SMCDraftInput"):
+        if self.verified_id is not None and other.verified_id is not None:
+            self.verified_id = torch.cat([self.verified_id, other.verified_id])
+        if self.logprob_diff is not None and other.logprob_diff is not None:
+            self.logprob_diff = torch.cat([self.logprob_diff, other.logprob_diff])
+        if self.decode_ctx is not None and other.decode_ctx is not None:
+            self.decode_ctx = self.decode_ctx.merge_batch(other.decode_ctx)
+
+    @property
+    def new_seq_lens(self) -> Optional[torch.Tensor]:
+        return self.decode_ctx.new_seq_lens if self.decode_ctx else None
+
+    def prepare_for_decode(self, batch: ModelWorkerBatch):
+        """Called by scheduler to stash per-cycle state."""
+        if self.decode_ctx is not None:
+            return
+
+        bs = len(batch.seq_lens)
+        orig_seq_lens = batch.seq_lens.clone()
+        orig_seq_lens_cpu = batch.seq_lens_cpu.clone()
+        orig_seq_lens_sum = int(orig_seq_lens.sum())
+        new_seq_lens = orig_seq_lens + self.num_tokens_per_req
+        
+        self.decode_ctx = SMCDecodeContext(
+            orig_seq_lens=orig_seq_lens,
+            orig_seq_lens_cpu=orig_seq_lens_cpu,
+            orig_seq_lens_sum=orig_seq_lens_sum,
+            new_seq_lens=new_seq_lens,
+            gamma=self.num_tokens_per_req - 1
+        )
 
     def __post_init__(self):
         super().__init__(SpecInputType.SMC_DRAFT)

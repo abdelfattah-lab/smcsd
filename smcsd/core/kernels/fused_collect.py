@@ -107,7 +107,7 @@ def _fused_collect_kernel(
     row_of_job_ptr,           # (max_slots,) int32
     global_counter_ptr,       # (1,)         int32   atomic
     resample_mask_ptr,        # (max_groups,) int32
-    THRESHOLD,                # float64
+    THRESHOLD_ptr,            # (max_groups,) float64
     N: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -122,6 +122,7 @@ def _fused_collect_kernel(
         return
 
     n_f = tl.full([], N, dtype=tl.float64)
+    threshold = tl.load(THRESHOLD_ptr + row)
 
     # Gather this row's slot ids, then the slots' interval log-weights.
     # Padded cols (when BLOCK > N) load slot 0 and weight -inf; they drop
@@ -200,7 +201,7 @@ def batched_collect_fused(
     interval_weights: torch.Tensor,
     group_to_slots: torch.Tensor,
     row_in_use: torch.Tensor,
-    threshold: float,
+    thresholds: torch.Tensor, # Changed from float to Tensor
     *,
     step_counter: int,
 ) -> BatchedResampleResult:
@@ -262,7 +263,7 @@ def batched_collect_fused(
         plan_rows,
         plan_counter,
         plan_mask,
-        float(threshold),
+        thresholds, # Now a tensor
         N=N,
         BLOCK=BLOCK,
     )

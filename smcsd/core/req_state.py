@@ -143,6 +143,13 @@ class ScheduleBatchSMC:
             self.max_slots, dtype=torch.float64, device=device
         )
 
+        # ── Lineage Tracking [max_slots] (Phase 3a) ──
+        # lineage_tags: unique ID for each particle's history.
+        # divergence_points: the seq_len where this particle last branched from its parent.
+        self.lineage_tags = torch.zeros(self.max_slots, dtype=torch.int64, device=device)
+        self.divergence_points = torch.zeros(self.max_slots, dtype=torch.int64, device=device)
+        self._next_lineage_tag = 1
+
         # ── Token history [max_slots, max_output_len] ──
         self.all_token_ids = torch.zeros(
             (self.max_slots, max_output_len), dtype=torch.int32, device=device
@@ -269,6 +276,11 @@ class ScheduleBatchSMC:
             self.top_ps[slot] = req.sampling_params.top_p
             self.top_ks[slot] = req.sampling_params.top_k
             self.min_ps[slot] = req.sampling_params.min_p
+            
+            # Phase 3a: Lineage initialization
+            self.lineage_tags[slot] = self._next_lineage_tag
+            self.divergence_points[slot] = 0
+            self._next_lineage_tag += 1
 
         self.group_slot_lists[group_id] = slots
 
@@ -623,6 +635,10 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[dst_slot] = self.kv_allocated_lens[src_slot]
         self.verified_ids[dst_slot] = self.verified_ids[src_slot]
         self.finished_mask[dst_slot] = self.finished_mask[src_slot]
+        
+        # Phase 3a: Lineage propagation
+        self.lineage_tags[dst_slot] = self.lineage_tags[src_slot]
+        self.divergence_points[dst_slot] = self.divergence_points[src_slot]
 
         src_count = int(self.token_counts[src_slot].item())
         self.token_counts[dst_slot] = src_count

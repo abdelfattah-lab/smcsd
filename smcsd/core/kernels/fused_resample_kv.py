@@ -19,6 +19,7 @@ def _fused_resample_kv_kernel(
     src_pool_indices_ptr,  # [n_jobs] int32
     dst_alloc_lens_ptr,  # [n_jobs] int32
     src_seq_lens_ptr,  # [n_jobs] int32
+    src_start_indices_ptr, # [n_jobs] int32 — divergence points (Phase 3a)
     dec_out_ptr,  # [total_dec] int32 — captured old dst KV indices
     dec_offsets_ptr,  # [n_jobs + 1] int32 — CSR offsets (starts with 0)
     BLOCK_SIZE: tl.constexpr,
@@ -28,8 +29,8 @@ def _fused_resample_kv_kernel(
     Phase 1: read req_to_token[dst, :dst_alloc]
              -> capture to dec_out[offset:offset+dst_alloc]
              -> atomic_add(refcount, -1)
-    Phase 2: read req_to_token[src, :src_len]
-             -> write to req_to_token[dst, :src_len]
+    Phase 2: read req_to_token[src, start:src_len]
+             -> write to req_to_token[dst, start:src_len]
              -> atomic_add(refcount, +1)
     """
     job = tl.program_id(0)
@@ -38,6 +39,7 @@ def _fused_resample_kv_kernel(
     src_pool = tl.load(src_pool_indices_ptr + job)
     dst_alloc = tl.load(dst_alloc_lens_ptr + job)
     src_len = tl.load(src_seq_lens_ptr + job)
+    src_start = tl.load(src_start_indices_ptr + job)
 
     dst_row = req_to_token_ptr + dst_pool * req_to_token_stride
     src_row = req_to_token_ptr + src_pool * req_to_token_stride
@@ -45,6 +47,7 @@ def _fused_resample_kv_kernel(
     dec_start = tl.load(dec_offsets_ptr + job)
 
     # Phase 1: read old dst -> capture + dec_ref
+    # (We dec_ref the entire old dst row because it's being completely overwritten)
     num_dec_iters = tl.cdiv(dst_alloc, BLOCK_SIZE)
     for i in range(num_dec_iters):
         offset = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -54,9 +57,10 @@ def _fused_resample_kv_kernel(
         tl.atomic_add(refcount_ptr + old_kv_idx.to(tl.int64), -1, mask=mask)
 
     # Phase 2: read src -> copy to dst + inc_ref
-    num_src_iters = tl.cdiv(src_len, BLOCK_SIZE)
+    # Only copy from src_start onwards (IBM Prefix Tagging)
+    num_src_iters = tl.cdiv(src_len - src_start, BLOCK_SIZE)
     for i in range(num_src_iters):
-        offset = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offset = src_start + i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offset < src_len
         src_kv_idx = tl.load(src_row + offset, mask=mask)
         tl.store(dst_row + offset, src_kv_idx, mask=mask)
@@ -70,6 +74,7 @@ def batched_resample_kv(
     src_pool_indices: torch.Tensor,
     dst_alloc_lens: torch.Tensor,
     src_seq_lens: torch.Tensor,
+    src_start_indices: torch.Tensor,
 ) -> torch.Tensor:
     """Fused KV block table copy + refcount update for SMC resampling.
 
@@ -98,6 +103,7 @@ def batched_resample_kv(
         src_pool_indices,
         dst_alloc_lens,
         src_seq_lens,
+        src_start_indices,
         dec_out,
         dec_offsets,
         BLOCK_SIZE=128,
