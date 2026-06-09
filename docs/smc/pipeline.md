@@ -340,11 +340,11 @@ matches the implementation.
 ### 4.6 Resample
 
 There is one resample path — two fused Triton kernels in sequence, no
-Python fallback, no flag.  `SMCCoordinator.collect_resample_jobs_batch`
-returns a `BatchedResampleResult` (dst_slots, src_slots, row_of_job,
-resample_mask, n_jobs) produced by the fused collect kernel;
-`dispatch_resample_batch` consumes it via `batched_resample_kv` plus a
-short Python loop for Req-level metadata copies.
+Python fallback, no flag, no host sync.  `SMCCoordinator.collect_resample_jobs_batch`
+returns a device-resident `BatchedResampleResult` (`dst_flat`, `src_flat`,
+`rows_flat`, an on-device `counter`, `resample_mask`);
+`dispatch_resample_batch` consumes it via one `batched_resample_kv` launch
+on a worst-case grid, gated in-kernel by the counter.
 
 The kernel sees **all** allocated particles of a group (including finished
 ones) as candidates — finish state is handled by copy-propagation, not by
@@ -372,32 +372,29 @@ exclusion.
       • offset = atomic_add(global_counter, n_copies)
       • scatter flat (dst_slot, src_slot, row_of_job) triples
       • scatter-zero log_weights[slots] and interval_weights[slots]
-    returns BatchedResampleResult  (one .item() sync at boundary)
+    returns BatchedResampleResult — fully device-resident; the job count
+    lives in `counter` (host consumers call `n_jobs_sync()` explicitly)
 
   batched_resample_kv( req_to_token, slot_ref_count,
-                       dst_pool, src_pool, dst_alloc, src_seq_len )
+                       plan_dst, plan_src, plan_counter, max_jobs,
+                       <slot-indexed lineage tensors>,
+                       freed_buf, freed_counter )
     ─────────────────────────────────────────────────────
-    one Triton program per (dst, src) pair:
-      Phase 1:  read req_to_token[dst, :dst_alloc]
-                → capture into dec_out
-                → atomic_add(refcount, -1)
+    worst-case grid (max_groups × (N-1)); each program loads the true
+    count from plan_counter and exits early — no host sync:
+      Phase 1:  dec_ref req_to_token[dst, :dst_alloc]; pages whose
+                refcount transitions 1→0 are appended to freed_buf
+                through the freed_counter atomic cursor
       Phase 2:  read req_to_token[src, :src_len]
                 → write  req_to_token[dst, :src_len]
                 → atomic_add(refcount, +1)
-    returns to_free = unique( dec_out where refcount == 0 )
-      → allocator.free(to_free)
+      Phase 3:  copy per-slot lineage scalars (seq/alloc lens, verified
+                + prev-draft ids, finish state, token count)
+      Phase 4:  copy all_token_ids[src, :count] → dst
 
-  # vectorised slot-tensor copies (device, no loops):
-  seq_lens[dst]          = seq_lens[src]
-  kv_allocated_lens[dst] = kv_allocated_lens[src]
-  verified_ids[dst]      = verified_ids[src]
-  finished_mask[dst]     = finished_mask[src]
-  token_counts[dst]      = token_counts[src]
-  all_token_ids[dst]     = all_token_ids[src]
-
-  # per-pair Python (the only unavoidable host cost):
-  for dst, src in zip(plan.dst_slots.tolist(), plan.src_slots.tolist()):
-      slot_state.copy_req_metadata(dst, src)
+  # postprocessing (one step later under overlap) frees the captured
+  # pages and resets the cursor:
+  allocator.free(freed_buf[phase, :n_freed]); freed_counter[phase] = 0
 ```
 
 Visually:
@@ -406,16 +403,14 @@ Visually:
 [ fused_collect kernel ] ─────────────►  one launch, all in-use rows
          │
          ▼
-flat (dst, src, row) triples on GPU
+device-resident plan: flat (dst, src, row) + on-device counter
          │
          ▼
-[ batched_resample_kv ] ─────────────►  one launch, all pairs
-         │
-         ▼
-vectorised slot-tensor copies (one line each)
-         │
-         ▼
-per-pair copy_req_metadata  (the only Python-side loop)
+[ batched_resample_kv ] ─────────────►  one launch, worst-case grid,
+         │                               KV copy + refcounts + lineage
+         ▼                               tensors + freed-page capture
+postprocessing frees freed_buf[:n]  (no Req-level metadata to copy —
+all decode-time particle state is tensor-resident)
 ```
 
 The fused collect kernel uses systematic resampling on CUDA
@@ -449,15 +444,19 @@ is False. Calls `slot_state.finalize_group(gid, parent_req)`:
 ```
   slots = group_slot_lists[gid]
 
-  # Pick best by (log_weight, visible_output_len).
-  # visible_output_len = min(req.finished_len or token_count, token_count)
-  best_slot = argmax over slots of (log_weights[s], visible_output_len(s))
-  best_req  = slot_to_req[best_slot]
+  # Unbiased log Ẑ: accumulated per-resample product + the final tail.
+  log_Z_hat = group_log_Z_hat[row] + logsumexp(interval_weights[slots]) - log(N)
 
-  parent_req.output_ids      = list(best_req.output_ids)
-  parent_req.finished_reason = copy(best_req.finished_reason)
-  parent_req.finished_len    = best_req.finished_len
-  (fallback to FINISH_ABORT if best_req.finished_reason is None)
+  # Posterior SAMPLE over particles (not argmax): P(slot) ∝ exp(log_weights).
+  pick = multinomial(softmax(log_weights[slots]))
+
+  # Finish state is tensor-resident; materialise it onto the parent.
+  parent_req.output_ids      = all_token_ids[pick, :finished_len[pick]]
+  parent_req.finished_reason = from finish_reason_code / matched_eos_token
+  parent_req.finished_len    = finished_len[pick]
+
+  # Full collection attached for the engine's side channel:
+  parent_req.smc_log_Z_hat / smc_log_w_tilde / smc_particle_output_ids
 
   free_group_slots(gid)
     ├── row_in_use[row] = False; group_to_slots[row] = -1
@@ -476,8 +475,8 @@ is False. Calls `slot_state.finalize_group(gid, parent_req)`:
 
 Because the fused kernel includes finished particles in the resample
 candidate set, a group that finalises here can have any of its slots
-marked finished and still hold the best weight — the `argmax` picks it
-regardless. The freed row goes back on `_free_rows` for a future group.
+marked finished and still hold high weight — the posterior sample weighs
+it accordingly. The freed row goes back on `_free_rows` for a future group.
 
 ---
 

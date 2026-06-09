@@ -186,10 +186,11 @@ flag that defaults to False in the scheduler.
   [ACTIVE]   ── per cycle: gather → forward → scatter → weight update
          │                           │
          │                           └─ possibly: finished_mask[slot] = True
-         │                              → dropped from next active_slots
+         │                              → weight increment zeroed from now on
          ▼
-  [FINISHED] ── held for resample ancestry (see §3) but excluded from gather
-         │
+  [FINISHED] ── STAYS in active_slots (absorbing state): keeps receiving
+         │      forward passes with zero weight increment, remains a
+         │      resample ancestor (see §3), may be revived as a resample dst
          ▼
   free_group_slots(gid)
          │       • req_to_token_pool.free(Req)
