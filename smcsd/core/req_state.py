@@ -824,8 +824,14 @@ class ScheduleBatchSMC:
         weight_cutoff = torch.full(
             (bs,), n_weight_cols - 1, dtype=torch.int64, device=self.device
         )
+        # For the weight cutoff, EOS takes precedence even when the length
+        # cap is hit in the same block (unlike the finish *reason*, where
+        # length wins historically): once the sequence emitted EOS, the
+        # later columns are post-EOS draft junk regardless of which finish
+        # reason gets reported.
+        eos_cut = newly_finished_mask & eos_hit
         weight_cutoff = torch.where(
-            eos_branch, first_eos.clamp(max=n_weight_cols - 1), weight_cutoff
+            eos_cut, first_eos.clamp(max=n_weight_cols - 1), weight_cutoff
         )
         weight_cutoff = torch.where(
             prev_finished_active,
