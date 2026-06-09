@@ -507,85 +507,73 @@ class SMCWorker(BaseSpecWorker):
         shape the verify/bonus/weight code already consumes) and
         ``draft_logprobs_stacked`` of shape (bs, gamma).
 
-        - step 0 (prev_last_draft_id == -1 sentinel, batch-uniform under step
-          alignment): 1-token head ``forward(verified_id) @ S`` — the legacy
-          iter-0 — then gamma-1 singles.
-        - step >=1: 2-token head ``[prev @ S-1, verified_id @ S]`` (see
-          ``prepare_for_draft_head``); d_0 is sampled from the S/bonus column,
-          then gamma-1 singles.
+        Every step runs the 2-token head ``[prev @ S-1, verified_id @ S]``
+        (see ``prepare_for_draft_head``); d_0 is sampled from the S/bonus
+        column, then gamma-1 singles.  On a group's FIRST decode step,
+        ``prev`` is the last committed prompt token (seeded at
+        ``allocate_slots``), so the S-1 write rewrites the prefill's draft
+        KV byte-identically — no step-0 special case.  Per-row head
+        selection is deliberately avoided: batches freely mix groups at
+        different steps under continuous batching, and any batch-global
+        step flag would mis-handle the joins (a -1 sentinel here used to
+        reach the embedding as a token id and kill the scheduler).
         """
         x0 = draft_input.verified_id
         prev = draft_input.prev_last_draft_id
-        # CPU flag from the scheduler's group bookkeeping — replaces the
-        # old device read `(prev < 0).all().item()`, which would block the
-        # draft launch on the previous step's write-back under overlapped
-        # scheduling.  Same semantics: 2-token head only once every group
-        # in the batch has a deferred draft token.
-        is_step0 = prev is None or draft_input.all_first_decode_step
+        assert prev is not None, (
+            "deferred-bonus draft requires prev_last_draft_id "
+            "(seeded at allocate_slots, carried by resample)"
+        )
 
         all_tokens = [x0]
         draft_logprobs = []
 
-        if is_step0:
-            # 1-token head == legacy iter-0 (plain decode at S).
-            draft_fb.input_ids = x0
-            draft_fb.positions = all_positions[:, 0].contiguous()
-            draft_fb.out_cache_loc = cache_locs[:, 0].contiguous()
-            draft_fb.seq_lens = all_seq_lens[:, 0].contiguous()
-            draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs
-            draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + 1
-            head_out = self.draft_runner.forward(draft_fb)
-            head_logits = head_out.logits_output.next_token_logits  # (bs, V)
+        # 2-token head extend [prev @ S-1, verified_id @ S]; d_0 from the
+        # second (S / bonus) column.
+        head_fb = ctx.prepare_for_draft_head(
+            prev, x0, cache_locs, self.req_to_token_pool, batch,
+            self.draft_runner,
+        )
+        hgr = self.draft_head_graph_runner
+        if hgr is not None and hgr.can_run(head_fb):
+            # Graph path: replay the dedicated num_tokens_per_bs=2 head
+            # runner.  replay() runs replay_prepare → attn metadata + buffer
+            # copy itself, and returns a LogitsProcessorOutput directly.
+            # replay() bypasses model_runner.forward (where _build_step_span_name
+            # emits the trace span), so label it explicitly here.
+            with torch.profiler.record_function(
+                f"step[DECODE smc-head-graph bs={bs} toks={2 * bs}]"
+            ):
+                head_logits_full = hgr.replay(head_fb).next_token_logits
         else:
-            # 2-token head extend [prev @ S-1, verified_id @ S]; d_0 from the
-            # second (S / bonus) column.
-            head_fb = ctx.prepare_for_draft_head(
-                prev, x0, cache_locs, self.req_to_token_pool, batch,
-                self.draft_runner,
-            )
-            hgr = self.draft_head_graph_runner
-            if hgr is not None and hgr.can_run(head_fb):
-                # Graph path: replay the dedicated num_tokens_per_bs=2 head
-                # runner.  replay() runs replay_prepare → attn metadata + buffer
-                # copy itself, and returns a LogitsProcessorOutput directly.
-                # replay() bypasses model_runner.forward (where _build_step_span_name
-                # emits the trace span), so label it explicitly here.
+            # Eager fallback (no head graph captured, or bs beyond the
+            # captured range).  The draft's *primary* graph runner is
+            # decode-only and its can_run() keys on request count, so it
+            # would wrongly replay a 1-token graph for this 2-token forward;
+            # null it for just this call and init metadata eagerly.
+            self.draft_runner.attn_backend.init_forward_metadata(head_fb)
+            saved_gr = getattr(self.draft_runner, "graph_runner", None)
+            self.draft_runner.graph_runner = None
+            try:
+                # Outer span labels the head; the inner forward emits a
+                # step[TARGET_VERIFY ...] span (vendored naming), nested.
                 with torch.profiler.record_function(
-                    f"step[DECODE smc-head-graph bs={bs} toks={2 * bs}]"
+                    f"step[DECODE smc-head-eager bs={bs} toks={2 * bs}]"
                 ):
-                    head_logits_full = hgr.replay(head_fb).next_token_logits
-            else:
-                # Eager fallback (no head graph captured, or bs beyond the
-                # captured range).  The draft's *primary* graph runner is
-                # decode-only and its can_run() keys on request count, so it
-                # would wrongly replay a 1-token graph for this 2-token forward;
-                # null it for just this call and init metadata eagerly.
-                self.draft_runner.attn_backend.init_forward_metadata(head_fb)
-                saved_gr = getattr(self.draft_runner, "graph_runner", None)
-                self.draft_runner.graph_runner = None
-                try:
-                    # Outer span labels the head; the inner forward emits a
-                    # step[TARGET_VERIFY ...] span (vendored naming), nested.
-                    with torch.profiler.record_function(
-                        f"step[DECODE smc-head-eager bs={bs} toks={2 * bs}]"
-                    ):
-                        head_logits_full = self.draft_runner.forward(
-                            head_fb, skip_attn_backend_init=True
-                        ).logits_output.next_token_logits
-                finally:
-                    self.draft_runner.graph_runner = saved_gr
-            # d_0 from the second (S / bonus) column of each req pair.
-            head_logits = head_logits_full.reshape(bs, 2, -1)[:, 1, :]  # (bs, V)
+                    head_logits_full = self.draft_runner.forward(
+                        head_fb, skip_attn_backend_init=True
+                    ).logits_output.next_token_logits
+            finally:
+                self.draft_runner.graph_runner = saved_gr
+        # d_0 from the second (S / bonus) column of each req pair.
+        head_logits = head_logits_full.reshape(bs, 2, -1)[:, 1, :]  # (bs, V)
 
         if self._smc_dbg_positions:
-            used_graph = (
-                not is_step0
-                and self.draft_head_graph_runner is not None
-            )
+            used_graph = self.draft_head_graph_runner is not None
             n_nan = int(torch.isnan(head_logits).sum().item())
             n_inf = int(torch.isinf(head_logits).sum().item())
             print(
-                f"[SMC_DBG] head is_step0={is_step0} graph={used_graph} "
+                f"[SMC_DBG] head graph={used_graph} "
                 f"nan={n_nan} inf={n_inf} shape={tuple(head_logits.shape)}",
                 flush=True,
             )

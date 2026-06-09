@@ -292,8 +292,11 @@ class SMCDecodeContext:
         ``req_to_token`` so it is correct after resampling.
 
         The last-position (``S`` / bonus column) logits give the proposal for
-        ``d_0``.  Step ≥1 only — step 0 has no deferred token and uses the
-        1-token head.
+        ``d_0``.  Used on EVERY decode step: on a group's first step,
+        ``prev_last_draft_id`` is the last committed prompt token (seeded at
+        ``allocate_slots``), so the ``S-1`` write rewrites the prefill's
+        draft KV byte-identically — which is what lets mixed-step batches
+        (continuous batching) share one head with no per-row branching.
         """
         device = batch.seq_lens.device
         head_num = 2
@@ -366,19 +369,15 @@ class SMCDraftInput(SpecInput):
     """
 
     verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token
-    # (bs,) this group's last *drafted* token d_{gamma-1} from the previous
-    # step, deferred into the next step's leading 2-token draft forward
-    # [prev_last_draft_id, verified_id].  None on the first decode step of a
-    # group (no predecessor) → that step uses a plain single-token head.
-    # Carried but NOT yet consumed by the draft loop (Step 2 wires the
-    # consumer); inert scaffolding for now.
+    # (bs,) per-row token at position S-1: the last *drafted* token
+    # d_{gamma-1} from the previous step (deferred into the next step's
+    # leading 2-token draft forward [prev_last_draft_id, verified_id]),
+    # or — on a group's first decode step — the last committed prompt
+    # token (seeded at allocate_slots), whose S-1 draft KV the head
+    # rewrites idempotently.  Always populated on the decode path, so the
+    # 2-token head needs no per-batch step flag and mixed-step batches
+    # (continuous batching) are handled uniformly.
     prev_last_draft_id: Optional[torch.Tensor] = None
-    # True iff NO group in this batch has completed a decode step yet —
-    # i.e. every row's prev_last_draft_id is the -1 sentinel.  Computed on
-    # the CPU by the scheduler (group bookkeeping) so the worker's
-    # deferred-bonus head selection does not need a device read on
-    # prev_last_draft_id at draft-launch time.
-    all_first_decode_step: bool = False
     logprob_diff: Optional[torch.Tensor] = None  # (bs, gamma) per-position, last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
