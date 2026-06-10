@@ -621,3 +621,177 @@ class TestFusedResampleKernel(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "Triton kernels require CUDA")
+class TestFusedWriteBack(CustomTestCase):
+    """``fused_write_back`` matches the torch reference on randomized state
+    (tokens, EOS placement, prior-finished rows, weight cutoffs)."""
+
+    DEVICE = "cuda"
+
+    def _make_state(self, max_slots, gamma_p1, max_eos=8, max_out=64, seed=0):
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        dev = self.DEVICE
+
+        def randi(shape, hi, dtype=torch.int32):
+            return torch.randint(0, hi, shape, generator=g).to(dtype).to(dev)
+
+        state = dict(
+            all_token_ids=torch.zeros(
+                (max_slots, max_out), dtype=torch.int32, device=dev
+            ),
+            token_counts=randi((max_slots,), 8),
+            verified_ids=randi((max_slots,), 100),
+            prev_ids=randi((max_slots,), 100),
+            finished_mask=(torch.rand(max_slots, generator=g) < 0.3).to(dev),
+            finished_len=randi((max_slots,), 20),
+            finish_reason_code=randi((max_slots,), 3, torch.int8),
+            matched_eos_token=randi((max_slots,), 100),
+            ignore_eos=(torch.rand(max_slots, generator=g) < 0.2).to(dev),
+            max_new_tokens=randi((max_slots,), 6) + 6,
+            eos_token_ids=torch.where(
+                torch.rand(max_slots, max_eos, generator=g) < 0.3,
+                torch.randint(
+                    0, 50, (max_slots, max_eos), generator=g, dtype=torch.int64
+                ),
+                torch.full((max_slots, max_eos), -1, dtype=torch.int64),
+            ).to(dev),
+            log_weights=torch.randn(
+                max_slots, generator=g, dtype=torch.float64
+            ).to(dev),
+            interval_weights=torch.randn(
+                max_slots, generator=g, dtype=torch.float64
+            ).to(dev),
+        )
+        return state
+
+    @staticmethod
+    def _torch_reference(state, active, next_token_ids, logprob_diff,
+                         bonus_ids, prev, stride):
+        dev = active.device
+        bs = active.shape[0]
+        accepted_2d = next_token_ids.reshape(bs, stride)
+        offsets = state["token_counts"][active].to(torch.int64)
+        row_idx = active.unsqueeze(1).expand(-1, stride)
+        col_idx = offsets.unsqueeze(1) + torch.arange(
+            stride, dtype=torch.int64, device=dev
+        )
+        state["all_token_ids"][row_idx, col_idx] = accepted_2d.to(torch.int32)
+        state["token_counts"][active] += stride
+        state["verified_ids"][active] = bonus_ids.to(torch.int32)
+        state["prev_ids"][active] = prev.to(torch.int32)
+
+        updated_counts = state["token_counts"][active]
+        max_tokens = state["max_new_tokens"][active]
+        length_hit = updated_counts >= max_tokens
+        eos_ids = state["eos_token_ids"][active]
+        eos_match = (
+            accepted_2d.unsqueeze(2).to(torch.int64) == eos_ids.unsqueeze(1)
+        ).any(dim=2)
+        eos_hit = eos_match.any(dim=1) & ~state["ignore_eos"][active]
+        prev_fin = state["finished_mask"][active]
+        newly = (length_hit | eos_hit) & ~prev_fin
+        state["finished_mask"][active] = prev_fin | newly
+
+        positions = torch.arange(stride, dtype=torch.int64, device=dev)
+        first_eos = torch.where(eos_match, positions, stride).min(dim=1).values
+        matched_tok = accepted_2d.gather(
+            1, first_eos.clamp(max=stride - 1).unsqueeze(1)
+        ).squeeze(1)
+        eos_branch = newly & ~length_hit
+        fin_len = torch.where(
+            length_hit,
+            max_tokens,
+            (updated_counts.to(torch.int64) - stride + first_eos + 1).to(
+                max_tokens.dtype
+            ),
+        )
+        fin_code = torch.where(length_hit, 1, 2).to(torch.int8)
+        state["finished_len"][active] = torch.where(
+            newly, fin_len, state["finished_len"][active]
+        )
+        state["finish_reason_code"][active] = torch.where(
+            newly, fin_code, state["finish_reason_code"][active]
+        )
+        state["matched_eos_token"][active] = torch.where(
+            eos_branch, matched_tok.to(torch.int32),
+            state["matched_eos_token"][active],
+        )
+
+        gamma = logprob_diff.shape[1]
+        cutoff = torch.full((bs,), gamma - 1, dtype=torch.int64, device=dev)
+        eos_cut = newly & eos_hit
+        cutoff = torch.where(
+            eos_cut, first_eos.clamp(max=gamma - 1), cutoff
+        )
+        cutoff = torch.where(prev_fin, torch.full_like(cutoff, -1), cutoff)
+        cols = torch.arange(gamma, device=dev).unsqueeze(0)
+        keep = cols <= cutoff.unsqueeze(1)
+        d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
+        state["log_weights"][active] += d
+        state["interval_weights"][active] += d
+
+    def test_matches_torch_reference(self):
+        from smcsd.core.kernels.fused_write_back import fused_write_back
+
+        max_slots, stride = 24, 5
+        gamma = stride - 1
+        for seed in (0, 1, 7):
+            torch.manual_seed(seed)
+            bs = 16
+            active = torch.randperm(max_slots, device=self.DEVICE)[:bs].to(
+                torch.int64
+            )
+            # Token range overlapping the EOS-id range so EOS hits occur.
+            next_tokens = torch.randint(
+                0, 60, (bs * stride,), device=self.DEVICE, dtype=torch.int64
+            )
+            logprob_diff = torch.randn(
+                bs, gamma, device=self.DEVICE, dtype=torch.float32
+            )
+            bonus = torch.randint(
+                0, 60, (bs,), device=self.DEVICE, dtype=torch.int64
+            )
+            prev = torch.randint(
+                0, 60, (bs,), device=self.DEVICE, dtype=torch.int64
+            )
+
+            ref = self._make_state(max_slots, stride, seed=seed)
+            fused = {
+                k: v.clone() for k, v in
+                self._make_state(max_slots, stride, seed=seed).items()
+            }
+
+            self._torch_reference(
+                ref, active, next_tokens, logprob_diff, bonus, prev, stride
+            )
+            fused_write_back(
+                active, next_tokens, logprob_diff, bonus, prev,
+                all_token_ids=fused["all_token_ids"],
+                token_counts=fused["token_counts"],
+                verified_ids=fused["verified_ids"],
+                prev_ids=fused["prev_ids"],
+                finished_mask=fused["finished_mask"],
+                finished_len=fused["finished_len"],
+                finish_reason_code=fused["finish_reason_code"],
+                matched_eos_token=fused["matched_eos_token"],
+                ignore_eos=fused["ignore_eos"],
+                max_new_tokens=fused["max_new_tokens"],
+                eos_token_ids=fused["eos_token_ids"],
+                log_weights=fused["log_weights"],
+                interval_weights=fused["interval_weights"],
+                gamma_plus_1=stride,
+            )
+
+            for name in ref:
+                if ref[name].dtype == torch.float64:
+                    self.assertTrue(
+                        torch.allclose(ref[name], fused[name], atol=1e-12),
+                        f"seed={seed}: {name} mismatch",
+                    )
+                else:
+                    self.assertTrue(
+                        torch.equal(ref[name], fused[name]),
+                        f"seed={seed}: {name} mismatch",
+                    )

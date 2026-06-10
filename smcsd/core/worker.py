@@ -690,30 +690,34 @@ class SMCWorker(BaseSpecWorker):
 
         Replaces prepare_for_draft + the draft AR loop + prepare_for_verify +
         the target verify forward + logprob extraction + bonus sampling with
-        one cache-locs kernel, the staging copies, two metadata updates, and
-        a single graph launch.  Output tensors are views into the runner's
-        persistent buffers; every consumer (scheduler write-back) is enqueued
-        on the same stream before the next cycle's staging copies, so reuse
-        is safe under both the sequential and overlapped event loops.
+        the staging copies, two metadata updates, and a single graph launch.
+        Output tensors are views into the runner's persistent buffers; every
+        consumer (scheduler write-back) is enqueued on the same stream before
+        the next cycle's staging copies, so reuse is safe under both the
+        sequential and overlapped event loops.
         """
-        from smcsd.common.verify import assign_smc_cache_locs_kernel
-
         bs = len(ctx.orig_seq_lens)
         gamma = self.gamma
 
-        r2t = self.req_to_token_pool.req_to_token
-        out_cache_loc = torch.empty(
-            bs * (gamma + 1), dtype=torch.int64, device=self.device
-        )
-        assign_smc_cache_locs_kernel[(bs,)](
-            batch.req_pool_indices,
-            r2t,
-            ctx.orig_seq_lens,
-            out_cache_loc,
-            r2t.shape[1],
-            gamma + 1,
-        )
-        cache_locs = out_cache_loc.reshape(bs, gamma + 1)
+        # Carried from the fused prepare kernel (the cycle's fresh pages);
+        # legacy fallback re-reads the block table.
+        cache_locs = ctx.cache_locs
+        if cache_locs is None:
+            from smcsd.common.verify import assign_smc_cache_locs_kernel
+
+            r2t = self.req_to_token_pool.req_to_token
+            out_cache_loc = torch.empty(
+                bs * (gamma + 1), dtype=torch.int64, device=self.device
+            )
+            assign_smc_cache_locs_kernel[(bs,)](
+                batch.req_pool_indices,
+                r2t,
+                ctx.orig_seq_lens,
+                out_cache_loc,
+                r2t.shape[1],
+                gamma + 1,
+            )
+            cache_locs = out_cache_loc.reshape(bs, gamma + 1)
 
         (
             tokens_out,
