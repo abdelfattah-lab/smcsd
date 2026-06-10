@@ -1,0 +1,321 @@
+"""One-CUDA-graph capture of the entire SMC draft phase.
+
+Today the draft phase issues, per decode cycle: gamma+1 separate decode-graph
+replays (each with its own replay_prepare) interleaved with eager sampling —
+~0.74 ms of host dispatch per draft step that profiles as ~25% GPU idle at
+bs=32 (see issue #14).  This runner captures the whole phase in ONE graph per
+batch-size bucket:
+
+    for s in 0..gamma:
+        logits = draft_model(input_ids, positions, attn_backends[s])
+        token  = argmax(logits/T + Gumbel)          # graph-safe RNG
+        logp   = (logits/T)[token] - logsumexp(logits/T)   # s < gamma only
+        input_ids <- token; positions += 1
+
+so a replay costs one kv-indices kernel + per-step metadata updates + a single
+graph launch.
+
+Design notes
+------------
+* Mirrors ``EAGLEDraftCudaGraphRunner`` (same ``CudaGraphRunner.capture``
+  driver, same multi-step attention-backend capture/replay API).  SMC is the
+  easy case: topk=1 chain drafting, static batch composition within a cycle,
+  per-step seq_lens affine in the step index.
+* Sampling runs in-graph.  ``torch.rand_like`` under graph capture uses the
+  graph-safe Philox state, so every replay draws fresh randomness; Gumbel-max
+  (#12) is what makes the sampler capturable — ``torch.multinomial`` is not.
+* The multi-step backend's graph kv-indices buffer is allocated HERE, not via
+  ``TritonMultiStepDraftBackend.init_cuda_graph_state``, because upstream
+  sizes it as ``(steps, max_num_tokens * model_context_len)`` int64 — at 128k
+  context that is unusable.  We size it by ``SMC_DRAFT_GRAPH_MAX_CONTEXT``
+  (default 8192) and ``SMC_DRAFT_GRAPH_MAX_BS`` (default 32) instead, and
+  ``can_run`` falls back to the per-step path whenever the live batch exceeds
+  either cap.  6 steps x 32 bs x 8192 ctx x 8 B ~= 12.6 GB.
+* Padding: unused rows write their KV to page 0 (the allocator's reserved
+  dummy slot) and sample garbage that is sliced off, same as every other
+  graph runner in sglang.
+"""
+
+from __future__ import annotations
+
+import bisect
+import logging
+import os
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang.srt.model_executor.cuda_graph_runner import (
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
+    CudaGraphRunner,
+    DeepEPCudaGraphRunnerAdapter,
+    _default_make_graph_key,
+    get_batch_sizes_to_capture,
+    get_global_graph_memory_pool,
+    model_capture_mode,
+    set_global_graph_memory_pool,
+    set_is_extend_in_batch,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from smcsd.core.info import SMCDecodeContext, SMCDraftInput
+
+if TYPE_CHECKING:
+    from smcsd.core.worker import SMCWorker
+
+logger = logging.getLogger(__name__)
+
+
+class SMCDraftPhaseGraphRunner:
+    def __init__(self, smc_worker: "SMCWorker"):
+        self.smc_worker = smc_worker
+        self.model_runner = model_runner = smc_worker.draft_runner
+        self.gamma = smc_worker.gamma
+        self.num_steps = self.gamma + 1
+        self.temperature = float(smc_worker.smc_draft_temperature)
+        assert self.temperature > 0, "phase graph requires stochastic sampling"
+        self.draft_attn_backend = smc_worker.draft_attn_backend
+
+        self.graphs = {}
+        self.output_buffers = {}
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
+        self.enable_pdmux = False
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.num_tokens_per_bs = 1
+
+        # Batch sizes: reuse the server's capture list, capped by our own
+        # memory-bound limit (see module docstring).
+        graph_max_bs = int(os.environ.get("SMC_DRAFT_GRAPH_MAX_BS", "32"))
+        capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs = [bs for bs in capture_bs if bs <= graph_max_bs]
+        self.compile_bs = []  # no torch.compile interplay
+        if not self.capture_bs:
+            raise ValueError(
+                f"SMC_DRAFT_GRAPH_MAX_BS={graph_max_bs} excludes every "
+                f"capturable batch size {capture_bs[:5]}..."
+            )
+        self.max_bs = max(self.capture_bs)
+
+        # Per-row context bound for the graph path (kv-indices buffer rows
+        # must hold seq_len entries per request).
+        self.max_context = min(
+            int(os.environ.get("SMC_DRAFT_GRAPH_MAX_CONTEXT", "8192")),
+            model_runner.model_config.context_len,
+        )
+
+        # ── Multi-step attention graph state (our sizing, see docstring) ──
+        # The kernel grid in common_template covers speculative_num_steps
+        # (= gamma+2) rows even though only gamma+1 step backends exist.
+        backend = self.draft_attn_backend
+        n_rows = backend.speculative_num_steps
+        device = model_runner.device
+        backend.cuda_graph_kv_indices = torch.zeros(
+            (n_rows, self.max_bs * self.max_context),
+            dtype=torch.int64,
+            device=device,
+        )
+        backend.cuda_graph_num_kv_splits = torch.full(
+            (self.max_bs,),
+            backend.attn_backends[0].max_kv_splits,
+            dtype=torch.int32,
+            device=device,
+        )
+        for i, step_backend in enumerate(backend.attn_backends):
+            step_backend.init_cuda_graph_state(
+                self.max_bs,
+                self.max_bs,
+                kv_indices_buf=backend.cuda_graph_kv_indices[i],
+                cuda_graph_num_kv_splits_buf=backend.cuda_graph_num_kv_splits,
+            )
+        self.seq_len_fill_value = backend.attn_backends[
+            0
+        ].get_cuda_graph_seq_len_fill_value()
+
+        # ── Graph input/output buffers ──
+        with torch.device(device):
+            self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.positions = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.seq_lens = torch.full(
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
+            )
+            # (gamma+1, max_bs): step-major cache locations.
+            self.out_cache_loc = torch.zeros(
+                (self.num_steps, self.max_bs), dtype=torch.int64
+            )
+            # Outputs: [x0, d_0..d_gamma] and per-position draft logprobs.
+            self.tokens_out = torch.zeros(
+                (self.max_bs, self.num_steps + 1), dtype=torch.int64
+            )
+            self.logprobs_out = torch.zeros(
+                (self.max_bs, self.gamma), dtype=torch.float32
+            )
+        self.seq_lens_cpu = torch.full(
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
+        )
+
+        # ForwardBatch per bucket, kept so replay-time metadata regeneration
+        # reads the very buffers the graph was captured against.
+        self.fbs = {}
+
+        try:
+            with model_capture_mode():
+                self.capture()
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture SMC draft phase graph failed: {e}\n"
+                f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
+        logger.info(
+            "SMCDraftPhaseGraphRunner: captured %d buckets (max_bs=%d, "
+            "max_context=%d, steps=%d)",
+            len(self.capture_bs), self.max_bs, self.max_context, self.num_steps,
+        )
+
+    # ── Capture ──
+
+    def capture(self):
+        CudaGraphRunner.capture(self)
+
+    def _create_graph(self):
+        return torch.cuda.CUDAGraph()
+
+    def _capture_init(self, run_once_fn):
+        for _ in range(2):
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+            run_once_fn()
+
+    def _capture_graph(self, graph, pool, stream, run_once_fn):
+        with torch.cuda.graph(graph, pool=pool, stream=stream):
+            out = run_once_fn()
+        return out
+
+    def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
+        graph = self._create_graph()
+        stream = self.stream
+        bs = num_seqs
+
+        input_ids = self.input_ids[:bs]
+        req_pool_indices = self.req_pool_indices[:bs]
+        positions = self.positions[:bs]
+        seq_lens = self.seq_lens[:bs]
+        seq_lens_cpu = self.seq_lens_cpu[:bs]
+        out_cache_loc_steps = [self.out_cache_loc[s, :bs] for s in range(self.num_steps)]
+        tokens_out = self.tokens_out[:bs]
+        logprobs_out = self.logprobs_out[:bs]
+
+        spec_info = SMCDraftInput(
+            verified_id=input_ids,
+            num_tokens_per_req=self.num_steps,
+        )
+
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            out_cache_loc=out_cache_loc_steps[0],
+            return_logprob=False,
+            positions=positions,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        self.fbs[bs] = fb
+
+        # Per-step kv metadata into the captured buffers.
+        self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(fb)
+
+        gamma = self.gamma
+        temperature = self.temperature
+        backends = self.draft_attn_backend.attn_backends
+        tiny = torch.finfo(torch.float32).tiny
+
+        def run_once():
+            set_is_extend_in_batch(False)
+            for s in range(self.num_steps):
+                fb.attn_backend = backends[s]
+                fb.out_cache_loc = out_cache_loc_steps[s]
+                # `forward` is the (patched) model.forward — returns a
+                # LogitsProcessorOutput directly.
+                logits = forward(input_ids, positions, fb).next_token_logits
+                scaled = logits / temperature
+                gumbel = -torch.log(
+                    -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
+                )
+                idx = torch.argmax(scaled + gumbel, dim=-1)
+                tokens_out[:, s + 1] = idx
+                if s < gamma:
+                    chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
+                    logprobs_out[:, s] = chosen - torch.logsumexp(scaled, dim=-1)
+                input_ids.copy_(idx)
+                positions.add_(1)
+            return (tokens_out, logprobs_out)
+
+        self.deepep_adapter.capture(is_extend_in_batch=False)
+        self._capture_init(run_once)
+        out = self._capture_graph(
+            graph, get_global_graph_memory_pool(), stream, run_once
+        )
+        set_global_graph_memory_pool(graph.pool())
+        return graph, out
+
+    # ── Replay ──
+
+    def can_run(self, raw_bs: int, ctx: SMCDecodeContext) -> bool:
+        if raw_bs > self.max_bs:
+            return False
+        # Per-step kv length peaks at orig_seq_len + gamma + 1; the kv-indices
+        # rows are sized to max_context entries per request.
+        max_len = int(ctx.orig_seq_lens_cpu.max().item()) + self.num_steps
+        return max_len <= self.max_context
+
+    def replay(
+        self,
+        verified_id: torch.Tensor,
+        cache_locs: torch.Tensor,
+        ctx: SMCDecodeContext,
+        req_pool_indices: torch.Tensor,
+    ):
+        """Returns (tokens_out[:raw_bs], logprobs_out[:raw_bs]) where
+        tokens_out columns are [x0, d_0, ..., d_gamma]."""
+        raw_bs = verified_id.shape[0]
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        bs = self.capture_bs[index]
+
+        if bs != raw_bs:
+            self.seq_lens.fill_(self.seq_len_fill_value)
+            self.seq_lens_cpu.fill_(self.seq_len_fill_value)
+            self.positions.zero_()
+            self.req_pool_indices.zero_()
+            self.out_cache_loc.zero_()  # padded rows scribble page 0
+            self.input_ids.zero_()
+
+        self.input_ids[:raw_bs].copy_(verified_id)
+        self.tokens_out[:raw_bs, 0].copy_(verified_id)
+        self.req_pool_indices[:raw_bs].copy_(req_pool_indices)
+        self.positions[:raw_bs].copy_(ctx.orig_seq_lens)
+        self.seq_lens[:raw_bs].copy_(ctx.orig_seq_lens)
+        self.seq_lens_cpu[:raw_bs].copy_(ctx.orig_seq_lens_cpu)
+        # (bs, gamma+1) -> step-major buffer.
+        self.out_cache_loc[:, :raw_bs].copy_(cache_locs.t())
+
+        fb = self.fbs[bs]
+        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(fb, bs)
+
+        # capture() stores keys via _default_make_graph_key(bs, None, None),
+        # which is the plain bs int.
+        self.graphs[_default_make_graph_key(bs)].replay()
+
+        return self.tokens_out[:raw_bs], self.logprobs_out[:raw_bs]
