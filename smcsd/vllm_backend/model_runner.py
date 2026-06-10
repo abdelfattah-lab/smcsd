@@ -258,20 +258,6 @@ class SMCGPUModelRunner(GPUModelRunner):
         if self.target_sampler is not None:
             self.target_sampler.apply_staged_writes()
 
-        # if particle_req_ids:
-        #     debug_particles = min(2, len(particle_req_ids))
-        #     print(f"[smc-debug] register_particle_group group_id={group_id} prompt_len={prompt_len} num_computed_tokens={num_computed_tokens}")
-        #     print(f"[smc-debug] shared_prefix_block_ids={tuple(list(x) for x in prefix_block_ids)}")
-        #     for i in range(debug_particles):
-        #         combined_block_ids = tuple(
-        #             list(prefix_block_ids[g]) + list(decode_block_ids[i][g])
-        #             for g in range(len(prefix_block_ids))
-        #         )
-        #         print(
-        #             f"[smc-debug] particle[{i}] req_id={particle_req_ids[i]} "
-        #             f"row={particle_rows[i]} combined_block_ids={combined_block_ids}"
-        #         )
-
         block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
         num_full_shared_blocks = num_computed_tokens // block_size
 
@@ -790,27 +776,6 @@ class SMCGPUModelRunner(GPUModelRunner):
             self.draft_attn_groups,
             self.draft_kv_cache_config,
         )
-    
-        # if not self._draft_attn_metadata_debugged and N >= 2:
-        #     print("[smc-debug] attn_metadata input")
-        #     print(f"[smc-debug] num_reqs={N} num_tokens={N} max_query_len=1")
-        #     print(f"[smc-debug] query_start_loc_gpu={input_batch.query_start_loc.tolist()}")
-        #     print(f"[smc-debug] query_start_loc_cpu={input_batch.query_start_loc_np.tolist()}")
-        #     print(f"[smc-debug] seq_lens={input_batch.seq_lens.tolist()}")
-        #     print(f"[smc-debug] positions={input_batch.positions.tolist()}")
-        #     print(f"[smc-debug] slot_ids={slot_ids.cpu().tolist()}")
-        #     for g, bt in enumerate(block_tables):
-        #         rows_to_show = min(2, bt.shape[0])
-        #         print(
-        #             f"[smc-debug] block_table[{g}] shape={tuple(bt.shape)} "
-        #             f"rows={bt[:rows_to_show].cpu().tolist()}"
-        #         )
-        #     print(f"[smc-debug] attn_metadata_keys={list(attn_metadata.keys())}")
-        #     print("[smc-debug] attn_metadata effective")
-        #     for layer_name, layer_metadata in attn_metadata.items():
-        #         print(f"[smc-debug] layer={layer_name}")
-        #         print(pformat(layer_metadata))
-        #     self._draft_attn_metadata_debugged = True
 
         return attn_metadata
 
@@ -986,7 +951,7 @@ class SMCGPUModelRunner(GPUModelRunner):
                 )
                 self.log_weights[active_rows] += logprob_diff_per_group[group_id]
 
-            # ESS over ALL N particles (including finished ones).
+            # ESS over all N particles.
             lw = self.log_weights[all_rows]                             # [N]
             log_Z = torch.logsumexp(lw, dim=0)
             log_w_norm = lw - log_Z
@@ -995,7 +960,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             if ess.item() >= resample_threshold * N:
                 continue
 
-            # Systematic resampling over ALL N particles.
+            # Systematic resampling over all N particles.
             w = log_w_norm.exp()                                        # [N] normalised
             cumw = torch.cumsum(w, dim=0)                               # [N] CDF
             u = torch.rand(1, device=self.device, dtype=torch.float32) / N
@@ -1006,7 +971,13 @@ class SMCGPUModelRunner(GPUModelRunner):
 
             src_rows = all_rows[ancestor_indices]                       # [N]
 
-            # KV copy: per-pair block count bounded by each source's actual written length.
+            # Resampling does not reassign block ownership. Instead, mutate
+            # the destination particles' private KV block contents so each
+            # destination row contains its sampled ancestor's model state.
+            # Shared full-prefix blocks are skipped.
+            # Private block copy length is per dst<-src pair and bounded by
+            # the source particle's actual written sequence length, avoiding
+            # copying unwritten future allocation.
             n_shared = group.num_full_shared_blocks
             n_shared_tokens = n_shared * block_size
             all_seq_lens_np = self.req_states.num_computed_tokens_np[all_rows.cpu().numpy()]
@@ -1016,12 +987,10 @@ class SMCGPUModelRunner(GPUModelRunner):
                 dst_local = copy_mask.nonzero(as_tuple=False).squeeze(1)
                 src_local = ancestor_indices[dst_local]
                 bt_tuple = self._gather_block_tables(all_rows)
+                # Copy both draft-model and target-model KV tensors. 
                 kv_all = list(self.draft_kv_caches) + list(self.kv_caches)
 
-                # Two-phase copy to avoid read-after-write aliasing in cycles
-                # (e.g. 0←1 and 1←0).  Phase 1 snapshots all source blocks;
-                # phase 2 applies the writes.  Only g==0 is handled since
-                # all layers share the same logical block IDs for single-group models.
+                # Two-phase copy to avoid read-after-write.
                 plan: list[tuple[torch.Tensor, list[torch.Tensor]]] = []
                 for di, si in zip(dst_local.cpu().tolist(), src_local.cpu().tolist()):
                     n_written_i = max(0, math.ceil(
@@ -1041,9 +1010,7 @@ class SMCGPUModelRunner(GPUModelRunner):
                     for kv, snapshot in zip(kv_all, snapshots):
                         self._write_kv_blocks(kv, dst_flat, snapshot)
 
-            # Copy req_states for all N particles.  Use .clone() on the RHS to
-            # materialise source values before any destination writes, guarding
-            # against potential alias when src_rows and rows overlap.
+            # Copy GPU runner bookkeeping for all N particles.
             rows_l = all_rows.long()
             src_rows_l = src_rows.long()
             self.req_states.last_sampled_tokens[rows_l] = (
@@ -1063,6 +1030,8 @@ class SMCGPUModelRunner(GPUModelRunner):
             self.req_states.num_computed_tokens_np[dst_np] = (
                 self.req_states.num_computed_tokens_np[src_np].copy()
             )
+            # Copy sampler penalty counters for draft and target samplers so
+            # repetition/frequency penalties follow the ancestor trajectory.
             if self.sampler is not None:
                 bc = self.sampler.penalties_state.output_bin_counts
                 if bc is not None:
@@ -1072,7 +1041,7 @@ class SMCGPUModelRunner(GPUModelRunner):
                 if bc is not None:
                     bc[rows_l] = bc[src_rows_l].clone()
 
-            # Reset weights for all N particles.
+            # Reset runner-side interval weights for all N particles.
             self.log_weights[all_rows] = 0.0
 
             resampled[group_id] = ancestor_indices.cpu()               # [N] in 0..N-1
