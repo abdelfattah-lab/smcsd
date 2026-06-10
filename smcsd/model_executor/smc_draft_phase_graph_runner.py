@@ -1,10 +1,11 @@
-"""One-CUDA-graph capture of the entire SMC draft phase.
+"""One-CUDA-graph capture of the SMC draft phase — and optionally the full
+decode cycle (draft + TARGET_VERIFY + weight diff + bonus).
 
 Today the draft phase issues, per decode cycle: gamma+1 separate decode-graph
 replays (each with its own replay_prepare) interleaved with eager sampling —
 ~0.74 ms of host dispatch per draft step that profiles as ~25% GPU idle at
-bs=32 (see issue #14).  This runner captures the whole phase in ONE graph per
-batch-size bucket:
+bs=32 (see issue #14).  ``SMCDraftPhaseGraphRunner`` captures the whole phase
+in ONE graph per batch-size bucket:
 
     for s in 0..gamma:
         logits = draft_model(input_ids, positions, attn_backends[s])
@@ -12,8 +13,13 @@ batch-size bucket:
         logp   = (logits/T)[token] - logsumexp(logits/T)   # s < gamma only
         input_ids <- token; positions += 1
 
-so a replay costs one kv-indices kernel + per-step metadata updates + a single
-graph launch.
+``SMCFullCycleGraphRunner`` extends the capture through the rest of the
+worker cycle — the TARGET_VERIFY forward on the score model, the fused
+score-logprob extraction, the per-position weight diff (alpha * score -
+draft), and the Gumbel-max bonus draw — so one replay covers everything the
+worker does between "batch prepared" and "GenerationBatchResult tensors
+ready".  SMC can do this where EAGLE can't because batch composition is
+static within a cycle: the draft loop and the verify pass see the same bs.
 
 Design notes
 ------------
@@ -31,6 +37,12 @@ Design notes
   (default 8192) and ``SMC_DRAFT_GRAPH_MAX_BS`` (default 32) instead, and
   ``can_run`` falls back to the per-step path whenever the live batch exceeds
   either cap.  6 steps x 32 bs x 8192 ctx x 8 B ~= 12.6 GB.
+* The full-cycle runner REUSES the target attention backend's existing
+  cuda-graph metadata state (allocated by the target's own graph runner) —
+  calling ``init_cuda_graph_state`` again would rebind the buffers and orphan
+  the target's captured verify graphs (see SMCDraftHeadGraphRunner's hazard
+  note).  Sharing is safe: every replay path writes its metadata immediately
+  before its own launch, and launches are sequential on one stream.
 * Padding: unused rows write their KV to page 0 (the allocator's reserved
   dummy slot) and sample garbage that is sliced off, same as every other
   graph runner in sglang.
@@ -61,6 +73,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from smcsd.common.verify import SMCVerifyInput
 from smcsd.core.info import SMCDecodeContext, SMCDraftInput
 
 if TYPE_CHECKING:
@@ -163,6 +176,8 @@ class SMCDraftPhaseGraphRunner:
         # reads the very buffers the graph was captured against.
         self.fbs = {}
 
+        self._init_extra_state()
+
         try:
             with model_capture_mode():
                 self.capture()
@@ -172,10 +187,13 @@ class SMCDraftPhaseGraphRunner:
                 f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
         logger.info(
-            "SMCDraftPhaseGraphRunner: captured %d buckets (max_bs=%d, "
-            "max_context=%d, steps=%d)",
+            "%s: captured %d buckets (max_bs=%d, max_context=%d, steps=%d)",
+            type(self).__name__,
             len(self.capture_bs), self.max_bs, self.max_context, self.num_steps,
         )
+
+    def _init_extra_state(self):
+        """Hook for subclasses to allocate additional buffers."""
 
     # ── Capture ──
 
@@ -196,25 +214,22 @@ class SMCDraftPhaseGraphRunner:
             out = run_once_fn()
         return out
 
-    def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
-        graph = self._create_graph()
-        stream = self.stream
-        bs = num_seqs
-
+    def _setup_draft_capture(self, bs: int):
+        """Slice buffers, build the draft ForwardBatch, and write the
+        per-step attention metadata for capture.  Returns (fb, slices)."""
         input_ids = self.input_ids[:bs]
         req_pool_indices = self.req_pool_indices[:bs]
         positions = self.positions[:bs]
         seq_lens = self.seq_lens[:bs]
         seq_lens_cpu = self.seq_lens_cpu[:bs]
-        out_cache_loc_steps = [self.out_cache_loc[s, :bs] for s in range(self.num_steps)]
-        tokens_out = self.tokens_out[:bs]
-        logprobs_out = self.logprobs_out[:bs]
+        out_cache_loc_steps = [
+            self.out_cache_loc[s, :bs] for s in range(self.num_steps)
+        ]
 
         spec_info = SMCDraftInput(
             verified_id=input_ids,
             num_tokens_per_req=self.num_steps,
         )
-
         fb = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
             batch_size=bs,
@@ -233,35 +248,47 @@ class SMCDraftPhaseGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self.fbs[bs] = fb
-
-        # Per-step kv metadata into the captured buffers.
         self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(fb)
+        return fb, input_ids, positions, out_cache_loc_steps
 
-        gamma = self.gamma
-        temperature = self.temperature
+    def _draft_steps_in_graph(self, bs, forward, fb, input_ids, positions,
+                              out_cache_loc_steps):
+        """The captured draft loop: gamma+1 forwards + Gumbel sampling."""
         backends = self.draft_attn_backend.attn_backends
+        tokens_out = self.tokens_out[:bs]
+        logprobs_out = self.logprobs_out[:bs]
         tiny = torch.finfo(torch.float32).tiny
+        for s in range(self.num_steps):
+            fb.attn_backend = backends[s]
+            fb.out_cache_loc = out_cache_loc_steps[s]
+            # `forward` is the (patched) model.forward — returns a
+            # LogitsProcessorOutput directly.
+            logits = forward(input_ids, positions, fb).next_token_logits
+            scaled = logits / self.temperature
+            gumbel = -torch.log(
+                -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
+            )
+            idx = torch.argmax(scaled + gumbel, dim=-1)
+            tokens_out[:, s + 1] = idx
+            if s < self.gamma:
+                chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
+                logprobs_out[:, s] = chosen - torch.logsumexp(scaled, dim=-1)
+            input_ids.copy_(idx)
+            positions.add_(1)
+        return tokens_out, logprobs_out
+
+    def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
+        graph = self._create_graph()
+        stream = self.stream
+        bs = num_seqs
+
+        fb, input_ids, positions, ocl_steps = self._setup_draft_capture(bs)
 
         def run_once():
             set_is_extend_in_batch(False)
-            for s in range(self.num_steps):
-                fb.attn_backend = backends[s]
-                fb.out_cache_loc = out_cache_loc_steps[s]
-                # `forward` is the (patched) model.forward — returns a
-                # LogitsProcessorOutput directly.
-                logits = forward(input_ids, positions, fb).next_token_logits
-                scaled = logits / temperature
-                gumbel = -torch.log(
-                    -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
-                )
-                idx = torch.argmax(scaled + gumbel, dim=-1)
-                tokens_out[:, s + 1] = idx
-                if s < gamma:
-                    chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
-                    logprobs_out[:, s] = chosen - torch.logsumexp(scaled, dim=-1)
-                input_ids.copy_(idx)
-                positions.add_(1)
-            return (tokens_out, logprobs_out)
+            return self._draft_steps_in_graph(
+                bs, forward, fb, input_ids, positions, ocl_steps
+            )
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
         self._capture_init(run_once)
@@ -281,15 +308,14 @@ class SMCDraftPhaseGraphRunner:
         max_len = int(ctx.orig_seq_lens_cpu.max().item()) + self.num_steps
         return max_len <= self.max_context
 
-    def replay(
+    def _stage_replay_inputs(
         self,
         verified_id: torch.Tensor,
         cache_locs: torch.Tensor,
         ctx: SMCDecodeContext,
         req_pool_indices: torch.Tensor,
     ):
-        """Returns (tokens_out[:raw_bs], logprobs_out[:raw_bs]) where
-        tokens_out columns are [x0, d_0, ..., d_gamma]."""
+        """Copy live inputs into the captured buffers; returns (raw_bs, bs)."""
         raw_bs = verified_id.shape[0]
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
@@ -310,12 +336,240 @@ class SMCDraftPhaseGraphRunner:
         self.seq_lens_cpu[:raw_bs].copy_(ctx.orig_seq_lens_cpu)
         # (bs, gamma+1) -> step-major buffer.
         self.out_cache_loc[:, :raw_bs].copy_(cache_locs.t())
+        return raw_bs, bs
 
-        fb = self.fbs[bs]
-        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(fb, bs)
-
+    def replay(
+        self,
+        verified_id: torch.Tensor,
+        cache_locs: torch.Tensor,
+        ctx: SMCDecodeContext,
+        req_pool_indices: torch.Tensor,
+    ):
+        """Returns (tokens_out[:raw_bs], logprobs_out[:raw_bs]) where
+        tokens_out columns are [x0, d_0, ..., d_gamma]."""
+        raw_bs, bs = self._stage_replay_inputs(
+            verified_id, cache_locs, ctx, req_pool_indices
+        )
+        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+            self.fbs[bs], bs
+        )
         # capture() stores keys via _default_make_graph_key(bs, None, None),
         # which is the plain bs int.
         self.graphs[_default_make_graph_key(bs)].replay()
-
         return self.tokens_out[:raw_bs], self.logprobs_out[:raw_bs]
+
+
+class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
+    """Draft phase + TARGET_VERIFY + weight diff + bonus, one graph.
+
+    Replay returns every tensor the worker needs for its
+    ``GenerationBatchResult``:
+
+        tokens_out        (bs, gamma+2)  [x0, d_0..d_gamma]
+        logprobs_out      (bs, gamma)    draft logprobs (diagnostic)
+        logprob_diff_out  (bs, gamma)    alpha * score_logp - draft_logp
+        bonus_out         (bs,)          Gumbel draw from p_T^alpha
+        next_tokens_out   (bs, gamma+1)  [d_0..d_{gamma-1}, bonus]
+
+    The verify forward runs on the TARGET model inside the same graph —
+    legal because a CUDA graph just records kernels, regardless of which
+    module launches them.  Its attention metadata uses the target backend's
+    EXISTING graph-state buffers (shared with the target's own verify
+    graphs; see module docstring).
+    """
+
+    def _init_extra_state(self):
+        worker = self.smc_worker
+        self.target_runner = worker.score_runner
+        self.target_backend = self.target_runner.attn_backend
+        self.target_temperature = float(worker.smc_target_temperature)
+        self.alpha = float(worker.smc_power_alpha)
+
+        n_verify_tokens = self.max_bs * self.num_steps
+        with torch.device(self.model_runner.device):
+            self.verify_input_ids = torch.zeros(
+                (n_verify_tokens,), dtype=torch.int64
+            )
+            self.verify_positions = torch.zeros(
+                (n_verify_tokens,), dtype=torch.int64
+            )
+            self.verify_out_cache_loc = torch.zeros(
+                (n_verify_tokens,), dtype=torch.int64
+            )
+            self.logprob_diff_out = torch.zeros(
+                (self.max_bs, self.gamma), dtype=torch.float32
+            )
+            self.bonus_out = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.next_tokens_out = torch.zeros(
+                (self.max_bs, self.num_steps), dtype=torch.int64
+            )
+        self.verify_fbs = {}
+
+    def _setup_verify_capture(self, bs: int):
+        n_tokens = bs * self.num_steps
+        verify_input_ids = self.verify_input_ids[:n_tokens]
+        verify_positions = self.verify_positions[:n_tokens]
+        verify_ocl = self.verify_out_cache_loc[:n_tokens]
+        seq_lens = self.seq_lens[:bs]
+        seq_lens_cpu = self.seq_lens_cpu[:bs]
+        req_pool_indices = self.req_pool_indices[:bs]
+
+        verify_spec = SMCVerifyInput(
+            draft_token_num=self.num_steps,
+            positions=verify_positions,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            seq_lens_cpu=seq_lens_cpu,
+            num_tokens_per_req=self.num_steps,
+        )
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            input_ids=verify_input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            req_to_token_pool=self.target_runner.req_to_token_pool,
+            token_to_kv_pool=self.target_runner.token_to_kv_pool,
+            attn_backend=self.target_backend,
+            out_cache_loc=verify_ocl,
+            return_logprob=False,
+            positions=verify_positions,
+            spec_algorithm=self.target_runner.spec_algorithm,
+            spec_info=verify_spec,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        verify_spec.populate_linear_verify_metadata(fb)
+        self.verify_fbs[bs] = (fb, verify_spec)
+        # NOTE: reuses the target backend's existing cuda-graph metadata
+        # buffers (allocated by the target's own graph runner) — do NOT call
+        # init_cuda_graph_state here, it would orphan the target's graphs.
+        self.target_backend.init_forward_metadata_capture_cuda_graph(
+            bs,
+            n_tokens,
+            req_pool_indices,
+            seq_lens,
+            None,
+            ForwardMode.TARGET_VERIFY,
+            verify_spec,
+        )
+        return fb, verify_input_ids, verify_positions
+
+    def _verify_in_graph(self, bs, fb, verify_input_ids, verify_positions):
+        gamma = self.gamma
+        tokens_out = self.tokens_out[:bs]
+        logprobs_out = self.logprobs_out[:bs]
+        logprob_diff_out = self.logprob_diff_out[:bs]
+        bonus_out = self.bonus_out[:bs]
+        next_tokens_out = self.next_tokens_out[:bs]
+        tiny = torch.finfo(torch.float32).tiny
+
+        # Score input = [x0, d_0..d_{gamma-1}] per row, request-major.
+        verify_input_ids.view(bs, self.num_steps).copy_(
+            tokens_out[:, : self.num_steps]
+        )
+        logits = self.target_runner.model.forward(
+            verify_input_ids, verify_positions, fb
+        ).next_token_logits
+        logits3 = logits.view(bs, self.num_steps, -1)
+
+        # Fused score logprobs under the tempered target p_T.
+        verify_scaled = logits3[:, :gamma, :] / self.target_temperature
+        chosen = verify_scaled.gather(
+            2, tokens_out[:, 1 : gamma + 1].unsqueeze(2)
+        ).squeeze(2)
+        score_logprobs = chosen - torch.logsumexp(verify_scaled, dim=-1)
+        logprob_diff_out.copy_(self.alpha * score_logprobs - logprobs_out)
+
+        # Bonus from the same p_T^alpha tempered-power target, Gumbel-max.
+        bonus_scaled = (
+            self.alpha * logits3[:, -1, :] / self.target_temperature
+        )
+        bonus_gumbel = -torch.log(
+            -torch.log(torch.rand_like(bonus_scaled).clamp_min_(tiny))
+        )
+        bonus_out.copy_(torch.argmax(bonus_scaled + bonus_gumbel, dim=-1))
+
+        next_tokens_out[:, :gamma].copy_(tokens_out[:, 1 : gamma + 1])
+        next_tokens_out[:, gamma].copy_(bonus_out)
+        return (
+            tokens_out,
+            logprobs_out,
+            logprob_diff_out,
+            bonus_out,
+            next_tokens_out,
+        )
+
+    def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
+        graph = self._create_graph()
+        stream = self.stream
+        bs = num_seqs
+
+        fb, input_ids, positions, ocl_steps = self._setup_draft_capture(bs)
+        verify_fb, verify_input_ids, verify_positions = (
+            self._setup_verify_capture(bs)
+        )
+
+        def run_once():
+            set_is_extend_in_batch(False)
+            self._draft_steps_in_graph(
+                bs, forward, fb, input_ids, positions, ocl_steps
+            )
+            return self._verify_in_graph(
+                bs, verify_fb, verify_input_ids, verify_positions
+            )
+
+        self.deepep_adapter.capture(is_extend_in_batch=False)
+        self._capture_init(run_once)
+        out = self._capture_graph(
+            graph, get_global_graph_memory_pool(), stream, run_once
+        )
+        set_global_graph_memory_pool(graph.pool())
+        return graph, out
+
+    def replay(
+        self,
+        verified_id: torch.Tensor,
+        cache_locs: torch.Tensor,
+        ctx: SMCDecodeContext,
+        req_pool_indices: torch.Tensor,
+    ):
+        raw_bs, bs = self._stage_replay_inputs(
+            verified_id, cache_locs, ctx, req_pool_indices
+        )
+        # Verify-side staging: positions [S..S+gamma] and request-major
+        # cache locations per row.
+        n_raw_tokens = raw_bs * self.num_steps
+        self.verify_positions[:n_raw_tokens].view(raw_bs, self.num_steps).copy_(
+            ctx.orig_seq_lens.unsqueeze(1)
+            + torch.arange(self.num_steps, device=cache_locs.device)
+        )
+        self.verify_out_cache_loc[:n_raw_tokens].view(
+            raw_bs, self.num_steps
+        ).copy_(cache_locs)
+
+        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+            self.fbs[bs], bs
+        )
+        verify_fb, verify_spec = self.verify_fbs[bs]
+        seq_lens_sum = int(self.seq_lens_cpu[:bs].sum().item())
+        self.target_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            self.req_pool_indices[:bs],
+            self.seq_lens[:bs],
+            seq_lens_sum,
+            None,
+            ForwardMode.TARGET_VERIFY,
+            verify_spec,
+            self.seq_lens_cpu[:bs],
+        )
+
+        self.graphs[_default_make_graph_key(bs)].replay()
+        return (
+            self.tokens_out[:raw_bs],
+            self.logprobs_out[:raw_bs],
+            self.logprob_diff_out[:raw_bs],
+            self.bonus_out[:raw_bs],
+            self.next_tokens_out[:raw_bs],
+        )
