@@ -82,6 +82,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smc-n-particles", type=int, default=8)
     parser.add_argument("--smc-gamma", type=int, default=8)
     parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=1,
+        help="How many prompts to run concurrently (= number of SMC groups). "
+        "Decode batch size is num_prompts * smc_n_particles.",
+    )
+    parser.add_argument(
         "--prompt",
         action="append",
         dest="prompts",
@@ -154,12 +161,12 @@ def build_engine(args: argparse.Namespace):
             smc_n_particles=args.smc_n_particles,
             smc_gamma=args.smc_gamma,
             page_size=1,
-            mem_fraction_static=0.4,
+            mem_fraction_static=0.65,
             trust_remote_code=True,
             log_level="info",
             random_seed=1,
             cuda_graph_max_bs=128,
-            attention_backend="fa3",
+            attention_backend="triton",
             smc_draft_temperature=0.8,
             smc_target_temperature=0.8,
             max_running_requests=128,
@@ -173,15 +180,16 @@ def build_engine(args: argparse.Namespace):
         n_particles=args.smc_n_particles,
         gamma=args.smc_gamma,
         page_size=1,
-        mem_fraction_static=0.4,
+        mem_fraction_static=0.65,
         trust_remote_code=True,
         log_level="info",
         random_seed=1,
         cuda_graph_max_bs=128,
-        attention_backend="fa3",
+        attention_backend="triton",
         draft_temperature=0.8,
         target_temperature=0.8,
         max_running_requests=128,
+        context_length=1028,
     )
 
 
@@ -193,7 +201,9 @@ def main() -> None:
     if args.profile_v2:
         os.environ["SGLANG_PROFILE_V2"] = "1"
 
-    prompts = args.prompts or DEFAULT_PROMPTS
+    prompts = (args.prompts or DEFAULT_PROMPTS)[: args.num_prompts]
+    if not prompts:
+        raise SystemExit("--num-prompts must select at least one prompt.")
     run_dir = build_run_dir(args.output_dir)
     profile_stages = ["decode"] if args.decode_only else ["prefill", "decode"]
     expected_artifacts = 1

@@ -15,7 +15,7 @@ internal Philox seed:
 * dst_slots are unique and disjoint from src_slots
 * ``|dst| == |src|`` (conservation: Σ target_counts = N)
 * weights are zeroed only on rows that resampled
-* KV refcounts move correctly and ``to_free`` reports slots that hit zero
+* KV refcounts move correctly and pages hitting zero land in the freed buffer
 """
 
 import unittest
@@ -143,7 +143,7 @@ class TestFusedCollectKernel(CustomTestCase):
 
         result = fx.run(threshold=0.5, step_counter=1)
 
-        self.assertEqual(result.n_jobs, 0)
+        self.assertEqual(result.n_jobs_sync(), 0)
         self.assertFalse(bool(result.resample_mask.any().item()))
         self.assertTrue(torch.equal(fx.iw_of_row(0), before_iw))
         self.assertTrue(torch.equal(fx.lw_of_row(0), before_lw))
@@ -158,7 +158,7 @@ class TestFusedCollectKernel(CustomTestCase):
         result = fx.run(threshold=0.5, step_counter=2)
 
         self.assertTrue(bool(result.resample_mask[0].item()))
-        self.assertEqual(result.n_jobs, 3)
+        self.assertEqual(result.n_jobs_sync(), 3)
 
         dst = result.dst_slots.tolist()
         src = result.src_slots.tolist()
@@ -189,7 +189,7 @@ class TestFusedCollectKernel(CustomTestCase):
 
         self.assertFalse(bool(result.resample_mask[0].item()))
         self.assertTrue(bool(result.resample_mask[1].item()))
-        self.assertEqual(result.n_jobs, 3)
+        self.assertEqual(result.n_jobs_sync(), 3)
         self.assertEqual(set(result.row_of_job.tolist()), {1})
         self.assertEqual(set(result.dst_slots.tolist()), {200, 201, 203})
         self.assertEqual(set(result.src_slots.tolist()), {202})
@@ -283,7 +283,7 @@ class TestFusedCollectKernel(CustomTestCase):
 
         expected_mask = [bool(r % 2 == 1) for r in range(G)]
         self.assertEqual(result.resample_mask.tolist(), expected_mask)
-        self.assertEqual(result.n_jobs, (G // 2) * (N - 1))
+        self.assertEqual(result.n_jobs_sync(), (G // 2) * (N - 1))
 
         # Per-row invariants across the whole batch.
         jobs_by_row: dict = {}
@@ -344,7 +344,7 @@ class TestFusedCollectKernel(CustomTestCase):
         result = fx.run(threshold=0.5, step_counter=77)
 
         self.assertTrue(result.resample_mask.all().item())
-        self.assertEqual(result.n_jobs, G * (N - 1))
+        self.assertEqual(result.n_jobs_sync(), G * (N - 1))
 
         # Per-row, src must all be the lone survivor's slot.
         for r in range(G):
@@ -410,117 +410,213 @@ class TestFusedCollectKernel(CustomTestCase):
                 )
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "Triton kernels require CUDA")
-class TestFusedResampleKVKernel(CustomTestCase):
-    """``batched_resample_kv`` — fused dec_ref + block-table copy + inc_ref."""
+@dataclass
+class ResampleFixture:
+    """Minimal slot-state harness for the device-driven resample kernel.
 
-    DEVICE = "cuda"
+    Mirrors the tensors ``dispatch_resample_batch`` hands to
+    ``batched_resample_kv``: slot-indexed lineage state, the KV pool, and
+    the freed-page capture buffer.  Slot ``i`` owns pool row ``i``.
+    """
 
-    def _build_pool(self, rows, refcount_size=64):
-        """Build ``(req_to_token, refcount)`` tensors and pre-arm refcounts.
+    req_to_token: torch.Tensor
+    refcount: torch.Tensor
+    req_pool_indices: torch.Tensor
+    kv_allocated_lens: torch.Tensor
+    seq_lens: torch.Tensor
+    verified_ids: torch.Tensor
+    prev_last_draft_ids: torch.Tensor
+    finished_mask: torch.Tensor
+    finished_len: torch.Tensor
+    finish_reason_code: torch.Tensor
+    matched_eos_token: torch.Tensor
+    token_counts: torch.Tensor
+    all_token_ids: torch.Tensor
+    freed_buf: torch.Tensor
+    freed_counter: torch.Tensor
 
-        Every non-zero KV index appearing in ``rows`` starts at refcount 1.
-        """
-        req_to_token = torch.tensor(
-            rows, dtype=torch.int32, device=self.DEVICE
-        )
-        refcount = torch.zeros(refcount_size, dtype=torch.int32, device=self.DEVICE)
+    @classmethod
+    def build(cls, rows, *, device, refcount_size=64) -> "ResampleFixture":
+        """``rows[i]`` is slot/pool-row ``i``'s block table.  Every non-zero
+        KV index starts at refcount 1.  Lineage tensors get distinct
+        per-slot values so copies are observable."""
+        dev = torch.device(device)
+        n = len(rows)
+        req_to_token = torch.tensor(rows, dtype=torch.int32, device=dev)
+        refcount = torch.zeros(refcount_size, dtype=torch.int32, device=dev)
         for row in rows:
             for idx in row:
                 if idx > 0:
                     refcount[idx] = 1
-        return req_to_token, refcount
+        used = [sum(1 for v in row if v > 0) for row in rows]
+        ids = torch.arange(n, dtype=torch.int64, device=dev)
+        return cls(
+            req_to_token=req_to_token,
+            refcount=refcount,
+            req_pool_indices=ids.clone(),
+            kv_allocated_lens=torch.tensor(used, dtype=torch.int64, device=dev),
+            seq_lens=torch.tensor(used, dtype=torch.int64, device=dev),
+            verified_ids=(100 + ids).to(torch.int32),
+            prev_last_draft_ids=(200 + ids).to(torch.int32),
+            finished_mask=(ids % 2 == 1),
+            finished_len=(10 + ids).to(torch.int32),
+            finish_reason_code=(ids % 3).to(torch.int8),
+            matched_eos_token=(300 + ids).to(torch.int32),
+            token_counts=torch.tensor(used, dtype=torch.int32, device=dev),
+            all_token_ids=(
+                1000 * (1 + ids.to(torch.int32)).unsqueeze(1)
+                + torch.arange(8, dtype=torch.int32, device=dev)
+            ),
+            freed_buf=torch.zeros(refcount_size, dtype=torch.int32, device=dev),
+            freed_counter=torch.zeros(1, dtype=torch.int32, device=dev),
+        )
+
+    def run(self, dst_slots, src_slots, *, max_jobs=None) -> None:
+        dev = self.req_to_token.device
+        n_jobs = len(dst_slots)
+        if max_jobs is None:
+            # Mimic dispatch: a worst-case grid larger than the true job
+            # count, gated on-device by the counter.
+            max_jobs = max(n_jobs + 2, 4)
+        cap = max(max_jobs, 1)
+        plan_dst = torch.zeros(cap, dtype=torch.int32, device=dev)
+        plan_src = torch.zeros(cap, dtype=torch.int32, device=dev)
+        if n_jobs:
+            plan_dst[:n_jobs] = torch.tensor(
+                dst_slots, dtype=torch.int32, device=dev
+            )
+            plan_src[:n_jobs] = torch.tensor(
+                src_slots, dtype=torch.int32, device=dev
+            )
+        plan_counter = torch.tensor([n_jobs], dtype=torch.int32, device=dev)
+        batched_resample_kv(
+            self.req_to_token,
+            self.refcount,
+            plan_dst=plan_dst,
+            plan_src=plan_src,
+            plan_counter=plan_counter,
+            max_jobs=max_jobs,
+            req_pool_indices=self.req_pool_indices,
+            kv_allocated_lens=self.kv_allocated_lens,
+            seq_lens=self.seq_lens,
+            verified_ids=self.verified_ids,
+            prev_last_draft_ids=self.prev_last_draft_ids,
+            finished_mask=self.finished_mask,
+            finished_len=self.finished_len,
+            finish_reason_code=self.finish_reason_code,
+            matched_eos_token=self.matched_eos_token,
+            token_counts=self.token_counts,
+            all_token_ids=self.all_token_ids,
+            freed_buf=self.freed_buf,
+            freed_counter=self.freed_counter,
+        )
+
+    def freed(self) -> list:
+        n = int(self.freed_counter.item())
+        return sorted(self.freed_buf[:n].tolist())
+
+    def assert_lineage_copied(self, test, dst: int, src: int) -> None:
+        for name in (
+            "seq_lens", "kv_allocated_lens", "verified_ids",
+            "prev_last_draft_ids", "finished_mask", "finished_len",
+            "finish_reason_code", "matched_eos_token", "token_counts",
+        ):
+            t = getattr(self, name)
+            test.assertEqual(
+                t[dst].item(), t[src].item(),
+                f"{name}[{dst}] not copied from slot {src}",
+            )
+        count = int(self.token_counts[src].item())
+        test.assertEqual(
+            self.all_token_ids[dst, :count].tolist(),
+            self.all_token_ids[src, :count].tolist(),
+            f"all_token_ids[{dst}, :{count}] not copied from slot {src}",
+        )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "Triton kernels require CUDA")
+class TestFusedResampleKernel(CustomTestCase):
+    """``batched_resample_kv`` — device-plan-driven dec_ref + block-table
+    copy + inc_ref + lineage-tensor copy + freed-page capture."""
+
+    DEVICE = "cuda"
 
     def test_single_pair_copies_block_table_and_updates_refcounts(self):
-        """One eviction job: dst row [11, 12] ← src row [21, 22, 23].
+        """One job: slot 0 (pages [11, 12]) ← slot 1 (pages [21, 22, 23]).
         The dst row is overwritten, src refcounts bump, old dst refcounts
-        drop — and since they had a single owner, they show up in to_free."""
-        rows = [[11, 12, 0, 0], [21, 22, 23, 0]]
-        req_to_token, refcount = self._build_pool(rows)
-
-        dst_pool = torch.tensor([0], dtype=torch.int32, device=self.DEVICE)
-        src_pool = torch.tensor([1], dtype=torch.int32, device=self.DEVICE)
-        dst_alloc = torch.tensor([2], dtype=torch.int32, device=self.DEVICE)
-        src_seq = torch.tensor([3], dtype=torch.int32, device=self.DEVICE)
-
-        to_free = batched_resample_kv(
-            req_to_token, refcount, dst_pool, src_pool, dst_alloc, src_seq,
+        drop — single-owner pages land in the freed buffer — and every
+        lineage tensor follows the copy."""
+        fx = ResampleFixture.build(
+            [[11, 12, 0, 0], [21, 22, 23, 0]], device=self.DEVICE
         )
 
-        self.assertEqual(req_to_token[0, :3].tolist(), [21, 22, 23])
-        self.assertEqual(refcount[21].item(), 2)
-        self.assertEqual(refcount[22].item(), 2)
-        self.assertEqual(refcount[23].item(), 2)
-        self.assertEqual(refcount[11].item(), 0)
-        self.assertEqual(refcount[12].item(), 0)
-        self.assertEqual(sorted(to_free.tolist()), [11, 12])
+        fx.run(dst_slots=[0], src_slots=[1])
+
+        self.assertEqual(fx.req_to_token[0, :3].tolist(), [21, 22, 23])
+        for idx in (21, 22, 23):
+            self.assertEqual(fx.refcount[idx].item(), 2)
+        for idx in (11, 12):
+            self.assertEqual(fx.refcount[idx].item(), 0)
+        self.assertEqual(fx.freed(), [11, 12])
+        fx.assert_lineage_copied(self, dst=0, src=1)
 
     def test_multiple_pairs_run_in_parallel(self):
-        """Two eviction jobs at once.  Each dst inherits its own src;
-        refcounts and to_free reflect both jobs."""
-        rows = [
-            [11, 12, 0, 0],
-            [13, 0, 0, 0],
-            [21, 22, 23, 0],
-            [24, 25, 0, 0],
-        ]
-        req_to_token, refcount = self._build_pool(rows)
-
-        dst_pool = torch.tensor([0, 1], dtype=torch.int32, device=self.DEVICE)
-        src_pool = torch.tensor([2, 3], dtype=torch.int32, device=self.DEVICE)
-        dst_alloc = torch.tensor([2, 1], dtype=torch.int32, device=self.DEVICE)
-        src_seq = torch.tensor([3, 2], dtype=torch.int32, device=self.DEVICE)
-
-        to_free = batched_resample_kv(
-            req_to_token, refcount, dst_pool, src_pool, dst_alloc, src_seq,
+        """Two jobs at once, launched on an oversized (worst-case) grid.
+        Each dst inherits its own src; refcounts and the freed buffer
+        reflect both jobs."""
+        fx = ResampleFixture.build(
+            [
+                [11, 12, 0, 0],
+                [13, 0, 0, 0],
+                [21, 22, 23, 0],
+                [24, 25, 0, 0],
+            ],
+            device=self.DEVICE,
         )
 
-        self.assertEqual(req_to_token[0, :3].tolist(), [21, 22, 23])
-        self.assertEqual(req_to_token[1, :2].tolist(), [24, 25])
+        fx.run(dst_slots=[0, 1], src_slots=[2, 3], max_jobs=8)
+
+        self.assertEqual(fx.req_to_token[0, :3].tolist(), [21, 22, 23])
+        self.assertEqual(fx.req_to_token[1, :2].tolist(), [24, 25])
         for idx in (21, 22, 23, 24, 25):
-            self.assertEqual(refcount[idx].item(), 2)
+            self.assertEqual(fx.refcount[idx].item(), 2)
         for idx in (11, 12, 13):
-            self.assertEqual(refcount[idx].item(), 0)
-        self.assertEqual(sorted(to_free.tolist()), [11, 12, 13])
+            self.assertEqual(fx.refcount[idx].item(), 0)
+        self.assertEqual(fx.freed(), [11, 12, 13])
+        fx.assert_lineage_copied(self, dst=0, src=2)
+        fx.assert_lineage_copied(self, dst=1, src=3)
 
     def test_shared_old_kv_only_freed_when_refcount_hits_zero(self):
-        """If a freed dst index still has another owner (refcount ≥ 2
-        initially), it must NOT appear in to_free — only the genuinely-
-        free slot does."""
-        rows = [[11, 12, 0, 0], [21, 22, 23, 0]]
-        req_to_token, refcount = self._build_pool(rows)
-        refcount[12] = 2  # slot 12 is shared
-
-        dst_pool = torch.tensor([0], dtype=torch.int32, device=self.DEVICE)
-        src_pool = torch.tensor([1], dtype=torch.int32, device=self.DEVICE)
-        dst_alloc = torch.tensor([2], dtype=torch.int32, device=self.DEVICE)
-        src_seq = torch.tensor([3], dtype=torch.int32, device=self.DEVICE)
-
-        to_free = batched_resample_kv(
-            req_to_token, refcount, dst_pool, src_pool, dst_alloc, src_seq,
+        """If a dec_ref'd dst page still has another owner (refcount ≥ 2
+        initially), it must NOT be captured as freed — only the genuinely
+        free page is."""
+        fx = ResampleFixture.build(
+            [[11, 12, 0, 0], [21, 22, 23, 0]], device=self.DEVICE
         )
+        fx.refcount[12] = 2  # page 12 is shared with a live owner
 
-        self.assertEqual(refcount[11].item(), 0)
-        self.assertEqual(refcount[12].item(), 1)
-        self.assertEqual(to_free.tolist(), [11])
+        fx.run(dst_slots=[0], src_slots=[1])
 
-    def test_empty_input_returns_empty_to_free(self):
-        """Zero jobs → kernel skipped, empty int64 tensor returned."""
-        rows = [[11, 12, 0, 0]]
-        req_to_token, refcount = self._build_pool(rows)
-        empty_int32 = torch.empty(0, dtype=torch.int32, device=self.DEVICE)
+        self.assertEqual(fx.refcount[11].item(), 0)
+        self.assertEqual(fx.refcount[12].item(), 1)
+        self.assertEqual(fx.freed(), [11])
 
-        to_free = batched_resample_kv(
-            req_to_token,
-            refcount,
-            empty_int32,
-            empty_int32,
-            empty_int32,
-            empty_int32,
+    def test_empty_plan_is_noop(self):
+        """counter == 0 with a non-zero grid: every program exits on the
+        counter load — no tensor moves, no pages freed."""
+        fx = ResampleFixture.build(
+            [[11, 12, 0, 0], [21, 22, 23, 0]], device=self.DEVICE
         )
+        before_r2t = fx.req_to_token.clone()
+        before_rc = fx.refcount.clone()
+        before_seq = fx.seq_lens.clone()
 
-        self.assertEqual(to_free.numel(), 0)
-        self.assertEqual(to_free.dtype, torch.int64)
+        fx.run(dst_slots=[], src_slots=[], max_jobs=4)
+
+        self.assertTrue(torch.equal(fx.req_to_token, before_r2t))
+        self.assertTrue(torch.equal(fx.refcount, before_rc))
+        self.assertTrue(torch.equal(fx.seq_lens, before_seq))
+        self.assertEqual(fx.freed(), [])
 
 
 if __name__ == "__main__":

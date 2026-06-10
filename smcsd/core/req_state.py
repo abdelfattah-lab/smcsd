@@ -20,18 +20,21 @@ Invariants
 * ``row_in_use[r]`` ⇒ ``group_to_slots[r, :N]`` holds N distinct slot ids,
   each assigned to exactly one particle.
 * Slot sets of distinct in-use rows are disjoint.
-* ``active_slots`` is the subset of allocated slots whose particle is NOT
-  finished.  Finished particles remain allocated and remain in
-  ``group_to_slots`` — they still participate in resampling (their
-  cumulative weight is part of the SMC mixture) and may be overwritten as
-  the destination of a resample copy.
+* ``active_slots`` contains EVERY allocated slot, finished or not
+  (absorbing-state semantics): finished particles keep receiving forward
+  passes with their weight increment zeroed, still participate in
+  resampling (their cumulative weight is part of the SMC mixture), and may
+  be overwritten as the destination of a resample copy.  Membership only
+  changes at ``allocate_slots`` / ``free_group_slots``.
 """
 
 from __future__ import annotations
 
-import copy
 import logging
+import math
+import os
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Deque, Dict, List, Optional
 
 import torch
@@ -51,6 +54,25 @@ logger = logging.getLogger(__name__)
 EMPTY_SLOT = -1
 
 
+@dataclass
+class HostSnapshot:
+    """Handle for one decode step's host snapshot.
+
+    Carries the double-buffer phase the step used and the CUDA event that
+    signals its pinned copies have landed.  Postprocessing calls ``wait()``
+    — which completes early, during the *next* step's forward — instead of
+    reading device tensors at the stream tail (which would block until all
+    enqueued work, including the next forward, finished).
+    """
+
+    phase: int
+    event: Optional["torch.cuda.Event"]
+
+    def wait(self) -> None:
+        if self.event is not None:
+            self.event.synchronize()
+
+
 class ScheduleBatchSMC:
     """Slot-major SMC batch state.
 
@@ -60,7 +82,7 @@ class ScheduleBatchSMC:
     * ``allocate_slots`` / ``free_group_slots`` — rare, at group materialise
       and finalize.
     * ``prepare_for_decode`` + ``build_model_worker_batch`` +
-      ``process_batch_result`` — hot path, once per decode step.
+      ``write_back_gpu`` — hot path, once per decode step.
     """
 
     def __init__(
@@ -100,6 +122,11 @@ class ScheduleBatchSMC:
         if self.token_to_kv_pool_allocator.page_size != 1:
             raise ValueError("SMC currently only supports page_size=1")
 
+        # Whether host->device staging tensors can be pinned (CUDA only) so
+        # the admission/teardown uploads are truly async.  See
+        # ``_to_device_async``.
+        self._pin_host = torch.device(device).type == "cuda"
+
         # ── Slot lifecycle (CPU) ──
         self.free_slots: Deque[int] = deque(range(self.max_slots))
         self.slot_to_req: Dict[int, Req] = {}
@@ -115,11 +142,33 @@ class ScheduleBatchSMC:
         self.verified_ids = torch.zeros(
             self.max_slots, dtype=torch.int32, device=device
         )
+        # Per-slot token at position S-1: the last *drafted* token d_{gamma-1}
+        # from the previous step (deferred into the next step's leading
+        # 2-token draft forward), or — on a group's first decode step — the
+        # last committed prompt token, whose draft KV the head rewrites
+        # idempotently.  Travels with lineage exactly like verified_ids.
+        self.prev_last_draft_ids = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
+        )
         self.token_counts = torch.zeros(
             self.max_slots, dtype=torch.int32, device=device
         )
         self.finished_mask = torch.zeros(
             self.max_slots, dtype=torch.bool, device=device
+        )
+        # Finish state, tensor-resident so it travels with lineage through
+        # the resample copy and is read back only at finalize time (no
+        # per-step Req-object sync).  `finished_len` is the visible output
+        # length; `finish_reason_code` is 0=running, 1=length, 2=EOS;
+        # `matched_eos_token` holds the matched id when code==2.
+        self.finished_len = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
+        )
+        self.finish_reason_code = torch.zeros(
+            self.max_slots, dtype=torch.int8, device=device
+        )
+        self.matched_eos_token = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
         )
         self.ignore_eos_t = torch.zeros(
             self.max_slots, dtype=torch.bool, device=device
@@ -130,6 +179,16 @@ class ScheduleBatchSMC:
         self.eos_token_ids_t = torch.full(
             (self.max_slots, max_eos_count), -1, dtype=torch.int64, device=device
         )
+
+        # CPU mirror of ``seq_lens``, maintained arithmetically: set at
+        # ``allocate_slots``, advanced by ``gamma_plus_1`` per decode step.
+        # Resampling never changes it — particles within a group are
+        # step-aligned, so ``seq_lens[dst] = seq_lens[src]`` is a no-op on
+        # lengths.  Lets batch construction provide ``seq_lens_cpu`` /
+        # ``seq_lens_sum`` (and the KV alloc count) without a device read,
+        # which is what keeps the prepare path sync-free for overlapped
+        # scheduling.  Verified against the device tensor when
+        self.seq_lens_host = torch.zeros(self.max_slots, dtype=torch.int64)
 
         # Cumulative SMC weights per particle — slot-indexed, float64 for
         # numerical stability across long decodes.  `log_weights` is the
@@ -148,15 +207,25 @@ class ScheduleBatchSMC:
             (self.max_slots, max_output_len), dtype=torch.int32, device=device
         )
 
-        # ── Sampling params [max_slots], static after allocation ──
-        self.temperatures = torch.ones(
+        # ── SamplingBatchInfo stubs ──
+        # SMC bypasses sglang's sampler (the worker does its own draft proposal
+        # and bonus sampling under engine-wide smc_* params), so per-request
+        # temperature / top_p / top_k / min_p are never read on this path.  We
+        # still need a SamplingBatchInfo to satisfy ModelWorkerBatch's schema,
+        # so we keep one set of constant placeholder tensors sized to
+        # max_slots and slice [:bs] at build time.
+        self._stub_temperatures = torch.ones(
             self.max_slots, 1, dtype=torch.float32, device=device
         )
-        self.top_ps = torch.ones(self.max_slots, dtype=torch.float32, device=device)
-        self.top_ks = torch.full(
+        self._stub_top_ps = torch.ones(
+            self.max_slots, dtype=torch.float32, device=device
+        )
+        self._stub_top_ks = torch.full(
             (self.max_slots,), -1, dtype=torch.int32, device=device
         )
-        self.min_ps = torch.zeros(self.max_slots, dtype=torch.float32, device=device)
+        self._stub_min_ps = torch.zeros(
+            self.max_slots, dtype=torch.float32, device=device
+        )
 
         # ── Active batch index ──
         # `active_slots` maps contiguous ModelWorkerBatch indices → slot ids.
@@ -165,6 +234,7 @@ class ScheduleBatchSMC:
         # callers (`build_model_worker_batch`) can resolve slot → Req without
         # per-element `.item()` syncs.
         self.active_slots = torch.empty(0, dtype=torch.int64, device=device)
+        self.active_slots_cpu = torch.empty(0, dtype=torch.int64)
         self._active_slots_list: List[int] = []
         self.num_active: int = 0
 
@@ -186,6 +256,13 @@ class ScheduleBatchSMC:
         self.row_in_use = torch.zeros(
             self.max_groups, dtype=torch.bool, device=device,
         )
+        # Per-group running unbiased log normalizing-constant estimate
+        # (log Z_hat), row-aligned with group_to_slots.  Accumulated at each
+        # resample boundary as logsumexp(interval_weights) - log(N) and folded
+        # with the final tail at finalize_group.
+        self.group_log_Z_hat = torch.zeros(
+            self.max_groups, dtype=torch.float64, device=device,
+        )
         self.group_id_to_row: Dict[str, int] = {}
         self.row_to_group_id: Dict[int, str] = {}
         self._free_rows: List[int] = list(range(self.max_groups))
@@ -194,9 +271,54 @@ class ScheduleBatchSMC:
         # inside `batched_collect_fused` — they are transient to one
         # kernel launch, not persistent batch state.
 
+        # ── Freed-page capture + host snapshot (double-buffered) ──
+        # The resample kernel appends KV pages whose refcount hit zero to
+        # `kv_freed_buf[phase]` through the `kv_freed_counter[phase]`
+        # atomic cursor.  At the end of `_resample`, `snapshot_to_host`
+        # async-copies the cursor and `finished_mask` into pinned host
+        # buffers and records an event; postprocessing waits on that event
+        # (NOT the stream tail), frees `kv_freed_buf[phase, :n]`, resets
+        # the cursor, and drains groups from the host mask.  Two phases
+        # because under overlapped scheduling step t+1's dispatch/snapshot
+        # are enqueued BEFORE step t's postprocessing runs — a single
+        # buffer would be clobbered before it was consumed.  Buffer rows
+        # are sized to the whole KV pool — the per-step bound on frees.
+        pool_cap = self.token_to_kv_pool_allocator.size + 1
+        is_cuda = torch.device(device).type == "cuda"
+        self._snap_phase = 0
+        self.kv_freed_buf = torch.empty(
+            (2, pool_cap), dtype=torch.int32, device=device
+        )
+        self.kv_freed_counter = torch.zeros(
+            (2, 1), dtype=torch.int32, device=device
+        )
+        self.kv_freed_count_host = torch.zeros(
+            (2, 1), dtype=torch.int32, pin_memory=is_cuda
+        )
+        self.finished_mask_host = torch.zeros(
+            (2, self.max_slots), dtype=torch.bool, pin_memory=is_cuda
+        )
+        self._snap_events = [
+            torch.cuda.Event() if is_cuda else None for _ in range(2)
+        ]
+
     # ────────────────────────────────────────────────────────
     #  Slot Allocation / Deallocation
     # ────────────────────────────────────────────────────────
+
+    def _to_device_async(self, values, dtype: torch.dtype) -> torch.Tensor:
+        """Upload a host list to ``self.device`` without a blocking sync.
+
+        Stages through pinned memory so the H2D copy is truly async on
+        CUDA; the pinned caching host allocator keeps the staging block
+        alive until the copy's stream event fires, so the returned tensor
+        is safe to use even though the source goes out of scope here.  On
+        CPU/non-pinnable devices this degrades to a plain transfer.
+        """
+        host = torch.tensor(values, dtype=dtype)
+        if self._pin_host:
+            host = host.pin_memory()
+        return host.to(self.device, non_blocking=self._pin_host)
 
     def allocate_slots(
         self,
@@ -210,6 +332,13 @@ class ScheduleBatchSMC:
         device-side group lookup row, and zeroes the group's cumulative
         weights.  Triggers one ``rebuild_active_slots`` to refresh the
         forward-pass gather index.
+
+        Sync-free transport: per-particle Python work only appends to host
+        lists; the device lands in a handful of async ops — ``index_fill_``
+        for fields uniform across the group (scalar baked into the launch),
+        pinned async uploads + one indexed scatter for varying / 2-D
+        fields.  Replaces ~21 blocking ``tensor[slot] = scalar`` H2D copies
+        per particle, which otherwise stall prefill postprocessing.
         """
         n = len(particle_reqs)
         if n != self.n_particles:
@@ -231,17 +360,24 @@ class ScheduleBatchSMC:
         self.group_id_to_row[group_id] = row
         self.row_to_group_id[row] = group_id
 
+        # ── Pure-CPU gather: per-particle values into host lists ──
+        pool_idx_list: List[int] = []
+        verified_list: List[int] = []
+        token_count_list: List[int] = []
+        ignore_eos_list: List[bool] = []
+        max_new_tokens_list: List[int] = []
+        eos_rows: List[List[int]] = []
+        max_n_out = 0
         for slot, req in zip(slots, particle_reqs):
             self.slot_to_req[slot] = req
+            self.seq_lens_host[slot] = shared_seq_len
 
-            self.req_pool_indices[slot] = req.req_pool_idx
-            self.seq_lens[slot] = shared_seq_len
-            self.kv_allocated_lens[slot] = shared_seq_len
-            self.verified_ids[slot] = req.output_ids[-1] if req.output_ids else 0
-            self.token_counts[slot] = len(req.output_ids)
-            self.finished_mask[slot] = False
-            self.ignore_eos_t[slot] = bool(req.sampling_params.ignore_eos)
-            self.max_new_tokens_t[slot] = req.sampling_params.max_new_tokens
+            pool_idx_list.append(req.req_pool_idx)
+            verified_list.append(req.output_ids[-1] if req.output_ids else 0)
+            token_count_list.append(len(req.output_ids))
+            ignore_eos_list.append(bool(req.sampling_params.ignore_eos))
+            max_new_tokens_list.append(req.sampling_params.max_new_tokens)
+            max_n_out = max(max_n_out, len(req.output_ids))
 
             # EOS token ids: gather from req.eos_token_ids, sampling_params
             # stop_token_ids, and the tokenizer.
@@ -255,31 +391,71 @@ class ScheduleBatchSMC:
                 if getattr(tok, "additional_stop_token_ids", None):
                     eos_ids.extend(tok.additional_stop_token_ids)
             eos_ids = list(dict.fromkeys(eos_ids))
-            for j in range(self.max_eos_count):
-                self.eos_token_ids_t[slot, j] = eos_ids[j] if j < len(eos_ids) else -1
+            eos_rows.append(
+                [eos_ids[j] if j < len(eos_ids) else -1
+                 for j in range(self.max_eos_count)]
+            )
 
-            # Seed the output_ids prefix into the history buffer.
-            n_out = len(req.output_ids)
-            if n_out > 0:
-                self.all_token_ids[slot, :n_out] = torch.tensor(
-                    req.output_ids, dtype=torch.int32, device=self.device
-                )
+        idx = self._to_device_async(slots, torch.int64)  # one upload, reused
 
-            self.temperatures[slot, 0] = req.sampling_params.temperature
-            self.top_ps[slot] = req.sampling_params.top_p
-            self.top_ks[slot] = req.sampling_params.top_k
-            self.min_ps[slot] = req.sampling_params.min_p
+        # ── Category 1: fields uniform across the group → index_fill_ ──
+        self.seq_lens.index_fill_(0, idx, shared_seq_len)
+        self.kv_allocated_lens.index_fill_(0, idx, shared_seq_len)
+        # Seed with the LAST COMMITTED token (position S-1 of the shared
+        # prefix; uniform across the group — every particle clones the same
+        # parent).  Its draft KV at S-1 was already written during prefill,
+        # so the deferred-bonus 2-token head's S-1 write is an idempotent
+        # rewrite on a group's first decode step — the head is universally
+        # valid and needs no step-0 special case.  (A -1 sentinel + batch
+        # global head selection was tried before and crashes whenever a new
+        # group joins a batch of already-decoding groups: the sentinel
+        # reaches the embedding as a token id.)
+        first_req = particle_reqs[0]
+        committed = first_req.origin_input_ids + first_req.output_ids
+        last_committed_token = int(committed[shared_seq_len - 1])
+        self.prev_last_draft_ids.index_fill_(0, idx, last_committed_token)
+        self.finished_mask.index_fill_(0, idx, 0)
+        self.finished_len.index_fill_(0, idx, 0)
+        self.finish_reason_code.index_fill_(0, idx, 0)
+        self.matched_eos_token.index_fill_(0, idx, 0)
+        self.log_weights.index_fill_(0, idx, 0.0)
+        self.interval_weights.index_fill_(0, idx, 0.0)
+
+        # ── Category 2: per-particle scalars → pinned upload + scatter ──
+        self.req_pool_indices[idx] = self._to_device_async(
+            pool_idx_list, torch.int64
+        )
+        self.verified_ids[idx] = self._to_device_async(verified_list, torch.int32)
+        self.token_counts[idx] = self._to_device_async(
+            token_count_list, torch.int32
+        )
+        self.ignore_eos_t[idx] = self._to_device_async(ignore_eos_list, torch.bool)
+        self.max_new_tokens_t[idx] = self._to_device_async(
+            max_new_tokens_list, torch.int32
+        )
+
+        # ── Category 3: 2-D fields → one matrix upload each ──
+        self.eos_token_ids_t[idx] = self._to_device_async(
+            eos_rows, torch.int64
+        )
+        if max_n_out > 0:
+            # Right-pad ragged prefixes to a rectangle; only [:n_out] of
+            # each row is meaningful (token_counts gates later reads).
+            prefix_rows = [
+                req.output_ids + [0] * (max_n_out - len(req.output_ids))
+                for req in particle_reqs
+            ]
+            self.all_token_ids[idx, :max_n_out] = self._to_device_async(
+                prefix_rows, torch.int32
+            )
 
         self.group_slot_lists[group_id] = slots
 
-        # Populate the device-side group lookup row and zero this row's
-        # cumulative weights in one shot.
-        slots_t = torch.as_tensor(slots, dtype=torch.int32, device=self.device)
-        self.group_to_slots[row, :n] = slots_t
-        self.row_in_use[row] = True
-        slot_idx64 = slots_t.to(torch.int64)
-        self.log_weights[slot_idx64] = 0.0
-        self.interval_weights[slot_idx64] = 0.0
+        # ── Group lookup row + per-row scalars ──
+        self.group_to_slots[row, :n] = idx.to(torch.int32)
+        row_idx = self._to_device_async([row], torch.int64)
+        self.row_in_use.index_fill_(0, row_idx, 1)
+        self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
 
         self.rebuild_active_slots()
         return slots
@@ -296,8 +472,12 @@ class ScheduleBatchSMC:
         row = self.group_id_to_row.pop(group_id, None)
         if row is not None:
             self.row_to_group_id.pop(row, None)
-            self.group_to_slots[row] = -1
-            self.row_in_use[row] = False
+            # fill_ / index_fill_ keep the scalar in the kernel launch — no
+            # blocking H2D (cf. the `tensor[idx] = scalar` gotcha).
+            self.group_to_slots[row].fill_(-1)
+            row_idx = self._to_device_async([row], torch.int64)
+            self.row_in_use.index_fill_(0, row_idx, 0)
+            self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
             self._free_rows.append(row)
 
         for slot in slots:
@@ -330,18 +510,29 @@ class ScheduleBatchSMC:
                         _clear_draft_mamba_slot(draft_pool, saved_idx)
                     self.req_to_token_pool.free(req)
 
-            self.req_pool_indices[slot] = EMPTY_SLOT
-            self.seq_lens[slot] = 0
-            self.kv_allocated_lens[slot] = 0
-            self.verified_ids[slot] = 0
-            self.token_counts[slot] = 0
-            self.finished_mask[slot] = False
-            self.ignore_eos_t[slot] = False
-            self.log_weights[slot] = 0.0
-            self.interval_weights[slot] = 0.0
-
+            self.seq_lens_host[slot] = 0
             self.slot_to_req.pop(slot, None)
             self.free_slots.append(slot)
+
+        # Clear all released slots' device tensors to sentinels in one shot
+        # per field (index_fill_, scalar in the kernel launch — no blocking
+        # H2D per slot).  The per-slot .item() reads above stay; they are
+        # the accepted finalize bubble.
+        if slots:
+            idx = self._to_device_async(slots, torch.int64)
+            self.req_pool_indices.index_fill_(0, idx, EMPTY_SLOT)
+            self.seq_lens.index_fill_(0, idx, 0)
+            self.kv_allocated_lens.index_fill_(0, idx, 0)
+            self.verified_ids.index_fill_(0, idx, 0)
+            self.prev_last_draft_ids.index_fill_(0, idx, 0)
+            self.token_counts.index_fill_(0, idx, 0)
+            self.finished_mask.index_fill_(0, idx, 0)
+            self.finished_len.index_fill_(0, idx, 0)
+            self.finish_reason_code.index_fill_(0, idx, 0)
+            self.matched_eos_token.index_fill_(0, idx, 0)
+            self.ignore_eos_t.index_fill_(0, idx, 0)
+            self.log_weights.index_fill_(0, idx, 0.0)
+            self.interval_weights.index_fill_(0, idx, 0.0)
 
         self.rebuild_active_slots()
 
@@ -353,23 +544,30 @@ class ScheduleBatchSMC:
         so per-group slices of the forward-pass output tensors (e.g.
         ``logprob_diff``) are contiguous.
 
-        Only invoked when particle membership changes (allocate, free, or
-        after a particle finishes).  Does one CPU→GPU tensor copy.
+        Finished particles are kept in ``active_slots`` (EOS-absorbing-state
+        semantics): they continue to receive forward passes so they can be
+        selected as ancestors during resampling, but their weight diff is
+        zeroed in ``write_back_gpu`` step (d) — the absorbing state
+        deterministically emits EOS, so log p(token | finished) = 0 for
+        both proposal and target.  Their cumulative ``log_weights`` is
+        therefore frozen at the value it had on the EOS transition step
+        and stays comparable to still-running particles, so they remain
+        fair candidates for resampling and finalization.  Already-finished
+        slots are also guarded from being re-marked as newly finished
+        (the ``& ~prev_finished_active`` term on ``newly_finished_mask``).
         """
-        # One batched D→H of the full finished mask — replaces the
-        # per-slot `.item()` sync that used to run inside the group loop.
-        finished_cpu = self.finished_mask.cpu().tolist()
-
         self._sorted_group_ids = sorted(self.group_slot_lists.keys())
         active_list: List[int] = []
         for group_id in self._sorted_group_ids:
             for s in self.group_slot_lists[group_id]:
-                if not finished_cpu[s]:
-                    active_list.append(s)
+                active_list.append(s)
 
         self.active_slots = torch.tensor(
             active_list, dtype=torch.int64, device=self.device
         )
+        # CPU twin of `active_slots` for gathering host-shadow tensors
+        # (seq_lens_host) without a device round trip.
+        self.active_slots_cpu = torch.tensor(active_list, dtype=torch.int64)
         self._active_slots_list = active_list
         self.num_active = len(active_list)
 
@@ -396,9 +594,16 @@ class ScheduleBatchSMC:
         kv_alloc_g = self.kv_allocated_lens[active]
         pool_idx_g = self.req_pool_indices[active]
         verified_g = self.verified_ids[active]
+        prev_last_draft_g = self.prev_last_draft_ids[active]
+
+        # Host shadow gather — provides every CPU-side scalar the batch
+        # build needs without reading the device tensors (which, under
+        # overlapped scheduling, may not be computed yet).
+        seq_lens_cpu_g = self.seq_lens_host[self.active_slots_cpu]
 
         ctx, new_kv_alloc = SMCDecodeContext.from_slot_gather(
             seq_lens=seq_lens_g,
+            seq_lens_cpu=seq_lens_cpu_g,
             kv_allocated_lens=kv_alloc_g,
             req_pool_indices=pool_idx_g,
             gamma_plus_1=self.gamma_plus_1,
@@ -408,9 +613,13 @@ class ScheduleBatchSMC:
 
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
+        self.seq_lens_host[self.active_slots_cpu] = (
+            seq_lens_cpu_g + self.gamma_plus_1
+        )
 
         return SMCDraftInput(
             verified_id=verified_g,
+            prev_last_draft_id=prev_last_draft_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
         )
@@ -436,17 +645,21 @@ class ScheduleBatchSMC:
 
         req_pool_indices = self.req_pool_indices[active]
         seq_lens = ctx.new_seq_lens if ctx is not None else self.seq_lens[active]
-        seq_lens_cpu = seq_lens.cpu()
+        # CPU values from the host shadow — no device read.  The shadow was
+        # already advanced by prepare_for_decode, so it equals new_seq_lens.
+        seq_lens_cpu = self.seq_lens_host[self.active_slots_cpu]
         seq_lens_sum = int(seq_lens_cpu.sum().item())
 
         reqs = [self.slot_to_req[s] for s in self._active_slots_list]
 
-        # Minimal SamplingBatchInfo — SMC worker does its own sampling.
+        # Stub SamplingBatchInfo — SMC worker does its own sampling under
+        # engine-wide smc_* params, so the per-row tensors are unused.  The
+        # stubs are constants slot-allocated once at init.
         sampling_info = SamplingBatchInfo(
-            temperatures=self.temperatures[active],
-            top_ps=self.top_ps[active],
-            top_ks=self.top_ks[active],
-            min_ps=self.min_ps[active],
+            temperatures=self._stub_temperatures[:bs],
+            top_ps=self._stub_top_ps[:bs],
+            top_ks=self._stub_top_ks[:bs],
+            min_ps=self._stub_min_ps[:bs],
             is_all_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
@@ -494,30 +707,32 @@ class ScheduleBatchSMC:
     #  Process Batch Result (write-back from forward pass)
     # ────────────────────────────────────────────────────────
 
-    def process_batch_result(
+    def write_back_gpu(
         self,
         next_token_ids: torch.Tensor,
-        accept_lens: torch.Tensor,
         logprob_diff: torch.Tensor,
         bonus_ids: torch.Tensor,
         *,
-        rebuild_active: bool = True,
-    ) -> List[int]:
+        prev_last_draft_ids: Optional[torch.Tensor] = None,
+    ) -> None:
         """Write forward-pass results back to slot-indexed tensors.
+
+        Sync-free by construction: every op here is a GPU tensor op — no
+        ``.item()`` / ``.tolist()`` / Python truth-value of a CUDA tensor —
+        so the whole write-back (and the resample kernels that consume
+        ``interval_weights`` immediately after) can be enqueued behind the
+        decode forward without a host round-trip.
 
         Order of operations:
 
         a. Scatter accepted tokens into ``all_token_ids``; bump ``token_counts``.
         b. Overwrite ``verified_ids`` with next-step bonus tokens.
-        c. Check finish conditions (length, EOS) batched on GPU.
-        d. Sync finished particles' output to their ``Req`` objects (only
-           the newly-finished ones — typically 0–2 per step).
-        e. Accumulate ``logprob_diff`` into the slot-indexed
-           ``log_weights`` / ``interval_weights`` — one vectorised
-           index_put_ per tensor, no Python loop, no ``.item()`` syncs.
-        f. Optionally rebuild the active-slot index.
-
-        Returns the list of slot ids that just transitioned to finished.
+        c. Check finish conditions (length, EOS) batched on GPU and record
+           them tensor-resident (``finished_mask`` / ``finished_len`` /
+           ``finish_reason_code`` / ``matched_eos_token``).  Req objects
+           are NOT touched; ``finalize_group`` reads the tensors lazily.
+        d. Accumulate ``logprob_diff`` into the slot-indexed
+           ``log_weights`` / ``interval_weights``.
         """
         active = self.active_slots
         bs = self.num_active
@@ -536,6 +751,12 @@ class ScheduleBatchSMC:
 
         # b. Next step's seed token.
         self.verified_ids[active] = bonus_ids.to(dtype=torch.int32)
+        # This step's last drafted token, deferred into next step's leading
+        # 2-token draft forward.  Carried but not yet consumed (Step 2).
+        if prev_last_draft_ids is not None:
+            self.prev_last_draft_ids[active] = prev_last_draft_ids.to(
+                dtype=torch.int32
+            )
 
         # c. Batched finish check on GPU.
         updated_counts = self.token_counts[active]
@@ -543,174 +764,223 @@ class ScheduleBatchSMC:
         length_hit = updated_counts >= max_tokens
 
         # EOS check: any accepted token in this step matches any of this
-        # slot's EOS ids.  Skipped for slots with ignore_eos=True.
+        # slot's EOS ids.  Skipped for slots with ignore_eos=True.  EOS-id
+        # padding is -1, which no token id can match.
         eos_ids = self.eos_token_ids_t[active]
-        eos_hit = (
+        eos_match = (
             accepted_2d.unsqueeze(2).to(torch.int64) == eos_ids.unsqueeze(1)
-        ).any(dim=2).any(dim=1)
-        eos_hit = eos_hit & ~self.ignore_eos_t[active]
+        ).any(dim=2)                                          # (bs, stride)
+        eos_hit = eos_match.any(dim=1) & ~self.ignore_eos_t[active]
 
-        newly_finished_mask = (length_hit | eos_hit) & ~self.finished_mask[active]
-        self.finished_mask[active] = self.finished_mask[active] | newly_finished_mask
+        prev_finished_active = self.finished_mask[active]
+        newly_finished_mask = (length_hit | eos_hit) & ~prev_finished_active
+        self.finished_mask[active] = prev_finished_active | newly_finished_mask
 
-        # d. Sync the small set of newly-finished particles back to their
-        #    Req objects (for finalize / streaming).  Keeps finished
-        #    particles in the resample candidate set via finished_mask +
-        #    ongoing participation in group_to_slots.
-        newly_finished: List[int] = []
-        if newly_finished_mask.any():
-            finished_indices = newly_finished_mask.nonzero(as_tuple=True)[0]
-            for idx in finished_indices.tolist():
-                slot = int(active[idx].item())
-                newly_finished.append(slot)
-                req = self.slot_to_req[slot]
-                count = int(self.token_counts[slot].item())
-                req.kv_committed_len = int(self.seq_lens[slot].item())
-                req.kv_allocated_len = int(self.kv_allocated_lens[slot].item())
-                if length_hit[idx].item():
-                    from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-                    req.finished_reason = FINISH_LENGTH(
-                        length=int(max_tokens[idx].item())
-                    )
-                    req.finished_len = int(max_tokens[idx].item())
-                else:
-                    from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
-                    eos_set = set(eos_ids[idx].tolist()) - {-1}
-                    matched_tok = 0
-                    eos_pos_in_stride = stride
-                    for j, t in enumerate(accepted_2d[idx].tolist()):
-                        if t in eos_set:
-                            matched_tok = t
-                            eos_pos_in_stride = j
-                            break
-                    req.finished_reason = FINISH_MATCHED_TOKEN(matched=matched_tok)
-                    old_count = count - stride
-                    req.finished_len = old_count + eos_pos_in_stride + 1
-                req.output_ids = self.all_token_ids[
-                    slot, : req.finished_len
-                ].tolist()
+        # First EOS column in this step's block (== stride where no EOS):
+        # min over masked positions, so "first occurrence" is guaranteed.
+        # Only consumed under eos-branch masks below.
+        positions = torch.arange(stride, dtype=torch.int64, device=self.device)
+        first_eos = torch.where(eos_match, positions, stride).min(dim=1).values
+        matched_tok = accepted_2d.gather(
+            1, first_eos.clamp(max=stride - 1).unsqueeze(1)
+        ).squeeze(1)
 
-        # e. Accumulate log-weights.  Vectorised over all active slots —
-        #    two in-place index_put_s, zero device syncs.
-        d = logprob_diff.to(torch.float64)
+        # Finish bookkeeping, tensor-resident so it travels with lineage
+        # through the resample copy and is read back lazily at finalize.
+        # Length finish takes precedence over EOS (historical behaviour):
+        # finished_len is max_new_tokens for length, or the position right
+        # after the EOS token for EOS.
+        eos_branch = newly_finished_mask & ~length_hit
+        fin_len = torch.where(
+            length_hit,
+            max_tokens,
+            (
+                updated_counts.to(torch.int64) - stride + first_eos + 1
+            ).to(max_tokens.dtype),
+        )
+        fin_code = torch.where(length_hit, 1, 2).to(self.finish_reason_code.dtype)
+        self.finished_len[active] = torch.where(
+            newly_finished_mask, fin_len, self.finished_len[active]
+        )
+        self.finish_reason_code[active] = torch.where(
+            newly_finished_mask, fin_code, self.finish_reason_code[active]
+        )
+        self.matched_eos_token[active] = torch.where(
+            eos_branch,
+            matched_tok.to(torch.int32),
+            self.matched_eos_token[active],
+        )
+
+        # Per-particle inclusive cutoff column for the weight sum below.
+        # logprob_diff has `gamma` columns (the drafted positions); a particle
+        # accrues weight from columns 0..cutoff inclusive.  Default keeps the
+        # whole block; a particle that terminates via EOS at block column j
+        # keeps only 0..j (the EOS token itself is a real sample; tokens after
+        # it are post-EOS draft junk and must not contribute — EOS is an
+        # absorbing state with incremental weight 1).  An EOS in the bonus
+        # slot keeps the full block (the clamp).  Already-finished particles
+        # keep nothing (cutoff -1).
+        n_weight_cols = logprob_diff.shape[1]
+        weight_cutoff = torch.full(
+            (bs,), n_weight_cols - 1, dtype=torch.int64, device=self.device
+        )
+        # For the weight cutoff, EOS takes precedence even when the length
+        # cap is hit in the same block (unlike the finish *reason*, where
+        # length wins historically): once the sequence emitted EOS, the
+        # later columns are post-EOS draft junk regardless of which finish
+        # reason gets reported.
+        eos_cut = newly_finished_mask & eos_hit
+        weight_cutoff = torch.where(
+            eos_cut, first_eos.clamp(max=n_weight_cols - 1), weight_cutoff
+        )
+        weight_cutoff = torch.where(
+            prev_finished_active,
+            torch.full_like(weight_cutoff, -1),
+            weight_cutoff,
+        )
+
+        # d. Accumulate log-weights.  `logprob_diff` is per-position
+        #    (bs, gamma); each particle sums columns 0..weight_cutoff
+        #    inclusive.  Already-finished slots (cutoff -1) contribute 0 — the
+        #    EOS-absorbing state emits EOS deterministically under both
+        #    proposal and target, so its incremental weight is 1 (log 0).  A
+        #    slot that terminates this step sums only up to its EOS column, so
+        #    post-EOS draft tokens — which are not part of the sequence — do
+        #    not corrupt its importance weight.
+        cols = torch.arange(n_weight_cols, device=self.device).unsqueeze(0)
+        keep = cols <= weight_cutoff.unsqueeze(1)
+        d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
         self.log_weights[active] += d
         self.interval_weights[active] += d
 
-        # f. Optional rebuild so callers can batch it with a subsequent
-        #    resample (which may also flip membership).
-        if newly_finished and rebuild_active:
-            self.rebuild_active_slots()
-
-        return newly_finished
-
     # ────────────────────────────────────────────────────────
-    #  Resampling helpers
+    #  Host snapshot (postprocessing inputs, no stream-tail block)
     # ────────────────────────────────────────────────────────
 
-    def resample_copy_slot(self, dst_slot: int, src_slot: int) -> None:
-        """Python fallback for a single dst←src resample copy.
+    def snapshot_to_host(self) -> HostSnapshot:
+        """Async-copy this step's postprocessing inputs (freed-page cursor,
+        finished mask) into the current phase's pinned buffers, record the
+        snapshot event, and flip the phase for the next step.
 
-        Not on the hot path after the refactor — the fused resample kernel
-        handles the KV/tensor copies — but kept as a reference and for
-        any offline tooling that exercises one-at-a-time copies.  Moves
-        the sequence-level tensors and the KV block table (with refcount
-        adjustments), then the Req-level metadata.
+        Enqueue-only — call at the end of the GPU-side resample step.
+        Postprocessing waits on the returned handle's event, reads the
+        pinned buffers, frees ``kv_freed_buf[phase, :n]``, and zeroes
+        ``kv_freed_counter[phase]`` (which is then stream-ordered before
+        that phase's next dispatch).
         """
-        old_dst_alloc = int(self.kv_allocated_lens[dst_slot].item())
-        src_seq_len = int(self.seq_lens[src_slot].item())
+        p = self._snap_phase
+        self.kv_freed_count_host[p].copy_(
+            self.kv_freed_counter[p], non_blocking=True
+        )
+        self.finished_mask_host[p].copy_(self.finished_mask, non_blocking=True)
+        ev = self._snap_events[p]
+        if ev is not None:
+            ev.record()
+        self._snap_phase = 1 - p
+        return HostSnapshot(phase=p, event=ev)
 
-        self.seq_lens[dst_slot] = self.seq_lens[src_slot]
-        self.kv_allocated_lens[dst_slot] = self.kv_allocated_lens[src_slot]
-        self.verified_ids[dst_slot] = self.verified_ids[src_slot]
-        self.finished_mask[dst_slot] = self.finished_mask[src_slot]
+    # ────────────────────────────────────────────────────────
+    #  Unbiased log-Z bookkeeping
+    # ────────────────────────────────────────────────────────
 
-        src_count = int(self.token_counts[src_slot].item())
-        self.token_counts[dst_slot] = src_count
-        if src_count > 0:
-            self.all_token_ids[dst_slot, :src_count] = (
-                self.all_token_ids[src_slot, :src_count]
-            )
+    def resample_logZ_increment(self) -> torch.Tensor:
+        """Per-row log Z_hat increment for the current step, computed BEFORE the
+        resample kernel zeroes weights.
 
-        src_pool = int(self.req_pool_indices[src_slot].item())
-        dst_pool = int(self.req_pool_indices[dst_slot].item())
-
-        if old_dst_alloc > 0:
-            old_indices = self.req_to_token_pool.req_to_token[
-                dst_pool, :old_dst_alloc
-            ].to(dtype=torch.int64, copy=True)
-            self.token_to_kv_pool_allocator.dec_ref_and_free(old_indices)
-
-        if src_seq_len > 0:
-            src_indices = self.req_to_token_pool.req_to_token[
-                src_pool, :src_seq_len
-            ].to(dtype=torch.int64, copy=True)
-            self.req_to_token_pool.write(
-                (dst_pool, slice(0, src_seq_len)),
-                src_indices.to(dtype=torch.int32),
-            )
-            self.token_to_kv_pool_allocator.inc_ref(src_indices)
-
-        self.copy_req_metadata(dst_slot, src_slot)
-
-    def copy_req_metadata(self, dst_slot: int, src_slot: int) -> None:
-        """Copy the Req-level text state from src to dst.
-
-        Invoked by the fast-path dispatcher after the fused kernel has
-        already copied every on-device tensor.  Mirrors the fields the
-        tokenizer / stream-output pipeline reads at finalize time.
+        For each in-use row r, ``logsumexp(interval_weights[slots_r]) - log(N)``;
+        free rows return 0.  The caller adds this — masked by the rows that
+        actually resampled — into ``group_log_Z_hat``, which realises the
+        unbiased SMC estimator's product over resample boundaries.  Free rows'
+        ``group_to_slots`` cells are -1, indexing the last weight entry, but
+        the caller masks those rows out via the kernel's ``resample_mask``.
         """
-        src_req = self.slot_to_req[src_slot]
-        dst_req = self.slot_to_req[dst_slot]
-        dst_req.output_ids = list(src_req.output_ids)
-        dst_req.finished_reason = copy.copy(src_req.finished_reason)
-        dst_req.finished_len = src_req.finished_len
-        dst_req.finished_output = src_req.finished_output
-        dst_req.to_finish = copy.copy(src_req.to_finish)
-        dst_req.kv_committed_len = src_req.kv_committed_len
-        dst_req.kv_allocated_len = src_req.kv_allocated_len
-        dst_req.decoded_text = src_req.decoded_text
-        dst_req.surr_offset = src_req.surr_offset
-        dst_req.read_offset = src_req.read_offset
+        iw_rows = self.interval_weights[self.group_to_slots.to(torch.int64)]
+        inc = torch.logsumexp(iw_rows, dim=1) - math.log(self.n_particles)
+        return torch.where(self.row_in_use, inc, torch.zeros_like(inc))
 
     # ────────────────────────────────────────────────────────
     #  Finalization
     # ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _finish_reason_from_code(code: int, fin_len: int, matched_tok: int):
+        """Materialise a BaseFinishReason from the tensor-resident finish
+        state (``finish_reason_code`` semantics: 0=running, 1=length, 2=EOS).
+        """
+        from sglang.srt.managers.schedule_batch import (
+            FINISH_ABORT,
+            FINISH_LENGTH,
+            FINISH_MATCHED_TOKEN,
+        )
+
+        if code == 1:
+            return FINISH_LENGTH(length=fin_len)
+        if code == 2:
+            return FINISH_MATCHED_TOKEN(matched=matched_tok)
+        return FINISH_ABORT("SMC group finalized without a finished particle.")
+
     def finalize_group(self, group_id: str, parent_req: Req) -> Req:
-        """Pick the best particle (by cumulative log-weight, tiebroken by
-        visible output length) and copy its text state to ``parent_req``.
+        """Finalize an SMC group: keep the posterior-sampled particle as the
+        primary output AND attach the full particle collection + unbiased
+        log Z_hat to ``parent_req``.
+
+        ``parent_req.output_ids`` / ``finished_reason`` hold one particle drawn
+        from the posterior P(slot) ∝ exp(log_weights[slot]), preserving the
+        single-sequence API.  Additionally sets, for the whole group:
+
+          * ``smc_log_Z_hat``           — unbiased log normalizing-constant est.,
+            the running per-resample product closed out with the final tail
+            boundary ``logsumexp(interval_weights) - log(N)``.
+          * ``smc_log_w_tilde``         — final per-particle log-weights.
+          * ``smc_particle_output_ids`` — every particle's output token ids.
 
         Frees all group slots and returns ``parent_req`` ready for
         ``stream_output``.
         """
         slots = self.group_slot_lists[group_id]
+        slot_idx_t = torch.tensor(slots, dtype=torch.int64, device=self.device)
 
-        def visible_output_len(slot: int) -> int:
-            req = self.slot_to_req[slot]
-            token_count = int(self.token_counts[slot].item())
-            if req.finished_len is None:
-                return token_count
-            return min(req.finished_len, token_count)
+        # Collection-level unbiased log Z_hat: accumulated per-resample product
+        # (group_log_Z_hat) + the final tail since the last resample.  Every
+        # slot holds a finished sequence here (the group only drains once no
+        # particle is active), and the resample copy carries the finish-state
+        # tensors (all_token_ids / finished_len / finish_reason_code), so each
+        # slot reflects its surviving lineage.
+        row = self.group_id_to_row.get(group_id)
+        base = self.group_log_Z_hat[row] if row is not None else 0.0
+        tail = torch.logsumexp(
+            self.interval_weights[slot_idx_t], dim=0
+        ) - math.log(self.n_particles)
+        log_Z_hat = float((base + tail))
+        log_w_tilde = [float(x) for x in self.log_weights[slot_idx_t].tolist()]
 
-        # Slot-indexed log_weights: no more particle_idx indirection.
-        best_slot = max(
-            slots,
-            key=lambda s: (
-                float(self.log_weights[s].item()),
-                visible_output_len(s),
-            ),
+        # Per-particle results read lazily from the slot tensors — the first
+        # (and only) time decode-time finish state crosses to the host.
+        fin_lens = self.finished_len[slot_idx_t].tolist()
+        fin_codes = self.finish_reason_code[slot_idx_t].tolist()
+        matched_toks = self.matched_eos_token[slot_idx_t].tolist()
+        particle_output_ids = [
+            self.all_token_ids[s, :n].tolist() for s, n in zip(slots, fin_lens)
+        ]
+
+        # Posterior sample over particles for the primary output. softmax
+        # handles the max-shift for numerical stability; multinomial respects
+        # the global torch RNG (seeded via ServerArgs.random_seed).
+        probs = torch.softmax(self.log_weights[slot_idx_t], dim=0)
+        pick = int(torch.multinomial(probs, num_samples=1).item())
+        parent_req.output_ids = list(particle_output_ids[pick])
+        parent_req.finished_reason = self._finish_reason_from_code(
+            fin_codes[pick], fin_lens[pick], matched_toks[pick]
         )
-        best_req = self.slot_to_req[best_slot]
-        parent_req.output_ids = list(best_req.output_ids)
-        if best_req.finished_reason is not None:
-            parent_req.finished_reason = copy.copy(best_req.finished_reason)
-            parent_req.finished_len = best_req.finished_len
-        else:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
-            parent_req.finished_reason = FINISH_ABORT(
-                "SMC group finalized without a finished particle."
-            )
-            parent_req.finished_len = len(parent_req.output_ids)
+        parent_req.finished_len = (
+            fin_lens[pick]
+            if fin_codes[pick] != 0
+            else len(parent_req.output_ids)
+        )
+
+        parent_req.smc_log_Z_hat = log_Z_hat
+        parent_req.smc_log_w_tilde = log_w_tilde
+        parent_req.smc_particle_output_ids = particle_output_ids
 
         self.free_group_slots(group_id)
         return parent_req
@@ -719,9 +989,15 @@ class ScheduleBatchSMC:
     #  Group Queries
     # ────────────────────────────────────────────────────────
 
-    def group_has_active(self, group_id: str) -> bool:
+    def group_has_active(
+        self, group_id: str, finished_mask_host: torch.Tensor
+    ) -> bool:
+        """Whether any particle of ``group_id`` is unfinished, read from a
+        pinned host snapshot (``finished_mask_host[snapshot.phase]``) —
+        never from the device tensor, which would block on the stream tail
+        under overlapped scheduling."""
         slots = self.group_slot_lists.get(group_id, [])
-        return any(not self.finished_mask[s].item() for s in slots)
+        return any(not bool(finished_mask_host[s]) for s in slots)
 
     def active_particle_count(self) -> int:
         return self.num_active

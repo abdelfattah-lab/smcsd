@@ -108,8 +108,21 @@ def copy_smc_resampled_hybrid_state(
     plan,
     device: torch.device | str,
 ) -> None:
-    """Copy hybrid recurrent state after SMC resampling clones particles."""
-    if plan.n_jobs == 0:
+    """Copy hybrid recurrent state after SMC resampling clones particles.
+
+    No-op for pure-attention models, decided from CPU-only pool metadata —
+    no device sync.  Only when a Mamba pool exists does this sync: the
+    ``plan.dst_slots`` / ``plan.src_slots`` views slice the device plan to
+    its valid jobs via ``n_jobs_sync()``, because the mamba ``copy_from``
+    is a torch indexed copy that needs exact host-shaped index tensors and
+    the flat plan buffers' tails are uninitialised.  An empty plan yields
+    empty slices, which the pairwise copy treats as a no-op.
+    """
+    has_mamba = any(
+        pool is not None and hasattr(pool, "mamba_pool")
+        for pool in (target_pool, draft_pool)
+    )
+    if not has_mamba:
         return
     dst_slots_t = plan.dst_slots.to(torch.long)
     src_slots_t = plan.src_slots.to(torch.long)
