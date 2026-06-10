@@ -1,7 +1,7 @@
 """Offline SMC engine backed by vLLM.
 
 Provides a single generate() API for batch offline inference.
-Uses EngineCore directly (in-process, no ZMQ) with UniProcExecutor.
+Uses in process EngineCore with UniProcExecutor.
 
 Injection points:
   - scheduler: vllm_config.scheduler_config.scheduler_cls = SMCVLLMScheduler
@@ -123,7 +123,6 @@ class SMCVLLMEngine:
                 ``draft_temperature`` and ``target_temperature``.
                 ``target_temperature`` is translated to the normal vLLM
                 ``temperature`` field for the parent request.
-            input_ids: Pre-tokenized input(s). Mutually exclusive with *prompt*.
 
         Returns:
             A dict (single prompt) or list of dicts with keys:
@@ -211,10 +210,7 @@ class SMCVLLMEngine:
             draft_particles, particle_log_weights = completed
             seed = seed_tokens[rid]
             particles = [seed + p for p in draft_particles]
-            # Pick the best particle by cumulative log-weight (primary) and output
-            # length (tiebreaker), mirroring finalize_group in the sglang backend.
-            # Log-weights are 0 until target log-probs at draft positions are
-            # accumulated; selection then falls back to the longest particle.
+            # Pick the best particle by cumulative log-weight (primary) and then output length
             if particles:
                 best_idx = max(
                     range(len(particles)),
@@ -232,6 +228,8 @@ class SMCVLLMEngine:
                 "prompt_tokens": prompt_token_counts[rid],
                 "completion_tokens": len(all_tokens),
                 "particles": particles,  # [N][seed + draft tokens]
+                "particle_log_weights": particle_log_weights,
+                "selected_particle_index": best_idx if particles else None,
             })
         return results[0] if is_single else results
 

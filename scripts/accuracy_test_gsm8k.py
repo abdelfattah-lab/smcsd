@@ -322,8 +322,8 @@ if __name__ == "__main__":
 
     # SMC parameters (used by smc_engine mode)
     smc_grp = parser.add_argument_group("SMC parameters")
-    smc_grp.add_argument("--particles", "-N", type=int, default=4)
-    smc_grp.add_argument("--gamma", "-g", type=int, default=4)
+    smc_grp.add_argument("--particles", "-N", type=int, default=12)
+    smc_grp.add_argument("--gamma", "-g", type=int, default=8)
     smc_grp.add_argument(
         "--temperature",
         type=float,
@@ -341,7 +341,7 @@ if __name__ == "__main__":
     bench = parser.add_argument_group("benchmark")
     bench.add_argument("--num-questions", type=int, default=80)
     bench.add_argument("--max-new-tokens", type=int, default=512)
-    bench.add_argument("--batch-size", type=int, default=1)
+    bench.add_argument("--batch-size", type=int, default=4)
     bench.add_argument(
         "--ignore-eos",
         action=argparse.BooleanOptionalAction,

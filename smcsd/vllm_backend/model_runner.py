@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from pprint import pformat
@@ -22,6 +23,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
@@ -71,6 +73,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         self.draft_attn_backends: dict[str, Any] = {}
         self.draft_attn_groups: list[list[Any]] = []
         self.draft_kv_caches: list[torch.Tensor] = []
+        self.draft_model_state = None
         self.particle_groups: dict[str, ParticleGroup] = {}  # group_id -> ParticleGroup
         self.target_sampler: Sampler | None = None
         self.log_weights: torch.Tensor  # allocated in initialize_kv_cache
@@ -127,6 +130,9 @@ class SMCGPUModelRunner(GPUModelRunner):
         draft_model.eval()
         self.draft_model = draft_model
         self.draft_vllm_config = draft_vllm_config
+        self.draft_model_state = init_model_state(
+            draft_vllm_config, draft_model, None, self.device
+        )
 
     def initialize_kv_cache(self, *args, **kwargs) -> None:
         super().initialize_kv_cache(*args, **kwargs)
@@ -208,6 +214,9 @@ class SMCGPUModelRunner(GPUModelRunner):
         temperature: float,
     ) -> None:
         """Register N particles into RequestState and BlockTables."""
+        # Free parent request runner row
+        self._remove_request(group_id)
+
         prompt_len = len(prompt_token_ids)
         particle_rows: list[int] = []
 
@@ -280,83 +289,152 @@ class SMCGPUModelRunner(GPUModelRunner):
         self,
         groups: list[NewParticleGroupData],
     ) -> None:
-        """Prefill draft KV for all new particle groups."""
-        assert self.draft_kv_cache_config is not None
+        """Prefill draft KV for new particle groups.
 
-        all_particle_rows: list[int] = []
-        all_input_ids: list[int] = []
-        all_positions: list[int] = []
-        all_seq_lens: list[int] = []
-        query_start_loc_list: list[int] = [0]
+        Full block-aligned prefix blocks are shared by every particle in a group. 
+        The prompt tail lives in each particle's private decode blocks and is written per particle.
+        """
+        def run_prefill_chunk(
+            particle_rows: list[int],
+            input_ids_list: list[int],
+            positions_list: list[int],
+            seq_lens_list: list[int],
+            num_scheduled_list: list[int],
+            query_start_loc_list: list[int],
+        ) -> None:
+            if not particle_rows:
+                return
+
+            total_N = len(particle_rows)
+            total_tokens = query_start_loc_list[-1]
+
+            particle_rows_t = torch.tensor(
+                particle_rows, dtype=torch.int32, device=self.device
+            )
+            input_ids = torch.tensor(
+                input_ids_list, dtype=torch.int32, device=self.device
+            )
+            positions = torch.tensor(
+                positions_list, dtype=torch.long, device=self.device
+            )
+            seq_lens = torch.tensor(
+                seq_lens_list, dtype=torch.int32, device=self.device
+            )
+            query_start_loc = torch.tensor(
+                query_start_loc_list, dtype=torch.int32, device=self.device
+            )
+            query_start_loc_np = np.array(query_start_loc_list, dtype=np.int32)
+
+            block_tables = self._gather_block_tables(particle_rows_t)
+            slot_ids = self.block_tables.compute_slot_mappings(
+                particle_rows_t,
+                query_start_loc,
+                positions,
+                num_tokens_padded=total_tokens,
+            )
+
+            input_batch = SimpleNamespace(
+                num_reqs=total_N,
+                num_tokens=total_tokens,
+                num_reqs_after_padding=total_N,
+                num_tokens_after_padding=total_tokens,
+                query_start_loc=query_start_loc,
+                query_start_loc_np=query_start_loc_np,
+                num_scheduled_tokens=np.array(num_scheduled_list, dtype=np.int32),
+                seq_lens=seq_lens,
+                seq_lens_cpu_upper_bound=seq_lens.cpu(),
+                dcp_local_seq_lens=None,
+                positions=positions,
+            )
+ 
+            attn_metadata = self.draft_model_state.prepare_attn(
+                input_batch,
+                CUDAGraphMode.NONE,
+                block_tables,
+                slot_ids,
+                self.draft_attn_groups,
+                self.draft_kv_cache_config,
+            )
+            slot_mappings_by_layer = build_slot_mappings_by_layer(
+                slot_ids, self.draft_kv_cache_config
+            )
+
+            with set_forward_context(
+                attn_metadata,
+                self.draft_vllm_config,
+                num_tokens=total_tokens,
+                slot_mapping=slot_mappings_by_layer,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=total_tokens, has_lora=False
+                ),
+            ):
+                self.draft_model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=None,
+                    inputs_embeds=None,
+                )
+
+        block_size = self.draft_kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+
+        shared_rows: list[int] = []
+        shared_input_ids: list[int] = []
+        shared_positions: list[int] = []
+        shared_seq_lens: list[int] = []
+        shared_num_scheduled: list[int] = []
+        shared_query_start_loc: list[int] = [0]
+
+        tail_rows: list[int] = []
+        tail_input_ids: list[int] = []
+        tail_positions: list[int] = []
+        tail_seq_lens: list[int] = []
+        tail_num_scheduled: list[int] = []
+        tail_query_start_loc: list[int] = [0]
 
         for group in groups:
             particle_rows = self.particle_groups[group.group_id].particle_rows
-            N = len(particle_rows)
             L = len(group.prompt_token_ids)
-            all_particle_rows.extend(particle_rows)
-            all_input_ids.extend(group.prompt_token_ids * N)
-            all_positions.extend(list(range(L)) * N)
-            all_seq_lens.extend([L] * N)
-            for _ in range(N):
-                query_start_loc_list.append(query_start_loc_list[-1] + L)
+            shared_len = (L // block_size) * block_size
+            tail_len = L - shared_len
 
-        total_N = len(all_particle_rows)
-        total_tokens = query_start_loc_list[-1]
+            if shared_len > 0:
+                shared_rows.append(particle_rows[0])
+                shared_input_ids.extend(group.prompt_token_ids[:shared_len])
+                shared_positions.extend(range(shared_len))
+                shared_seq_lens.append(shared_len)
+                shared_num_scheduled.append(shared_len)
+                shared_query_start_loc.append(
+                    shared_query_start_loc[-1] + shared_len
+                )
 
-        particle_rows_t = torch.tensor(all_particle_rows, dtype=torch.int32, device=self.device)
-        input_ids = torch.tensor(all_input_ids, dtype=torch.int32, device=self.device)
-        positions = torch.tensor(all_positions, dtype=torch.long, device=self.device)
-        seq_lens = torch.tensor(all_seq_lens, dtype=torch.int32, device=self.device)
-        query_start_loc = torch.tensor(query_start_loc_list, dtype=torch.int32, device=self.device)
-        query_start_loc_np = np.array(query_start_loc_list, dtype=np.int32)
+            if tail_len > 0:
+                tail_tokens = group.prompt_token_ids[shared_len:]
+                tail_pos = list(range(shared_len, L))
+                for row in particle_rows:
+                    tail_rows.append(row)
+                    tail_input_ids.extend(tail_tokens)
+                    tail_positions.extend(tail_pos)
+                    tail_seq_lens.append(L)
+                    tail_num_scheduled.append(tail_len)
+                    tail_query_start_loc.append(tail_query_start_loc[-1] + tail_len)
 
-        block_tables = self._gather_block_tables(particle_rows_t)
-        slot_ids = self.block_tables.compute_slot_mappings(
-            particle_rows_t,
-            query_start_loc,
-            positions,
-            num_tokens_padded=total_tokens,
+        run_prefill_chunk(
+            shared_rows,
+            shared_input_ids,
+            shared_positions,
+            shared_seq_lens,
+            shared_num_scheduled,
+            shared_query_start_loc,
         )
-
-        input_batch = SimpleNamespace(
-            num_reqs=total_N,
-            num_tokens=total_tokens,
-            num_reqs_after_padding=total_N,
-            num_tokens_after_padding=total_tokens,
-            query_start_loc=query_start_loc,
-            query_start_loc_np=query_start_loc_np,
-            num_scheduled_tokens=np.array(all_seq_lens, dtype=np.int32),
-            seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens.cpu(),
-            dcp_local_seq_lens=None,
-            positions=positions,
+        run_prefill_chunk(
+            tail_rows,
+            tail_input_ids,
+            tail_positions,
+            tail_seq_lens,
+            tail_num_scheduled,
+            tail_query_start_loc,
         )
-        attn_metadata = self.model_state.prepare_attn(
-            input_batch,
-            CUDAGraphMode.NONE,
-            block_tables,
-            slot_ids,
-            self.draft_attn_groups,
-            self.draft_kv_cache_config,
-        )
-        slot_mappings_by_layer = build_slot_mappings_by_layer(
-            slot_ids, self.draft_kv_cache_config
-        )
-
-        with set_forward_context(
-            attn_metadata,
-            self.draft_vllm_config,
-            num_tokens=total_tokens,
-            slot_mapping=slot_mappings_by_layer,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            batch_descriptor=BatchDescriptor(num_tokens=total_tokens, has_lora=False),
-        ):
-            self.draft_model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=None,
-                inputs_embeds=None,
-            )
 
     def _run_batched_target_prefill_tail(
         self,
@@ -499,7 +577,7 @@ class SMCGPUModelRunner(GPUModelRunner):
 
         A_total = offset
         if A_total == 0:
-            return {}
+            return {}, {}
 
         rows = torch.tensor(all_rows, dtype=torch.int32, device=self.device)
         # L_i: seq_len at the start of this draft cycle for each particle
@@ -703,7 +781,8 @@ class SMCGPUModelRunner(GPUModelRunner):
         """
         N = input_batch.num_reqs
         block_tables = self._gather_block_tables(input_batch.idx_mapping)
-        attn_metadata = self.model_state.prepare_attn(
+        assert self.draft_model_state is not None
+        attn_metadata = self.draft_model_state.prepare_attn(
             input_batch,
             CUDAGraphMode.NONE,
             block_tables,
@@ -931,7 +1010,6 @@ class SMCGPUModelRunner(GPUModelRunner):
             n_shared = group.num_full_shared_blocks
             n_shared_tokens = n_shared * block_size
             all_seq_lens_np = self.req_states.num_computed_tokens_np[all_rows.cpu().numpy()]
-            src_seq_lens = all_seq_lens_np[ancestor_indices.cpu().numpy()]  # [N]
 
             copy_mask = ancestor_indices != torch.arange(N, device=self.device)
             if copy_mask.any():
@@ -1019,6 +1097,14 @@ class SMCGPUModelRunner(GPUModelRunner):
 
         smc_draft_results: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
+        active_ids = (
+            {g.group_id for g in scheduler_output.new_particle_groups}
+            | {b.group_id for b in scheduler_output.ongoing_smc_groups}
+        )
+        for group_id in list(self.particle_groups):
+            if group_id not in active_ids:
+                self.remove_particle_group(group_id)
+
         # Register all new groups (req_states, block_tables, sampler).
         for new_group in scheduler_output.new_particle_groups:
             self.register_particle_group(
@@ -1043,27 +1129,35 @@ class SMCGPUModelRunner(GPUModelRunner):
         resampled_groups: dict[str, torch.Tensor] = {}
         smc_logprob_diffs: dict[str, torch.Tensor] = {}
         if all_batches:
-            smc_draft_results = self._run_batched_draft_decode(all_batches)
-            bonus_tokens_per_group, logprob_diff_per_group = self._run_batched_target_verify(
-                all_batches, smc_draft_results
-            )
+            resample_threshold = self.vllm_config.smc_config.resample_threshold
+            if os.environ.get("SMC_VLLM_UNBATCH_DRAFT") == "1":
+                for batch in all_batches:
+                    smc_draft_results.update(
+                        self._run_batched_draft_decode([batch])
+                    )
+            else:
+                smc_draft_results = self._run_batched_draft_decode(all_batches)
+
+            if os.environ.get("SMC_VLLM_UNBATCH_TARGET") == "1":
+                bonus_tokens_per_group = {}
+                logprob_diff_per_group = {}
+                for batch in all_batches:
+                    bonus, logprob_diff = self._run_batched_target_verify(
+                        [batch], smc_draft_results
+                    )
+                    bonus_tokens_per_group.update(bonus)
+                    logprob_diff_per_group.update(logprob_diff)
+            else:
+                bonus_tokens_per_group, logprob_diff_per_group = self._run_batched_target_verify(
+                    all_batches, smc_draft_results
+                )
             for group_id, bonus in bonus_tokens_per_group.items():
                 draft_ids, log_probs, _ = smc_draft_results[group_id]
                 smc_draft_results[group_id] = (draft_ids, log_probs, bonus)
             smc_logprob_diffs = logprob_diff_per_group
-            resample_threshold = self.vllm_config.smc_config.resample_threshold
             resampled_groups = self._run_batched_resample(
                 all_batches, logprob_diff_per_group, resample_threshold
             )
-
-        # Free rows for any groups the scheduler finished this step.
-        active_ids = (
-            {g.group_id for g in scheduler_output.new_particle_groups}
-            | {b.group_id for b in scheduler_output.ongoing_smc_groups}
-        )
-        for group_id in list(self.particle_groups):
-            if group_id not in active_ids:
-                self.remove_particle_group(group_id)
 
         return SMCModelRunnerOutput(
             req_ids=base_output.req_ids,
