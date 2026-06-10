@@ -126,6 +126,12 @@ class SMCEngine:
         if power_alpha <= 0:
             raise ValueError("power_alpha must be > 0.")
         server_args.smc_power_alpha = float(power_alpha)
+        # SMCEngine consumes SMCParticleOutput itself (both scheduler sockets
+        # point back at this process), so opt in to the scheduler's particle
+        # collection emission.  HTTP launches never set this: there the same
+        # socket feeds a real DetokenizerManager, whose TypeBasedDispatcher
+        # raises ValueError on unknown message types.
+        server_args.smc_emit_particle_output = True
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
         configure_logger(server_args)

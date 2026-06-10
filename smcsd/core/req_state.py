@@ -20,11 +20,12 @@ Invariants
 * ``row_in_use[r]`` ⇒ ``group_to_slots[r, :N]`` holds N distinct slot ids,
   each assigned to exactly one particle.
 * Slot sets of distinct in-use rows are disjoint.
-* ``active_slots`` is the subset of allocated slots whose particle is NOT
-  finished.  Finished particles remain allocated and remain in
-  ``group_to_slots`` — they still participate in resampling (their
-  cumulative weight is part of the SMC mixture) and may be overwritten as
-  the destination of a resample copy.
+* ``active_slots`` contains EVERY allocated slot, finished or not
+  (absorbing-state semantics): finished particles keep receiving forward
+  passes with their weight increment zeroed, still participate in
+  resampling (their cumulative weight is part of the SMC mixture), and may
+  be overwritten as the destination of a resample copy.  Membership only
+  changes at ``allocate_slots`` / ``free_group_slots``.
 """
 
 from __future__ import annotations
@@ -141,10 +142,11 @@ class ScheduleBatchSMC:
         self.verified_ids = torch.zeros(
             self.max_slots, dtype=torch.int32, device=device
         )
-        # Per-slot last *drafted* token d_{gamma-1} from the previous step,
-        # deferred into the next step's leading 2-token draft forward.  Travels
-        # with lineage exactly like verified_ids.  0 means "no predecessor"
-        # (group start) → single-token head.  Carried but not yet consumed.
+        # Per-slot token at position S-1: the last *drafted* token d_{gamma-1}
+        # from the previous step (deferred into the next step's leading
+        # 2-token draft forward), or — on a group's first decode step — the
+        # last committed prompt token, whose draft KV the head rewrites
+        # idempotently.  Travels with lineage exactly like verified_ids.
         self.prev_last_draft_ids = torch.zeros(
             self.max_slots, dtype=torch.int32, device=device
         )
@@ -264,10 +266,6 @@ class ScheduleBatchSMC:
         self.group_id_to_row: Dict[str, int] = {}
         self.row_to_group_id: Dict[int, str] = {}
         self._free_rows: List[int] = list(range(self.max_groups))
-        # Live groups that have completed >= 1 decode step.  CPU stand-in
-        # for the worker's old device-side `(prev_last_draft_ids < 0).all()`
-        # head-selection check (a sync at draft-launch time).
-        self._decoded_group_ids: set[str] = set()
 
         # Fused-collect kernel output buffers are allocated per call
         # inside `batched_collect_fused` — they are transient to one
@@ -403,11 +401,19 @@ class ScheduleBatchSMC:
         # ── Category 1: fields uniform across the group → index_fill_ ──
         self.seq_lens.index_fill_(0, idx, shared_seq_len)
         self.kv_allocated_lens.index_fill_(0, idx, shared_seq_len)
-        # -1 sentinel = "no deferred draft token yet" (group's first decode
-        # step).  The deferred-bonus path keys on this to use a 1-token head
-        # for step 0 (never touching the prompt's S-1 slot) and a 2-token
-        # head from step 1 on.  -1 is unambiguous since token ids are >= 0.
-        self.prev_last_draft_ids.index_fill_(0, idx, -1)
+        # Seed with the LAST COMMITTED token (position S-1 of the shared
+        # prefix; uniform across the group — every particle clones the same
+        # parent).  Its draft KV at S-1 was already written during prefill,
+        # so the deferred-bonus 2-token head's S-1 write is an idempotent
+        # rewrite on a group's first decode step — the head is universally
+        # valid and needs no step-0 special case.  (A -1 sentinel + batch
+        # global head selection was tried before and crashes whenever a new
+        # group joins a batch of already-decoding groups: the sentinel
+        # reaches the embedding as a token id.)
+        first_req = particle_reqs[0]
+        committed = first_req.origin_input_ids + first_req.output_ids
+        last_committed_token = int(committed[shared_seq_len - 1])
+        self.prev_last_draft_ids.index_fill_(0, idx, last_committed_token)
         self.finished_mask.index_fill_(0, idx, 0)
         self.finished_len.index_fill_(0, idx, 0)
         self.finish_reason_code.index_fill_(0, idx, 0)
@@ -463,7 +469,6 @@ class ScheduleBatchSMC:
         ``rebuild_active_slots``.
         """
         slots = self.group_slot_lists.pop(group_id, [])
-        self._decoded_group_ids.discard(group_id)
         row = self.group_id_to_row.pop(group_id, None)
         if row is not None:
             self.row_to_group_id.pop(row, None)
@@ -612,17 +617,11 @@ class ScheduleBatchSMC:
             seq_lens_cpu_g + self.gamma_plus_1
         )
 
-        # Consumed by the worker's deferred-bonus head selection in place of
-        # a device read on prev_last_draft_ids (see SMCDraftInput field doc).
-        all_first = not self._decoded_group_ids
-        self._decoded_group_ids.update(self.group_slot_lists.keys())
-
         return SMCDraftInput(
             verified_id=verified_g,
             prev_last_draft_id=prev_last_draft_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
-            all_first_decode_step=all_first,
         )
 
     def prepare_for_extend(self):
@@ -825,8 +824,14 @@ class ScheduleBatchSMC:
         weight_cutoff = torch.full(
             (bs,), n_weight_cols - 1, dtype=torch.int64, device=self.device
         )
+        # For the weight cutoff, EOS takes precedence even when the length
+        # cap is hit in the same block (unlike the finish *reason*, where
+        # length wins historically): once the sequence emitted EOS, the
+        # later columns are post-EOS draft junk regardless of which finish
+        # reason gets reported.
+        eos_cut = newly_finished_mask & eos_hit
         weight_cutoff = torch.where(
-            eos_branch, first_eos.clamp(max=n_weight_cols - 1), weight_cutoff
+            eos_cut, first_eos.clamp(max=n_weight_cols - 1), weight_cutoff
         )
         weight_cutoff = torch.where(
             prev_finished_active,
