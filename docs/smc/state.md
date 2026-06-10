@@ -109,10 +109,13 @@ interval_weights  float64   [max_slots]             since-last-resample accumula
 
 all_token_ids     int32     [max_slots, max_output_len]   complete history
 
-temperatures      float32   [max_slots, 1]          sampling params
-top_ps            float32   [max_slots]             (static after alloc —
-top_ks            int32     [max_slots]              SMC worker does its
-min_ps            float32   [max_slots]              own temp adjust)
+_stub_temperatures  float32  [max_slots, 1]   constant stubs for
+_stub_top_ps        float32  [max_slots]      SamplingBatchInfo (the SMC
+_stub_top_ks        int32    [max_slots]      worker does its own draft +
+_stub_min_ps        float32  [max_slots]      bonus sampling under
+                                              engine-wide smc_* params —
+                                              per-request sampling params
+                                              are not honored on this path)
 ```
 
 `EMPTY_SLOT` (= -1) marks a free slot in `req_pool_indices`.
@@ -183,10 +186,11 @@ flag that defaults to False in the scheduler.
   [ACTIVE]   ── per cycle: gather → forward → scatter → weight update
          │                           │
          │                           └─ possibly: finished_mask[slot] = True
-         │                              → dropped from next active_slots
+         │                              → weight increment zeroed from now on
          ▼
-  [FINISHED] ── held for resample ancestry (see §3) but excluded from gather
-         │
+  [FINISHED] ── STAYS in active_slots (absorbing state): keeps receiving
+         │      forward passes with zero weight increment, remains a
+         │      resample ancestor (see §3), may be revived as a resample dst
          ▼
   free_group_slots(gid)
          │       • req_to_token_pool.free(Req)

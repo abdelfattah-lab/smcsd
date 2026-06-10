@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 from collections import deque
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ from smcsd.common.utils import (
     fanout_smc_parent_hybrid_state,
     validate_smc_parent_req,
 )
+from smcsd.core.info import SMCParticleOutput
 from smcsd.mem_cache.allocator import copy_block_table
 from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
@@ -85,10 +87,12 @@ class SMCCoordinator:
 
     1. ``collect`` — for every in-use group, normalise interval weights, check
        ESS against ``threshold * N``, and (if below threshold) run systematic
-       resampling, emitting flat ``dst/src/row_of_job`` tensors.
-    2. ``dispatch`` — hand those flat tensors to ``batched_resample_kv`` (fused
-       KV block-table copy + refcount update) plus a per-pair
-       ``copy_req_metadata`` Python loop (inherent unavoidable cost).
+       resampling, emitting a device-resident flat ``dst/src/row`` plan.
+    2. ``dispatch`` — one device-driven ``batched_resample_kv`` launch
+       (worst-case grid, gated on-device by ``plan.counter``) that applies
+       the KV block-table copy + refcounts AND all per-slot lineage-tensor
+       copies.  All decode-time particle state is tensor-resident, so no
+       Req-level metadata is touched and no host sync occurs.
 
     Only the fused systematic path is supported.
     """
@@ -111,22 +115,6 @@ class SMCCoordinator:
         self.resample_threshold = resample_threshold
         self.resample_method = resample_method
         self._fast_step_counter = 0
-        
-        # Phase 2b: Adaptive Parameter Scaling
-        self.use_adaptive_threshold = os.environ.get("SMCSD_ADAPTIVE_THRESHOLD", "false").lower() == "true"
-        if self.use_adaptive_threshold:
-            logger.info("SMCCoordinator: Adaptive resample threshold enabled")
-
-        # Phase 3a: Common Prefix Tagging (IBM)
-        self.use_prefix_tagging = os.environ.get("SMCSD_USE_PREFIX_TAGGING", "false").lower() == "true"
-        if self.use_prefix_tagging:
-            logger.info("SMCCoordinator: Common Prefix Tagging enabled")
-
-        # Phase 4: Dynamic Parameter Scaling (Siemens)
-        self.use_dynamic_temp = os.environ.get("SMCSD_USE_DYNAMIC_TEMP", "false").lower() == "true"
-        if self.use_dynamic_temp:
-            logger.info("SMCCoordinator: Dynamic temperature scaling enabled")
-
         logger.info(
             "SMCCoordinator: resample_method=%s (fused systematic kernel)",
             resample_method,
@@ -141,39 +129,14 @@ class SMCCoordinator:
         ``dispatch_resample_batch``.
         """
         from smcsd.core.kernels.fused_collect import batched_collect_fused
-        from smcsd.core.kernels.kle_variance import compute_kle_variance
 
         self._fast_step_counter += 1
-        
-        current_thresholds = torch.full(
-            (slot_state.max_groups,), self.resample_threshold, 
-            dtype=torch.float64, device=self.device
-        )
-        
-        if self.use_adaptive_threshold:
-            # Phase 2b: Karhunen-Loève Expansion (KLE) Variance Sensing
-            # Compute variance of log-weights across particles for each group
-            variances = compute_kle_variance(
-                slot_state.interval_weights,
-                slot_state.group_to_slots,
-                slot_state.row_in_use
-            )
-            
-            # Adaptive logic: increase threshold where variance is high 
-            # (indicating a complex semantic junction).
-            # Heuristic: threshold' = threshold * (1 + log1p(variance))
-            # This ensures we resample more aggressively when paths are diverging.
-            adaptive_boost = torch.log1p(variances)
-            current_thresholds = current_thresholds * (1.0 + adaptive_boost)
-            # Clip to prevent excessive resampling (max 0.9)
-            current_thresholds = torch.clamp(current_thresholds, max=0.9)
-
         return batched_collect_fused(
             slot_state.log_weights,
             slot_state.interval_weights,
             slot_state.group_to_slots,
             slot_state.row_in_use,
-            current_thresholds, # Now passing a tensor of thresholds
+            self.resample_threshold,
             step_counter=self._fast_step_counter,
         )
 
@@ -181,78 +144,59 @@ class SMCCoordinator:
         self,
         plan,
         slot_state: "ScheduleBatchSMC",
-        *,
-        rebuild_active: bool = True,
     ) -> None:
-        """Apply a resample plan: fused KV copy + per-slot tensor copies +
-        per-pair req metadata loop. No-op on empty plans.
+        """Apply a resample plan in one device-driven kernel launch — no
+        host sync.
+
+        The grid is the host-known worst case (``live_rows × (N-1)``, from
+        CPU bookkeeping); each program reads the true job count from
+        ``plan.counter`` and exits early, so an empty plan costs one no-op
+        launch instead of a blocking ``.item()``.  The kernel performs the
+        KV block-table copy + refcounts AND every per-slot lineage-tensor
+        copy (finish state included), gathering pool rows / lengths
+        in-kernel from the slot tensors.
+
+        KV pages whose refcount hits zero are appended to the current
+        snapshot phase's ``slot_state.kv_freed_buf`` row; the scheduler
+        frees them in postprocessing (which under overlap runs after the
+        NEXT step's dispatch has been enqueued — hence the double buffer).
+        Deferral is safe: a refcount-0 page is unreachable from every
+        block table but stays out of the allocator's free pool until
+        ``free()`` runs, so it cannot be re-allocated in between.
         """
-        if plan.n_jobs == 0:
+        # Capacity bound: every group row resamples and keeps one survivor
+        # (counts sum to N, so dead slots <= N-1 per row).  Deliberately
+        # NOT the live-row count: a static grid never changes between
+        # steps, which keeps this launch CUDA-graph-capturable.  Free rows
+        # are gated off by row_in_use in collect, so they emit no jobs and
+        # the extra programs exit on the counter load.
+        max_jobs = slot_state.max_groups * (slot_state.n_particles - 1)
+        if max_jobs == 0:  # N == 1: resampling is structurally impossible
             return
 
         from smcsd.core.kernels.fused_resample_kv import batched_resample_kv
 
-        dst_idx = plan.dst_slots.to(torch.int64)
-        src_idx = plan.src_slots.to(torch.int64)
-
-        if __debug__:
-            assert not torch.isin(dst_idx, src_idx).any().item(), (
-                "Cross-group dst/src slot overlap detected"
-            )
-
-        dst_pool_indices = slot_state.req_pool_indices[dst_idx].to(torch.int32)
-        src_pool_indices = slot_state.req_pool_indices[src_idx].to(torch.int32)
-        dst_alloc_lens = slot_state.kv_allocated_lens[dst_idx].to(torch.int32)
-        src_seq_lens = slot_state.seq_lens[src_idx].to(torch.int32)
-        
-        if self.use_prefix_tagging:
-            src_start_indices = slot_state.divergence_points[src_idx].to(torch.int32)
-        else:
-            # Baseline: copy entire KV cache (start from 0)
-            src_start_indices = torch.zeros_like(src_seq_lens)
-
-        to_free = batched_resample_kv(
+        batched_resample_kv(
             slot_state.req_to_token_pool.req_to_token,
             slot_state.token_to_kv_pool_allocator.slot_ref_count,
-            dst_pool_indices,
-            src_pool_indices,
-            dst_alloc_lens,
-            src_seq_lens,
-            src_start_indices,
+            plan_dst=plan.dst_flat,
+            plan_src=plan.src_flat,
+            plan_counter=plan.counter,
+            max_jobs=max_jobs,
+            req_pool_indices=slot_state.req_pool_indices,
+            kv_allocated_lens=slot_state.kv_allocated_lens,
+            seq_lens=slot_state.seq_lens,
+            verified_ids=slot_state.verified_ids,
+            prev_last_draft_ids=slot_state.prev_last_draft_ids,
+            finished_mask=slot_state.finished_mask,
+            finished_len=slot_state.finished_len,
+            finish_reason_code=slot_state.finish_reason_code,
+            matched_eos_token=slot_state.matched_eos_token,
+            token_counts=slot_state.token_counts,
+            all_token_ids=slot_state.all_token_ids,
+            freed_buf=slot_state.kv_freed_buf[slot_state._snap_phase],
+            freed_counter=slot_state.kv_freed_counter[slot_state._snap_phase],
         )
-        if to_free.numel() > 0:
-            slot_state.token_to_kv_pool_allocator.free(to_free)
-
-        # Batch-copy slot tensors on device.
-        slot_state.seq_lens[dst_idx] = slot_state.seq_lens[src_idx]
-        slot_state.kv_allocated_lens[dst_idx] = slot_state.kv_allocated_lens[src_idx]
-        slot_state.verified_ids[dst_idx] = slot_state.verified_ids[src_idx]
-        slot_state.finished_mask[dst_idx] = slot_state.finished_mask[src_idx]
-        slot_state.token_counts[dst_idx] = slot_state.token_counts[src_idx]
-        slot_state.all_token_ids[dst_idx] = slot_state.all_token_ids[src_idx]
-        
-        # Phase 3a: Lineage Tracking & Divergence Point Updates
-        # Cloned particles branch from their source at the CURRENT sequence length.
-        if self.use_prefix_tagging:
-            slot_state.divergence_points[dst_idx] = slot_state.seq_lens[src_idx]
-            # Unique tags for the new semantic branches
-            new_tags = torch.arange(
-                int(slot_state._next_lineage_tag), 
-                int(slot_state._next_lineage_tag + len(dst_idx)),
-                device=self.device
-            )
-            slot_state.lineage_tags[dst_idx] = new_tags
-            slot_state._next_lineage_tag += len(dst_idx)
-
-        # Per-pair req-level metadata copy (Python; output_ids list,
-        # finished_reason object, etc.).
-        for dst_slot, src_slot in zip(
-            dst_idx.tolist(), src_idx.tolist(), strict=True
-        ):
-            slot_state.copy_req_metadata(dst_slot, src_slot)
-
-        if rebuild_active:
-            slot_state.rebuild_active_slots()
 
 
 class SMCScheduler(Scheduler):
@@ -307,6 +251,59 @@ class SMCScheduler(Scheduler):
             resample_threshold=server_args.smc_resample_threshold,
             resample_method=server_args.smc_resample_method,
         )
+
+        # Overlapped scheduling: opt-in via SMC_ENABLE_OVERLAP=1, gated to
+        # pure-attention models.  Hybrid (Mamba) models copy recurrent
+        # state in postprocessing, which must complete before the next
+        # forward reads it — overlap would enqueue that forward first.
+        draft_hybrid_pool = getattr(
+            self.model_worker, "_dense_draft_hybrid_req_to_token_pool", None
+        )
+        is_hybrid = any(
+            pool is not None and hasattr(pool, "mamba_pool")
+            for pool in (self.req_to_token_pool, draft_hybrid_pool)
+        )
+        want_overlap = bool(int(os.environ.get("SMC_ENABLE_OVERLAP", "0")))
+        self._use_overlap_loop = want_overlap and not is_hybrid
+        if want_overlap and is_hybrid:
+            logger.warning(
+                "SMC_ENABLE_OVERLAP=1 ignored: hybrid (Mamba) models "
+                "require sequential postprocessing."
+            )
+        if self._use_overlap_loop:
+            logger.info("SMCScheduler: overlapped scheduling enabled.")
+
+        # Debug instrumentation (scheduler process — the one that owns the
+        # CUDA context, so torch.cuda.* must be queried here, not from the
+        # engine/profiling script process):
+        #   SMC_SYNC_DEBUG=1        warn (with stack) on every syncing CUDA op
+        #   SMC_LOG_ALLOC_RETRIES=1 log whenever the caching allocator hits
+        #                           its synchronize-and-retry slow path
+        if bool(int(os.environ.get("SMC_SYNC_DEBUG", "0"))):
+            torch.cuda.set_sync_debug_mode("warn")
+            logger.info("SMCScheduler: CUDA sync debug mode = warn")
+        self._log_alloc_retries = bool(
+            int(os.environ.get("SMC_LOG_ALLOC_RETRIES", "0"))
+        )
+        self._last_alloc_retries = 0
+
+    def _maybe_log_alloc_retries(self) -> None:
+        """Log when the CUDA caching allocator hit cudaMalloc failure and
+        synchronized to retry — the serialization mechanism that masquerades
+        as a sync in whatever op allocated next."""
+        if not self._log_alloc_retries:
+            return
+        retries = torch.cuda.memory_stats().get("num_alloc_retries", 0)
+        if retries != self._last_alloc_retries:
+            logger.warning(
+                "CUDA caching allocator sync-retry: num_alloc_retries "
+                "%d -> %d (reserved=%.0fMB allocated=%.0fMB)",
+                self._last_alloc_retries,
+                retries,
+                torch.cuda.memory_reserved() / 1e6,
+                torch.cuda.memory_allocated() / 1e6,
+            )
+            self._last_alloc_retries = retries
 
     def _make_runtime_tracking_batch(
         self,
@@ -371,7 +368,10 @@ class SMCScheduler(Scheduler):
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None
         with self.device_module.StreamContext(self.schedule_stream):
-            self._event_loop()
+            if self._use_overlap_loop:
+                self._event_loop_overlap()
+            else:
+                self._event_loop()
 
     @DynamicGradMode()
     def _event_loop(self) -> None:
@@ -392,9 +392,15 @@ class SMCScheduler(Scheduler):
             if batch is not None:
                 result = self.run_batch(batch)
                 if batch_kind == "prefill":
-                    self._process_prefill_result(batch, result)
+                    self._process_prefill_result(
+                        batch, result, self._take_prefill_groups()
+                    )
                 else:
-                    self._process_decode_result(result)
+                    # GPU-side step first (write-back + fused resample,
+                    # enqueued behind the decode forward), then host-side
+                    # postprocessing (the sync quarantine).
+                    plan, snapshot = self._resample(result)
+                    self._process_decode_result(result, plan, snapshot)
             else:
                 # self_check_during_idle was removed in upstream sglang;
                 # only self_check_during_busy remains.
@@ -403,6 +409,96 @@ class SMCScheduler(Scheduler):
             self.last_batch = tracking_batch
             if hasattr(self, "waiting_queue"):
                 self.waiting_queue = []
+
+    @DynamicGradMode()
+    def _event_loop_overlap(self) -> None:
+        """Overlapped scheduler loop: postprocessing of step t runs on the
+        CPU while the GPU executes step t+1.
+
+        Per iteration: prepare + launch the next batch (sync-free for
+        decode — forward, write-back, collect, dispatch, and the host
+        snapshot are all pure enqueues), THEN pop and postprocess the
+        previous batch's result.  The snapshot event completes during the
+        new batch's forward, so postprocessing never blocks on the stream
+        tail.
+
+        One-step-late semantics this accepts:
+        * A fully-finished group is drained one step late and receives one
+          extra decode step — valid (absorbing states, weight increment 0;
+          an extra resample of frozen weights is still a proper SMC step),
+          but it shifts RNG consumption vs the sequential loop.
+        * KV pages freed at step t re-enter the allocator pool at t's
+          postprocessing, i.e. after t+1 was prepared — see the headroom
+          check below.
+        * Admission capacity decisions are one step stale (conservative).
+        """
+        result_queue: Deque = deque()
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                self._flush_result_queue(result_queue)
+                self.cancel_bubble_timer()
+                continue
+
+            # Headroom: the pending step's freed pages are not yet back in
+            # the allocator pool.  If the next decode allocation could need
+            # them, settle pending postprocessing first (host-metadata
+            # check only — no sync).
+            if result_queue:
+                need = (
+                    self.slot_state.active_particle_count()
+                    * self.slot_state.gamma_plus_1
+                )
+                if self.token_to_kv_pool_allocator.available_size() < need:
+                    self._flush_result_queue(result_queue)
+
+            batch, batch_kind = self._get_next_batch()
+            tracking_batch = self._make_runtime_tracking_batch(batch)
+            self.cur_batch = tracking_batch
+            self.running_batch = (
+                tracking_batch if tracking_batch is not None else ScheduleBatch(reqs=[])
+            )
+
+            if batch is not None:
+                result = self.run_batch(batch)
+                if batch_kind == "decode":
+                    plan, snapshot = self._resample(result)
+                    result_queue.append(
+                        ("decode", batch, result, plan, snapshot)
+                    )
+                else:
+                    result_queue.append(
+                        ("prefill", batch, result, self._take_prefill_groups())
+                    )
+
+            # Keep at most one in-flight entry: postprocess everything
+            # older than the batch launched above (or everything, when
+            # idle).  This is where the CPU work overlaps the GPU.
+            pending_limit = 1 if batch is not None else 0
+            while len(result_queue) > pending_limit:
+                self._process_queued_result(result_queue)
+
+            self._maybe_log_alloc_retries()
+            self.last_batch = tracking_batch
+            if hasattr(self, "waiting_queue"):
+                self.waiting_queue = []
+
+    def _process_queued_result(self, result_queue: Deque) -> None:
+        entry = result_queue.popleft()
+        if entry[0] == "prefill":
+            _, q_batch, q_result, q_groups = entry
+            self._process_prefill_result(q_batch, q_result, q_groups)
+        else:
+            _, _, q_result, q_plan, q_snapshot = entry
+            self._process_decode_result(q_result, q_plan, q_snapshot)
+
+    def _flush_result_queue(self, result_queue: Deque) -> None:
+        """Settle all pending postprocessing (pause, headroom pressure)."""
+        while result_queue:
+            self._process_queued_result(result_queue)
+        self.last_batch = None
 
     # ── Runtime Memory Checks (override base mixin) ──
     #
@@ -509,7 +605,10 @@ class SMCScheduler(Scheduler):
     # ── Batch Selection ──
 
     def _get_next_batch(self) -> Tuple[Optional[ScheduleBatch], Optional[str]]:
-        self._drain_finished_groups()
+        # NOTE: no drain here.  Draining reads finish state, which on the
+        # prepare path would be a device read at the stream tail; groups
+        # are drained in decode postprocessing (from the host snapshot),
+        # which always runs before the next _get_next_batch.
 
         if self.prefill_groups:
             raise RuntimeError("SMCScheduler has an unprocessed prefill batch.")
@@ -574,19 +673,30 @@ class SMCScheduler(Scheduler):
         batch.prepare_for_extend()
         return batch
 
+    def _take_prefill_groups(self) -> List[SequenceGroup]:
+        """Detach the pending prefill groups from scheduler state.
+
+        Called at launch time so the groups can ride the result queue under
+        overlapped scheduling — ``self.prefill_groups`` must be empty again
+        before the next ``_get_next_batch`` runs.
+        """
+        groups = self.prefill_groups
+        self.prefill_groups = []
+        return groups
+
     def _process_prefill_result(
         self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        groups: List[SequenceGroup],
     ) -> None:
-        groups = self.prefill_groups
-        self.prefill_groups = []
         if not groups:
             raise RuntimeError("Prefill result without active prefill group.")
 
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-
+        # `result.copy_done` is always None on the SMC path: the SMC server
+        # args force disable_overlap_schedule, so the inherited run_batch
+        # never takes the overlap branch that creates it.  The .tolist()
+        # below is a synchronous device read — safe without an event.
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
@@ -674,7 +784,7 @@ class SMCScheduler(Scheduler):
 
         # Populate slot state
         try:
-            slots = self.slot_state.allocate_slots(
+            self.slot_state.allocate_slots(
                 group_id=group.group_id,
                 particle_reqs=particle_reqs,
                 shared_seq_len=shared_seq_len,
@@ -716,10 +826,21 @@ class SMCScheduler(Scheduler):
             return None
         return self.slot_state.build_model_worker_batch(draft_input)
 
-    def _process_decode_result(self, result: GenerationBatchResult) -> None:
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
+    def _resample(self, result: GenerationBatchResult):
+        """GPU-side post-decode step: write-back + fused collect/resample.
 
+        Runs right after ``run_batch`` and before postprocessing.  Every op
+        here is a GPU tensor op enqueued behind the decode forward — no
+        event waits, no Req objects, no host syncs — so under a
+        future overlapped scheduler the host can move on to preparing the
+        next batch while this work executes.
+
+        Returns ``(plan, snapshot)`` for ``_process_decode_result``: the
+        device-resident resample plan, and the host-snapshot handle whose
+        event gates postprocessing's pinned-buffer reads (freed-page
+        cursor, finished mask).  Freed KV pages accumulate in
+        ``slot_state.kv_freed_buf`` (freed there, not here).
+        """
         if result.logprob_diff is None:
             raise RuntimeError("SMCScheduler requires batched logprob_diff.")
 
@@ -736,46 +857,100 @@ class SMCScheduler(Scheduler):
         bonus_ids = next_draft.verified_id if next_draft is not None else None
         if bonus_ids is None:
             raise RuntimeError("SMCScheduler: result missing next_draft_input.verified_id")
+        # This step's last drafted token, deferred into next step's leading
+        # 2-token draft forward.  Carried but not yet consumed (Step 2).
+        prev_last_draft_ids = (
+            next_draft.prev_last_draft_id if next_draft is not None else None
+        )
 
-        # Write results back to slot state (defer rebuild to end of cycle).
-        newly_finished = self.slot_state.process_batch_result(
+        # GPU write-back: token scatter, finish flags, weight accumulation.
+        # Sync-free — finish state lands in slot tensors, not Req objects.
+        self.slot_state.write_back_gpu(
             next_token_ids=result.next_token_ids,
-            accept_lens=result.accept_lens,
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
-            rebuild_active=False,
+            prev_last_draft_ids=prev_last_draft_ids,
         )
+
+        # Snapshot the per-row log Z_hat increment BEFORE the resample kernel
+        # zeroes weights, then fold it into group_log_Z_hat for the rows that
+        # actually resample (unbiased-estimator product over resample steps).
+        logZ_inc = self.slot_state.resample_logZ_increment()
 
         # Resample all groups via the fused systematic kernel.
         plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
-        did_resample = plan.n_jobs > 0
-        if did_resample:
-            self.coordinator.dispatch_resample_batch(
-                plan, self.slot_state, rebuild_active=False,
+        self.slot_state.group_log_Z_hat += torch.where(
+            plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
+        )
+        self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+        snapshot = self.slot_state.snapshot_to_host()
+        return plan, snapshot
+
+    def _process_decode_result(
+        self,
+        result: GenerationBatchResult,
+        plan,
+        snapshot,
+    ) -> None:
+        """Host-side postprocessing — the sync quarantine.
+
+        Everything that needs a GPU→CPU round trip lands here, after the
+        GPU-side ``_resample``.  Device state is read through the pinned
+        host snapshot (gated by its event, which completes during the next
+        step's forward) — never via ``.item()`` on device tensors, which
+        would block on the stream tail under overlapped scheduling.  The
+        accepted exceptions: the hybrid Mamba plan slice (sequential loop
+        only) and finalize_group's device reads (rare, once per group
+        lifetime).
+        """
+        snapshot.wait()
+
+        # Free the KV pages the resample kernel released into this phase's
+        # capture buffer.  Deferred from dispatch: refcount-0 pages are
+        # unreachable but not yet in the allocator's free pool, so nothing
+        # can re-allocate them in between.  The count comes from pinned
+        # memory; the free itself is enqueue-only (host-known shape), and
+        # the cursor reset is stream-ordered before this phase's next use.
+        n_freed = int(self.slot_state.kv_freed_count_host[snapshot.phase].item())
+        if n_freed > 0:
+            self.token_to_kv_pool_allocator.free(
+                self.slot_state.kv_freed_buf[snapshot.phase, :n_freed].to(
+                    torch.int64
+                )
             )
-            copy_smc_resampled_hybrid_state(
-                target_pool=self.req_to_token_pool,
-                draft_pool=getattr(
-                    self.model_worker,
-                    "_dense_draft_hybrid_req_to_token_pool",
-                    None,
-                ),
-                slot_state=self.slot_state,
-                plan=plan,
-                device=self.device,
-            )
+            self.slot_state.kv_freed_counter[snapshot.phase].zero_()
 
-        # Single rebuild per decode cycle if membership changed
-        if newly_finished or did_resample:
-            self.slot_state.rebuild_active_slots()
+        # Hybrid (Mamba) recurrent-state copy.  Internally a CPU-metadata
+        # no-op for pure-attention models; only hybrid models pay the
+        # plan-slicing sync.
+        copy_smc_resampled_hybrid_state(
+            target_pool=self.req_to_token_pool,
+            draft_pool=getattr(
+                self.model_worker,
+                "_dense_draft_hybrid_req_to_token_pool",
+                None,
+            ),
+            slot_state=self.slot_state,
+            plan=plan,
+            device=self.device,
+        )
 
-        # Drain finished groups
-        self._drain_finished_groups()
+        # No rebuild here: neither finishing (absorbing-state semantics) nor
+        # resampling changes slot membership — only allocate_slots /
+        # free_group_slots do, and both rebuild themselves.
 
-    def _drain_finished_groups(self) -> None:
+        # Drain finished groups, reading finish state from the pinned
+        # snapshot (post-resample lineage of this step).
+        self._drain_finished_groups(
+            self.slot_state.finished_mask_host[snapshot.phase]
+        )
+
+    def _drain_finished_groups(self, finished_mask_host) -> None:
         remaining: List[SequenceGroup] = []
         for group in self.running_groups:
-            if self.slot_state.group_has_active(group.group_id):
+            if self.slot_state.group_has_active(
+                group.group_id, finished_mask_host
+            ):
                 remaining.append(group)
                 continue
             self._finalize_group(group)
@@ -792,6 +967,26 @@ class SMCScheduler(Scheduler):
 
         parent_req = self.slot_state.finalize_group(group.group_id, group.parent_req)
         parent_req.time_stats.set_completion_time()
+        # Emit the full particle collection + unbiased log Z_hat on the same
+        # scheduler->engine socket, BEFORE the token output.  FIFO delivery
+        # guarantees the engine sees this while the rid is still pending (the
+        # finish signal rides on the BatchTokenIDOutput that follows).
+        #
+        # Gated on smc_emit_particle_output (a dynamic ServerArgs attribute
+        # set only by the offline SMCEngine, like smc_power_alpha): in HTTP
+        # mode this socket feeds a real DetokenizerManager, whose
+        # TypeBasedDispatcher raises ValueError on unknown message types —
+        # an ungated send kills the detokenizer on the first finalized
+        # group.  parent_req.smc_* stay populated either way.
+        if getattr(self.server_args, "smc_emit_particle_output", False):
+            self.send_to_detokenizer.send_output(
+                SMCParticleOutput(
+                    rid=parent_req.rid,
+                    log_Z_hat=parent_req.smc_log_Z_hat,
+                    log_w_tilde=parent_req.smc_log_w_tilde,
+                    particle_output_ids=parent_req.smc_particle_output_ids,
+                )
+            )
         self.stream_output([parent_req], False)
 
 

@@ -69,24 +69,56 @@ import triton.language as tl
 
 @dataclass
 class BatchedResampleResult:
-    """Output of one fused-collect launch.
+    """Output of one fused-collect launch — a fully device-resident plan.
 
-    All tensors are GPU-resident except ``n_jobs``, which costs one
-    ``.item()`` sync at the kernel boundary (needed so downstream callers
-    can slice the flat output tensors).
+    The job count lives in ``counter`` (a (1,) int32 GPU tensor); the flat
+    buffers are full-capacity with the valid prefix ``[:counter]``.  Nothing
+    syncs at construction, so the collect launch is enqueued behind the
+    decode forward and consumed by the device-driven dispatch kernel
+    without any host round trip.
 
-    * ``dst_slots``, ``src_slots`` are aligned 1:1 — job ``i`` copies
-      ``src_slots[i] → dst_slots[i]``.
+    Host-side consumers — postprocessing (Mamba hybrid-state slicing) and
+    tests — must call ``n_jobs_sync()``, the ONE place a host sync can
+    happen.  It is an explicit method, not a property, so hot-path syncs
+    stay greppable in review.  The ``dst_slots`` / ``src_slots`` /
+    ``row_of_job`` views slice via ``n_jobs_sync()`` and therefore also
+    sync; never touch them on the GPU-only path — use the ``*_flat``
+    buffers plus ``counter`` there.
+
+    * ``dst_flat``, ``src_flat`` are aligned 1:1 — job ``i`` copies
+      ``src_flat[i] → dst_flat[i]``.
     * Intra-row order is deterministic (cumsum-based compaction); inter-row
       order is atomic-completion order.  Neither matters to the downstream
       KV-copy kernel.
     """
 
-    dst_slots: torch.Tensor       # (n_jobs,) int32
-    src_slots: torch.Tensor       # (n_jobs,) int32
-    row_of_job: torch.Tensor      # (n_jobs,) int32
+    dst_flat: torch.Tensor        # (flat_cap,) int32, valid prefix [:counter]
+    src_flat: torch.Tensor        # (flat_cap,) int32, valid prefix [:counter]
+    rows_flat: torch.Tensor       # (flat_cap,) int32, valid prefix [:counter]
+    counter: torch.Tensor         # (1,) int32 — device-side job count
     resample_mask: torch.Tensor   # (max_groups,) bool
-    n_jobs: int
+    _n_jobs: Optional[int] = None  # host count cache; None = never synced
+
+    def n_jobs_sync(self) -> int:
+        """Job count on the host — the one boundary sync, lazy and cached."""
+        if self._n_jobs is None:
+            self._n_jobs = int(self.counter.item())
+        return self._n_jobs
+
+    @property
+    def dst_slots(self) -> torch.Tensor:
+        """Host-sliced view of the valid jobs.  Forces ``n_jobs_sync()``."""
+        return self.dst_flat[: self.n_jobs_sync()]
+
+    @property
+    def src_slots(self) -> torch.Tensor:
+        """Host-sliced view of the valid jobs.  Forces ``n_jobs_sync()``."""
+        return self.src_flat[: self.n_jobs_sync()]
+
+    @property
+    def row_of_job(self) -> torch.Tensor:
+        """Host-sliced view of the valid jobs.  Forces ``n_jobs_sync()``."""
+        return self.rows_flat[: self.n_jobs_sync()]
 
 
 @triton.jit
@@ -228,10 +260,11 @@ def batched_collect_fused(
     Returns
     -------
     BatchedResampleResult
-        Encodes the resample plan for ``dispatch_resample_batch``: for
-        each of the ``n_jobs`` jobs, copy ``src_slots[i] → dst_slots[i]``
-        (tagged with its source row in ``row_of_job[i]``).
+        Device-resident resample plan for ``dispatch_resample_batch``: for
+        each of the ``counter`` jobs, copy ``src_flat[i] → dst_flat[i]``
+        (tagged with its source row in ``rows_flat[i]``).
         ``resample_mask[r]`` flags rows that actually resampled this step.
+        No host sync happens here; see ``BatchedResampleResult``.
 
     Notes
     -----
@@ -268,11 +301,10 @@ def batched_collect_fused(
         BLOCK=BLOCK,
     )
 
-    n_jobs = int(plan_counter.item())   # the one boundary sync
     return BatchedResampleResult(
-        dst_slots=plan_dst[:n_jobs],
-        src_slots=plan_src[:n_jobs],
-        row_of_job=plan_rows[:n_jobs],
+        dst_flat=plan_dst,
+        src_flat=plan_src,
+        rows_flat=plan_rows,
+        counter=plan_counter,
         resample_mask=plan_mask.to(torch.bool),
-        n_jobs=n_jobs,
     )

@@ -104,6 +104,7 @@ class _FakeAllocator:
         self.dec_calls = []
         self.free_calls = []
         self.page_size = 1
+        self.size = size  # read by ScheduleBatchSMC for kv_freed_buf sizing
         self.slot_ref_count = torch.zeros(size, dtype=torch.int32)
 
     def inc_ref(self, indices):
@@ -217,48 +218,43 @@ class TestSMCSchedulerAdmission(CustomTestCase):
 
 
 class TestSMCFinalizeGroup(CustomTestCase):
-    """``ScheduleBatchSMC.finalize_group`` — argmax on slot-indexed log_weights."""
+    """``ScheduleBatchSMC.finalize_group`` — posterior sample over
+    slot-indexed log_weights + tensor-resident finish state + the
+    particle-collection / log-Ẑ attachments."""
 
-    def test_finalize_picks_best_visible_finished_length(self):
-        """Two particles tie on log_weight: pick the one with greater visible
-        output (token_count clipped to finished_len), copy its
-        output_ids / finished_reason / finished_len into parent_req."""
+    def _arm_group(self, slot_state, *, log_weights, finished_lens,
+                   reason_codes, matched_toks, outputs):
+        """Populate the tensor-resident finish state for a 2-slot group."""
+        slot_state.group_slot_lists = {"g": [0, 1]}
+        for s in (0, 1):
+            slot_state.log_weights[s] = log_weights[s]
+            slot_state.interval_weights[s] = log_weights[s]
+            slot_state.finished_len[s] = finished_lens[s]
+            slot_state.finish_reason_code[s] = reason_codes[s]
+            slot_state.matched_eos_token[s] = matched_toks[s]
+            slot_state.token_counts[s] = len(outputs[s])
+            slot_state.all_token_ids[s, : len(outputs[s])] = torch.tensor(
+                outputs[s], dtype=torch.int32
+            )
+
+    def test_finalize_samples_dominant_weight(self):
+        """With one particle overwhelmingly heavier, the posterior sample
+        deterministically picks it; its tensor-resident finish state is
+        materialised onto parent_req (EOS → FINISH_MATCHED_TOKEN)."""
         slot_state = _build_slot_state(
             max_num_reqs=2,
-            rows=[[1, 2, 3, 4], [5, 6, 7, 0]],
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
             n_particles=2,
         )
-        req0 = _FakeReq(
-            rid="g_p0",
-            particle_idx=0,
-            req_pool_idx=0,
-            output_ids=[1, 2],
-            kv_indices=[1, 2, 3, 4],
-            finished_reason=SimpleNamespace(type="stop"),
-            finished_len=2,
+        # softmax([0, -1e9]) == [1, 0] exactly in float64 → deterministic.
+        self._arm_group(
+            slot_state,
+            log_weights=[0.0, -1e9],
+            finished_lens=[2, 3],
+            reason_codes=[2, 1],          # winner finished via EOS
+            matched_toks=[7, 0],
+            outputs=[[5, 7], [8, 9, 10]],
         )
-        req1 = _FakeReq(
-            rid="g_p1",
-            particle_idx=1,
-            req_pool_idx=1,
-            output_ids=[1, 2, 3],
-            kv_indices=[5, 6, 7],
-            finished_reason=SimpleNamespace(type="length"),
-            finished_len=3,
-        )
-        slot_state.slot_to_req = {0: req0, 1: req1}
-        slot_state.group_slot_lists = {"g": [0, 1]}
-        # Equal log_weights → tiebreak on visible output length.  The new
-        # layout stores log_weights slot-indexed directly.
-        slot_state.log_weights[0] = 0.0
-        slot_state.log_weights[1] = 0.0
-        slot_state.req_pool_indices[0] = 0
-        slot_state.req_pool_indices[1] = 1
-        slot_state.kv_allocated_lens[0] = 4
-        slot_state.kv_allocated_lens[1] = 3
-        slot_state.token_counts[0] = 4  # finished_len=2 → visible=2
-        slot_state.token_counts[1] = 3  # finished_len=3 → visible=3 ✓ winner
-
         freed = []
         slot_state.free_group_slots = lambda group_id: freed.append(group_id)
 
@@ -268,58 +264,105 @@ class TestSMCFinalizeGroup(CustomTestCase):
         finalized = slot_state.finalize_group("g", parent_req)
 
         self.assertIs(finalized, parent_req)
-        self.assertEqual(parent_req.output_ids, [1, 2, 3])
-        self.assertEqual(parent_req.finished_len, 3)
-        self.assertEqual(parent_req.finished_reason.type, "length")
+        self.assertEqual(parent_req.output_ids, [5, 7])
+        self.assertEqual(parent_req.finished_len, 2)
+        from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+        self.assertIsInstance(parent_req.finished_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(freed, ["g"])
 
-    def test_finalize_picks_highest_log_weight(self):
-        """When log_weights differ, the heavier particle wins regardless
-        of output length."""
+    def test_finalize_attaches_particle_collection_and_log_Z(self):
+        """parent_req carries the full collection: per-particle outputs
+        (sliced to finished_len), final log-weights, and the unbiased
+        log-Ẑ tail ``logsumexp(interval_weights) - log(N)``."""
+        import math
+
         slot_state = _build_slot_state(
             max_num_reqs=2,
             rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
             n_particles=2,
         )
-        heavy = _FakeReq(
-            rid="g_p0",
-            particle_idx=0,
-            req_pool_idx=0,
-            output_ids=[1],
-            kv_indices=[1],
-            finished_reason=SimpleNamespace(type="stop"),
-            finished_len=1,
+        self._arm_group(
+            slot_state,
+            log_weights=[0.0, 0.0],
+            finished_lens=[1, 3],
+            reason_codes=[1, 1],          # both length-finished
+            matched_toks=[0, 0],
+            outputs=[[5], [8, 9, 10]],
         )
-        light = _FakeReq(
-            rid="g_p1",
-            particle_idx=1,
-            req_pool_idx=1,
-            output_ids=[2, 3, 4],
-            kv_indices=[2],
-            finished_reason=SimpleNamespace(type="stop"),
-            finished_len=3,
-        )
-        slot_state.slot_to_req = {0: heavy, 1: light}
-        slot_state.group_slot_lists = {"g": [0, 1]}
-        slot_state.log_weights[0] = 1.0    # heavier
-        slot_state.log_weights[1] = 0.0
-        slot_state.req_pool_indices[0] = 0
-        slot_state.req_pool_indices[1] = 1
-        slot_state.kv_allocated_lens[0] = 1
-        slot_state.kv_allocated_lens[1] = 1
-        slot_state.token_counts[0] = 1
-        slot_state.token_counts[1] = 3
-
         slot_state.free_group_slots = lambda group_id: None
 
         parent_req = SimpleNamespace(
             output_ids=[], finished_reason=None, finished_len=None
         )
-        finalized = slot_state.finalize_group("g", parent_req)
+        slot_state.finalize_group("g", parent_req)
 
-        self.assertIs(finalized, parent_req)
-        self.assertEqual(parent_req.output_ids, [1])
-        self.assertEqual(parent_req.finished_len, 1)
+        self.assertEqual(
+            parent_req.smc_particle_output_ids, [[5], [8, 9, 10]]
+        )
+        self.assertEqual(parent_req.smc_log_w_tilde, [0.0, 0.0])
+        # No resample boundary accrued (no group row) → log Ẑ is just the
+        # tail: logsumexp([0, 0]) - log(2) = 0.
+        self.assertAlmostEqual(parent_req.smc_log_Z_hat, 0.0, places=12)
+        # Length finish materialises FINISH_LENGTH.
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+        self.assertIsInstance(parent_req.finished_reason, FINISH_LENGTH)
+        # math import is used implicitly above via the documented formula.
+        del math
+
+
+class _FakeSamplingParams(SimpleNamespace):
+    pass
+
+
+class TestSMCAllocateSlots(CustomTestCase):
+    """``allocate_slots`` seeding — regression for the deferred-bonus
+    mixed-batch crash."""
+
+    def _make_particle(self, *, pool_idx, origin_input_ids, output_ids):
+        return SimpleNamespace(
+            req_pool_idx=pool_idx,
+            origin_input_ids=list(origin_input_ids),
+            output_ids=list(output_ids),
+            eos_token_ids=[2],
+            sampling_params=_FakeSamplingParams(
+                ignore_eos=False,
+                max_new_tokens=8,
+                stop_token_ids=None,
+            ),
+        )
+
+    def test_prev_last_draft_seeded_with_last_committed_token(self):
+        """The 2-token deferred-bonus head consumes prev_last_draft_ids on a
+        group's FIRST decode step, so allocate_slots must seed it with the
+        last committed token (whose S-1 draft KV the head rewrites
+        idempotently) — never a sentinel, which would reach the embedding
+        as a token id in mixed-step batches."""
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 2, 3, 0], [4, 5, 6, 0]],
+            n_particles=2,
+        )
+        # Committed prefix = prompt [11, 12, 13]; x0=99 sampled at prefill
+        # (its KV not yet written) → shared_seq_len = 3, last committed
+        # token = 13.
+        particles = [
+            self._make_particle(
+                pool_idx=i, origin_input_ids=[11, 12, 13], output_ids=[99]
+            )
+            for i in range(2)
+        ]
+
+        slots = slot_state.allocate_slots(
+            group_id="g", particle_reqs=particles, shared_seq_len=3
+        )
+
+        for s in slots:
+            self.assertEqual(int(slot_state.prev_last_draft_ids[s].item()), 13)
+            self.assertEqual(int(slot_state.verified_ids[s].item()), 99)
+            self.assertEqual(int(slot_state.seq_lens[s].item()), 3)
+        # All slots active (absorbing-state semantics keep membership
+        # static between allocate and free).
+        self.assertEqual(slot_state.num_active, 2)
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ def format_instruction(question: str) -> str:
 def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False):
     """Load GSM8K and build chat-template prompts + gold labels."""
     print("Loading GSM8K dataset...")
-    dataset = load_dataset("gsm8k", "main", split="test")
+    dataset = load_dataset("openai/gsm8k", "main", split="test")
 
     prompts = []
     labels = []
