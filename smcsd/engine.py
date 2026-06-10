@@ -27,6 +27,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     TokenizedGenerateReqInput,
 )
+from smcsd.core.info import SMCParticleOutput
 from smcsd.core.scheduler import run_smc_scheduler_process
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -66,6 +67,7 @@ class SMCEngine:
         gamma: int = 4,
         draft_temperature: float = 0.7,
         target_temperature: float = 1.0,
+        power_alpha: float = 1.0,
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
         # Hardware
@@ -115,6 +117,21 @@ class SMCEngine:
 
         server_args = ServerArgs(**merged)
         self.server_args = server_args
+
+        # power_alpha rides the ServerArgs *instance* as a dynamic attribute
+        # (plain dataclass, no __slots__ — extra attrs live in __dict__ and
+        # survive pickling into the scheduler subprocess).  This keeps the
+        # vendored ServerArgs class unmodified; SMCWorker reads it via getattr
+        # with a 1.0 default so non-SMCEngine launches are unaffected.
+        if power_alpha <= 0:
+            raise ValueError("power_alpha must be > 0.")
+        server_args.smc_power_alpha = float(power_alpha)
+        # SMCEngine consumes SMCParticleOutput itself (both scheduler sockets
+        # point back at this process), so opt in to the scheduler's particle
+        # collection emission.  HTTP launches never set this: there the same
+        # socket feeds a real DetokenizerManager, whose TypeBasedDispatcher
+        # raises ValueError on unknown message types.
+        server_args.smc_emit_particle_output = True
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
         configure_logger(server_args)
@@ -265,6 +282,25 @@ class SMCEngine:
                         results[rid]["aborted"] = True
                 continue
 
+            # Side-channel: the full SMC particle collection for a group,
+            # sent just before the group's token output (FIFO ⇒ rid still
+            # pending here).  Stash it onto the pending result entry.
+            if isinstance(msg, SMCParticleOutput):
+                rid = msg.rid
+                if rid in pending:
+                    entry = results.setdefault(
+                        rid,
+                        {
+                            "output_ids": [],
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                        },
+                    )
+                    entry["smc_log_Z_hat"] = msg.log_Z_hat
+                    entry["smc_log_w_tilde"] = msg.log_w_tilde
+                    entry["smc_particle_output_ids"] = msg.particle_output_ids
+                continue
+
             if not isinstance(msg, BatchTokenIDOutput):
                 # Other control messages -- safe to skip
                 continue
@@ -306,14 +342,23 @@ class SMCEngine:
             entry = results[rid]
             out_ids = entry["output_ids"]
             text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
-            outputs.append(
-                {
-                    "text": text,
-                    "output_ids": out_ids,
-                    "prompt_tokens": entry["prompt_tokens"],
-                    "completion_tokens": entry["completion_tokens"],
-                }
-            )
+            out = {
+                "text": text,
+                "output_ids": out_ids,
+                "prompt_tokens": entry["prompt_tokens"],
+                "completion_tokens": entry["completion_tokens"],
+            }
+            # SMC particle collection (present when the group reported one).
+            particle_ids = entry.get("smc_particle_output_ids")
+            if particle_ids is not None:
+                out["smc_log_Z_hat"] = entry.get("smc_log_Z_hat")
+                out["smc_log_w_tilde"] = entry.get("smc_log_w_tilde")
+                out["smc_particle_output_ids"] = particle_ids
+                out["smc_particle_texts"] = [
+                    self.tokenizer.decode(pids, skip_special_tokens=True)
+                    for pids in particle_ids
+                ]
+            outputs.append(out)
 
         return outputs[0] if is_single else outputs
 

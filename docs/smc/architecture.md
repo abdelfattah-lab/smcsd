@@ -201,7 +201,7 @@ Each cycle does:
 See [`pipeline.md`](./pipeline.md) for each substage in detail.
 
 **FINALIZE.** When a group runs out of active slots, the best particle is
-picked by `argmax(log_weight[slot], output_length)`, its `output_ids` /
+picked by `softmax(log_weight[slot])`, its `output_ids` /
 `finished_reason` are copied onto the parent `Req`, the group's slots are
 freed (allocator refcounts drop), the group row is released, and the
 parent is streamed out.

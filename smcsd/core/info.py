@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
@@ -31,6 +32,24 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+
+@dataclass
+class SMCParticleOutput:
+    """Side-channel message: the full particle collection for one finalized SMC
+    group, sent scheduler -> engine alongside the normal token output.
+
+    Plain-Python fields only, so it pickles cleanly over ZMQ.  ``log_Z_hat`` is
+    the unbiased log normalizing-constant estimate for the group;
+    ``log_w_tilde`` are the final per-particle log-weights; ``particle_output_ids``
+    holds every particle's generated token ids.
+    """
+
+    rid: str
+    log_Z_hat: float
+    log_w_tilde: List[float]
+    particle_output_ids: List[List[int]]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -53,17 +72,21 @@ class SMCDecodeContext:
     @staticmethod
     def from_slot_gather(
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         kv_allocated_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         gamma_plus_1: int,
         req_to_token_pool: ReqToTokenPool,
         tree_cache,
     ) -> Tuple["SMCDecodeContext", torch.Tensor]:
-        """Vectorized KV allocation — replaces the Python loop in
-        SMCDraftInput.prepare_for_decode (smc_info.py L203-217).
+        """Vectorized KV allocation, sync-free.
 
         Args:
             seq_lens: (bs,) int64, gathered contiguously from slot state.
+            seq_lens_cpu: (bs,) int64 CPU host-shadow gather of the same
+                values (see ``ScheduleBatchSMC.seq_lens_host``).  Trusted
+                without a device read so this whole prepare can be enqueued
+                before earlier GPU work has produced ``seq_lens``.
             kv_allocated_lens: (bs,) int64, gathered contiguously from slot state.
             req_pool_indices: (bs,) int64, gathered contiguously from slot state.
             gamma_plus_1: number of tokens per request (gamma + 1).
@@ -77,15 +100,19 @@ class SMCDecodeContext:
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = len(seq_lens)
-        seq_lens_cpu = seq_lens.cpu()
         orig_seq_lens = seq_lens.clone()
-        orig_seq_lens_sum = int(seq_lens_cpu.sum().item())
+        orig_seq_lens_sum = int(seq_lens_cpu.sum().item())  # CPU tensor — no sync
 
-        # Vectorized allocation (replaces per-req Python loop)
+        # Vectorized allocation (replaces per-req Python loop).  The device
+        # math handles the general alloc_start >= seq case for the block
+        # table writes; the host alloc COUNT relies on the maintained
+        # invariant kv_allocated_lens == seq_lens at prepare time (set at
+        # allocate, both advanced to seq + gamma+1 here, both copied
+        # together on resample), so every row needs exactly gamma+1 pages.
         alloc_start = torch.maximum(kv_allocated_lens, seq_lens)
         needed_len = seq_lens + gamma_plus_1
         new_alloc = torch.clamp(needed_len - alloc_start, min=0)
-        num_needed = int(new_alloc.sum().item())  # single GPU→CPU sync
+        num_needed = bs * gamma_plus_1
 
         nxt_kv_lens = alloc_start + new_alloc
 
@@ -241,6 +268,92 @@ class SMCDecodeContext:
 
         return verify_forward_batch, can_run_cuda_graph
 
+    def prepare_for_draft_head(
+        self,
+        prev_last_draft_id: torch.Tensor,
+        verified_id: torch.Tensor,
+        cache_locs: torch.Tensor,
+        req_to_token_pool: ReqToTokenPool,
+        batch: ModelWorkerBatch,
+        draft_model_runner: "ModelRunner",
+    ) -> ForwardBatch:
+        """Build the deferred-bonus 2-token draft head (eager, no CUDA graph).
+
+        Mirrors ``prepare_for_verify`` but on the DRAFT runner with
+        ``draft_token_num=2``: a linear (EXTEND-style) causal pass over
+        ``[prev_last_draft_id, verified_id]`` at positions ``[S-1, S]`` with
+        prefix length ``S-1``.  The draft KV is valid through ``S-2``; this head
+        writes positions ``S-1`` and ``S``.  The ``S-1`` slot is the one the
+        previous step deferred (its over-draft) — it may hold stale bytes (its
+        own unwritten content, duplicated by the resample KV-copy), which this
+        head overwrites before any read: within this forward the ``S`` token
+        attends to the ``S-1`` token's freshly-computed KV, and later decodes
+        run only after the head completes.  The slot is looked up live from
+        ``req_to_token`` so it is correct after resampling.
+
+        The last-position (``S`` / bonus column) logits give the proposal for
+        ``d_0``.  Used on EVERY decode step: on a group's first step,
+        ``prev_last_draft_id`` is the last committed prompt token (seeded at
+        ``allocate_slots``), so the ``S-1`` write rewrites the prefill's
+        draft KV byte-identically — which is what lets mixed-step batches
+        (continuous batching) share one head with no per-row branching.
+        """
+        device = batch.seq_lens.device
+        head_num = 2
+
+        orig_seq_lens = self.orig_seq_lens
+        # Prefix the head attends to: positions 0..S-2 (length S-1).
+        prefix_lens = orig_seq_lens - 1
+
+        # Tokens [prev, verified] per req, interleaved (req-major).
+        head_token_ids = torch.stack(
+            [prev_last_draft_id.to(torch.int64), verified_id.to(torch.int64)],
+            dim=1,
+        ).reshape(-1)
+
+        # Positions [S-1, S] per req.
+        step_offsets = torch.arange(head_num, device=device)
+        positions = (prefix_lens.unsqueeze(1) + step_offsets).reshape(-1)
+
+        # out_cache_loc [slot(S-1), slot(S)] per req.  slot(S-1) looked up live
+        # from req_to_token (post-resample correct); slot(S) is this step's
+        # first freshly-allocated slot (cache_locs[:, 0]).
+        rp = batch.req_pool_indices
+        r2t = req_to_token_pool.req_to_token
+        slot_sm1 = r2t[rp, (orig_seq_lens - 1).to(torch.int64)]
+        slot_s = cache_locs[:, 0]
+        out_cache_loc = torch.stack(
+            [slot_sm1.to(cache_locs.dtype), slot_s], dim=1
+        ).reshape(-1)
+
+        # Derived from the host-shadow CPU copy — no device read (this runs
+        # inside the worker's draft launch, on the sync-free hot path).
+        prefix_lens_cpu = self.orig_seq_lens_cpu - 1
+        head_spec = SMCVerifyInput(
+            draft_token_num=head_num,
+            positions=positions,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            seq_lens_sum=self.orig_seq_lens_sum - len(prefix_lens_cpu),
+            seq_lens_cpu=prefix_lens_cpu,
+            num_tokens_per_req=head_num,
+        )
+
+        head_batch = copy.copy(batch)
+        head_batch.input_ids = head_token_ids
+        head_batch.out_cache_loc = out_cache_loc
+        head_batch.seq_lens = prefix_lens
+        head_batch.seq_lens_cpu = prefix_lens_cpu
+        head_batch.seq_lens_sum = head_spec.seq_lens_sum
+        head_batch.spec_info = head_spec
+        head_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        head_batch.forward_mode = ForwardMode.TARGET_VERIFY
+
+        forward_batch = ForwardBatch.init_new(head_batch, draft_model_runner)
+        head_spec.populate_linear_verify_metadata(forward_batch)
+        # Attention metadata is set up by the caller: replay_prepare (graph
+        # path) or attn_backend.init_forward_metadata (eager fallback).
+        return forward_batch
+
 
 # ──────────────────────────────────────────────────────────────
 #  SMCDraftInput — pure data carrier
@@ -256,7 +369,16 @@ class SMCDraftInput(SpecInput):
     """
 
     verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token
-    logprob_diff: Optional[torch.Tensor] = None  # (bs,) from last step
+    # (bs,) per-row token at position S-1: the last *drafted* token
+    # d_{gamma-1} from the previous step (deferred into the next step's
+    # leading 2-token draft forward [prev_last_draft_id, verified_id]),
+    # or — on a group's first decode step — the last committed prompt
+    # token (seeded at allocate_slots), whose S-1 draft KV the head
+    # rewrites idempotently.  Always populated on the decode path, so the
+    # 2-token head needs no per-batch step flag and mixed-step batches
+    # (continuous batching) are handled uniformly.
+    prev_last_draft_id: Optional[torch.Tensor] = None
+    logprob_diff: Optional[torch.Tensor] = None  # (bs, gamma) per-position, last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
 
