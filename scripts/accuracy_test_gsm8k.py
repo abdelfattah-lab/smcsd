@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import re
 import time
 from decimal import Decimal, InvalidOperation
@@ -46,6 +47,17 @@ def normalize_numeric_answer(value: str) -> Optional[str]:
     if dec == dec.to_integral_value():
         return str(dec.quantize(Decimal(1)))
     return format(dec.normalize(), "f")
+
+def normalize_numeric_answer(value: str) -> Optional[str]:
+    """Normalize equivalent numeric strings, e.g. 75.00 -> 75."""
+    try:
+        dec = Decimal(value.replace(",", ""))
+    except InvalidOperation:
+        return None
+    if dec == dec.to_integral_value():
+        return str(dec.quantize(Decimal(1)))
+    return format(dec.normalize(), "f")
+
 
 def extract_answer(text: str) -> Optional[str]:
     """Extract numeric answer from model output or gold answer."""
