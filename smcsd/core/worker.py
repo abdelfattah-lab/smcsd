@@ -234,6 +234,43 @@ class SMCWorker(BaseSpecWorker):
                 self.draft_runner
             )
 
+        # Whole-draft-phase CUDA graph (issue #14): capture all gamma+1 draft
+        # forwards + in-graph Gumbel sampling in one graph per bs bucket,
+        # replacing gamma+1 separate decode-graph replays + eager sampling
+        # (~25% GPU idle from host dispatch at bs=32).  Opt-in; the per-step
+        # path stays as the fallback for oversized batches / long contexts.
+        self.draft_phase_graph_runner = None
+        if bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0"))):
+            from sglang.srt.layers.attention.triton_backend import (
+                TritonMultiStepDraftBackend,
+            )
+
+            reasons = []
+            if backup_disable_cuda_graph:
+                reasons.append("cuda graph disabled")
+            if self.smc_defer_bonus:
+                reasons.append(
+                    "SMC_DEFER_BONUS=1 (phase graph captures the legacy "
+                    "gamma+1 schedule; deferred-head capture is a follow-up)"
+                )
+            if not self.smc_draft_temperature > 0:
+                reasons.append("greedy draft (temperature 0)")
+            if not isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend):
+                reasons.append(
+                    f"unsupported multi-step backend "
+                    f"{type(self.draft_attn_backend).__name__} (triton only)"
+                )
+            if reasons:
+                logger.warning(
+                    "SMC_DRAFT_PHASE_GRAPH=1 ignored: %s", "; ".join(reasons)
+                )
+            else:
+                from smcsd.model_executor.smc_draft_phase_graph_runner import (
+                    SMCDraftPhaseGraphRunner,
+                )
+
+                self.draft_phase_graph_runner = SMCDraftPhaseGraphRunner(self)
+
     def _dense_hybrid_state_shape(self) -> Optional[Tuple[Tuple, Tuple]]:
         target_cfg = getattr(self.score_runner, "hybrid_gdn_config", None)
         draft_cfg = getattr(self.draft_runner, "hybrid_gdn_config", None)
@@ -681,6 +718,23 @@ class SMCWorker(BaseSpecWorker):
                 ctx, draft_input, draft_fb, cache_locs,
                 all_positions, all_seq_lens, batch, bs, gamma,
             )
+        elif (
+            self.draft_phase_graph_runner is not None
+            and not draft_fb.forward_mode.is_idle()
+            and self.draft_phase_graph_runner.can_run(bs, ctx)
+        ):
+            # Whole-phase graph: one launch for all gamma+1 draft forwards +
+            # in-graph Gumbel sampling (issue #14).  Returns the same
+            # [x0, d_0..d_gamma] layout the verify/bonus code consumes.
+            tokens_out, draft_logprobs_stacked = (
+                self.draft_phase_graph_runner.replay(
+                    draft_input.verified_id,
+                    cache_locs,
+                    ctx,
+                    batch.req_pool_indices,
+                )
+            )
+            all_tokens = [tokens_out[:, j] for j in range(gamma + 2)]
         else:
             # Legacy gamma+1 single-token AR loop (over-draft included).
             use_multistep = (
