@@ -13,6 +13,7 @@ has a different recurrent-state shape get an isolated draft Mamba pool via
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 import os
@@ -45,6 +46,22 @@ class SMCDenseDraftTpModelWorker(TpModelWorker):
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
+
+        # Draft-only quantization (e.g. SMC_DRAFT_QUANTIZATION=fp8): the
+        # draft phase is weight-read-bound at decode, so quantized draft
+        # weights cut its HBM traffic.  The sampler stays exact —
+        # importance weights are computed under the same (quantized)
+        # proposal q the tokens are drawn from, so this changes proposal
+        # quality only, never introduces bias.  The target model is
+        # untouched.  Swap self.server_args to the modified copy so the
+        # draft ModelRunner sees a consistent view.
+        draft_quant = os.environ.get("SMC_DRAFT_QUANTIZATION")
+        if draft_quant:
+            # Shallow copy (NOT dataclasses.replace, which would re-run
+            # ServerArgs.__post_init__ on an already-derived instance).
+            draft_args = copy.copy(self.server_args)
+            draft_args.quantization = draft_quant
+            self.server_args = draft_args
 
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
@@ -255,10 +272,11 @@ class SMCWorker(BaseSpecWorker):
             reasons = []
             if backup_disable_cuda_graph:
                 reasons.append("cuda graph disabled")
-            if self.smc_defer_bonus:
+            if self.smc_defer_bonus and not want_cycle:
                 reasons.append(
                     "SMC_DEFER_BONUS=1 (phase graph captures the legacy "
-                    "gamma+1 schedule; deferred-head capture is a follow-up)"
+                    "gamma+1 schedule; the deferred head is only captured "
+                    "by the full-cycle runner, SMC_CYCLE_GRAPH=1)"
                 )
             if not self.smc_draft_temperature > 0:
                 reasons.append("greedy draft (temperature 0)")
@@ -284,10 +302,19 @@ class SMCWorker(BaseSpecWorker):
                 logger.warning("%s=1 ignored: %s", flag, "; ".join(reasons))
             elif want_cycle:
                 from smcsd.model_executor.smc_draft_phase_graph_runner import (
+                    SMCDeferredCycleGraphRunner,
                     SMCFullCycleGraphRunner,
                 )
 
-                self.cycle_graph_runner = SMCFullCycleGraphRunner(self)
+                # With SMC_DEFER_BONUS=1 the cycle capture uses the deferred
+                # draft schedule (2-token head + gamma-1 singles): one fewer
+                # draft forward per cycle.
+                runner_cls = (
+                    SMCDeferredCycleGraphRunner
+                    if self.smc_defer_bonus
+                    else SMCFullCycleGraphRunner
+                )
+                self.cycle_graph_runner = runner_cls(self)
             else:
                 from smcsd.model_executor.smc_draft_phase_graph_runner import (
                     SMCDraftPhaseGraphRunner,
@@ -719,6 +746,9 @@ class SMCWorker(BaseSpecWorker):
             )
             cache_locs = out_cache_loc.reshape(bs, gamma + 1)
 
+        replay_kwargs = {}
+        if getattr(self.cycle_graph_runner, "deferred", False):
+            replay_kwargs["prev_last_draft_id"] = draft_input.prev_last_draft_id
         (
             tokens_out,
             _draft_logprobs,
@@ -730,6 +760,7 @@ class SMCWorker(BaseSpecWorker):
             cache_locs,
             ctx,
             batch.req_pool_indices,
+            **replay_kwargs,
         )
 
         next_token_ids = next_tokens.reshape(-1)

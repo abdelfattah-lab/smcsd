@@ -573,3 +573,278 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self.bonus_out[:raw_bs],
             self.next_tokens_out[:raw_bs],
         )
+
+
+class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
+    """Full-cycle graph with the deferred-bonus draft schedule.
+
+    The in-graph draft phase becomes a 2-token head ``[prev_last_draft @
+    S-1, verified @ S]`` followed by gamma-1 single-token decodes — gamma
+    draft forwards per cycle instead of gamma+1.  The over-draft forward
+    disappears; d_{gamma-1}'s draft-KV write is deferred into the NEXT
+    cycle's head, exactly like the eager ``SMC_DEFER_BONUS`` path
+    (``SMCWorker._draft_ar_deferred``), including the first-step property
+    that ``prev`` is the last committed prompt token whose S-1 write
+    rewrites the prefill's draft KV byte-identically.
+
+    The head runs as a TARGET_VERIFY-mode forward on the DRAFT model inside
+    the same capture, on the draft's PRIMARY attention backend — whose
+    verify-block-size global the worker pins to 2 under SMC_DEFER_BONUS —
+    reusing that backend's existing cuda-graph metadata buffers.  Same
+    sharing argument as SMCDraftHeadGraphRunner and the target side of the
+    cycle capture: every replay path writes its own metadata immediately
+    before its own launch, and launches are sequential on one stream.
+
+    ``tokens_out`` columns are ``[x0, d_0..d_{gamma-1}]`` (the final
+    over-draft column stays zero); the worker reads
+    ``prev_last_draft_id = tokens_out[:, gamma]`` identically either way.
+    The verify pass, weight diff, and bonus draw are inherited unchanged —
+    the verify input ``tokens_out[:, :gamma+1]`` carries the same token
+    layout as the legacy schedule.
+    """
+
+    deferred = True
+
+    def _init_extra_state(self):
+        super()._init_extra_state()
+        self.draft_primary_backend = self.model_runner.attn_backend
+        n_head_tokens = 2 * self.max_bs
+        with torch.device(self.model_runner.device):
+            self.prev_input = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.head_input_ids = torch.zeros((n_head_tokens,), dtype=torch.int64)
+            self.head_positions = torch.zeros((n_head_tokens,), dtype=torch.int64)
+            self.head_out_cache_loc = torch.zeros(
+                (n_head_tokens,), dtype=torch.int64
+            )
+            self.head_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+        self.head_seq_lens_cpu = torch.zeros((self.max_bs,), dtype=torch.int64)
+        self.head_fbs = {}
+
+    def _setup_head_capture(self, bs: int):
+        """Build the head's ForwardBatch (TARGET_VERIFY on the draft model,
+        2 tokens per request) and write its capture metadata."""
+        n_tokens = 2 * bs
+        head_input_ids = self.head_input_ids[:n_tokens]
+        head_positions = self.head_positions[:n_tokens]
+        head_ocl = self.head_out_cache_loc[:n_tokens]
+        head_seq_lens = self.head_seq_lens[:bs]
+        head_seq_lens_cpu = self.head_seq_lens_cpu[:bs]
+        req_pool_indices = self.req_pool_indices[:bs]
+
+        # Head prefix is S-1 (the deferred slot is rewritten, not appended).
+        head_seq_lens.copy_(self.seq_lens[:bs] - 1)
+        head_seq_lens_cpu.copy_(self.seq_lens_cpu[:bs] - 1)
+
+        head_spec = SMCVerifyInput(
+            draft_token_num=2,
+            positions=head_positions,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            seq_lens_sum=int(head_seq_lens.sum().item()),
+            seq_lens_cpu=head_seq_lens_cpu,
+            num_tokens_per_req=2,
+        )
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            input_ids=head_input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=head_seq_lens,
+            seq_lens_cpu=head_seq_lens_cpu,
+            seq_lens_sum=int(head_seq_lens.sum().item()),
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.draft_primary_backend,
+            out_cache_loc=head_ocl,
+            return_logprob=False,
+            positions=head_positions,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=head_spec,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        head_spec.populate_linear_verify_metadata(fb)
+        self.head_fbs[bs] = (fb, head_spec)
+        # Reuses the draft primary backend's existing cuda-graph metadata
+        # buffers (allocated by the draft's own decode graph runner) — do
+        # NOT call init_cuda_graph_state here (rebinding hazard, see module
+        # docstring).
+        self.draft_primary_backend.init_forward_metadata_capture_cuda_graph(
+            bs,
+            n_tokens,
+            req_pool_indices,
+            head_seq_lens,
+            None,
+            ForwardMode.TARGET_VERIFY,
+            head_spec,
+        )
+        return fb
+
+    def _draft_steps_in_graph(self, bs, forward, fb, input_ids, positions,
+                              out_cache_loc_steps):
+        """Deferred captured draft phase: head + gamma-1 singles."""
+        backends = self.draft_attn_backend.attn_backends
+        tokens_out = self.tokens_out[:bs]
+        logprobs_out = self.logprobs_out[:bs]
+        tiny = torch.finfo(torch.float32).tiny
+
+        head_fb, _ = self.head_fbs[bs]
+        n_head = 2 * bs
+        head_ids2 = self.head_input_ids[:n_head].view(bs, 2)
+        head_pos2 = self.head_positions[:n_head].view(bs, 2)
+        head_ocl2 = self.head_out_cache_loc[:n_head].view(bs, 2)
+        seq_lens = self.seq_lens[:bs]
+
+        # Head input staging — captured ops over the staged cycle buffers,
+        # recomputed from live values on every replay.  Column 0 of
+        # head_out_cache_loc (the deferred S-1 slot) is the one input staged
+        # eagerly in replay(): it needs a live block-table read with
+        # pad-row-safe zeros (page 0).
+        head_ids2[:, 0] = self.prev_input[:bs]
+        head_ids2[:, 1] = input_ids                  # x0 / verified_id
+        head_pos2[:, 0] = seq_lens - 1
+        head_pos2[:, 1] = seq_lens
+        head_ocl2[:, 1] = out_cache_loc_steps[0]     # fresh slot @ S
+
+        logits2 = forward(
+            self.head_input_ids[:n_head],
+            self.head_positions[:n_head],
+            head_fb,
+        ).next_token_logits
+        head_logits = logits2.view(bs, 2, -1)[:, 1, :]   # S / bonus column
+
+        scaled = head_logits / self.temperature
+        gumbel = -torch.log(
+            -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
+        )
+        idx = torch.argmax(scaled + gumbel, dim=-1)
+        tokens_out[:, 1] = idx
+        chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
+        logprobs_out[:, 0] = chosen - torch.logsumexp(scaled, dim=-1)
+        input_ids.copy_(idx)
+        positions.add_(1)
+
+        # gamma-1 singles: forward(d_{s-1}) @ S+s for s = 1..gamma-1.
+        for s in range(1, self.gamma):
+            fb.attn_backend = backends[s]
+            fb.out_cache_loc = out_cache_loc_steps[s]
+            logits = forward(input_ids, positions, fb).next_token_logits
+            scaled = logits / self.temperature
+            gumbel = -torch.log(
+                -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
+            )
+            idx = torch.argmax(scaled + gumbel, dim=-1)
+            tokens_out[:, s + 1] = idx
+            chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
+            logprobs_out[:, s] = chosen - torch.logsumexp(scaled, dim=-1)
+            input_ids.copy_(idx)
+            positions.add_(1)
+        return tokens_out, logprobs_out
+
+    def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
+        graph = self._create_graph()
+        stream = self.stream
+        bs = num_seqs
+
+        fb, input_ids, positions, ocl_steps = self._setup_draft_capture(bs)
+        self._setup_head_capture(bs)
+        verify_fb, verify_input_ids, verify_positions = (
+            self._setup_verify_capture(bs)
+        )
+
+        def run_once():
+            set_is_extend_in_batch(False)
+            self._draft_steps_in_graph(
+                bs, forward, fb, input_ids, positions, ocl_steps
+            )
+            return self._verify_in_graph(
+                bs, verify_fb, verify_input_ids, verify_positions
+            )
+
+        self.deepep_adapter.capture(is_extend_in_batch=False)
+        self._capture_init(run_once)
+        out = self._capture_graph(
+            graph, get_global_graph_memory_pool(), stream, run_once
+        )
+        set_global_graph_memory_pool(graph.pool())
+        return graph, out
+
+    def replay(
+        self,
+        verified_id: torch.Tensor,
+        cache_locs: torch.Tensor,
+        ctx: SMCDecodeContext,
+        req_pool_indices: torch.Tensor,
+        prev_last_draft_id: torch.Tensor = None,
+    ):
+        assert prev_last_draft_id is not None, (
+            "deferred cycle graph requires prev_last_draft_id "
+            "(seeded at allocate_slots, carried by resample)"
+        )
+        raw_bs, bs = self._stage_replay_inputs(
+            verified_id, cache_locs, ctx, req_pool_indices
+        )
+        if bs != raw_bs:
+            self.prev_input.zero_()
+            self.head_out_cache_loc.zero_()  # pad rows scribble page 0
+        self.prev_input[:raw_bs].copy_(prev_last_draft_id)
+
+        # Deferred S-1 slot: live block-table lookup (post-resample
+        # correct), enqueued eagerly so pad rows keep page 0.
+        r2t = self.model_runner.req_to_token_pool.req_to_token
+        slot_sm1 = r2t[
+            req_pool_indices.to(torch.int64),
+            (ctx.orig_seq_lens - 1).to(torch.int64),
+        ]
+        self.head_out_cache_loc[: 2 * raw_bs].view(raw_bs, 2)[:, 0].copy_(
+            slot_sm1
+        )
+
+        # Head metadata: prefix S-1 on the draft primary backend.
+        torch.sub(self.seq_lens[:bs], 1, out=self.head_seq_lens[:bs])
+        self.head_seq_lens_cpu[:bs].copy_(self.seq_lens_cpu[:bs] - 1)
+        head_sum = int(self.head_seq_lens_cpu[:bs].sum().item())
+        _, head_spec = self.head_fbs[bs]
+        self.draft_primary_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            self.req_pool_indices[:bs],
+            self.head_seq_lens[:bs],
+            head_sum,
+            None,
+            ForwardMode.TARGET_VERIFY,
+            head_spec,
+            self.head_seq_lens_cpu[:bs],
+        )
+
+        # Verify-side staging + metadata — same as the parent runner.
+        n_raw_tokens = raw_bs * self.num_steps
+        self.verify_positions[:n_raw_tokens].view(raw_bs, self.num_steps).copy_(
+            ctx.orig_seq_lens.unsqueeze(1)
+            + torch.arange(self.num_steps, device=cache_locs.device)
+        )
+        self.verify_out_cache_loc[:n_raw_tokens].view(
+            raw_bs, self.num_steps
+        ).copy_(cache_locs)
+
+        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+            self.fbs[bs], bs
+        )
+        verify_fb, verify_spec = self.verify_fbs[bs]
+        seq_lens_sum = int(self.seq_lens_cpu[:bs].sum().item())
+        self.target_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            self.req_pool_indices[:bs],
+            self.seq_lens[:bs],
+            seq_lens_sum,
+            None,
+            ForwardMode.TARGET_VERIFY,
+            verify_spec,
+            self.seq_lens_cpu[:bs],
+        )
+
+        self.graphs[_default_make_graph_key(bs)].replay()
+        return (
+            self.tokens_out[:raw_bs],
+            self.logprobs_out[:raw_bs],
+            self.logprob_diff_out[:raw_bs],
+            self.bonus_out[:raw_bs],
+            self.next_tokens_out[:raw_bs],
+        )
