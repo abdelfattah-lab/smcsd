@@ -47,6 +47,22 @@ class SMCDenseDraftTpModelWorker(TpModelWorker):
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
 
+        # Draft-only quantization (e.g. SMC_DRAFT_QUANTIZATION=fp8): the
+        # draft phase is weight-read-bound at decode, so quantized draft
+        # weights cut its HBM traffic.  The sampler stays exact —
+        # importance weights are computed under the same (quantized)
+        # proposal q the tokens are drawn from, so this changes proposal
+        # quality only, never introduces bias.  The target model is
+        # untouched.  Swap self.server_args to the modified copy so the
+        # draft ModelRunner sees a consistent view.
+        draft_quant = os.environ.get("SMC_DRAFT_QUANTIZATION")
+        if draft_quant:
+            # Shallow copy (NOT dataclasses.replace, which would re-run
+            # ServerArgs.__post_init__ on an already-derived instance).
+            draft_args = copy.copy(self.server_args)
+            draft_args.quantization = draft_quant
+            self.server_args = draft_args
+
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
             model_path=self.server_args.speculative_draft_model_path,
