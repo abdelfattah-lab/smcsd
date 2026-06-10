@@ -29,7 +29,6 @@ class SMCParticleGroupState:
     particle_finished: list[bool] = field(default_factory=list)
     draft_temperature: float = 1.0
     # Cumulative log-weight per particle: sum_t log(p_target(x_t)/p_draft(x_t)).
-    # Updated each cycle once target log-probs at draft positions are available.
     log_weights: list[float] = field(default_factory=list)  # [N]
     # Per-particle sequence lengths: only active particles advance each cycle.
     # After resampling, remapped from ancestors so the runner always gets the
@@ -121,7 +120,11 @@ class SMCVLLMScheduler(Scheduler):
         # Share only full prefix blocks across particles
         num_full_shared_blocks = num_computed_tokens // self.block_size
         num_shared_tokens = num_full_shared_blocks * self.block_size
-        private_tokens_needed = (num_computed_tokens - num_shared_tokens) + max_tokens
+        private_tokens_needed = (
+            (num_computed_tokens - num_shared_tokens)
+            + max_tokens
+            + gamma
+        )
         n_decode_blocks = math.ceil(private_tokens_needed / self.block_size)
 
         # Fork blocks: touches prefix N times and allocates decode blocks per particle
