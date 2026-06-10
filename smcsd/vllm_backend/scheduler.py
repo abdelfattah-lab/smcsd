@@ -302,7 +302,6 @@ class SMCVLLMScheduler(Scheduler):
                 continue
 
             # draft_token_ids: [A, gamma+1]; [:, 0] is the carried seed input.
-            # A = number of active (unfinished) particles this cycle.
             # Commits gamma+1 tokens per particle: x_1..x_gamma from draft
             # plus next_seed_ids (the target bonus token), which seeds the next cycle.
             active_ps = [p for p, f in enumerate(state.particle_finished) if not f]
@@ -337,22 +336,17 @@ class SMCVLLMScheduler(Scheduler):
                 if max_tokens is not None and len(state.accumulated_tokens[p]) >= max_tokens:
                     state.particle_finished[p] = True
 
-            # Accumulate log-weight increments: delta_w^n = sum_t log(p_target/p_draft).
-            # logprob_diff[i] corresponds to active_ps[i] (same ordering).
+            # Accumulate log-weight increments.
             logprob_diff = model_runner_output.smc_logprob_diffs.get(group_id)
             if logprob_diff is not None:
                 for i, p in enumerate(active_ps):
                     state.log_weights[p] += float(logprob_diff[i].item())
 
             # Advance per-particle seq_lens for active particles only.
-            # Finished particles keep their last length so that if they later
-            # become ancestors after resampling, the correct (shorter) length
-            # propagates to the destination particle.
             for p in active_ps:
                 state.particle_num_computed_tokens[p] += self.smc_gamma + 1
 
             # Apply resampling ancestry over all N particles.
-            # ancestor_indices_t[p] = global source particle index for particle p.
             ancestor_indices_t = model_runner_output.resampled_groups.get(group_id)
             if ancestor_indices_t is not None:
                 anc = ancestor_indices_t.tolist()  # [N], indices into 0..N-1
