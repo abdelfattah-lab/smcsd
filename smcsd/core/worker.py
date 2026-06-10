@@ -237,14 +237,21 @@ class SMCWorker(BaseSpecWorker):
         # Whole-draft-phase CUDA graph (issue #14): capture all gamma+1 draft
         # forwards + in-graph Gumbel sampling in one graph per bs bucket,
         # replacing gamma+1 separate decode-graph replays + eager sampling
-        # (~25% GPU idle from host dispatch at bs=32).  Opt-in; the per-step
-        # path stays as the fallback for oversized batches / long contexts.
+        # (~25% GPU idle from host dispatch at bs=32).  SMC_CYCLE_GRAPH=1
+        # extends the capture through TARGET_VERIFY + weight diff + bonus —
+        # one launch for the whole worker cycle.  Opt-in; the per-step path
+        # stays as the fallback for oversized batches / long contexts.
         self.draft_phase_graph_runner = None
-        if bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0"))):
+        self.cycle_graph_runner = None
+        want_cycle = bool(int(os.environ.get("SMC_CYCLE_GRAPH", "0")))
+        want_phase = bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0")))
+        if want_cycle or want_phase:
             from sglang.srt.layers.attention.triton_backend import (
+                TritonAttnBackend,
                 TritonMultiStepDraftBackend,
             )
 
+            flag = "SMC_CYCLE_GRAPH" if want_cycle else "SMC_DRAFT_PHASE_GRAPH"
             reasons = []
             if backup_disable_cuda_graph:
                 reasons.append("cuda graph disabled")
@@ -260,10 +267,27 @@ class SMCWorker(BaseSpecWorker):
                     f"unsupported multi-step backend "
                     f"{type(self.draft_attn_backend).__name__} (triton only)"
                 )
-            if reasons:
-                logger.warning(
-                    "SMC_DRAFT_PHASE_GRAPH=1 ignored: %s", "; ".join(reasons)
+            if want_cycle and self.score_runner.hybrid_gdn_config is not None:
+                reasons.append(
+                    "hybrid target (cycle graph cannot capture the "
+                    "post-verify mamba state commit)"
                 )
+            if want_cycle and not isinstance(
+                self.score_runner.attn_backend, TritonAttnBackend
+            ):
+                reasons.append(
+                    f"unsupported target backend "
+                    f"{type(self.score_runner.attn_backend).__name__} "
+                    "(triton only)"
+                )
+            if reasons:
+                logger.warning("%s=1 ignored: %s", flag, "; ".join(reasons))
+            elif want_cycle:
+                from smcsd.model_executor.smc_draft_phase_graph_runner import (
+                    SMCFullCycleGraphRunner,
+                )
+
+                self.cycle_graph_runner = SMCFullCycleGraphRunner(self)
             else:
                 from smcsd.model_executor.smc_draft_phase_graph_runner import (
                     SMCDraftPhaseGraphRunner,
@@ -656,6 +680,76 @@ class SMCWorker(BaseSpecWorker):
         draft_logprobs_stacked = torch.stack(draft_logprobs, dim=1)  # (bs, gamma)
         return all_tokens, draft_logprobs_stacked
 
+    def _forward_decode_cycle_graph(
+        self,
+        batch: ModelWorkerBatch,
+        draft_input: SMCDraftInput,
+        ctx: SMCDecodeContext,
+    ) -> GenerationBatchResult:
+        """Run one decode cycle through the full-cycle CUDA graph.
+
+        Replaces prepare_for_draft + the draft AR loop + prepare_for_verify +
+        the target verify forward + logprob extraction + bonus sampling with
+        one cache-locs kernel, the staging copies, two metadata updates, and
+        a single graph launch.  Output tensors are views into the runner's
+        persistent buffers; every consumer (scheduler write-back) is enqueued
+        on the same stream before the next cycle's staging copies, so reuse
+        is safe under both the sequential and overlapped event loops.
+        """
+        from smcsd.common.verify import assign_smc_cache_locs_kernel
+
+        bs = len(ctx.orig_seq_lens)
+        gamma = self.gamma
+
+        r2t = self.req_to_token_pool.req_to_token
+        out_cache_loc = torch.empty(
+            bs * (gamma + 1), dtype=torch.int64, device=self.device
+        )
+        assign_smc_cache_locs_kernel[(bs,)](
+            batch.req_pool_indices,
+            r2t,
+            ctx.orig_seq_lens,
+            out_cache_loc,
+            r2t.shape[1],
+            gamma + 1,
+        )
+        cache_locs = out_cache_loc.reshape(bs, gamma + 1)
+
+        (
+            tokens_out,
+            _draft_logprobs,
+            logprob_diff,
+            bonus,
+            next_tokens,
+        ) = self.cycle_graph_runner.replay(
+            draft_input.verified_id,
+            cache_locs,
+            ctx,
+            batch.req_pool_indices,
+        )
+
+        next_token_ids = next_tokens.reshape(-1)
+        accept_lens = torch.full(
+            (bs,), gamma + 1, dtype=torch.int32, device=self.device
+        )
+        # This step's last drafted token, deferred-bonus seed for next cycle.
+        prev_last_draft_id = tokens_out[:, gamma]
+
+        next_draft_input = SMCDraftInput(
+            verified_id=bonus,
+            prev_last_draft_id=prev_last_draft_id,
+            logprob_diff=logprob_diff,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+        )
+        return GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=next_token_ids,
+            accept_lens=accept_lens,
+            next_draft_input=next_draft_input,
+            logprob_diff=logprob_diff,
+            can_run_cuda_graph=True,
+        )
+
     def _forward_decode(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_idle():
             return self._forward_idle(batch)
@@ -669,6 +763,16 @@ class SMCWorker(BaseSpecWorker):
 
         if draft_input.verified_id is not None:
             draft_input.verified_id.record_stream(current_stream)
+
+        # ---- 0. Full-cycle graph (issue #14, stage 3) ----
+        # One launch covers draft AR + TARGET_VERIFY + weight diff + bonus,
+        # skipping both ForwardBatch.init_new constructions and all per-phase
+        # dispatch.  Falls through to the regular path when the batch exceeds
+        # the captured bs/context caps.
+        if self.cycle_graph_runner is not None and self.cycle_graph_runner.can_run(
+            len(ctx.orig_seq_lens), ctx
+        ):
+            return self._forward_decode_cycle_graph(batch, draft_input, ctx)
 
         # ---- 1. Prepare draft ----
         draft_fb, can_cuda_graph, cache_locs, all_positions, all_seq_lens = (
