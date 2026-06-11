@@ -21,6 +21,9 @@ experiments on top of the standalone `smcsd/` implementation.
 - **`tps_benchmark_scripts/`** — Throughput sweeps (shell scripts)
   across (gamma, n) pairs and batch sizes. See
   `tps_benchmark_scripts/BENCHMARK_CONFIGS.md` for details.
+- **`collect_proposal_data.py`** / **`train_proposal.py`** — Proposal
+  (draft-model) finetuning loop. See
+  [Proposal Finetuning](#proposal-finetuning).
 
 ## Reproducing GSM8K Accuracy
 
@@ -104,6 +107,51 @@ python scripts/accuracy_test_gsm8k_http.py --mode baseline --num-questions 200
   questions at temperature 0.7 — within sampling noise).
 - SMC does not populate the EAGLE-style `avg_spec_accept_length` in `/server_info`,
   so accept length shows `n/a`; use output throughput as the speed metric.
+
+## Proposal Finetuning
+
+SMC's efficiency is governed by the per-token KL between the draft proposal
+`q_Td` and the tempered target `softmax(alpha * z_target / T_target)` — every
+nat removed lowers importance-weight variance, raises ESS, and reduces
+resampling (particle degeneracy). The loop is fully offline; the engine
+needs no changes to consume a finetuned draft.
+
+```bash
+# 1. Collect rollouts on the GSM8K *train* split (eval uses test) with the
+#    SMC config you deploy. Dumps every particle trajectory + log-weights +
+#    cycle diagnostics as JSONL. SMC_TRACK_ESS=1 is set automatically.
+python scripts/collect_proposal_data.py \
+    -o /data/proposal_data/gsm8k_train_N8g8.jsonl \
+    -N 8 -g 8 --num-prompts 2000 --batch-size 16
+
+# 2. Finetune the draft. Default loss is token-level KL distillation against
+#    the EXACT tempered target the engine weights against (temperatures and
+#    power alpha are read from the dump's meta line); --loss wsft is a
+#    cheaper posterior-weighted SFT baseline. Saves merged bf16 HF
+#    checkpoints (epoch_K/ and final/).
+python scripts/train_proposal.py \
+    --data /data/proposal_data/gsm8k_train_N8g8.jsonl \
+    --output-dir /data/proposal_ckpts/llama1b-kl \
+    --loss kl --epochs 1 --batch-size 4 --grad-accum 8 --lr 1e-5
+
+# 3. Evaluate: quality on GSM8K test + the proposal-health diagnostics.
+python scripts/accuracy_test_gsm8k.py --mode smc_engine \
+    --draft-model /data/proposal_ckpts/llama1b-kl/final \
+    -N 8 -g 8 --num-questions 200
+```
+
+Per-request diagnostics ride the engine's particle side channel:
+`smc_n_cycles`, `smc_n_resamples` (always on), and `smc_mean_ess`
+(scheduler env `SMC_TRACK_ESS=1`). A better proposal shows up as a lower
+resample rate / higher mean ESS *before* it shows up in task accuracy —
+re-collect with the finetuned draft and compare, then iterate
+(collect → train → collect) since the on-policy data distribution shifts
+as the proposal improves. The payoff experiment is re-sweeping gamma / N:
+a closer proposal should hold quality at higher gamma and lower N.
+
+Constraints: the draft checkpoint must be a merged HF directory (no LoRA
+adapters) sharing the target's vocab; `train_proposal.py` saves exactly
+that.
 
 ## Throughput Sweeps
 
