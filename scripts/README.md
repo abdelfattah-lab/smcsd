@@ -153,6 +153,20 @@ Constraints: the draft checkpoint must be a merged HF directory (no LoRA
 adapters) sharing the target's vocab; `train_proposal.py` saves exactly
 that.
 
+**Measured recipe for a general-purpose draft** (Llama 8B/1B, June 2026):
+one round of forward-KL distillation on mixed-domain rollouts
+(open-perfectblend prompts, prompts-only, source-stratified), then
+**iteration 2: re-collect the same prompts with the round-1 draft and
+retrain from it with `--kl-direction reverse`**. Forward KL alone
+generalizes only on low-entropy domains (math) and slightly degrades
+held-out chat/IF at any data scale; reverse KL on on-policy data improved
+every held-out domain by 0.07–0.11 resample rate and dominated the mixed
+objective. Mode-seeking trade-off: reverse KL is strongest at small N
+(flat weights matter most when particles are scarce) and can soften
+large-N accuracy slightly — if N is large, also evaluate a 50/50
+weight-interpolation with the base draft (model soup), which dominated
+both parents on diagnostics in round 1.
+
 ## Throughput Sweeps
 
 See `tps_benchmark_scripts/` for shell-based sweeps across batch sizes
