@@ -159,20 +159,39 @@ def collate(examples, idxs, pad_id, device):
 
 
 def kl_loss(student_logits, teacher_logits, comp_mask, weights, cfg):
-    """Per-token KL( p_T^alpha || q_Td ) over completion positions.
+    """Per-token KL between p_T^alpha and q_Td over completion positions.
 
     Matches the engine's weight equation exactly: teacher logprobs are
     ``log_softmax(alpha * z_t / T_target)`` (the normalized tempered-power
     target the bonus token is sampled from), student logprobs are
     ``log_softmax(z_s / T_draft)`` (what the draft AR loop samples from).
-    Returns (loss, mean_token_kl).
+
+    ``cfg.kl_direction`` picks the divergence:
+
+    * ``forward``  — KL(p || q): coverage.  Penalizes q underweighting
+      tokens p likes (the "sibling found a token I missed" side of SMC
+      weight variance).
+    * ``reverse``  — KL(q || p): precision.  Penalizes q proposing tokens
+      p rejects — the per-token weight increment IS log p - log q at
+      q's own samples, so this directly targets particle death.
+    * ``both``     — mean of the two; both tails drive ESS.
+
+    Returns (loss, mean_token_divergence).
     """
     p_log = F.log_softmax(
         cfg.power_alpha * teacher_logits.float() / cfg.target_temperature,
         dim=-1,
     )
     q_log = F.log_softmax(student_logits.float() / cfg.draft_temperature, dim=-1)
-    kl = (p_log.exp() * (p_log - q_log)).sum(-1)  # (B, L-1)
+    if cfg.kl_direction == "forward":
+        kl = (p_log.exp() * (p_log - q_log)).sum(-1)  # (B, L-1)
+    elif cfg.kl_direction == "reverse":
+        kl = (q_log.exp() * (q_log - p_log)).sum(-1)
+    else:  # both
+        kl = 0.5 * (
+            (p_log.exp() * (p_log - q_log)).sum(-1)
+            + (q_log.exp() * (q_log - p_log)).sum(-1)
+        )
     w = comp_mask * weights.unsqueeze(1)
     denom = w.sum().clamp_min(1.0)
     loss = (kl * w).sum() / denom
@@ -232,6 +251,7 @@ def main(args):
         power_alpha=args.power_alpha
         if args.power_alpha is not None
         else meta["power_alpha"],
+        kl_direction=args.kl_direction,
     )
     init_from = args.init_from or meta["draft_model"]
     teacher_path = args.teacher or meta["model"]
@@ -391,6 +411,11 @@ if __name__ == "__main__":
                         help="collection dump(s) from collect_proposal_data.py")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--loss", choices=["kl", "wsft"], default="kl")
+    parser.add_argument("--kl-direction", choices=["forward", "reverse", "both"],
+                        default="forward",
+                        help="divergence for --loss kl: forward=KL(p||q) "
+                             "(coverage), reverse=KL(q||p) (precision, targets "
+                             "particle death), both=mean of the two")
     parser.add_argument("--init-from", type=str, default=None,
                         help="student init (default: dump meta draft_model)")
     parser.add_argument("--teacher", type=str, default=None,
