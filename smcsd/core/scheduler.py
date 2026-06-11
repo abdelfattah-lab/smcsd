@@ -876,12 +876,16 @@ class SMCScheduler(Scheduler):
         # zeroes weights, then fold it into group_log_Z_hat for the rows that
         # actually resample (unbiased-estimator product over resample steps).
         logZ_inc = self.slot_state.resample_logZ_increment()
+        # Pre-resample ESS diagnostic (no-op unless SMC_TRACK_ESS=1) — must
+        # precede the collect kernel, which zeroes resampled rows' weights.
+        self.slot_state.accumulate_ess()
 
         # Resample all groups via the fused systematic kernel.
         plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
         self.slot_state.group_log_Z_hat += torch.where(
             plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
         )
+        self.slot_state.accumulate_cycle_counters(plan.resample_mask)
         self.coordinator.dispatch_resample_batch(plan, self.slot_state)
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
@@ -985,6 +989,9 @@ class SMCScheduler(Scheduler):
                     log_Z_hat=parent_req.smc_log_Z_hat,
                     log_w_tilde=parent_req.smc_log_w_tilde,
                     particle_output_ids=parent_req.smc_particle_output_ids,
+                    n_cycles=parent_req.smc_n_cycles,
+                    n_resamples=parent_req.smc_n_resamples,
+                    mean_ess=parent_req.smc_mean_ess,
                 )
             )
         self.stream_output([parent_req], False)

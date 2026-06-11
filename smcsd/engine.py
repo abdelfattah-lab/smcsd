@@ -299,6 +299,9 @@ class SMCEngine:
                     entry["smc_log_Z_hat"] = msg.log_Z_hat
                     entry["smc_log_w_tilde"] = msg.log_w_tilde
                     entry["smc_particle_output_ids"] = msg.particle_output_ids
+                    entry["smc_n_cycles"] = msg.n_cycles
+                    entry["smc_n_resamples"] = msg.n_resamples
+                    entry["smc_mean_ess"] = msg.mean_ess
                 continue
 
             if not isinstance(msg, BatchTokenIDOutput):
@@ -354,6 +357,9 @@ class SMCEngine:
                 out["smc_log_Z_hat"] = entry.get("smc_log_Z_hat")
                 out["smc_log_w_tilde"] = entry.get("smc_log_w_tilde")
                 out["smc_particle_output_ids"] = particle_ids
+                out["smc_n_cycles"] = entry.get("smc_n_cycles", 0)
+                out["smc_n_resamples"] = entry.get("smc_n_resamples", 0)
+                out["smc_mean_ess"] = entry.get("smc_mean_ess")
                 out["smc_particle_texts"] = [
                     self.tokenizer.decode(pids, skip_special_tokens=True)
                     for pids in particle_ids

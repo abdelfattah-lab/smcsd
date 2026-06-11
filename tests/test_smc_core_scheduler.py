@@ -310,6 +310,110 @@ class TestSMCFinalizeGroup(CustomTestCase):
         del math
 
 
+class TestSMCCycleDiagnostics(CustomTestCase):
+    """Per-group decode-cycle diagnostics: ``accumulate_cycle_counters``,
+    ``accumulate_ess`` (SMC_TRACK_ESS gate), and their materialisation as
+    ``smc_n_cycles`` / ``smc_n_resamples`` / ``smc_mean_ess`` at finalize."""
+
+    def _arm_row(self, slot_state, *, log_weights, outputs):
+        """Arm a 2-particle group at row 0 with full row bookkeeping (the
+        finalize-group tests above skip the row; diagnostics need it)."""
+        slot_state.group_slot_lists = {"g": [0, 1]}
+        slot_state.group_id_to_row = {"g": 0}
+        slot_state.group_to_slots[0, :2] = torch.tensor([0, 1], dtype=torch.int32)
+        slot_state.row_in_use[0] = True
+        for s in (0, 1):
+            slot_state.log_weights[s] = log_weights[s]
+            slot_state.interval_weights[s] = log_weights[s]
+            slot_state.finished_len[s] = len(outputs[s])
+            slot_state.finish_reason_code[s] = 1
+            slot_state.token_counts[s] = len(outputs[s])
+            slot_state.all_token_ids[s, : len(outputs[s])] = torch.tensor(
+                outputs[s], dtype=torch.int32
+            )
+        slot_state.free_group_slots = lambda group_id: None
+
+    def test_cycle_counters_accumulate_and_attach(self):
+        """Three cycles, one of which resamples → n_cycles=3, n_resamples=1
+        on the finalized parent.  Free rows stay untouched."""
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+        )
+        self._arm_row(slot_state, log_weights=[0.0, 0.0], outputs=[[5], [6]])
+
+        mask_hit = torch.zeros(slot_state.max_groups, dtype=torch.bool)
+        mask_hit[0] = True
+        mask_miss = torch.zeros(slot_state.max_groups, dtype=torch.bool)
+        slot_state.accumulate_cycle_counters(mask_miss)
+        slot_state.accumulate_cycle_counters(mask_hit)
+        slot_state.accumulate_cycle_counters(mask_miss)
+
+        self.assertEqual(int(slot_state.group_n_cycles[0]), 3)
+        self.assertEqual(int(slot_state.group_n_resamples[0]), 1)
+        self.assertEqual(int(slot_state.group_n_cycles[1:].sum()), 0)
+
+        parent_req = SimpleNamespace(
+            output_ids=[], finished_reason=None, finished_len=None
+        )
+        slot_state.finalize_group("g", parent_req)
+        self.assertEqual(parent_req.smc_n_cycles, 3)
+        self.assertEqual(parent_req.smc_n_resamples, 1)
+        self.assertIsNone(parent_req.smc_mean_ess)  # track_ess off
+
+    def test_mean_ess_tracks_interval_weights(self):
+        """With SMC_TRACK_ESS on: equal interval weights give ESS = N per
+        cycle; a degenerate pair gives ESS ≈ 1.  finalize reports the mean."""
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+        )
+        slot_state.track_ess = True
+        self._arm_row(slot_state, log_weights=[0.0, 0.0], outputs=[[5], [6]])
+        mask_miss = torch.zeros(slot_state.max_groups, dtype=torch.bool)
+
+        # Cycle 1: equal weights → ESS = 2.
+        slot_state.accumulate_ess()
+        slot_state.accumulate_cycle_counters(mask_miss)
+        # Cycle 2: degenerate weights → ESS → 1.
+        slot_state.interval_weights[1] = -1e9
+        slot_state.accumulate_ess()
+        slot_state.accumulate_cycle_counters(mask_miss)
+
+        parent_req = SimpleNamespace(
+            output_ids=[], finished_reason=None, finished_len=None
+        )
+        slot_state.finalize_group("g", parent_req)
+        self.assertEqual(parent_req.smc_n_cycles, 2)
+        self.assertAlmostEqual(parent_req.smc_mean_ess, 1.5, places=9)
+
+    def test_finalize_without_row_defaults_diagnostics(self):
+        """Groups armed without row bookkeeping (the legacy test path)
+        finalize with zeroed counters and mean_ess=None."""
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+        )
+        slot_state.group_slot_lists = {"g": [0, 1]}
+        for s in (0, 1):
+            slot_state.finished_len[s] = 1
+            slot_state.finish_reason_code[s] = 1
+            slot_state.token_counts[s] = 1
+            slot_state.all_token_ids[s, 0] = 5
+        slot_state.free_group_slots = lambda group_id: None
+
+        parent_req = SimpleNamespace(
+            output_ids=[], finished_reason=None, finished_len=None
+        )
+        slot_state.finalize_group("g", parent_req)
+        self.assertEqual(parent_req.smc_n_cycles, 0)
+        self.assertEqual(parent_req.smc_n_resamples, 0)
+        self.assertIsNone(parent_req.smc_mean_ess)
+
+
 class _FakeSamplingParams(SimpleNamespace):
     pass
 

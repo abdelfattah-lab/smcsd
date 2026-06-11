@@ -263,6 +263,24 @@ class ScheduleBatchSMC:
         self.group_log_Z_hat = torch.zeros(
             self.max_groups, dtype=torch.float64, device=device,
         )
+        # Per-group decode-cycle diagnostics, row-aligned with group_to_slots.
+        # n_cycles counts decode cycles the row was in use for; n_resamples
+        # counts cycles whose ESS check triggered the resample kernel.
+        # ess_sum accumulates the pre-resample ESS of interval_weights only
+        # under SMC_TRACK_ESS=1 — it costs one (max_groups, N) gather plus two
+        # logsumexps per cycle, which the default hot loop doesn't pay.
+        # All updates are enqueue-only; values cross to the host once per
+        # group, at finalize.
+        self.group_n_cycles = torch.zeros(
+            self.max_groups, dtype=torch.int64, device=device,
+        )
+        self.group_n_resamples = torch.zeros(
+            self.max_groups, dtype=torch.int64, device=device,
+        )
+        self.track_ess = os.environ.get("SMC_TRACK_ESS", "0") == "1"
+        self.group_ess_sum = torch.zeros(
+            self.max_groups, dtype=torch.float64, device=device,
+        )
         self.group_id_to_row: Dict[str, int] = {}
         self.row_to_group_id: Dict[int, str] = {}
         self._free_rows: List[int] = list(range(self.max_groups))
@@ -456,6 +474,9 @@ class ScheduleBatchSMC:
         row_idx = self._to_device_async([row], torch.int64)
         self.row_in_use.index_fill_(0, row_idx, 1)
         self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
+        self.group_n_cycles.index_fill_(0, row_idx, 0)
+        self.group_n_resamples.index_fill_(0, row_idx, 0)
+        self.group_ess_sum.index_fill_(0, row_idx, 0.0)
 
         self.rebuild_active_slots()
         return slots
@@ -478,6 +499,9 @@ class ScheduleBatchSMC:
             row_idx = self._to_device_async([row], torch.int64)
             self.row_in_use.index_fill_(0, row_idx, 0)
             self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
+            self.group_n_cycles.index_fill_(0, row_idx, 0)
+            self.group_n_resamples.index_fill_(0, row_idx, 0)
+            self.group_ess_sum.index_fill_(0, row_idx, 0.0)
             self._free_rows.append(row)
 
         for slot in slots:
@@ -899,6 +923,42 @@ class ScheduleBatchSMC:
         return torch.where(self.row_in_use, inc, torch.zeros_like(inc))
 
     # ────────────────────────────────────────────────────────
+    #  Decode-cycle diagnostics
+    # ────────────────────────────────────────────────────────
+
+    def accumulate_ess(self) -> None:
+        """Accumulate each in-use row's ESS of the current interval weights
+        into ``group_ess_sum``.  Same quantity the fused collect kernel
+        tests against the resample threshold — for normalized weights
+        ``w = softmax(iw)``, ``ESS = 1/Σw² = exp(2·lse(iw) − lse(2·iw))``.
+
+        Must run BEFORE the collect kernel, which zeroes the interval
+        weights of resampled rows.  No-op unless ``SMC_TRACK_ESS=1``;
+        enqueue-only either way.  Free rows' ``group_to_slots`` cells are
+        -1 (they index the last weight entry), masked out via
+        ``row_in_use``.
+        """
+        if not self.track_ess:
+            return
+        iw_rows = self.interval_weights[self.group_to_slots.to(torch.int64)]
+        lse1 = torch.logsumexp(iw_rows, dim=1)
+        lse2 = torch.logsumexp(iw_rows * 2.0, dim=1)
+        ess = torch.exp(2.0 * lse1 - lse2)
+        self.group_ess_sum += torch.where(
+            self.row_in_use, ess, torch.zeros_like(ess)
+        )
+
+    def accumulate_cycle_counters(self, resample_mask: torch.Tensor) -> None:
+        """Bump per-row cycle / resample counters for this decode step.
+
+        ``resample_mask`` is the collect kernel's ``(max_groups,) bool``
+        output (False at rows it gated out), so no extra masking is needed
+        there.  Enqueue-only — two elementwise adds.
+        """
+        self.group_n_cycles += self.row_in_use.to(torch.int64)
+        self.group_n_resamples += resample_mask.to(torch.int64)
+
+    # ────────────────────────────────────────────────────────
     #  Finalization
     # ────────────────────────────────────────────────────────
 
@@ -933,6 +993,8 @@ class ScheduleBatchSMC:
             boundary ``logsumexp(interval_weights) - log(N)``.
           * ``smc_log_w_tilde``         — final per-particle log-weights.
           * ``smc_particle_output_ids`` — every particle's output token ids.
+          * ``smc_n_cycles`` / ``smc_n_resamples`` / ``smc_mean_ess`` —
+            decode-cycle diagnostics (mean ESS only under SMC_TRACK_ESS=1).
 
         Frees all group slots and returns ``parent_req`` ready for
         ``stream_output``.
@@ -981,6 +1043,23 @@ class ScheduleBatchSMC:
         parent_req.smc_log_Z_hat = log_Z_hat
         parent_req.smc_log_w_tilde = log_w_tilde
         parent_req.smc_particle_output_ids = particle_output_ids
+
+        # Decode-cycle diagnostics (proposal-quality signal): resample rate
+        # n_resamples/n_cycles, and mean pre-resample ESS when SMC_TRACK_ESS=1.
+        # Row may be None for groups armed directly in tests.
+        if row is not None:
+            n_cycles = int(self.group_n_cycles[row].item())
+            n_resamples = int(self.group_n_resamples[row].item())
+            mean_ess = (
+                float(self.group_ess_sum[row].item()) / n_cycles
+                if self.track_ess and n_cycles > 0
+                else None
+            )
+        else:
+            n_cycles, n_resamples, mean_ess = 0, 0, None
+        parent_req.smc_n_cycles = n_cycles
+        parent_req.smc_n_resamples = n_resamples
+        parent_req.smc_mean_ess = mean_ess
 
         self.free_group_slots(group_id)
         return parent_req

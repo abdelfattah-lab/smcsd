@@ -50,6 +50,13 @@ class SMCParticleOutput:
     log_Z_hat: float
     log_w_tilde: List[float]
     particle_output_ids: List[List[int]]
+    # Decode-cycle diagnostics: cycles the group was live, cycles that
+    # triggered a resample, and mean pre-resample ESS (None unless the
+    # scheduler ran with SMC_TRACK_ESS=1).  Defaulted for compatibility
+    # with senders predating these fields.
+    n_cycles: int = 0
+    n_resamples: int = 0
+    mean_ess: Optional[float] = None
 
 
 # ──────────────────────────────────────────────────────────────
