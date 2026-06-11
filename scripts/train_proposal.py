@@ -306,8 +306,14 @@ def main(args):
     def save(tag):
         out = os.path.join(args.output_dir, tag)
         # bf16 state dict — half the disk, and the dtype the engine runs.
+        # The config dtype must say bfloat16 too: it's what sglang loads the
+        # draft as, and a float32 draft crashes CUDA-graph buffer sharing
+        # against the bf16 target ("input_embeds has different dtype").
         sd = {k: v.to(torch.bfloat16) for k, v in model.state_dict().items()}
+        saved_dtype = model.config.dtype
+        model.config.dtype = torch.bfloat16
         model.save_pretrained(out, state_dict=sd, safe_serialization=True)
+        model.config.dtype = saved_dtype
         tokenizer.save_pretrained(out)
         print(f"  saved {out}")
 
