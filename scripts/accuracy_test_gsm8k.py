@@ -21,6 +21,7 @@ Usage:
 import argparse
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import numpy as np
