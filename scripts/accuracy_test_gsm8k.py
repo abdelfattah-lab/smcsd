@@ -36,16 +36,25 @@ DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 # Shared preprocessing (identical across all modes)
 # ---------------------------------------------------------------------------
 
+def normalize_numeric_answer(value: str) -> Optional[str]:
+    """Normalize equivalent numeric strings, e.g. 75.00 -> 75."""
+    try:
+        dec = Decimal(value.replace(",", ""))
+    except InvalidOperation:
+        return None
+    if dec == dec.to_integral_value():
+        return str(dec.quantize(Decimal(1)))
+    return format(dec.normalize(), "f")
 
 def extract_answer(text: str) -> Optional[str]:
     """Extract numeric answer from model output or gold answer."""
     match = re.search(r"####\s*(-?\d+(?:,\d+)*(?:\.\d+)?)", text)
     if match:
-        return match.group(1).replace(",", "")
+        return normalize_numeric_answer(match.group(1))
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     last_line = lines[-1] if lines else text.strip()
     numbers = re.findall(r"-?\d+(?:,\d+)*(?:\.\d+)?", last_line)
-    return numbers[-1].replace(",", "") if numbers else None
+    return normalize_numeric_answer(numbers[-1]) if numbers else None
 
 
 def format_instruction(question: str) -> str:
