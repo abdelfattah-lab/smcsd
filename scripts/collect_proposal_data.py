@@ -63,7 +63,7 @@ def load_prompts(tokenizer, args):
                 rec = json.loads(line)
                 q = rec.get("question") or rec["prompt"]
                 questions.append(q)
-                instructions.append(format_instruction(q))
+                instructions.append(q if args.raw_prompts else format_instruction(q))
 
     prompts = [
         tokenizer.apply_chat_template(
@@ -219,6 +219,9 @@ if __name__ == "__main__":
                       help="'gsm8k' or a JSONL file with question/prompt fields")
     data.add_argument("--split", type=str, default="train",
                       help="dataset split (default: train — eval uses test)")
+    data.add_argument("--raw-prompts", action="store_true", default=False,
+                      help="use JSONL prompts as-is (skip the GSM8K math "
+                           "instruction wrapper); chat template still applies")
     data.add_argument("--num-prompts", type=int, default=1000)
     data.add_argument("--max-new-tokens", type=int, default=512)
     data.add_argument("--batch-size", type=int, default=16)
