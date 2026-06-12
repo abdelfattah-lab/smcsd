@@ -179,6 +179,11 @@ N=8** — sharpening with nothing to buy. Run the per-domain holdout
 diagnostics with the base draft before training; if rr is already low,
 use a smaller draft (e.g. Qwen3-0.6B) where the recipe has headroom AND
 the speed payoff is larger, rather than finetuning an already-good one.
+Measured on Qwen3-8B + 0.6B (rr 0.51–0.85, GSM8K 64.5%/61.5% at N=8/4):
+one reverse-KL round gave +11.5/+13.5pp GSM8K and −0.08–0.12 rr across
+all domains — same magnitudes as Llama. It does not close a 3× draft
+capacity gap (base 1.7B still wins on quality); the finetuned small
+draft is the throughput operating point, not a 1.7B replacement.
 
 ## Throughput Sweeps
 
