@@ -545,6 +545,10 @@ class SMCGPUModelRunner(GPUModelRunner):
         all_start_seq_lens: list[int] = []
         all_draft_ids: list[torch.Tensor] = []
         all_draft_log_probs: list[torch.Tensor] = []
+        all_token_counts: list[int] = []
+        all_max_tokens: list[int | None] = []
+        all_stop_token_ids: list[list[int]] = []
+        all_target_temperatures: list[float] = []
 
         offset = 0
         for batch in batches:
@@ -554,8 +558,23 @@ class SMCGPUModelRunner(GPUModelRunner):
             A_i = len(active_local)
             if A_i > 0:
                 seq_lens_i = batch.seq_lens[active_local]
+                token_counts = getattr(batch, "token_counts", [0] * len(group.particle_rows))
+                max_tokens = getattr(batch, "max_tokens", None)
+                stop_token_ids = list(getattr(batch, "stop_token_ids", []) or [])
+                target_temperature = getattr(batch, "target_temperature", None)
+                if target_temperature is None:
+                    sp = getattr(batch, "sampling_params", None)
+                    target_temperature = (
+                        sp.temperature
+                        if sp is not None and sp.temperature is not None
+                        else 1.0
+                    )
                 all_rows.extend(group.particle_rows[i] for i in active_local)
                 all_start_seq_lens.extend(seq_lens_i.tolist())
+                all_token_counts.extend(token_counts[i] for i in active_local)
+                all_max_tokens.extend([max_tokens] * A_i)
+                all_stop_token_ids.extend([stop_token_ids] * A_i)
+                all_target_temperatures.extend([float(target_temperature)] * A_i)
                 all_draft_ids.append(draft_results[batch.group_id][0])       # [A_i, gamma+1]
                 all_draft_log_probs.append(draft_results[batch.group_id][1]) # [A_i, gamma]
             group_slices[batch.group_id] = (offset, offset + A_i)
@@ -651,26 +670,28 @@ class SMCGPUModelRunner(GPUModelRunner):
         # Bonus logits from the last position (L_i+gamma) for sampling.
         bonus_logits = all_logits_2d[:, -1, :]                         # [A_total, V]
 
-        # ---- log-weight increment: sum_t log(p_target(x_t) / p_draft(x_t)) ----
+        # ---- log-weight increment: keep per-position diffs. ----
         draft_ids = torch.cat(all_draft_ids, dim=0)                     # [A_total, gamma+1]
         draft_log_probs = torch.cat(all_draft_log_probs, dim=0)         # [A_total, gamma] scalars
         if gamma > 0:
             # Target log-probs at positions 0..gamma-1 predict tokens t_1..t_gamma.
-            # Use temperature 1.0 (untempered) for the target side of the weight,
-            # matching sglang's design: the importance weight log(p_T1_target/q_T_draft)
-            # measures alignment with the target mode rather than a specific temperature
-            # slice, and avoids premature weight collapse when T_target < 1.
+            target_temperatures = torch.tensor(
+                all_target_temperatures, dtype=all_logits_2d.dtype, device=self.device
+            ).clamp_min(1e-5)
             target_log_probs = torch.log_softmax(
-                all_logits_2d[:, :gamma, :], dim=-1
+                all_logits_2d[:, :gamma, :] / target_temperatures.view(-1, 1, 1),
+                dim=-1,
             )                                                           # [A_total, gamma, V]
             draft_token_ids = draft_ids[:, 1:gamma + 1].long()         # [A_total, gamma]
             log_p_target = target_log_probs.gather(
                 2, draft_token_ids.unsqueeze(2)
             ).squeeze(2)                                                # [A_total, gamma]
             # draft_log_probs is already [A_total, gamma] scalars gathered at sampling time.
-            logprob_diff_flat = (log_p_target - draft_log_probs).sum(dim=1)  # [A_total]
+            logprob_diff_per_pos = log_p_target - draft_log_probs       # [A_total, gamma]
         else:
-            logprob_diff_flat = torch.zeros(A_total, dtype=torch.float32, device=self.device)
+            logprob_diff_per_pos = torch.empty(
+                A_total, 0, dtype=torch.float32, device=self.device
+            )
 
         bonus_input_batch = self._build_draft_input_batch(
             particle_rows=rows,
@@ -682,6 +703,45 @@ class SMCGPUModelRunner(GPUModelRunner):
         )
         sampler_output = self.target_sampler(bonus_logits, bonus_input_batch)
         bonus_tokens = sampler_output.sampled_token_ids.squeeze(-1).to(torch.int32)
+
+        # Mask out post-stop / post-length draft weights before resampling.
+        if gamma > 0:
+            accepted_tokens = torch.cat(
+                (draft_ids[:, 1:].to(torch.int32), bonus_tokens.unsqueeze(1)),
+                dim=1,
+            )  # [A_total, gamma+1]
+            weight_lens = [gamma] * A_total
+            for i, (count, max_tokens) in enumerate(
+                zip(all_token_counts, all_max_tokens)
+            ):
+                if max_tokens is not None:
+                    visible_len = max(0, min(gamma + 1, int(max_tokens) - int(count)))
+                    weight_lens[i] = min(weight_lens[i], visible_len, gamma)
+
+            accepted_cpu = accepted_tokens.detach().cpu().tolist()
+            for i, stop_ids in enumerate(all_stop_token_ids):
+                if not stop_ids:
+                    continue
+                stop_set = set(stop_ids)
+                stop_pos = next(
+                    (j for j, token_id in enumerate(accepted_cpu[i]) if token_id in stop_set),
+                    -1,
+                )
+                if stop_pos >= 0:
+                    weight_lens[i] = min(weight_lens[i], stop_pos + 1, gamma)
+
+            weight_lens_t = torch.tensor(
+                weight_lens, dtype=torch.int64, device=self.device
+            )
+            keep = (
+                torch.arange(gamma, device=self.device).unsqueeze(0)
+                < weight_lens_t.unsqueeze(1)
+            )
+            logprob_diff_flat = (logprob_diff_per_pos * keep).sum(dim=1)
+        else:
+            logprob_diff_flat = torch.zeros(
+                A_total, dtype=torch.float32, device=self.device
+            )
 
         # Commit step gamma with the bonus token
         post_update(

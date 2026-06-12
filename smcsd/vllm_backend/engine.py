@@ -16,6 +16,7 @@ import time
 import uuid
 from typing import Union
 
+import torch
 from transformers import AutoTokenizer
 from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import SamplingParams
@@ -210,17 +211,18 @@ class SMCVLLMEngine:
             draft_particles, particle_log_weights = completed
             seed = seed_tokens[rid]
             particles = [seed + p for p in draft_particles]
-            # Pick the best particle by cumulative log-weight (primary) and then output length
+            # Match the SGLang backend: sample the primary output from the
+            # final SMC particle approximation instead of taking MAP.
             if particles:
-                best_idx = max(
-                    range(len(particles)),
-                    key=lambda i: (
-                        particle_log_weights[i] if i < len(particle_log_weights) else 0.0,
-                        len(particles[i]),
-                    ),
-                )
+                weights = list(particle_log_weights)
+                if len(weights) < len(particles):
+                    weights.extend([0.0] * (len(particles) - len(weights)))
+                weights_t = torch.tensor(weights[: len(particles)], dtype=torch.float64)
+                probs = torch.softmax(weights_t, dim=0)
+                best_idx = int(torch.multinomial(probs, num_samples=1).item())
                 all_tokens = particles[best_idx]
             else:
+                best_idx = None
                 all_tokens = seed
             results.append({
                 "text": self.tokenizer.decode(all_tokens, skip_special_tokens=True),
