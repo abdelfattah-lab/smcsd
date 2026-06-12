@@ -28,7 +28,7 @@ DEFAULT_DRAFT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
 # GSM8K helpers 
 def normalize_numeric_answer(value: str) -> Optional[str]:
-    """Normalize equivalent numeric strings, e.g. 75.00 -> 75."""
+    """Normalize equivalent numeric strings."""
     try:
         dec = Decimal(value.replace(",", ""))
     except InvalidOperation:
@@ -221,7 +221,7 @@ def main():
     parser.add_argument("--particles", "-N", type=int, default=12)
     parser.add_argument("--gamma", "-g", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--num-questions", type=int, default=100)
+    parser.add_argument("--num-questions", type=int, default=300)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-model-len", type=int, default=2048)
