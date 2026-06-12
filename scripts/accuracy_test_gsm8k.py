@@ -42,6 +42,10 @@ def extract_answer(text: str) -> Optional[str]:
     match = re.search(r"####\s*(-?\d+(?:,\d+)*(?:\.\d+)?)", text)
     if match:
         return match.group(1).replace(",", "")
+    # Qwen-style: final answer in (possibly display-math) \boxed{...}.
+    boxed = re.findall(r"\\boxed\{\s*(-?\d+(?:,\d+)*(?:\.\d+)?)\s*\}", text)
+    if boxed:
+        return boxed[-1].replace(",", "")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     last_line = lines[-1] if lines else text.strip()
     numbers = re.findall(r"-?\d+(?:,\d+)*(?:\.\d+)?", last_line)
@@ -171,6 +175,7 @@ def run_baseline_eval(args, prompts, labels):
     engine_kwargs = dict(
         model_path=args.model,
         trust_remote_code=True,
+        attention_backend=args.attention_backend,
     )
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
