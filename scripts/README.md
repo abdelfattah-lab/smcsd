@@ -170,6 +170,16 @@ matter most when particles are scarce) and can soften large-N accuracy
 slightly — if N is large, also evaluate a 50/50 weight-interpolation with
 the base draft (model soup), which gave the best N=8 GSM8K accuracy.
 
+**Check headroom first.** The recipe pays in proportion to the baseline
+proposal mismatch. Llama-3.1-8B + 3.2-1B (resample rate 0.50–0.74 across
+domains) gained +7–12pp GSM8K and −0.07–0.11 rr everywhere. Qwen3-8B +
+Qwen3-1.7B is already well-matched (rr 0.29 on math, 0.53 mixed): the same
+pipeline was ~neutral on diagnostics, flat at N=4, and **cost 4.5pp at
+N=8** — sharpening with nothing to buy. Run the per-domain holdout
+diagnostics with the base draft before training; if rr is already low,
+use a smaller draft (e.g. Qwen3-0.6B) where the recipe has headroom AND
+the speed payoff is larger, rather than finetuning an already-good one.
+
 ## Throughput Sweeps
 
 See `tps_benchmark_scripts/` for shell-based sweeps across batch sizes
