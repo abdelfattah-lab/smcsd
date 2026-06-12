@@ -154,18 +154,21 @@ adapters) sharing the target's vocab; `train_proposal.py` saves exactly
 that.
 
 **Measured recipe for a general-purpose draft** (Llama 8B/1B, June 2026):
-one round of forward-KL distillation on mixed-domain rollouts
-(open-perfectblend prompts, prompts-only, source-stratified), then
-**iteration 2: re-collect the same prompts with the round-1 draft and
-retrain from it with `--kl-direction reverse`**. Forward KL alone
-generalizes only on low-entropy domains (math) and slightly degrades
-held-out chat/IF at any data scale; reverse KL on on-policy data improved
-every held-out domain by 0.07–0.11 resample rate and dominated the mixed
-objective. Mode-seeking trade-off: reverse KL is strongest at small N
-(flat weights matter most when particles are scarce) and can soften
-large-N accuracy slightly — if N is large, also evaluate a 50/50
-weight-interpolation with the base draft (model soup), which dominated
-both parents on diagnostics in round 1.
+collect rollouts with the current draft on a deployment-mix prompt set
+(prompts-only, source-stratified — e.g. open-perfectblend), train with
+**`--kl-direction reverse`**, and optionally iterate (re-collect with the
+new draft, continue training at lower lr). The controlled ablation on
+identical round-1 data: forward KL generalizes only on low-entropy
+domains (math) and slightly degrades held-out chat/IF at any data scale;
+swapping ONLY the objective to reverse KL improved every held-out domain
+by 0.06–0.11 resample rate (chat 0.736→0.658, IF 0.738→0.654, code
+0.574→0.504, math 0.496→0.413 vs base) — the objective is the main
+effect. A second on-policy round adds a small uniform bump (~0.01–0.03 rr,
++1.5–2pp GSM8K). Mixed fwd+rev underperformed pure reverse everywhere.
+Mode-seeking trade-off: reverse KL is strongest at small N (flat weights
+matter most when particles are scarce) and can soften large-N accuracy
+slightly — if N is large, also evaluate a 50/50 weight-interpolation with
+the base draft (model soup), which gave the best N=8 GSM8K accuracy.
 
 ## Throughput Sweeps
 
