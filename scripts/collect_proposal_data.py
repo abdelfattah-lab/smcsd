@@ -65,11 +65,15 @@ def load_prompts(tokenizer, args):
                 questions.append(q)
                 instructions.append(q if args.raw_prompts else format_instruction(q))
 
+    chat_template_kwargs = {}
+    if args.disable_thinking:
+        chat_template_kwargs["enable_thinking"] = False
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": ins}],
             tokenize=False,
             add_generation_prompt=True,
+            **chat_template_kwargs,
         )
         for ins in instructions
     ]
@@ -222,6 +226,9 @@ if __name__ == "__main__":
     data.add_argument("--raw-prompts", action="store_true", default=False,
                       help="use JSONL prompts as-is (skip the GSM8K math "
                            "instruction wrapper); chat template still applies")
+    data.add_argument("--disable-thinking", action="store_true", default=False,
+                      help="pass enable_thinking=False to Qwen-style chat "
+                           "templates (keep consistent with eval!)")
     data.add_argument("--num-prompts", type=int, default=1000)
     data.add_argument("--max-new-tokens", type=int, default=512)
     data.add_argument("--batch-size", type=int, default=16)
