@@ -165,6 +165,24 @@ Next levers (de-risked, not yet built): CUDA graphs on the drafter (shortens the
 bottleneck stage directly), deeper prefetch (W>1), and composing async with cohort
 pipelining for batch>1.
 
+### Profiling (torch trace of the verifier scheduler; `scripts/smc_profile_engine.py --engine-kind smc_async|smc_decoupled`)
+
+Verifier-GPU busy fraction (union of kernel intervals on the main compute stream ÷
+wall span):
+
+| trace | GPU busy | wall | util |
+|---|---:|---:|---:|
+| lockstep, DECODE-only | 1387 ms | 2130 ms | **65.1%** |
+| async (K=2), combined | 1737 ms | 2410 ms | **72.1%** |
+
+The lockstep DECODE trace shows the verifier GPU **~35% idle** — that idle is exactly
+the time the verifier waits for the drafter's StepResp while the drafter computes the
+window. That idle is what the async prefetch recovers (the verify runs while the
+drafter computes the *next* window), surfacing as the +21–26% throughput. The async
+util (72%) is directionally consistent though not a clean apples-to-apples decode
+comparison (the async run's by-stage split fell back to a single combined trace, so
+it includes the compute-dense prefill). Traces open in Perfetto (ui.perfetto.dev).
+
 ### Chosen design: free-run between resample barriers (frontier-clone)
 
 With the no-bonus anchor the drafter's next anchor is its own token, so the drafter
