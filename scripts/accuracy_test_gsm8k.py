@@ -90,6 +90,8 @@ def run_smc_engine_eval(args, prompts, labels):
         from smcsd.decoupled.engine import DecoupledSMCEngine as SMCEngine
     elif args.mode == "smc_pipelined":
         from smcsd.decoupled.engine import PipelinedDecoupledSMCEngine as SMCEngine
+    elif args.mode == "smc_async":
+        from smcsd.decoupled.engine import AsyncDecoupledSMCEngine as SMCEngine
     else:
         from smcsd.engine import SMCEngine
 
@@ -222,10 +224,11 @@ def main(args):
         "smc_engine": "SMCEngine (dedicated offline)",
         "smc_decoupled": "DecoupledSMCEngine (draft engine on separate GPU)",
         "smc_pipelined": "PipelinedDecoupledSMCEngine (cross-group draft/verify overlap)",
+        "smc_async": "AsyncDecoupledSMCEngine (prefetch overlap + barrier resampling)",
         "baseline": "Baseline (vanilla)",
     }
     print(f"Mode: {mode_label[args.mode]} | Model: {args.model}")
-    if args.mode in ("smc_engine", "smc_decoupled", "smc_pipelined"):
+    if args.mode in ("smc_engine", "smc_decoupled", "smc_pipelined", "smc_async"):
         draft = args.draft_model or DEFAULT_DRAFT_MODEL
         print(
             f"  particles={args.particles}, gamma={args.gamma}, "
@@ -253,7 +256,7 @@ def main(args):
     prompts, labels = load_gsm8k(tokenizer, args.num_questions)
 
     # Run evaluation
-    if args.mode in ("smc_engine", "smc_decoupled", "smc_pipelined"):
+    if args.mode in ("smc_engine", "smc_decoupled", "smc_pipelined", "smc_async"):
         preds, total_tokens, latency = run_smc_engine_eval(args, prompts, labels)
     else:
         preds, total_tokens, latency = run_baseline_eval(args, prompts, labels)
@@ -265,7 +268,7 @@ def main(args):
 
     print(f"\n{'=' * 55}")
     print(f"  {mode_label[args.mode]}")
-    if args.mode in ("smc_engine", "smc_decoupled", "smc_pipelined"):
+    if args.mode in ("smc_engine", "smc_decoupled", "smc_pipelined", "smc_async"):
         print(f"  N={args.particles}, γ={args.gamma}, temp={args.temperature}")
     print(f"{'=' * 55}")
     print(f"  Accuracy:          {correct}/{n} ({100 * correct / n:.1f}%)")
@@ -285,7 +288,7 @@ if __name__ == "__main__":
     # Core
     parser.add_argument(
         "--mode",
-        choices=["baseline", "smc_engine", "smc_decoupled", "smc_pipelined"],
+        choices=["baseline", "smc_engine", "smc_decoupled", "smc_pipelined", "smc_async"],
         default="smc_engine",
         help=(
             "baseline = vanilla, smc_engine = dedicated SMCEngine, "

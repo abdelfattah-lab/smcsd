@@ -148,7 +148,7 @@ class PendingDecodeStep:
 
     batch: ModelWorkerBatch
     ctx: object  # SMCDecodeContext
-    cache_locs: torch.Tensor
+    cache_locs: Optional[torch.Tensor]  # computed in finish_decode
     tag: int
 
 
@@ -269,14 +269,59 @@ class DecoupledSMCWorker(BaseSpecWorker):
     # overlap one cohort's draft with another cohort's verify.  The lockstep
     # path is start + blocking recv + finish — behavior unchanged.
 
+    def send_step_req(
+        self,
+        active_slots: List[int],
+        verified_ids_cpu: List[int],
+        seq_lens_cpu: List[int],
+        tag: int = 0,
+    ) -> None:
+        """Fire one draft round on the drafter (no slot_state dependency).
+
+        The async scheduler uses this to prefetch the next window's StepReq from
+        raw lists while it verifies the current window locally — the overlap.
+        """
+        self._client.send_step(
+            slots=active_slots,
+            verified_ids=verified_ids_cpu,
+            seq_lens=seq_lens_cpu,
+            tag=tag,
+        )
+
     def start_decode(self, batch: ModelWorkerBatch, tag: int = 0) -> "PendingDecodeStep":
         draft_input: SMCDraftInput = batch.spec_info
         ctx = draft_input.decode_ctx
+        active_slots = getattr(draft_input, "active_slots_cpu", None)
+        if active_slots is None:
+            raise RuntimeError(
+                "DecoupledSMCWorker requires active_slots_cpu on the draft "
+                "input (set by DecoupledSMCScheduler._prepare_decode_batch)."
+            )
+        self.send_step_req(
+            active_slots,
+            draft_input.verified_id.cpu().tolist(),
+            ctx.orig_seq_lens_cpu.tolist(),
+            tag=tag,
+        )
+        return PendingDecodeStep(batch=batch, ctx=ctx, cache_locs=None, tag=tag)
+
+    def _forward_decode(self, batch: ModelWorkerBatch):
+        if batch.forward_mode.is_idle():
+            return self._forward_idle(batch)
+        pending = self.start_decode(batch)
+        resp = self._client.recv_step_resp()
+        return self.finish_decode(pending, resp)
+
+    def finish_decode(self, pending: "PendingDecodeStep", resp):
+        batch = pending.batch
+        ctx = pending.ctx
+        draft_input: SMCDraftInput = batch.spec_info
         bs = len(ctx.orig_seq_lens)
         gamma = self.gamma
 
-        # ---- 1. Target-side cache locations for x0..x_gamma (the scheduler's
-        #         from_slot_gather already allocated + wrote req_to_token) ----
+        # Target-side cache locations for x0..x_gamma (computed here, not at
+        # send time, so the async path can prefetch the StepReq before the
+        # verifier's target KV for this window is even touched).
         out_cache_loc = torch.empty(
             bs * (gamma + 1), dtype=torch.int64, device=ctx.orig_seq_lens.device
         )
@@ -289,36 +334,6 @@ class DecoupledSMCWorker(BaseSpecWorker):
             gamma + 1,
         )
         cache_locs = out_cache_loc.reshape(bs, gamma + 1)
-
-        # ---- 2. Fire the draft round on the drafter process ----
-        active_slots = getattr(draft_input, "active_slots_cpu", None)
-        if active_slots is None:
-            raise RuntimeError(
-                "DecoupledSMCWorker requires active_slots_cpu on the draft "
-                "input (set by DecoupledSMCScheduler._prepare_decode_batch)."
-            )
-        self._client.send_step(
-            slots=active_slots,
-            verified_ids=draft_input.verified_id.cpu().tolist(),
-            seq_lens=ctx.orig_seq_lens_cpu.tolist(),
-            tag=tag,
-        )
-        return PendingDecodeStep(batch=batch, ctx=ctx, cache_locs=cache_locs, tag=tag)
-
-    def _forward_decode(self, batch: ModelWorkerBatch):
-        if batch.forward_mode.is_idle():
-            return self._forward_idle(batch)
-        pending = self.start_decode(batch)
-        resp = self._client.recv_step_resp()
-        return self.finish_decode(pending, resp)
-
-    def finish_decode(self, pending: "PendingDecodeStep", resp):
-        batch = pending.batch
-        ctx = pending.ctx
-        cache_locs = pending.cache_locs
-        draft_input: SMCDraftInput = batch.spec_info
-        bs = len(ctx.orig_seq_lens)
-        gamma = self.gamma
         if resp.tag != pending.tag:
             raise RuntimeError(
                 f"Draft step reply tag mismatch: got {resp.tag}, "

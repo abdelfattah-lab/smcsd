@@ -26,6 +26,7 @@ import uuid
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.server_args import ServerArgs
 
+from smcsd.decoupled.async_scheduler import run_async_smc_scheduler_process
 from smcsd.decoupled.draft_server import run_smc_draft_server_process
 from smcsd.decoupled.pipeline_scheduler import run_pipelined_smc_scheduler_process
 from smcsd.decoupled.scheduler import DRAFT_IPC_ENV, run_decoupled_smc_scheduler_process
@@ -132,3 +133,15 @@ class PipelinedDecoupledSMCEngine(DecoupledSMCEngine):
     """
 
     scheduler_process_func = staticmethod(run_pipelined_smc_scheduler_process)
+
+
+class AsyncDecoupledSMCEngine(DecoupledSMCEngine):
+    """Decoupled SMC engine with prefetch draft/verify overlap + barrier
+    resampling (within-group async; helps even at batch 1).
+
+    Requires no-bonus mode (the anchor must be drafter-known) — pass
+    ``drop_bonus``/``SMCSD_DROP_BONUS=1`` and an anchor temperature.  The
+    resample barrier interval is ``SMCSD_RESAMPLE_INTERVAL`` (default 2).
+    """
+
+    scheduler_process_func = staticmethod(run_async_smc_scheduler_process)

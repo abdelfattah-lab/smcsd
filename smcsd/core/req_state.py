@@ -555,7 +555,13 @@ class ScheduleBatchSMC:
         ).any(dim=2).any(dim=1)
         eos_hit = eos_hit & ~self.ignore_eos_t[active]
 
-        newly_finished_mask = (length_hit | eos_hit) & ~self.finished_mask[active]
+        # Slots already finished BEFORE this step must not accumulate weight
+        # (they only persist in the active set in the async path, where finished
+        # particles ride along until the next resample barrier).  In lockstep
+        # finished slots are excluded from `active`, so this mask is all-True
+        # there — a no-op.
+        finished_before = self.finished_mask[active].clone()
+        newly_finished_mask = (length_hit | eos_hit) & ~finished_before
         self.finished_mask[active] = self.finished_mask[active] | newly_finished_mask
 
         # d. Sync the small set of newly-finished particles back to their
@@ -596,8 +602,10 @@ class ScheduleBatchSMC:
                 ].tolist()
 
         # e. Accumulate log-weights.  Vectorised over all active slots —
-        #    two in-place index_put_s, zero device syncs.
+        #    two in-place index_put_s, zero device syncs.  Zero the increment
+        #    for slots already finished before this step (async ride-along).
         d = logprob_diff.to(torch.float64)
+        d = torch.where(finished_before, torch.zeros_like(d), d)
         self.log_weights[active] += d
         self.interval_weights[active] += d
 
