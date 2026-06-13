@@ -142,6 +142,10 @@ class ScheduleBatchSMC:
         self.verified_ids = torch.zeros(
             self.max_slots, dtype=torch.int32, device=device
         )
+        # Lineage Tracking (Phase 3a)
+        self.lineage_tags = torch.zeros(self.max_slots, dtype=torch.int64, device=device)
+        self.divergence_points = torch.zeros(self.max_slots, dtype=torch.int64, device=device)
+        self._next_lineage_tag = 1
         # Per-slot token at position S-1: the last *drafted* token d_{gamma-1}
         # from the previous step (deferred into the next step's leading
         # 2-token draft forward), or — on a group's first decode step — the

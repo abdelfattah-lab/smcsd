@@ -76,6 +76,11 @@ class SMCWorker(BaseSpecWorker):
         self._target_worker = target_worker  # score model
 
         self.gamma = server_args.speculative_num_steps
+        self.n_particles = server_args.smc_n_particles
+        self.sampling_method = os.environ.get("SMCSD_SAMPLING_METHOD", "multinomial")
+        self.use_antithetic = os.environ.get("SMCSD_USE_ANTITHETIC", "false").lower() == "true"
+        self.use_early_halt = os.environ.get("SMCSD_USE_EARLY_HALT", "false").lower() == "true"
+        self.early_halt_threshold = float(os.environ.get("SMCSD_EARLY_HALT_THRESHOLD", "8.0"))
         self.speculative_num_draft_tokens = self.gamma + 1
         self.smc_draft_temperature = server_args.smc_draft_temperature
         self.smc_target_temperature = max(
@@ -113,6 +118,8 @@ class SMCWorker(BaseSpecWorker):
 
         server_args.context_length = target_worker.model_runner.model_config.context_len
         self.score_runner = self._target_worker.model_runner
+        if self.sampling_method == "qmc":
+            self.sobol_engine = torch.quasirandom.SobolEngine(dimension=self.gamma + 1, scramble=True)
 
         # Do not capture cuda graph during TpModelWorker init —
         # we capture manually after the draft model is fully set up
@@ -681,7 +688,14 @@ class SMCWorker(BaseSpecWorker):
             draft_logprobs = []
             current_ids = x0
 
-            for step in range(gamma + 1):
+            # Mask for Early-Halt: track which requests are still active.
+        num_reqs = bs // self.n_particles
+        req_active_mask = torch.ones(num_reqs, dtype=torch.bool, device=self.device)
+        particle_active_mask = torch.ones(bs, dtype=torch.bool, device=self.device)
+
+        for step in range(gamma + 1):
+            if not req_active_mask.any():
+                break
                 draft_fb.input_ids = current_ids
                 draft_fb.positions = all_positions[:, step].contiguous()
                 draft_fb.out_cache_loc = cache_locs[:, step].contiguous()
