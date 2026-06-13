@@ -679,8 +679,13 @@ class ScheduleBatchSMC:
         dst_req.finished_len = src_req.finished_len
         dst_req.finished_output = src_req.finished_output
         dst_req.to_finish = copy.copy(src_req.to_finish)
-        dst_req.kv_committed_len = src_req.kv_committed_len
-        dst_req.kv_allocated_len = src_req.kv_allocated_len
+        # Read KV lengths from the authoritative slot tensors (already copied
+        # dst←src by the caller), NOT from src_req: an async finished ride-along
+        # src advances its slot seq_len each window without updating its Req
+        # field, so src_req.kv_committed_len can lag.  Keeps the invariant
+        # req.kv_committed_len == seq_lens[slot] that the rest of the code relies on.
+        dst_req.kv_committed_len = int(self.seq_lens[dst_slot].item())
+        dst_req.kv_allocated_len = int(self.kv_allocated_lens[dst_slot].item())
         dst_req.decoded_text = src_req.decoded_text
         dst_req.surr_offset = src_req.surr_offset
         dst_req.read_offset = src_req.read_offset
