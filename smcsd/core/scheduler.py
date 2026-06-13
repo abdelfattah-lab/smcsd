@@ -274,6 +274,16 @@ class SMCScheduler(Scheduler):
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
         )
+        # Resample interval K: only check ESS / resample every K decode steps
+        # (interval_weights still accumulate every step, so the K-th check sees
+        # the K-window-accumulated weights).  K=1 is the default per-step
+        # behavior; K>1 simulates the "free-run K windows between resample
+        # barriers" approximation of the async drafter (resampling delayed by
+        # up to K windows).
+        import os
+
+        self.resample_interval = max(int(os.environ.get("SMCSD_RESAMPLE_INTERVAL", "1")), 1)
+        self._decode_step = 0
 
     def _make_runtime_tracking_batch(
         self,
@@ -694,13 +704,18 @@ class SMCScheduler(Scheduler):
 
         # One fused collect over every in-use group row, then dispatch the
         # resulting dst/src plan.  The kernel gates on row_in_use, so we
-        # don't need to filter the group list on the Python side.
-        plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
-        did_resample = plan.n_jobs > 0
-        if did_resample:
-            self.coordinator.dispatch_resample_batch(
-                plan, self.slot_state, rebuild_active=False,
-            )
+        # don't need to filter the group list on the Python side.  With
+        # resample_interval K>1, only check every K-th step (interval_weights
+        # keep accumulating in between) — the barrier-async approximation.
+        self._decode_step += 1
+        did_resample = False
+        if self._decode_step % self.resample_interval == 0:
+            plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
+            did_resample = plan.n_jobs > 0
+            if did_resample:
+                self.coordinator.dispatch_resample_batch(
+                    plan, self.slot_state, rebuild_active=False,
+                )
 
         # Single rebuild per decode cycle if membership changed.
         if newly_finished or did_resample:

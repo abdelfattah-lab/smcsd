@@ -66,7 +66,60 @@ the small gap vs colocated is sampling noise at n=200 (possibly compounded sligh
 by the float32 draft-logprob wire encoding — which is *more* precise, so not a
 deficit). Operating recipe: `--drop-bonus` + `SMCSD_ANCHOR_TEMP=0.3`.
 
-## Tier 2 — continuous async drafter + common-window-snapshot resampler
+## Tier 2 — async drafter (design decided by de-risk measurements)
+
+Two cheap measurements (colocated, no systems work) settled the architecture
+before building anything:
+
+1. **Is resampling load-bearing?** no-bonus anchor-0.3, **resample threshold 0**
+   (no resampling) → **55.0%** vs 69.0% with resampling. Worth ~14pt — the async
+   path MUST keep resampling. (Symptom: degenerate runs pick a prematurely-finished
+   max-weight particle → short answers that never reach `####`.)
+2. **Does delaying resampling to barriers preserve accuracy?** `SMCSD_RESAMPLE_INTERVAL=K`
+   resamples only every K decode steps (interval_weights accumulate between), which
+   is exactly the barrier-async approximation. **K=2 → 64.5%, K=4 → 64.5%** (vs
+   K=1 per-window 69.0%, no-resample 55.0%). The delay costs a *fixed* ~4.5pt that
+   saturates immediately (K=2 ≈ K=4) — and 64.5% is within ~1.8pt of the **decoupled
+   lockstep no-bonus baseline (66.3%)**, which is the relevant comparison since async
+   runs on the decoupled path. So the barrier approximation is **essentially free
+   relative to where async actually runs.** Barrier-async design validated.
+
+### De-risk verdict (all three measurements positive)
+
+| step | finding | implication |
+|---|---|---|
+| drop-anchor (Tier 1) | 69.0% @ anchor 0.3 (tied w/ 71.0% bonus) | anchor becomes drafter-known → async possible |
+| no resampling | 55.0% | resampling load-bearing; async must keep it |
+| resample every K=2–4 | 64.5% (~free vs decoupled 66.3%) | barrier-async preserves accuracy; **no redraft/rollback needed** |
+
+The async algorithm is fully de-risked. Remaining work is the **systems
+realization** (free-running drafter overlapping verify, with K-window resample
+barriers) — a substantial, ordering-sensitive build (run-ahead seq_lens accounting,
+barrier pipeline drain) deferred to its own focused effort rather than rushed
+unvalidated. The `SMCSD_RESAMPLE_INTERVAL` knob is the validated algorithmic core.
+
+### Chosen design: free-run between resample barriers (frontier-clone)
+
+With the no-bonus anchor the drafter's next anchor is its own token, so the drafter
+can **free-run** without the verifier. Design:
+
+- Drafter free-runs windows (bounded credit W), anchored on its own tokens, pushing
+  `(tokens, draft logprobs)` per window; never stalls except on credit.
+- Verifier scores windows behind it, accumulates per-particle weights.
+- Resampling happens at **K-window barriers** where the verifier has caught up to the
+  drafter's frontier — so the resample is applied at a *common* frontier and reduces
+  to the existing `batched_resample_kv` full-state clone (survivor → retired). **No
+  redraft, no rollback, no stale-window buffer remapping** — the barrier makes
+  verifier and drafter agree on the frontier.
+- The *only* approximation: resampling is delayed from its ESS-detection window to the
+  next barrier (stale by ≤K windows) — the relaxation already approved. Tier 2b
+  measures its accuracy cost directly.
+
+This is why Tier 2b matters: if "resample every K windows" holds accuracy, the async
+build is the (tractable) barrier design; if it needs per-window responsiveness, the
+build escalates to detection-point resampling with buffer remapping.
+
+## Tier 2 (original sketch) — continuous async drafter + common-window-snapshot resampler
 
 - Drafter free-runs windows (bounded credit W), streams (tokens, draft logprobs).
 - Verifier consumes, scores, accumulates per-particle weights, **checkpoints
