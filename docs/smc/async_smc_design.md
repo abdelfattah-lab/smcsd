@@ -59,6 +59,13 @@ exploration). At the optimum, 0.3 recovers 4.5 of the 6.5pt → 69.0%, statistic
 tied with the 71.0% bonus baseline at n=200 (σ≈3.2pt). **Tier 1 gate effectively met
 on an async-compatible anchor.**
 
+**Tier 1b (decoupled, anchor 0.3):** 65.5% and 67.0% on two runs (mean ~66.3%) —
+within ~1σ of colocated 69.0%; the drafter-known anchor flows across the process
+boundary with no seq_lens divergence. The decoupled path is functionally validated;
+the small gap vs colocated is sampling noise at n=200 (possibly compounded slightly
+by the float32 draft-logprob wire encoding — which is *more* precise, so not a
+deficit). Operating recipe: `--drop-bonus` + `SMCSD_ANCHOR_TEMP=0.3`.
+
 ## Tier 2 — continuous async drafter + common-window-snapshot resampler
 
 - Drafter free-runs windows (bounded credit W), streams (tokens, draft logprobs).
