@@ -124,21 +124,33 @@ class SMCCoordinator:
 
     # ── Public API ──────────────────────────────────────────
 
-    def collect_resample_jobs_batch(self, slot_state: "ScheduleBatchSMC"):
+    def collect_resample_jobs_batch(
+        self,
+        slot_state: "ScheduleBatchSMC",
+        row_mask: Optional[torch.Tensor] = None,
+    ):
         """Run the fused collect kernel over all in-use group rows.
 
         Returns a ``BatchedResampleResult``.  The ``step_counter`` increments
         on every call so ``tl.rand(step_counter, row)`` draws independent
         stratified uniforms across steps.
+
+        ``row_mask`` (bool, ``[max_groups]``) optionally restricts collection
+        to a subset of group rows — used by the pipelined decoupled scheduler
+        so a verify of one cohort can never resample a group whose draft round
+        is still in flight.
         """
         from smcsd.core.kernels.fused_collect import batched_collect_fused
 
         self._step_counter += 1
+        row_in_use = slot_state.row_in_use
+        if row_mask is not None:
+            row_in_use = row_in_use & row_mask
         return batched_collect_fused(
             slot_state.log_weights,
             slot_state.interval_weights,
             slot_state.group_to_slots,
-            slot_state.row_in_use,
+            row_in_use,
             self.resample_threshold,
             step_counter=self._step_counter,
         )

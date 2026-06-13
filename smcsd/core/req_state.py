@@ -363,17 +363,23 @@ class ScheduleBatchSMC:
     #  Decode Preparation (sparse → vectorized KV alloc → sparse)
     # ────────────────────────────────────────────────────────
 
-    def prepare_for_decode(self) -> SMCDraftInput:
+    def prepare_for_decode(
+        self, active: Optional[torch.Tensor] = None
+    ) -> SMCDraftInput:
         """Gather the live slot tensors, vectorised KV allocation, scatter
         back, and return a ready-to-use ``SMCDraftInput`` for the worker.
+
+        ``active`` optionally restricts the step to a subset of the active
+        slots (used by the pipelined decoupled scheduler to step one cohort
+        of groups at a time); defaults to all active slots.
         """
-        if self.num_active == 0:
+        if active is None:
+            active = self.active_slots
+        if active.numel() == 0:
             return SMCDraftInput(
                 verified_id=torch.empty(0, dtype=torch.int32, device=self.device),
                 num_tokens_per_req=self.gamma_plus_1,
             )
-
-        active = self.active_slots
 
         seq_lens_g = self.seq_lens[active]
         kv_alloc_g = self.kv_allocated_lens[active]
@@ -410,11 +416,21 @@ class ScheduleBatchSMC:
     def build_model_worker_batch(
         self,
         draft_input: SMCDraftInput,
+        active: Optional[torch.Tensor] = None,
+        active_list: Optional[List[int]] = None,
     ) -> ModelWorkerBatch:
         """Assemble a contiguous ``ModelWorkerBatch`` for the worker from
-        the live subset of slot-indexed tensors."""
-        active = self.active_slots
-        bs = self.num_active
+        the live subset of slot-indexed tensors.
+
+        ``active`` / ``active_list`` optionally restrict the batch to a slot
+        subset (pipelined cohort stepping); both default to the full active set
+        and must describe the same slots in the same order when given.
+        """
+        if active is None:
+            active = self.active_slots
+        if active_list is None:
+            active_list = self._active_slots_list
+        bs = len(active_list)
         ctx = draft_input.decode_ctx
 
         req_pool_indices = self.req_pool_indices[active]
@@ -422,7 +438,7 @@ class ScheduleBatchSMC:
         seq_lens_cpu = seq_lens.cpu()
         seq_lens_sum = int(seq_lens_cpu.sum().item())
 
-        reqs = [self.slot_to_req[s] for s in self._active_slots_list]
+        reqs = [self.slot_to_req[s] for s in active_list]
 
         # Minimal SamplingBatchInfo — SMC worker does its own sampling.
         sampling_info = SamplingBatchInfo(
@@ -485,8 +501,13 @@ class ScheduleBatchSMC:
         bonus_ids: torch.Tensor,
         *,
         rebuild_active: bool = True,
+        active: Optional[torch.Tensor] = None,
     ) -> List[int]:
         """Write forward-pass results back to slot-indexed tensors.
+
+        ``active`` optionally names the slot subset this result covers (must
+        match the slots the forward batch was built from); defaults to the
+        full active set.
 
         Order of operations:
 
@@ -502,8 +523,9 @@ class ScheduleBatchSMC:
 
         Returns the list of slot ids that just transitioned to finished.
         """
-        active = self.active_slots
-        bs = self.num_active
+        if active is None:
+            active = self.active_slots
+        bs = active.numel()
         stride = self.gamma_plus_1
 
         # a. Scatter accepted tokens into (bs, stride) columns starting at

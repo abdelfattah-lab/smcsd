@@ -56,6 +56,9 @@ class SMCEngine:
         engine.shutdown()
     """
 
+    # Subclasses (e.g. the decoupled engine) swap in their scheduler entry point.
+    scheduler_process_func = staticmethod(run_smc_scheduler_process)
+
     def __init__(
         self,
         model_path: str,
@@ -153,7 +156,7 @@ class SMCEngine:
 
         # -- 6. Launch scheduler subprocess(es) --
         self._scheduler_init_result = Engine._launch_scheduler_processes(
-            server_args, port_args, run_smc_scheduler_process
+            server_args, port_args, type(self).scheduler_process_func
         )
         self._scheduler_init_result.wait_for_ready()
         logger.info("SMCEngine: Scheduler is ready.")

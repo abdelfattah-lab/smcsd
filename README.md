@@ -105,6 +105,36 @@ SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via
 
 See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design overview.
 
+## Decoupled mode (experimental)
+
+`smcsd/decoupled/` runs the draft model in a **separate process on its own GPU**
+(target = verifier on GPU 0, draft = drafter on GPU 1), driven lockstep over a
+ZMQ wire protocol (draft-prefill / materialize / step / resample-commit / close).
+The verifier remains authoritative for weights, resampling, and termination; the
+drafter holds a mirrored slot KV state and returns per-position draft logprobs.
+Design notes: [docs/smc/decoupled_design.md](docs/smc/decoupled_design.md).
+
+```bash
+# GSM8K accuracy, draft engine on GPU 1
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_decoupled \
+  --particles 12 --gamma 8 --temperature 0.7 \
+  --attention-backend triton \
+  --num-questions 1000
+```
+
+Python API: `from smcsd.decoupled.engine import DecoupledSMCEngine` — a drop-in
+`SMCEngine` replacement with extra kwargs `draft_gpu_id` (default 1) and
+`draft_mem_fraction_static` (default 0.5).
+
+### Cross-group pipelining
+
+With ≥2 concurrent requests, `--mode smc_pipelined` / `PipelinedDecoupledSMCEngine`
+overlaps one cohort of groups' draft round (draft GPU) with another cohort's
+verify (target GPU). Each group is still strictly lockstep with itself — SMC's
+bonus-token anchor and resampling forbid run-ahead — but the two GPUs stay busy
+on different groups. Cohort count via `SMCSD_PIPELINE_COHORTS` (default 2).
+
 ## Citation
 
 ```bibtex
@@ -127,6 +157,6 @@ See [docs/smc/architecture.md](docs/smc/architecture.md) for the detailed design
 - [ ] vLLM support
 - [ ] Async/Delayed resampling (CPU/GPU overlap for KV cache rewrites)
 - [ ] Async SMC-SD at resample threshold 0 (overlap draft and target for SIS)
-- [ ] Disaggregation (draft/target separation)
+- [x] Disaggregation (draft/target separation) — lockstep prototype in `smcsd/decoupled/`
 
 PRs welcome!
