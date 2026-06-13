@@ -53,6 +53,14 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        from sglang.srt.utils import get_bool_env_var
+
+        if not get_bool_env_var("SMCSD_DROP_BONUS", "false"):
+            raise RuntimeError(
+                "AsyncDecoupledSMCScheduler requires no-bonus mode "
+                "(SMCSD_DROP_BONUS=1): the next-round anchor must be "
+                "drafter-known for the prefetch to be valid."
+            )
         self.barrier_k = max(int(os.environ.get(RESAMPLE_INTERVAL_ENV, "2")), 1)
         self.gamma = self.server_args.speculative_num_steps
         self._tag = itertools.count(1)

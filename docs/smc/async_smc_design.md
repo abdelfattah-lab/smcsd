@@ -92,11 +92,24 @@ before building anything:
 | no resampling | 55.0% | resampling load-bearing; async must keep it |
 | resample every K=2–4 | 64.5% (~free vs decoupled 66.3%) | barrier-async preserves accuracy; **no redraft/rollback needed** |
 
-The async algorithm is fully de-risked. Remaining work is the **systems
-realization** (free-running drafter overlapping verify, with K-window resample
-barriers) — a substantial, ordering-sensitive build (run-ahead seq_lens accounting,
-barrier pipeline drain) deferred to its own focused effort rather than rushed
-unvalidated. The `SMCSD_RESAMPLE_INTERVAL` knob is the validated algorithmic core.
+The async algorithm is fully de-risked. The `SMCSD_RESAMPLE_INTERVAL` knob is the
+validated algorithmic core.
+
+### Systems realization (built — `smcsd/decoupled/async_scheduler.py`)
+
+`AsyncDecoupledSMCEngine` / eval `--mode smc_async`. The overlap is a **prefetch**:
+the verifier sends the next window's StepReq the instant it receives the current
+response (the anchor is drafter-known, so no verifier round-trip is needed for it),
+then runs its local target verify while the drafter computes that next window. **The
+drafter is unchanged** — still a pure reactor. Resampling fires only at K-window
+barriers where the pipeline is drained, reducing to the existing
+`batched_resample_kv` clone (no redraft/rollback). Finished particles ride along to
+the barrier with weight increments masked.
+
+Each event-loop iteration runs one K-window prefetch train, drained at the barrier
+so prefill admission stays clean. Smoke (GSM8K 20q, anchor 0.3, K=2): **65.0%**, no
+seq_lens divergence — prefetch / barrier / ride-along all correct end-to-end.
+Requires no-bonus (`SMCSD_DROP_BONUS=1`).
 
 ### Chosen design: free-run between resample barriers (frontier-clone)
 
