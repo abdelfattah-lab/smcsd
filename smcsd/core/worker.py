@@ -53,6 +53,21 @@ class SMCWorker(BaseSpecWorker):
         self.smc_target_temperature = max(
             float(server_args.smc_target_temperature), 1e-5
         )
+        # No-bonus (drop-anchor) mode: instead of sampling the next-round anchor
+        # from the target (the "bonus"), commit the draft's own (gamma+1)-th
+        # token as the anchor and reweight it.  Distribution-exact IS, and the
+        # prerequisite for async drafting (the anchor becomes drafter-known).
+        import os
+
+        from sglang.srt.utils import get_bool_env_var
+
+        self.drop_bonus = get_bool_env_var("SMCSD_DROP_BONUS", "false")
+        # Optional lower temperature for the no-bonus anchor token (recovers
+        # accuracy by cutting per-window drift). None = same as draft temp.
+        _anchor_t = os.environ.get("SMCSD_ANCHOR_TEMP")
+        self.anchor_temperature = (
+            max(float(_anchor_t), 0.05) if _anchor_t is not None else None
+        )
 
         # Share req_to_token_pool, separate KV caches
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -230,16 +245,29 @@ class SMCWorker(BaseSpecWorker):
 
             logits = draft_out.logits_output.next_token_logits
 
-            scaled_logits = logits / self.smc_draft_temperature
+            # In no-bonus mode the (gamma+1)-th token is the committed anchor; an
+            # optional lower anchor temperature samples it closer to the mode to
+            # cut per-window drift while staying drafter-known (async-compatible)
+            # and unbiased (full support — its draft logprob is taken under the
+            # same lowered-temp distribution used to sample it).
+            step_temp = self.smc_draft_temperature
+            if self.drop_bonus and step == gamma and self.anchor_temperature is not None:
+                step_temp = self.anchor_temperature
+
+            scaled_logits = logits / step_temp
             log_probs = torch.log_softmax(scaled_logits, dim=-1)
-            if self.smc_draft_temperature > 0:
+            if step_temp > 0:
                 next_token = torch.multinomial(
                     log_probs.exp(), num_samples=1
                 ).squeeze(-1)
             else:
                 next_token = torch.argmax(logits, dim=-1)
 
-            if step < gamma:
+            # No-bonus mode weights the (gamma+1)-th draft token too (it becomes
+            # the committed anchor); bonus mode leaves it as the target-sampled
+            # bonus and weights only the first gamma positions.
+            n_weighted = gamma + 1 if self.drop_bonus else gamma
+            if step < n_weighted:
                 token_logprob = log_probs.gather(
                     1, next_token.unsqueeze(1)
                 ).squeeze(1)
@@ -249,6 +277,7 @@ class SMCWorker(BaseSpecWorker):
             current_ids = next_token
 
         draft_logprobs_stacked = torch.stack(draft_logprobs, dim=1)
+        n_weighted = gamma + 1 if self.drop_bonus else gamma
 
         # ---- 3. Score verify ----
         verify_forward_batch, can_run_cuda_graph = ctx.prepare_for_verify(
@@ -276,30 +305,37 @@ class SMCWorker(BaseSpecWorker):
         )
         score_log_probs = torch.log_softmax(score_logits, dim=-1)
         score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
-        target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
-        score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
+        # Score rows 0..n_weighted-1 predict the committed tokens x1..x_{n_weighted}.
+        target_tokens = torch.stack(all_tokens[1 : n_weighted + 1], dim=1)
+        score_logprobs_stacked = score_log_probs[:, :n_weighted, :].gather(
             2, target_tokens.unsqueeze(2)
         ).squeeze(2)
 
         # ---- 5. Logprob diff ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
 
-        # ---- 6. Bonus token ----
-        bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
-        bonus_log_probs = torch.log_softmax(
-            bonus_logits / self.smc_target_temperature, dim=-1
-        )
-        bonus = torch.multinomial(bonus_log_probs.exp(), num_samples=1).squeeze(-1)
+        # ---- 6. Anchor for next round ----
+        if self.drop_bonus:
+            # Commit the draft's own (gamma+1)-th token; already weighted above.
+            next_verified_id = all_tokens[gamma + 1]
+        else:
+            # Sample the bonus from the target's last verify row (exact, unweighted).
+            bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
+            bonus_log_probs = torch.log_softmax(
+                bonus_logits / self.smc_target_temperature, dim=-1
+            )
+            next_verified_id = torch.multinomial(
+                bonus_log_probs.exp(), num_samples=1
+            ).squeeze(-1)
 
         # ---- 7. Output ----
         output_token_ids = torch.stack(
-            all_tokens[1 : gamma + 1] + [bonus], dim=1
+            all_tokens[1 : gamma + 1] + [next_verified_id], dim=1
         )
         next_token_ids = output_token_ids.reshape(-1)
         accept_lens = torch.full(
             (bs,), gamma + 1, dtype=torch.int32, device=self.device
         )
-        next_verified_id = bonus
 
         next_token_ids.record_stream(current_stream)
         accept_lens.record_stream(current_stream)

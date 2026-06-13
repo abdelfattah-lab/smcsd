@@ -16,6 +16,7 @@ asserted against the mirror every round to fail fast on divergence.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 from typing import Dict, List, Optional
 
@@ -74,6 +75,17 @@ class SMCDraftServer:
         self.server_args = server_args
         self.gamma = gamma
         self.draft_temperature = max(float(draft_temperature), 1e-5)
+        # No-bonus mode: also produce (and weight) the (gamma+1)-th draft token
+        # as the next-round anchor, optionally at a lower temperature to cut
+        # per-window drift.  Mirrors smcsd/core/worker.py (env inherited from
+        # the engine process that spawns this drafter).
+        from sglang.srt.utils import get_bool_env_var
+
+        self.drop_bonus = get_bool_env_var("SMCSD_DROP_BONUS", "false")
+        _anchor_t = os.environ.get("SMCSD_ANCHOR_TEMP")
+        self.anchor_temperature = (
+            max(float(_anchor_t), 0.05) if _anchor_t is not None else None
+        )
 
         # -- Draft model worker (own pools; SMCModelRunner installs the
         #    refcounted allocator since is_draft_worker=False here) --
@@ -307,6 +319,10 @@ class SMCDraftServer:
         # Simple per-step AR path (same as SMCWorker._forward_decode's
         # non-multistep branch): update seq metadata in place, full forward
         # with per-step attention metadata init.
+        # No-bonus mode returns gamma+1 tokens (the last is the next-round anchor,
+        # sampled at anchor_temperature); bonus mode returns gamma (the verifier
+        # samples the anchor from the target).
+        n_emit = gamma + 1 if self.drop_bonus else gamma
         current_ids = verified
         tokens: List[torch.Tensor] = []
         logprobs: List[torch.Tensor] = []
@@ -320,11 +336,14 @@ class SMCDraftServer:
             draft_out = self.model_runner.forward(draft_fb)
 
             logits = draft_out.logits_output.next_token_logits
-            scaled_logits = logits / self.draft_temperature
+            step_temp = self.draft_temperature
+            if self.drop_bonus and step == gamma and self.anchor_temperature is not None:
+                step_temp = self.anchor_temperature
+            scaled_logits = logits / step_temp
             log_probs = torch.log_softmax(scaled_logits, dim=-1)
             next_token = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
 
-            if step < gamma:
+            if step < n_emit:
                 token_logprob = log_probs.gather(
                     1, next_token.unsqueeze(1)
                 ).squeeze(1)

@@ -171,6 +171,12 @@ class DecoupledSMCWorker(BaseSpecWorker):
         self.smc_target_temperature = max(
             float(server_args.smc_target_temperature), 1e-5
         )
+        # No-bonus mode: the anchor is the drafter's own (gamma+1)-th token
+        # (returned over the wire), weighted; no target bonus sampling.  Mirrors
+        # SMCWorker.  The drafter applies the matching anchor temperature.
+        from sglang.srt.utils import get_bool_env_var
+
+        self.drop_bonus = get_bool_env_var("SMCSD_DROP_BONUS", "false")
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -350,29 +356,40 @@ class DecoupledSMCWorker(BaseSpecWorker):
             f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
             f"cuda_graph={can_run_cuda_graph})"
         )
+        # `tokens` has n_weighted columns: gamma (bonus) or gamma+1 (no-bonus,
+        # the last being the committed anchor x_{gamma+1}).  Score rows 0..n-1
+        # predict x1..x_n.
+        n_weighted = gamma + 1 if self.drop_bonus else gamma
         score_log_probs = torch.log_softmax(score_logits, dim=-1)
         score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
-        score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
+        score_logprobs_stacked = score_log_probs[:, :n_weighted, :].gather(
             2, tokens.unsqueeze(2)
         ).squeeze(2)
 
         # ---- 5. Logprob diff (SMC importance weight increment) ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
 
-        # ---- 6. Bonus token ----
-        bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
-        bonus_log_probs = torch.log_softmax(
-            bonus_logits / self.smc_target_temperature, dim=-1
-        )
-        bonus = torch.multinomial(bonus_log_probs.exp(), num_samples=1).squeeze(-1)
+        # ---- 6./7. Anchor + output ----
+        if self.drop_bonus:
+            # Anchor = the drafter's own (gamma+1)-th token; output = x1..x_{gamma+1}.
+            next_verified_id = tokens[:, gamma]
+            output_token_ids = tokens
+        else:
+            bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
+            bonus_log_probs = torch.log_softmax(
+                bonus_logits / self.smc_target_temperature, dim=-1
+            )
+            next_verified_id = torch.multinomial(
+                bonus_log_probs.exp(), num_samples=1
+            ).squeeze(-1)
+            output_token_ids = torch.cat(
+                [tokens, next_verified_id.unsqueeze(1)], dim=1
+            )
 
-        # ---- 7. Output ----
-        output_token_ids = torch.cat([tokens, bonus.unsqueeze(1)], dim=1)
         next_token_ids = output_token_ids.reshape(-1)
         accept_lens = torch.full(
             (bs,), gamma + 1, dtype=torch.int32, device=device
         )
-        next_verified_id = bonus
 
         next_draft_input = SMCDraftInput(
             verified_id=next_verified_id,

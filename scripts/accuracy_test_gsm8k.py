@@ -240,6 +240,14 @@ def main(args):
     if args.seed is not None:
         np.random.seed(args.seed)
 
+    if args.drop_bonus:
+        # No-bonus (drop-anchor) SMC: anchor on the draft's own (gamma+1)-th
+        # token + reweight, instead of the target-sampled bonus.  Read by the
+        # SMC worker in the scheduler subprocess (env inherited via spawn).
+        import os
+        os.environ["SMCSD_DROP_BONUS"] = "1"
+        print("  drop_bonus=True (no-bonus / drop-anchor mode)")
+
     # Load tokenizer and data (shared across all modes)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     prompts, labels = load_gsm8k(tokenizer, args.num_questions)
@@ -314,6 +322,11 @@ if __name__ == "__main__":
     smc_grp.add_argument(
         "--resample-threshold", type=float, default=None,
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
+    )
+    smc_grp.add_argument(
+        "--drop-bonus", action="store_true",
+        help="No-bonus mode: anchor on the draft's own token + reweight instead "
+             "of the target-sampled bonus (async-SMC foundation).",
     )
     # Benchmark
     bench = parser.add_argument_group("benchmark")
