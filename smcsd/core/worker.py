@@ -222,6 +222,11 @@ class SMCWorker(BaseSpecWorker):
             draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu
             self.draft_attn_backend.init_forward_metadata(draft_fb)
 
+        # No-bonus mode weights the (gamma+1)-th draft token too (it becomes
+        # the committed anchor); bonus mode leaves it as the target-sampled
+        # bonus and weights only the first gamma positions.
+        n_weighted = gamma + 1 if self.drop_bonus else gamma
+
         x0 = draft_input.verified_id
         all_tokens = [x0]
         draft_logprobs = []
@@ -263,10 +268,6 @@ class SMCWorker(BaseSpecWorker):
             else:
                 next_token = torch.argmax(logits, dim=-1)
 
-            # No-bonus mode weights the (gamma+1)-th draft token too (it becomes
-            # the committed anchor); bonus mode leaves it as the target-sampled
-            # bonus and weights only the first gamma positions.
-            n_weighted = gamma + 1 if self.drop_bonus else gamma
             if step < n_weighted:
                 token_logprob = log_probs.gather(
                     1, next_token.unsqueeze(1)
@@ -277,7 +278,6 @@ class SMCWorker(BaseSpecWorker):
             current_ids = next_token
 
         draft_logprobs_stacked = torch.stack(draft_logprobs, dim=1)
-        n_weighted = gamma + 1 if self.drop_bonus else gamma
 
         # ---- 3. Score verify ----
         verify_forward_batch, can_run_cuda_graph = ctx.prepare_for_verify(

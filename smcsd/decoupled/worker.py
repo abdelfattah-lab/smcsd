@@ -148,7 +148,6 @@ class PendingDecodeStep:
 
     batch: ModelWorkerBatch
     ctx: object  # SMCDecodeContext
-    cache_locs: Optional[torch.Tensor]  # computed in finish_decode
     tag: int
 
 
@@ -303,7 +302,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
             ctx.orig_seq_lens_cpu.tolist(),
             tag=tag,
         )
-        return PendingDecodeStep(batch=batch, ctx=ctx, cache_locs=None, tag=tag)
+        return PendingDecodeStep(batch=batch, ctx=ctx, tag=tag)
 
     def _forward_decode(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_idle():
@@ -348,7 +347,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
         x0 = draft_input.verified_id.to(torch.int64)
         all_tokens = [x0] + [tokens[:, j] for j in range(gamma)]
 
-        # ---- 3. Score verify (identical to colocated SMCWorker) ----
+        # ---- 1. Score verify (identical to colocated SMCWorker) ----
         verify_forward_batch, can_run_cuda_graph = ctx.prepare_for_verify(
             self.req_to_token_pool,
             batch,
@@ -363,7 +362,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
             skip_attn_backend_init=True,
         )
 
-        # ---- 4. Extract score logprobs ----
+        # ---- 2. Extract score logprobs ----
         score_logits = score_result.logits_output.next_token_logits
         expected_rows = bs * (gamma + 1)
         assert score_logits.shape[0] == expected_rows, (
@@ -381,10 +380,10 @@ class DecoupledSMCWorker(BaseSpecWorker):
             2, tokens.unsqueeze(2)
         ).squeeze(2)
 
-        # ---- 5. Logprob diff (SMC importance weight increment) ----
+        # ---- 3. Logprob diff (SMC importance weight increment) ----
         logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
 
-        # ---- 6./7. Anchor + output ----
+        # ---- 4. Anchor + output ----
         if self.drop_bonus:
             # Anchor = the drafter's own (gamma+1)-th token; output = x1..x_{gamma+1}.
             next_verified_id = tokens[:, gamma]

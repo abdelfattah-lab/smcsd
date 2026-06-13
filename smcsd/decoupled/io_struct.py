@@ -9,7 +9,7 @@ Lifecycle per group (FIFO order on one channel = total order both sides see):
     DraftPrefillReq ──▶ DraftPrefillResp          (blocking, prompt prefill + x0)
     DraftMaterializeGroup                          (parent → N particle fan-out)
     repeat per round:
-        DraftStepReq ──▶ DraftStepResp             (blocking, gamma AR tokens+logprobs)
+        DraftStepReq ──▶ DraftStepResp             (blocking, AR tokens+logprobs)
         DraftCommitResample                        (only when resampling fired)
     DraftCloseGroup                                (finalize/abort; idempotent)
 
@@ -73,15 +73,17 @@ class DraftStepReq:
     """
 
     slots: List[int]
-    verified_ids: List[int]  # x0 per slot (last round's bonus token)
+    verified_ids: List[int]  # x0 per slot (last round's anchor token)
     seq_lens: List[int]
     tag: int = 0
 
 
 @dataclass
 class DraftStepResp:
-    tokens: np.ndarray  # (bs, gamma) int64 — x1..x_gamma per slot
-    logprobs: np.ndarray  # (bs, gamma) float32 — draft logprob of each token
+    # n_emit columns per slot: gamma (bonus mode, x1..x_gamma) or gamma+1
+    # (no-bonus mode, x1..x_{gamma+1} — the last is the next-round anchor).
+    tokens: np.ndarray  # (bs, n_emit) int64 — drafted tokens per slot
+    logprobs: np.ndarray  # (bs, n_emit) float32 — draft logprob of each token
     tag: int = 0
 
 

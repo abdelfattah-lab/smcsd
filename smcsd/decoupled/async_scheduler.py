@@ -167,7 +167,6 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 pending = PendingDecodeStep(
                     batch=next_batch,
                     ctx=next_batch.spec_info.decode_ctx,
-                    cache_locs=None,
                     tag=next_tag,
                 )
 
