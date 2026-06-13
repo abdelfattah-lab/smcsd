@@ -113,12 +113,17 @@ so prefill admission stays clean. Requires no-bonus (`SMCSD_DROP_BONUS=1`).
 
 | mode | accuracy | tok/s |
 |---|---|---|
-| decoupled lockstep no-bonus | 66.3% | ~78 |
+| decoupled lockstep no-bonus | 68.5% | 79.8 |
 | **async (K=2 barrier, prefetch)** | **66.0%** | **97.1** |
 
-Same accuracy (within noise), **+24% throughput at batch 1** — the within-group
-draft/verify overlap the cohort pipeline cannot provide with a single group. No
-seq_lens divergence; prefetch / barrier / ride-along all correct end-to-end.
+**+21.7% throughput at batch 1**, accuracy within noise (2.5pt ≈ 0.75σ at n=200,
+plus the K=2 barrier delay measured as ~free) — the within-group draft/verify
+overlap the cohort pipeline cannot provide with a single group. No seq_lens
+divergence; prefetch / barrier / ride-along all correct end-to-end.
+
+Next levers (de-risked, not yet built): CUDA graphs on the drafter (shortens the
+bottleneck stage directly), deeper prefetch (W>1), and composing async with cohort
+pipelining for batch>1.
 
 ### Chosen design: free-run between resample barriers (frontier-clone)
 
