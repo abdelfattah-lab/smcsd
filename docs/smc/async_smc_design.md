@@ -6,6 +6,40 @@ the current lockstep where each round blocks on the target. Approved relaxations
 
 **Gate:** GSM8K 200 questions runnable at ~70% (N=12, γ=8, temp 0.7, triton).
 
+## Accuracy ablation (GSM8K 200q, N=12, γ=8, temp 0.7, triton, batch 1)
+
+Each row changes ONE factor from the one above it — the controlled decomposition of
+where accuracy comes from and what each async relaxation costs:
+
+| # | configuration | accuracy | Δ | what it isolates |
+|---|---|---:|---:|---|
+| 0 | bonus baseline (colocated) | 71.0% | — | reference: exact target-sampled anchor each window |
+| 1 | drop bonus, anchor @ draft temp 0.7 | 64.5% | −6.5 | cost of dropping the exact-target anchor (population drift) |
+| 2 | + anchor temp 0.3 | 69.0% | +4.5 | mode-seeking anchor cuts drift (interior optimum; 0.15→62.5, 0.4→68.5) |
+| — | (no resampling at all) | 55.0% | −14 vs #2 | resampling is load-bearing |
+| 3 | + barrier-delay resampling K=2 (colocated proxy) | 64.5% | −4.5 | cost of delaying resampling to K-window barriers (saturates: K=4 also 64.5%) |
+| 4 | **async runtime, K=2** (real 2-process) | **66.0%** | — | systems realization; ≈ #3 + decoupled noise |
+| 5 | async runtime, K=1 (no overlap) | 70.0% | — | per-window resample, drained every window ≈ lockstep |
+| 6 | async runtime, K=4 (more overlap) | 64.5% | — | accuracy/throughput knob |
+
+**Async K-sweep (accuracy vs throughput, 200q):**
+
+| async K | accuracy | tok/s | note |
+|---:|---:|---:|---|
+| 1 | 70.0% | 76.9 | no overlap (≈ lockstep 68.5% / 79.8) — confirms the async path doesn't regress |
+| **2** | **66.0%** | **97.1** | **+26% tok/s vs K=1; sweet spot** |
+| 4 | 64.5% | 96.8 | tok/s flat vs K=2, accuracy −1.5pt |
+
+The throughput **saturates at K=2** (≈97 tok/s): K=4 adds more overlap windows but no
+more speed — the drafter is the bottleneck, so once verify is fully hidden behind
+draft at K=2, more overlap can't help; it only adds resampling delay. So K=2 is
+optimal: full overlap throughput at the best accuracy among overlapping configs.
+
+Takeaways: the two async relaxations (drop-anchor, barrier-delay resampling) each cost
+a few points but are individually recoverable/bounded; the anchor temperature is the
+single most important knob (±6pt across 0.15→0.7). Async K is the throughput/accuracy
+dial — but throughput saturates at K=2 (drafter-bound), so K=2 dominates K≥4.
+
 ## The organizing principle
 
 Async drafting with a reweighted own-token anchor is **distribution-exact** — it's
@@ -120,6 +154,12 @@ so prefill admission stays clean. Requires no-bonus (`SMCSD_DROP_BONUS=1`).
 plus the K=2 barrier delay measured as ~free) — the within-group draft/verify
 overlap the cohort pipeline cannot provide with a single group. No seq_lens
 divergence; prefetch / barrier / ride-along all correct end-to-end.
+
+**At scale (GSM8K 1000q, anchor 0.3, K=2):** 68.1% accuracy (8 invalid) — holds at
+scale, a touch above the 200q. A strict adversarial code review verified all seven
+async invariants (prefetch seq_lens parity, writeback ordering, finished-before
+weight mask, ride-along output/KV safety, no-bonus weighting parity vs colocated,
+tag/FIFO, prefill/close ordering) with no critical/high bugs.
 
 Next levers (de-risked, not yet built): CUDA graphs on the drafter (shortens the
 bottleneck stage directly), deeper prefetch (W>1), and composing async with cohort

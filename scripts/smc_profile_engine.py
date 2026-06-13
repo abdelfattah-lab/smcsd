@@ -46,9 +46,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--engine-kind",
-        choices=["engine", "smc_engine"],
+        choices=["engine", "smc_engine", "smc_decoupled", "smc_async"],
         default="engine",
-        help="Choose regular Engine() or dedicated SMCEngine().",
+        help="regular Engine() / SMCEngine() / decoupled (2-GPU lockstep) / async "
+             "(2-GPU prefetch+barrier).",
+    )
+    parser.add_argument(
+        "--drop-bonus", action="store_true",
+        help="No-bonus mode (required for smc_async).",
+    )
+    parser.add_argument(
+        "--anchor-temp", type=float, default=None,
+        help="SMCSD_ANCHOR_TEMP for no-bonus anchor (e.g. 0.3).",
+    )
+    parser.add_argument(
+        "--resample-interval", type=int, default=None,
+        help="SMCSD_RESAMPLE_INTERVAL = async barrier K.",
+    )
+    parser.add_argument(
+        "--attention-backend", default="triton",
+        help="Attention backend (triton on A6000; fa3 on Hopper).",
     )
     parser.add_argument("--model-path", default=default_model_path())
     parser.add_argument("--draft-model-path", default=default_draft_model_path())
@@ -165,24 +182,41 @@ def build_engine(args: argparse.Namespace):
             max_running_requests=128,
         )
 
-    from smcsd.engine import SMCEngine
+    # No-bonus / anchor-temp / barrier-K flow to the scheduler + drafter
+    # subprocesses via env (inherited on spawn).
+    if args.drop_bonus or args.engine_kind == "smc_async":
+        os.environ["SMCSD_DROP_BONUS"] = "1"
+    if args.anchor_temp is not None:
+        os.environ["SMCSD_ANCHOR_TEMP"] = str(args.anchor_temp)
+    if args.resample_interval is not None:
+        os.environ["SMCSD_RESAMPLE_INTERVAL"] = str(args.resample_interval)
 
-    return SMCEngine(
+    common = dict(
         model_path=args.model_path,
         draft_model_path=args.draft_model_path,
         n_particles=args.smc_n_particles,
         gamma=args.smc_gamma,
         page_size=1,
-        mem_fraction_static=0.4,
+        mem_fraction_static=0.6,
         trust_remote_code=True,
         log_level="info",
         random_seed=1,
-        cuda_graph_max_bs=128,
-        attention_backend="fa3",
+        attention_backend=args.attention_backend,
         draft_temperature=0.8,
         target_temperature=0.8,
         max_running_requests=128,
     )
+
+    if args.engine_kind == "smc_decoupled":
+        from smcsd.decoupled.engine import DecoupledSMCEngine
+        return DecoupledSMCEngine(**common)
+    if args.engine_kind == "smc_async":
+        from smcsd.decoupled.engine import AsyncDecoupledSMCEngine
+        return AsyncDecoupledSMCEngine(**common)
+
+    from smcsd.engine import SMCEngine
+
+    return SMCEngine(cuda_graph_max_bs=128, **common)
 
 
 def main() -> None:
