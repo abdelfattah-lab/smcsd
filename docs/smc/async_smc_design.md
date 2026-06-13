@@ -107,9 +107,18 @@ barriers where the pipeline is drained, reducing to the existing
 the barrier with weight increments masked.
 
 Each event-loop iteration runs one K-window prefetch train, drained at the barrier
-so prefill admission stays clean. Smoke (GSM8K 20q, anchor 0.3, K=2): **65.0%**, no
-seq_lens divergence — prefetch / barrier / ride-along all correct end-to-end.
-Requires no-bonus (`SMCSD_DROP_BONUS=1`).
+so prefill admission stays clean. Requires no-bonus (`SMCSD_DROP_BONUS=1`).
+
+**Measured (GSM8K 200q, no-bonus anchor 0.3, N=12 γ=8 temp 0.7 triton, batch 1, 2×A6000):**
+
+| mode | accuracy | tok/s |
+|---|---|---|
+| decoupled lockstep no-bonus | 66.3% | ~78 |
+| **async (K=2 barrier, prefetch)** | **66.0%** | **97.1** |
+
+Same accuracy (within noise), **+24% throughput at batch 1** — the within-group
+draft/verify overlap the cohort pipeline cannot provide with a single group. No
+seq_lens divergence; prefetch / barrier / ride-along all correct end-to-end.
 
 ### Chosen design: free-run between resample barriers (frontier-clone)
 
