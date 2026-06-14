@@ -89,7 +89,14 @@ class SMCDraftServer:
 
         # -- Draft model worker (own pools; SMCModelRunner installs the
         #    refcounted allocator since is_draft_worker=False here) --
+        # Mirror the colocated SMCWorker draft path: suppress auto-capture
+        # during worker init, build the multi-step decode attention backend,
+        # then restore + manually capture device graphs.  CUDA graphs on the
+        # drafter (the bottleneck) replay a captured standard-decode graph per
+        # AR step; the multi-step backend is the fallback for uncaptured shapes.
         port_args = PortArgs.init_new(server_args)
+        backup_disable_cuda_graph = server_args.disable_cuda_graph
+        server_args.disable_cuda_graph = True
         self.tp_worker = SMCTpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -103,6 +110,24 @@ class SMCDraftServer:
         )
         self.model_runner = self.tp_worker.model_runner
         self.model_config = self.tp_worker.model_config
+
+        self.draft_attn_backend = None
+        try:
+            from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
+            factory = DraftBackendFactory(
+                server_args, self.model_runner, topk=1,
+                speculative_num_steps=self.gamma + 2,
+            )
+            self.draft_attn_backend = factory.create_decode_backend()
+        except Exception as exc:  # fallback to plain forward for uncaptured shapes
+            logger.warning("SMCDraftServer: multistep draft backend unavailable: %s", exc)
+
+        server_args.disable_cuda_graph = backup_disable_cuda_graph
+        self.model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        if not backup_disable_cuda_graph:
+            self.model_runner.init_device_graphs()
+        self.draft_cuda_graph = not backup_disable_cuda_graph
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
@@ -306,19 +331,28 @@ class SMCDraftServer:
         )
         batch = self._build_decode_batch(active, draft_input, ctx)
 
-        draft_fb, _can_cuda_graph, cache_locs, all_positions, all_seq_lens = (
+        graph_runner = getattr(self.model_runner, "graph_runner", None)
+        draft_fb, can_cuda_graph, cache_locs, all_positions, all_seq_lens = (
             ctx.prepare_for_draft(
                 verified,
                 self.req_to_token_pool,
                 batch,
-                None,  # no CUDA graph on the drafter prototype
+                graph_runner,
                 self.model_runner,
             )
         )
 
-        # Simple per-step AR path (same as SMCWorker._forward_decode's
-        # non-multistep branch): update seq metadata in place, full forward
-        # with per-step attention metadata init.
+        # Draft AR (mirrors SMCWorker._forward_decode): replay the captured
+        # standard-decode CUDA graph per step when the batch shape matches (the
+        # fast path on the bottleneck drafter), else the multi-step attention
+        # backend, else a plain per-step forward.
+        use_multistep = self.draft_attn_backend is not None and not can_cuda_graph
+        if use_multistep and not draft_fb.forward_mode.is_idle():
+            draft_fb.spec_info = draft_input
+            draft_fb.seq_lens = ctx.orig_seq_lens
+            draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu
+            self.draft_attn_backend.init_forward_metadata(draft_fb)
+
         # No-bonus mode returns gamma+1 tokens (the last is the next-round anchor,
         # sampled at anchor_temperature); bonus mode returns gamma (the verifier
         # samples the anchor from the target).
@@ -330,10 +364,17 @@ class SMCDraftServer:
             draft_fb.input_ids = current_ids
             draft_fb.positions = all_positions[:, step].contiguous()
             draft_fb.out_cache_loc = cache_locs[:, step].contiguous()
-            draft_fb.seq_lens = all_seq_lens[:, step].contiguous()
-            draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
-            draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
-            draft_out = self.model_runner.forward(draft_fb)
+
+            if use_multistep:
+                draft_fb.attn_backend = self.draft_attn_backend.attn_backends[step]
+                draft_out = self.model_runner.forward(
+                    draft_fb, skip_attn_backend_init=True
+                )
+            else:
+                draft_fb.seq_lens = all_seq_lens[:, step].contiguous()
+                draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
+                draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
+                draft_out = self.model_runner.forward(draft_fb)
 
             logits = draft_out.logits_output.next_token_logits
             step_temp = self.draft_temperature

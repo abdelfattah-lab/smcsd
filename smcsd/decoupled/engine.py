@@ -51,17 +51,27 @@ class DecoupledSMCEngine(SMCEngine):
         # Drafter placement / sizing
         draft_gpu_id: int = 1,
         draft_mem_fraction_static: float = 0.5,
+        draft_cuda_graph: bool = True,
         **kwargs,
     ):
         # -- 1. Drafter ServerArgs (a plain model server for the draft model;
         #       the SMC refcounted allocator is installed by SMCTpModelWorker) --
+        # Env override for quick A/B (cuda-graph vs multistep-only vs plain):
+        #   SMCSD_DRAFT_CUDA_GRAPH=0/1
+        _dcg = os.environ.get("SMCSD_DRAFT_CUDA_GRAPH")
+        if _dcg is not None:
+            draft_cuda_graph = _dcg not in ("0", "false", "False")
         user_max = kwargs.get("max_running_requests")
         draft_args_kwargs = dict(
             model_path=draft_model_path,
             skip_tokenizer_init=True,
             disable_radix_cache=True,
             page_size=1,
-            disable_cuda_graph=True,
+            # CUDA graphs on the drafter (the bottleneck stage): the AR loop
+            # replays a captured standard-decode graph per step (mirrors the
+            # colocated SMCWorker draft path).  The drafter has no speculative
+            # algorithm, so it captures plain decode graphs.
+            disable_cuda_graph=not draft_cuda_graph,
             # Upstream force-disables piecewise CUDA graph whenever a
             # speculative algorithm is set (colocated SMC therefore never
             # drafts through it).  This drafter has no spec algorithm in its
