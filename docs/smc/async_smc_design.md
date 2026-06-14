@@ -222,6 +222,33 @@ Per decode window, batch 1, N=12, γ=8 (very stable across samples):
 So the next concrete win is **eliminating the barrier stall** (~+30%), then attacking
 the draft AR. Deeper prefetch (W>1) and async × cohort pipelining (batch>1) remain.
 
+**Validation — cuda-graph K-sweep (200q) confirms the barrier diagnosis:**
+
+| K (cuda-graph async) | accuracy | tok/s |
+|---:|---:|---:|
+| 2 | 66.0% | 133.1 |
+| 4 | 61.0% | 148.6 |
+| 8 | 63.5% | 147.3 |
+
+Larger K (fewer barriers) raises throughput now (133 → 148.6, **+12%, saturating at
+K≥4**) — the opposite of the pre-cuda-graph sweep (K=2≈K=4, drafter-bound). This
+confirms barriers are now the bottleneck, but the gain **saturates at +12%** (beyond
+fewer barriers, the residual draft>verify floor takes over), and it costs ~2–5pt
+accuracy (more resampling delay). *(My initial ~+30% estimate was inflated by the
+`SMCSD_TIMING` drafter sync, which slows the drafter and inflates the measured recv;
+the non-instrumented K-sweep shows the true ceiling is ~+12%.)*
+
+So the two real levers:
+- **Speculative prefetch across the barrier** — targets the same ~+12% but keeps
+  K=2's 66% accuracy (overlap the barrier instead of reducing barrier count). Protocol
+  change with resample-ordering subtleties (the resample fires at the barrier frontier
+  while a speculative draft has advanced past it → stale-result handling) — a focused
+  follow-up.
+- **Faster drafter** (the bigger lever): draft 42 ms > verify 30 ms, so even perfect
+  barrier overlap floors throughput at the draft rate. The 9 sequential AR steps are
+  the real ceiling — tree drafting (parallel candidates), a smaller draft model, or
+  smaller γ would lift it more than the barrier fix.
+
 ### Profiling (torch trace of the verifier scheduler; `scripts/smc_profile_engine.py --engine-kind smc_async|smc_decoupled`)
 
 Verifier-GPU busy fraction (union of kernel intervals on the main compute stream ÷
