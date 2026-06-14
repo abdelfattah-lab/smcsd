@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import time
 from typing import Dict, List, Optional
 
 import psutil
@@ -86,6 +87,11 @@ class SMCDraftServer:
         self.anchor_temperature = (
             max(float(_anchor_t), 0.05) if _anchor_t is not None else None
         )
+        # Optional draft-time decomposition (SMCSD_TIMING=1): the AR loop wall
+        # time per window (the final .cpu() syncs, so this captures GPU time).
+        self._timing = get_bool_env_var("SMCSD_TIMING", "false")
+        self._t_draft = {"alloc": 0.0, "ar": 0.0, "out": 0.0}
+        self._t_draft_n = 0
 
         # -- Draft model worker (own pools; SMCModelRunner installs the
         #    refcounted allocator since is_draft_worker=False here) --
@@ -312,6 +318,8 @@ class SMCDraftServer:
                 f"mirror={seq_cpu} verifier={list(msg.seq_lens)} slots={msg.slots}"
             )
 
+        tm = self._timing
+        t0 = time.perf_counter() if tm else 0.0
         ctx, new_kv_alloc = SMCDecodeContext.from_slot_gather(
             seq_lens=seq_g,
             kv_allocated_lens=self.kv_allocated_lens[active],
@@ -322,6 +330,8 @@ class SMCDraftServer:
         )
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
+        if tm:
+            self._t_draft["alloc"] += time.perf_counter() - t0
 
         verified = torch.tensor(
             msg.verified_ids, dtype=torch.int32, device=self.device
@@ -360,6 +370,7 @@ class SMCDraftServer:
         current_ids = verified
         tokens: List[torch.Tensor] = []
         logprobs: List[torch.Tensor] = []
+        t0 = time.perf_counter() if tm else 0.0
         for step in range(gamma + 1):
             draft_fb.input_ids = current_ids
             draft_fb.positions = all_positions[:, step].contiguous()
@@ -392,10 +403,28 @@ class SMCDraftServer:
                 logprobs.append(token_logprob)
             current_ids = next_token
 
+        if tm:
+            torch.cuda.synchronize()
+            self._t_draft["ar"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         tokens_np = torch.stack(tokens, dim=1).cpu().numpy()
         logprobs_np = (
             torch.stack(logprobs, dim=1).to(torch.float32).cpu().numpy()
         )
+        if tm:
+            self._t_draft["out"] += time.perf_counter() - t0
+            self._t_draft_n += 1
+            if self._t_draft_n >= 200:
+                per = {k: 1e3 * v / self._t_draft_n for k, v in self._t_draft.items()}
+                print(
+                    f"[DRAFT_TIMING] {self._t_draft_n} windows (per-window ms): "
+                    f"alloc={per['alloc']:.2f} "
+                    f"ar({gamma+1} steps,cuda_graph={not use_multistep})={per['ar']:.2f} "
+                    f"out={per['out']:.2f} total={sum(per.values()):.2f}",
+                    flush=True,
+                )
+                self._t_draft = {k: 0.0 for k in self._t_draft}
+                self._t_draft_n = 0
         return DraftStepResp(tokens=tokens_np, logprobs=logprobs_np, tag=msg.tag)
 
     def _build_decode_batch(

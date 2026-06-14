@@ -28,6 +28,7 @@ import itertools
 import logging
 import os
 import signal
+import time
 from typing import List, Optional
 
 import psutil
@@ -64,6 +65,12 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         self.barrier_k = max(int(os.environ.get(RESAMPLE_INTERVAL_ENV, "2")), 1)
         self.gamma = self.server_args.speculative_num_steps
         self._tag = itertools.count(1)
+        # Optional timing decomposition (SMCSD_TIMING=1): how long the verifier
+        # blocks on the drafter (recv wait = drafter-bound signal) vs its own
+        # work (verify dispatch + writeback + prepare + barrier).
+        self._timing = get_bool_env_var("SMCSD_TIMING", "false")
+        self._t = {"recv": 0.0, "verify": 0.0, "prep": 0.0, "barrier": 0.0}
+        self._t_windows = 0
         logger.info(
             "AsyncDecoupledSMCScheduler: prefetch overlap, resample barrier K=%d",
             self.barrier_k,
@@ -135,8 +142,12 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         tag = next(self._tag)
         pending = worker.start_decode(batch, tag=tag)
 
+        tm = self._timing
         for w in range(K):
+            t0 = time.perf_counter() if tm else 0.0
             resp = client.recv_step_resp()
+            if tm:
+                self._t["recv"] += time.perf_counter() - t0
             if resp.tag != pending.tag:
                 raise RuntimeError(
                     f"Async step reply tag mismatch: got {resp.tag}, "
@@ -156,25 +167,50 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 )
 
             # Verify the current window (overlaps the drafter computing the next).
+            t0 = time.perf_counter() if tm else 0.0
             result = worker.finish_decode(pending, resp)
             self._writeback_window(result, active_t)
+            if tm:
+                self._t["verify"] += time.perf_counter() - t0
 
             if not is_last:
                 # Prepare the verifier side of the next window (target KV +
                 # seq_lens advance) — AFTER writeback so it reads this window's
                 # seq_lens, matching lockstep.
+                t0 = time.perf_counter() if tm else 0.0
                 next_batch = self._prepare_decode_batch_fixed(active_t, active_list)
+                if tm:
+                    self._t["prep"] += time.perf_counter() - t0
                 pending = PendingDecodeStep(
                     batch=next_batch,
                     ctx=next_batch.spec_info.decode_ctx,
                     tag=next_tag,
                 )
+            self._t_windows += 1
 
         # Barrier: resample on the K-window-accumulated weights at the drained
         # frontier, mirror the plan to the drafter, then rebuild + drain.
+        t0 = time.perf_counter() if tm else 0.0
         self._barrier_resample()
         self.slot_state.rebuild_active_slots()
         self._drain_finished_groups()
+        if tm:
+            self._t["barrier"] += time.perf_counter() - t0
+            if self._t_windows >= 200:
+                tot = sum(self._t.values()) or 1.0
+                n = self._t_windows
+                print(
+                    f"[ASYNC_TIMING] {n} windows: "
+                    f"recv(drafter-wait)={100*self._t['recv']/tot:.0f}% "
+                    f"verify={100*self._t['verify']/tot:.0f}% "
+                    f"prep={100*self._t['prep']/tot:.0f}% "
+                    f"barrier={100*self._t['barrier']/tot:.0f}% | per-window "
+                    f"recv={1e3*self._t['recv']/n:.2f}ms "
+                    f"verify={1e3*self._t['verify']/n:.2f}ms",
+                    flush=True,
+                )
+                self._t = {k: 0.0 for k in self._t}
+                self._t_windows = 0
         self.last_batch = tracking_batch
 
     def _prepare_decode_batch_fixed(self, active_t, active_list):

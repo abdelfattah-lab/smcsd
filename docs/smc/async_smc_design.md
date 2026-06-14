@@ -186,8 +186,41 @@ uncaptured-shape fallback, not the fast path), cuda-graph replay **133.1**. The 
 graph is the entire speedup; the multistep backend is kept only as the >cuda_graph_max_bs
 fallback.
 
-Next levers: deeper prefetch (W>1) and composing async with cohort pipelining for
-batch>1.
+### Timing decomposition of the cuda-graph async (SMCSD_TIMING=1)
+
+Per decode window, batch 1, N=12, γ=8 (very stable across samples):
+
+| side | component | per-window |
+|---|---|---:|
+| drafter | KV alloc | 0.43 ms |
+| drafter | **AR loop (9 cuda-graph steps)** | **41.6 ms** |
+| drafter | output transfer | 0.12 ms |
+| drafter | **total** | **42.2 ms** |
+| verifier | **recv (drafter-wait)** | **28.0 ms (48%)** |
+| verifier | verify + writeback | 30.3 ms (51%) |
+| verifier | prep + barrier | ~1% |
+
+**Where the remaining throughput is:**
+
+1. **Barrier windows run serial (the big one).** With perfect overlap, recv would
+   be `draft − verify` = 42.2 − 30.3 ≈ **12.5 ms**. It's 28 ms because at K=2 *half*
+   the windows are resample barriers where the verifier doesn't prefetch — so they
+   wait the full 42 ms draft with no overlap. Averaging overlap (~14 ms) with barrier
+   (~42 ms) ≈ 28 ms, matching the measurement. Eliminating the barrier stall → recv
+   toward ~14 ms → **~+30% throughput**. Two fixes:
+   - *Config:* larger K (fewer barriers) — now that the drafter is fast and balanced
+     with verify, larger K should raise throughput (revises the pre-cuda-graph finding
+     that K=2≈K=4). Trades a little accuracy (more resampling delay).
+   - *Principled:* **speculative prefetch at the barrier** — prefetch the next window
+     before resampling (resampling is intermittent / ESS-gated); on the rare resample,
+     discard the speculative draft. Keeps K=2 accuracy with large-K throughput.
+2. **Drafter still the residual bottleneck (draft 42 ms > verify 30 ms).** Even with
+   perfect overlap, recv floors at ~12.5 ms. The 9 sequential AR steps (4.6 ms each
+   for a 1B model at bs=12) dominate. Levers: a smaller/faster draft model, tree
+   drafting (parallel candidates), or reducing γ.
+
+So the next concrete win is **eliminating the barrier stall** (~+30%), then attacking
+the draft AR. Deeper prefetch (W>1) and async × cohort pipelining (batch>1) remain.
 
 ### Profiling (torch trace of the verifier scheduler; `scripts/smc_profile_engine.py --engine-kind smc_async|smc_decoupled`)
 
