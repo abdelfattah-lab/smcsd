@@ -179,6 +179,13 @@ async overlap itself, exactly as predicted (fix the bottleneck stage first). Tog
 `draft_cuda_graph` kwarg / `SMCSD_DRAFT_CUDA_GRAPH`. (A 20q smoke read 50% — n=20
 sampling noise; the 200q confirms 66.0% parity with the graph-free async.)
 
+Draft-path decomposition (async K=2, 200q — all accuracy-equivalent ~66%, the win is
+pure speed): plain eager per-step **97.1**, multistep backend only **86.2** (the
+per-step attn-backend switching costs more than it saves at this batch — it's the
+uncaptured-shape fallback, not the fast path), cuda-graph replay **133.1**. The cuda
+graph is the entire speedup; the multistep backend is kept only as the >cuda_graph_max_bs
+fallback.
+
 Next levers: deeper prefetch (W>1) and composing async with cohort pipelining for
 batch>1.
 
