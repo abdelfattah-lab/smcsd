@@ -161,9 +161,26 @@ async invariants (prefetch seq_lens parity, writeback ordering, finished-before
 weight mask, ride-along output/KV safety, no-bonus weighting parity vs colocated,
 tag/FIFO, prefill/close ordering) with no critical/high bugs.
 
-Next levers (de-risked, not yet built): CUDA graphs on the drafter (shortens the
-bottleneck stage directly), deeper prefetch (W>1), and composing async with cohort
-pipelining for batch>1.
+### Drafter CUDA graphs (the bottleneck fix — bigger win than the overlap)
+
+The drafter ran graph-free (9 eager per-step AR forwards) and was the system
+bottleneck — so async hid the *cheap* stage (verify) behind the *expensive* one
+(draft). Porting the colocated draft path (cuda-graph replay per AR step +
+multistep backend) into `SMCDraftServer` shortens the bottleneck directly:
+
+| config (GSM8K 200q, async K=2, anchor 0.3, batch 1) | accuracy | tok/s | vs lockstep |
+|---|---:|---:|---:|
+| decoupled lockstep no-bonus | 68.5% | 79.8 | — |
+| + async overlap (K=2) | 66.0% | 97.1 | +21% |
+| **+ drafter CUDA graphs** | **66.0%** | **133.1** | **+66%** |
+
+**+37% on top of the overlap, zero accuracy cost** — and a larger win than the
+async overlap itself, exactly as predicted (fix the bottleneck stage first). Toggle:
+`draft_cuda_graph` kwarg / `SMCSD_DRAFT_CUDA_GRAPH`. (A 20q smoke read 50% — n=20
+sampling noise; the 200q confirms 66.0% parity with the graph-free async.)
+
+Next levers: deeper prefetch (W>1) and composing async with cohort pipelining for
+batch>1.
 
 ### Profiling (torch trace of the verifier scheduler; `scripts/smc_profile_engine.py --engine-kind smc_async|smc_decoupled`)
 
