@@ -425,7 +425,9 @@ class SMCDraftServer:
                 )
                 self._t_draft = {k: 0.0 for k in self._t_draft}
                 self._t_draft_n = 0
-        return DraftStepResp(tokens=tokens_np, logprobs=logprobs_np, tag=msg.tag)
+        return DraftStepResp(
+            tokens=tokens_np, logprobs=logprobs_np, tag=msg.tag, epoch=msg.epoch
+        )
 
     def _build_decode_batch(
         self,

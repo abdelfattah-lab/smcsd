@@ -99,11 +99,16 @@ class DraftEngineClient:
         verified_ids: List[int],
         seq_lens: List[int],
         tag: int = 0,
+        epoch: int = 0,
     ) -> None:
         """Fire a draft round without waiting for the reply (pipelined path)."""
         self.send_to_drafter.send_pyobj(
             DraftStepReq(
-                slots=slots, verified_ids=verified_ids, seq_lens=seq_lens, tag=tag
+                slots=slots,
+                verified_ids=verified_ids,
+                seq_lens=seq_lens,
+                tag=tag,
+                epoch=epoch,
             )
         )
 
@@ -149,6 +154,7 @@ class PendingDecodeStep:
     batch: ModelWorkerBatch
     ctx: object  # SMCDecodeContext
     tag: int
+    epoch: int = 0
 
 
 class DecoupledSMCWorker(BaseSpecWorker):
@@ -176,6 +182,14 @@ class DecoupledSMCWorker(BaseSpecWorker):
         from sglang.srt.utils import get_bool_env_var
 
         self.drop_bonus = get_bool_env_var("SMCSD_DROP_BONUS", "false")
+        # Diagnostic (SMCSD_BONUS_AGREE_STATS=1): in no-bonus mode, measure how
+        # often the drafter's anchor token (tokens[:, gamma]) equals the target
+        # bonus — the "at-will bonus" match rate that bounds how much of the bonus
+        # is already gotten for free vs would need a stall to reclaim.
+        self._bonus_agree = get_bool_env_var("SMCSD_BONUS_AGREE_STATS", "false")
+        self._ba_n = 0
+        self._ba_match_sample = 0
+        self._ba_match_argmax = 0
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -274,6 +288,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
         verified_ids_cpu: List[int],
         seq_lens_cpu: List[int],
         tag: int = 0,
+        epoch: int = 0,
     ) -> None:
         """Fire one draft round on the drafter (no slot_state dependency).
 
@@ -285,9 +300,12 @@ class DecoupledSMCWorker(BaseSpecWorker):
             verified_ids=verified_ids_cpu,
             seq_lens=seq_lens_cpu,
             tag=tag,
+            epoch=epoch,
         )
 
-    def start_decode(self, batch: ModelWorkerBatch, tag: int = 0) -> "PendingDecodeStep":
+    def start_decode(
+        self, batch: ModelWorkerBatch, tag: int = 0, epoch: int = 0
+    ) -> "PendingDecodeStep":
         draft_input: SMCDraftInput = batch.spec_info
         ctx = draft_input.decode_ctx
         active_slots = getattr(draft_input, "active_slots_cpu", None)
@@ -301,8 +319,9 @@ class DecoupledSMCWorker(BaseSpecWorker):
             draft_input.verified_id.cpu().tolist(),
             ctx.orig_seq_lens_cpu.tolist(),
             tag=tag,
+            epoch=epoch,
         )
-        return PendingDecodeStep(batch=batch, ctx=ctx, tag=tag)
+        return PendingDecodeStep(batch=batch, ctx=ctx, tag=tag, epoch=epoch)
 
     def _forward_decode(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_idle():
@@ -311,12 +330,19 @@ class DecoupledSMCWorker(BaseSpecWorker):
         resp = self._client.recv_step_resp()
         return self.finish_decode(pending, resp)
 
-    def finish_decode(self, pending: "PendingDecodeStep", resp):
+    def finish_decode(self, pending: "PendingDecodeStep", resp, drop_bonus=None):
         batch = pending.batch
         ctx = pending.ctx
         draft_input: SMCDraftInput = batch.spec_info
         bs = len(ctx.orig_seq_lens)
         gamma = self.gamma
+        # Per-call anchor mode.  Defaults to the worker's mode, but the async
+        # scheduler overrides it to False on the BARRIER window (drained, so the
+        # target bonus is available before the next train's window-0 StepReq):
+        # weight only gamma draft positions and seed the next anchor from the
+        # exact target sample, even though the drafter ran no-bonus and emitted
+        # gamma+1 columns (we slice to gamma).
+        drop_bonus = self.drop_bonus if drop_bonus is None else drop_bonus
 
         # Target-side cache locations for x0..x_gamma (computed here, not at
         # send time, so the async path can prefetch the StepReq before the
@@ -337,6 +363,11 @@ class DecoupledSMCWorker(BaseSpecWorker):
             raise RuntimeError(
                 f"Draft step reply tag mismatch: got {resp.tag}, "
                 f"expected {pending.tag} (FIFO violated?)"
+            )
+        if resp.epoch != pending.epoch:
+            raise RuntimeError(
+                f"Draft step reply epoch mismatch: got {resp.epoch}, "
+                f"expected {pending.epoch} (train fence violated?)"
             )
         device = ctx.orig_seq_lens.device
         tokens = torch.from_numpy(resp.tokens).to(device=device, dtype=torch.int64)
@@ -370,26 +401,49 @@ class DecoupledSMCWorker(BaseSpecWorker):
             f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
             f"cuda_graph={can_run_cuda_graph})"
         )
-        # `tokens` has n_weighted columns: gamma (bonus) or gamma+1 (no-bonus,
-        # the last being the committed anchor x_{gamma+1}).  Score rows 0..n-1
-        # predict x1..x_n.
-        n_weighted = gamma + 1 if self.drop_bonus else gamma
+        # Weight n_weighted columns: gamma (bonus — the anchor is the exact target
+        # sample, weight 0) or gamma+1 (no-bonus — the anchor is the reweighted
+        # (gamma+1)-th draft token).  `tokens` may carry gamma+1 columns even in
+        # bonus mode (a no-bonus drafter that this call overrides), so slice it.
+        n_weighted = gamma + 1 if drop_bonus else gamma
+        weighted_tokens = tokens[:, :n_weighted]
+        weighted_draft_lp = draft_logprobs_stacked[:, :n_weighted]
         score_log_probs = torch.log_softmax(score_logits, dim=-1)
         score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
         score_logprobs_stacked = score_log_probs[:, :n_weighted, :].gather(
-            2, tokens.unsqueeze(2)
+            2, weighted_tokens.unsqueeze(2)
         ).squeeze(2)
 
         # ---- 3. Logprob diff (SMC importance weight increment) ----
-        logprob_diff = (score_logprobs_stacked - draft_logprobs_stacked).sum(dim=1)
+        logprob_diff = (score_logprobs_stacked - weighted_draft_lp).sum(dim=1)
 
         # ---- 4. Anchor + output ----
-        if self.drop_bonus:
+        if drop_bonus:
             # Anchor = the drafter's own (gamma+1)-th token; output = x1..x_{gamma+1}.
             next_verified_id = tokens[:, gamma]
             output_token_ids = tokens
+            if self._bonus_agree:
+                # Compare the drafter's anchor to the target bonus (both sampled,
+                # and the argmax) — the at-will match rate.
+                blogits = score_logits.reshape(bs, gamma + 1, -1)[:, gamma, :]
+                blp = torch.log_softmax(blogits / self.smc_target_temperature, dim=-1)
+                bsample = torch.multinomial(blp.exp(), num_samples=1).squeeze(-1)
+                bargmax = blogits.argmax(dim=-1)
+                anchor = tokens[:, gamma]
+                self._ba_n += bs
+                self._ba_match_sample += int((anchor == bsample).sum().item())
+                self._ba_match_argmax += int((anchor == bargmax).sum().item())
+                if self._ba_n >= 2000:
+                    print(
+                        f"[BONUS_AGREE] {self._ba_n} anchors: "
+                        f"draft==target_sample={100*self._ba_match_sample/self._ba_n:.1f}% "
+                        f"draft==target_argmax={100*self._ba_match_argmax/self._ba_n:.1f}%",
+                        flush=True,
+                    )
+                    self._ba_n = self._ba_match_sample = self._ba_match_argmax = 0
         else:
-            bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
+            # Anchor = exact target sample after x_gamma; output = x1..x_gamma + bonus.
+            bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, gamma, :]
             bonus_log_probs = torch.log_softmax(
                 bonus_logits / self.smc_target_temperature, dim=-1
             )
@@ -397,7 +451,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
                 bonus_log_probs.exp(), num_samples=1
             ).squeeze(-1)
             output_token_ids = torch.cat(
-                [tokens, next_verified_id.unsqueeze(1)], dim=1
+                [tokens[:, :gamma], next_verified_id.unsqueeze(1)], dim=1
             )
 
         next_token_ids = output_token_ids.reshape(-1)

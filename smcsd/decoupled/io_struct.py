@@ -76,6 +76,11 @@ class DraftStepReq:
     verified_ids: List[int]  # x0 per slot (last round's anchor token)
     seq_lens: List[int]
     tag: int = 0
+    # Train counter, echoed back unchanged by the drafter (a pure reactor that
+    # cannot tell speculative from committed). The async scheduler uses it as a
+    # fail-fast fence for the speculative-barrier-prefetch path; default 0 keeps
+    # the lockstep / pipelined callers wire-compatible.
+    epoch: int = 0
 
 
 @dataclass
@@ -85,6 +90,7 @@ class DraftStepResp:
     tokens: np.ndarray  # (bs, n_emit) int64 — drafted tokens per slot
     logprobs: np.ndarray  # (bs, n_emit) float32 — draft logprob of each token
     tag: int = 0
+    epoch: int = 0  # echoed from the matching DraftStepReq (see above)
 
 
 @dataclass
