@@ -190,6 +190,11 @@ class DecoupledSMCWorker(BaseSpecWorker):
         self._ba_n = 0
         self._ba_match_sample = 0
         self._ba_match_argmax = 0
+        # Maximal-coupling acceptance rate E[min(1, p_target(a)/q_draft(a))] =
+        # 1 - TV(p_target, q_draft): the reuse rate if we accept the draft anchor
+        # via residual/speculative coupling (preserves the exact bonus marginal),
+        # which is >= the independent-equality rate and decides at-will viability.
+        self._ba_accept_sum = 0.0
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -430,17 +435,27 @@ class DecoupledSMCWorker(BaseSpecWorker):
                 bsample = torch.multinomial(blp.exp(), num_samples=1).squeeze(-1)
                 bargmax = blogits.argmax(dim=-1)
                 anchor = tokens[:, gamma]
+                # Coupled acceptance: accept the draft anchor a with prob
+                # min(1, p_target(a)/q_draft(a)).  log q_draft(a) is the anchor's
+                # own draft logprob (column gamma); log p_target(a) is the target
+                # bonus logprob of a.
+                log_p_a = blp.gather(1, anchor.unsqueeze(1)).squeeze(1)
+                log_q_a = draft_logprobs_stacked[:, gamma]
+                accept = torch.clamp(torch.exp(log_p_a - log_q_a), max=1.0)
                 self._ba_n += bs
                 self._ba_match_sample += int((anchor == bsample).sum().item())
                 self._ba_match_argmax += int((anchor == bargmax).sum().item())
+                self._ba_accept_sum += float(accept.sum().item())
                 if self._ba_n >= 2000:
                     print(
                         f"[BONUS_AGREE] {self._ba_n} anchors: "
-                        f"draft==target_sample={100*self._ba_match_sample/self._ba_n:.1f}% "
-                        f"draft==target_argmax={100*self._ba_match_argmax/self._ba_n:.1f}%",
+                        f"indep draft==target_sample={100*self._ba_match_sample/self._ba_n:.1f}% "
+                        f"argmax={100*self._ba_match_argmax/self._ba_n:.1f}% | "
+                        f"COUPLED accept(min(1,p/q))={100*self._ba_accept_sum/self._ba_n:.1f}%",
                         flush=True,
                     )
                     self._ba_n = self._ba_match_sample = self._ba_match_argmax = 0
+                    self._ba_accept_sum = 0.0
         else:
             # Anchor = exact target sample after x_gamma; output = x1..x_gamma + bonus.
             bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, gamma, :]
