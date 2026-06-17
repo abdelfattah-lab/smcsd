@@ -142,6 +142,16 @@ class ScheduleBatchSMC:
         self.interval_weights = torch.zeros(
             self.max_slots, dtype=torch.float64, device=device
         )
+        # Net-new lifetime finalize accumulator (B1 repair,
+        # docs/smc/async_bonus_design.md §2c).  Accumulated alongside
+        # `log_weights` in `process_batch_result`, but NEVER zeroed by the fused
+        # collect kernel (which zeros log_weights/interval_weights on resampled
+        # rows) nor by `reset_interval_weights`.  Under reset-to-zero at staggered
+        # frontiers `log_weights` no longer means "lifetime weight"; finalize
+        # selects on this true-lifetime score instead.
+        self.finalize_score = torch.zeros(
+            self.max_slots, dtype=torch.float64, device=device
+        )
 
         # ── Token history [max_slots, max_output_len] ──
         self.all_token_ids = torch.zeros(
@@ -280,6 +290,7 @@ class ScheduleBatchSMC:
         slot_idx64 = slots_t.to(torch.int64)
         self.log_weights[slot_idx64] = 0.0
         self.interval_weights[slot_idx64] = 0.0
+        self.finalize_score[slot_idx64] = 0.0
 
         self.rebuild_active_slots()
         return slots
@@ -322,6 +333,7 @@ class ScheduleBatchSMC:
             self.ignore_eos_t[slot] = False
             self.log_weights[slot] = 0.0
             self.interval_weights[slot] = 0.0
+            self.finalize_score[slot] = 0.0
 
             self.slot_to_req.pop(slot, None)
             self.free_slots.append(slot)
@@ -608,6 +620,9 @@ class ScheduleBatchSMC:
         d = torch.where(finished_before, torch.zeros_like(d), d)
         self.log_weights[active] += d
         self.interval_weights[active] += d
+        # Never zeroed by the collect kernel or by reset_interval_weights — the
+        # true-lifetime importance weight used at finalize (B1 repair).
+        self.finalize_score[active] += d
 
         # f. Optional rebuild so callers can batch it with a subsequent
         #    resample (which may also flip membership).
@@ -690,12 +705,22 @@ class ScheduleBatchSMC:
         dst_req.surr_offset = src_req.surr_offset
         dst_req.read_offset = src_req.read_offset
 
+    def reset_interval_weights(self, active: torch.Tensor) -> None:
+        """Reset the "since last resample" accumulator to zero over a slot set.
+
+        Used by the ragged-now async-bonus path (docs/smc/async_bonus_design.md
+        §2c/§4) after every resample to extend the kernel's resampled-row zero
+        (fused_collect.py:194) to NON-resampled active rows.  `finalize_score` is
+        left intact (it is the true-lifetime finalize accumulator).
+        """
+        self.interval_weights[active] = 0.0
+
     # ────────────────────────────────────────────────────────
     #  Finalization
     # ────────────────────────────────────────────────────────
 
     def finalize_group(self, group_id: str, parent_req: Req) -> Req:
-        """Pick the best particle (by cumulative log-weight, tiebroken by
+        """Pick the best particle (by true-lifetime finalize score, tiebroken by
         visible output length) and copy its text state to ``parent_req``.
 
         Frees all group slots and returns ``parent_req`` ready for
@@ -710,11 +735,15 @@ class ScheduleBatchSMC:
                 return token_count
             return min(req.finished_len, token_count)
 
-        # Slot-indexed log_weights: no more particle_idx indirection.
+        # Select on the never-reset lifetime accumulator (B1 repair): under
+        # reset-to-zero `log_weights` is zeroed by the collect kernel every
+        # resample, so comparing it across particles that resampled a different
+        # number of windows ago is meaningless.  `finalize_score` is the true
+        # lifetime importance weight (docs/smc/async_bonus_design.md §2c).
         best_slot = max(
             slots,
             key=lambda s: (
-                float(self.log_weights[s].item()),
+                float(self.finalize_score[s].item()),
                 visible_output_len(s),
             ),
         )

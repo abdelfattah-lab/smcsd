@@ -310,6 +310,20 @@ class SMCDraftServer:
         bs = len(msg.slots)
         gamma = self.gamma
 
+        if isinstance(msg.rollback, list):
+            # Fused S4 (SMCSD_ASYNC_BONUS): per-slot rewind — committed rows roll
+            # back 0 (new window), re-drafted rows roll back gamma+1 (in-place).
+            # Element-wise subtract so a mixed StepReq does not corrupt the
+            # committed rows' seq_lens / trip the divergence assert below.
+            if any(msg.rollback):
+                self.seq_lens[active] -= torch.tensor(
+                    msg.rollback, dtype=self.seq_lens.dtype, device=self.device
+                )
+        elif msg.rollback:
+            # Mode A (BET_DISCARD): undo a discarded speculative window's advance so
+            # this re-draft's seq_lens match the mirror; the slack KV is reused.
+            self.seq_lens[active] -= msg.rollback
+
         seq_g = self.seq_lens[active]
         seq_cpu = seq_g.cpu().tolist()
         if seq_cpu != list(msg.seq_lens):

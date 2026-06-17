@@ -342,3 +342,93 @@ a fluke — both seeds land at ~−4.5 pt accuracy and ~+33% throughput:
 **KV-cache verification:** code audit (clean) + runtime invariant asserts + forced-95%-
 resample @ `CUDA_LAUNCH_BLOCKING=1` (60q, 0 IMA / 0 invariant-violations / 0 leaks):
 `sbp_kvstress.log`. Confirms the gap is algorithmic, not memory corruption.
+
+---
+
+## Bonus-bet: at-will run-ahead (`SMCSD_BET_KEEP` / `SMCSD_BET_DISCARD`)
+
+**Question.** Can we reach max accuracy (commit the exact target bonus `b` on *every* anchor)
+*while keeping the overlap* — framed as SPECTRE's run-ahead: "bet that the drafter's `x_{γ+1}`
+equals the target bonus `b`; on a wrong guess, discard"? The next window must fire before verify
+finishes, so it is always seeded with the drafter-known `x_{γ+1}`; `b` is known only post-verify.
+Per particle `x_{γ+1} == b` ~84% (anchor-temp 0.3). Two ways to settle the bet on a miss:
+
+- **`BET_KEEP`** — commit `b` anyway, **keep** the speculative window (drafted from `x_{γ+1}`) as a
+  1-token seam, reweight (full overlap, never re-draft).
+- **`BET_DISCARD`** — commit `b`, and on any miss **discard** the speculative window and re-draft
+  every particle from `b` (the literal SPECTRE "discard on wrong guess").
+
+**Measured (GSM8K 1000q, seed 0, N=12 γ=8, K=2, anchor 0.3, triton + drafter CUDA graphs, 2×A6000;
+baselines reproduce this report byte-identically — no-bonus tokens 191 522):**
+
+| config | accuracy | tok/s | overlap | bonus coverage |
+|---|---:|---:|---|---|
+| no-bonus async (floor) | 66.3% | 135.0 | full | none |
+| **`BET_KEEP`** | **67.0%** | **134.6** | full | every anchor — via seam |
+| barrier-bonus | 68.3% | 133.0 | full | 1/K clean anchors |
+| **`BET_DISCARD`** | **71.1%** | **109.1** | partial | every anchor, clean (re-draft) |
+| lockstep+bonus (K=1) | 73.5% | 107 | none | every anchor, clean |
+
+**Verdict — you cannot bring back the accuracy while keeping the overlap.**
+
+- **`BET_KEEP` recovers ~nothing (67.0% ≈ floor 66.3%, within σ≈1.6 pt), at full overlap.** The seam
+  is unbiased but useless: when `b ≠ x_{γ+1}` the kept window was drafted from `x_{γ+1}`, so the
+  verifier scores it against the committed `b`-prefix and `Σ(log p_target(t|b) − log q_draft(t|x_{γ+1}))`
+  goes sharply negative → the particle's weight is crushed → it dies at the next resample. So
+  `BET_KEEP` effectively **kills the ~16% mismatched particles each train** (lost ESS) — the same
+  adoption-coupling pathology as SBP. Committing `b` on more anchors does not help if doing so poisons
+  the particle. It even trails barrier-bonus (68.3%), whose 1/K bonus is on the *drained* window (no
+  seam). **The discard is not optional.**
+- **`BET_DISCARD` recovers the K=2 bonus (71.1% = floor + ~5 pt) but spends the overlap.** Re-drafting
+  from `b` (no drift) gets the clean bonus, but 109.1 tok/s ≈ lockstep+bonus (107) → it rides the
+  existing frontier, it does not extend it (lockstep+bonus K=1 dominates it on both axes). It is *not*
+  "throughput-dead" (the naïve ~−36% prediction was wrong): resampling makes the 12 particles largely
+  clones, so their `x_{γ+1}`/`b` correlate and miss *together* → only ~34% of interior windows re-draft
+  (7 880 total), not the naïve 1−0.84¹²≈88%, and overlap on matched windows offsets most of the rest.
+- A at K=1 ≡ lockstep (no interior window → no overlap); no regime measured where its partial overlap
+  beats lockstep K=1. **The only free overlap-with-bonus stays barrier-bonus's 1/K clean anchors.**
+
+**Takeaway.** A clean bonus *requires the drafter to draft from `b`* — you either drain that window
+(lockstep, or barrier-bonus on 1/K) or re-draft it (`BET_DISCARD`); both cost the overlap. There is no
+seam shortcut.
+
+**Implementation (≈35 lines, env-gated, mutually exclusive with SBP / barrier-bonus).** Both modes set
+`drop_bonus=False` on every window in `_run_decode_train` (the existing bonus-commit path, `n_weighted=γ`
+so the anchor `b` carries 0 weight). The bet-miss mask is computed scheduler-side
+(`resp.tokens[:, γ]` vs `result.next_draft_input.verified_id`) — no `finish_decode` change. `BET_DISCARD`
+adds a drain + re-fire from `b` reusing the captured pre-writeback `seq_lens_next`, with a new
+`DraftStepReq.rollback` field (`io_struct.py` → `worker.send_step` → `draft_server._handle_step`
+lowers the mirror `seq_len` by γ+1 so the discarded window's advance is undone and its KV is overwritten
+in place — no free, no leak). Logs: `run_{A_bet_discard,B_bet_keep,barrier,nobonus}.log`.
+
+---
+
+## Throughput push: 5-round profiling of the async decode loop (negative result)
+
+**Question.** Push no-bonus async tok/s above 134 *accuracy-safe*. **Result: not achievable on this path** —
+three concrete levers were implemented and measured to fail, and the bottleneck is now precisely located.
+
+**Decomposition (no-bonus async, 200q, `SMCSD_TIMING`):** per-window critical path 58.6 ms = recv-wait
+28.3 ms (47%) + verify 30.3 ms (51%); prep/barrier ~0. Drafter `ar` = **41.8 ms** (9 AR steps, forward
+CUDA-graphed) is the true bottleneck (recv-wait tracks it); verify is fully hidden behind it. The ~16 ms
+bubble (recv-wait 28.3 vs ideal `draft−verify`≈12 ms) is **entirely the post-barrier window-0 stall**: the
+next train's window-0 has no prefetch, so the verifier waits the full ~42 ms (interior windows wait ~12 ms;
+averaged over K=2 → ~28 ms).
+
+| Round | Lever | Verdict |
+|---|---|---|
+| R1 | `SKIP_REPLAY_PREP` — force multistep, skip per-step replay-prep | **Crash.** The per-step prep sets `raw_num_token` + the KV indices the captured graph replays; it *feeds* the graph, can't be skipped. |
+| R2 | diagnostics | no-resample barriers = **23%**; graph-OFF `ar`=70.7 ms vs 41.8 ms ⇒ **graph essential**. |
+| R3 | `NORESAMPLE_PREFETCH` — fire window-0 across no-resample barriers | **No gain + not bit-identical.** Structural: knowing `n_jobs==0` needs the last verify, so the fire is too late to overlap it. SBP fires *before* verify (overlaps 30 ms) but unconditionally → the −4.4pt coupling. Can't have both. |
+| R5 | `BATCH_DRAFT_PREP` (deep-#1) — precompute all 9 steps' KV metadata, feed the graph buffers, replay directly | **Bit-identical (130/200, 37964 exact; per-step buffer-diff self-check = 0 divergences) but ~0 gain** (`ar` 41.8→41.5, 134→133 tok/s). Disproves the prep hypothesis: the prep triton launches **overlap GPU work**, not the critical path; the AR loop is GPU-bound at the 1B forward floor. |
+
+**Why accuracy-safe is blocked.** (a) The barrier stall can't be hidden without firing across the barrier
+before the resample is known — i.e. SBP's unconditional fire and its −4.4pt coupling. (b) The drafter floor
+is the 9 graph **replays + host round-trips**, not the per-step prep (R5). (c) `verify=30.3 ms` is the hard
+wall: even a zero-overhead drafter is verify-bound at **~180–185 tok/s**.
+
+**The only ways to go faster** (both off the accuracy-safe path): **SBP** — already built, 177 tok/s @ −4.4pt
+(opt-in speed flag); or **GRAPH_AR** — capture the whole γ+1-step AR loop into ONE graph (9 replays → 1),
+reaching ~180 tok/s at accuracy *within seed noise* (needs a ~300-LOC multi-step SMC draft graph runner +
+graph-safe `multinomial_with_seed`; not built). All three failed levers were reverted — **no code change
+from this round.** Don't push `ar` below ~28 ms (verify is the wall) and don't re-attempt R1/R3/R5.

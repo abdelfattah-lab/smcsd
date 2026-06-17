@@ -22,7 +22,7 @@ step reply (needed for SMC importance weights).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 
@@ -81,6 +81,17 @@ class DraftStepReq:
     # fail-fast fence for the speculative-barrier-prefetch path; default 0 keeps
     # the lockstep / pipelined callers wire-compatible.
     epoch: int = 0
+    # Mode A (SMCSD_BET_DISCARD): rewind the drafter's mirror seq_len by this many
+    # tokens BEFORE this round, undoing a discarded speculative window's advance so
+    # the seq_lens assertion passes and the discarded KV is overwritten in place.
+    # 0 = no-op (every other caller).
+    #
+    # Fused S4 (SMCSD_ASYNC_BONUS, docs/smc/async_bonus_design.md §2b / B2): a single
+    # StepReq mixes matched/committed rows (rollback 0, advancing a new window) and
+    # mismatched rows (rollback gamma+1, re-drafting in place from the bonus b).  When
+    # a per-slot ``List[int]`` is given, the drafter subtracts it element-wise from its
+    # mirror; a scalar ``int`` broadcasts (the existing modes are wire-unchanged).
+    rollback: Union[int, List[int]] = 0
 
 
 @dataclass

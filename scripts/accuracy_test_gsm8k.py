@@ -119,6 +119,10 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_running_requests"] = args.max_running_requests
     else:
         engine_kwargs["max_running_requests"] = max(args.particles + 4, 16)
+    if args.draft_gpu_id is not None:
+        engine_kwargs["draft_gpu_id"] = args.draft_gpu_id
+    if args.draft_mem_fraction is not None:
+        engine_kwargs["draft_mem_fraction_static"] = args.draft_mem_fraction
     sampling_params = {
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": args.ignore_eos,
@@ -351,6 +355,12 @@ if __name__ == "__main__":
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=16)
+    eng.add_argument("--draft-gpu-id", type=int, default=None,
+                      help="GPU id for the decoupled drafter (default 1; set 0 to "
+                           "colocate target+drafter on a single GPU)")
+    eng.add_argument("--draft-mem-fraction", type=float, default=None,
+                      help="mem fraction for the decoupled drafter (default 0.5; "
+                           "lower it, e.g. 0.15, when colocating on a single GPU)")
 
     args = parser.parse_args()
     main(args)

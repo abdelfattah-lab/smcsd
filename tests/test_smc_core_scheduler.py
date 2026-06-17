@@ -248,10 +248,10 @@ class TestSMCFinalizeGroup(CustomTestCase):
         )
         slot_state.slot_to_req = {0: req0, 1: req1}
         slot_state.group_slot_lists = {"g": [0, 1]}
-        # Equal log_weights → tiebreak on visible output length.  The new
-        # layout stores log_weights slot-indexed directly.
-        slot_state.log_weights[0] = 0.0
-        slot_state.log_weights[1] = 0.0
+        # Equal finalize_score → tiebreak on visible output length.  Finalize
+        # selects on the never-reset lifetime `finalize_score` (B1 repair).
+        slot_state.finalize_score[0] = 0.0
+        slot_state.finalize_score[1] = 0.0
         slot_state.req_pool_indices[0] = 0
         slot_state.req_pool_indices[1] = 1
         slot_state.kv_allocated_lens[0] = 4
@@ -274,7 +274,7 @@ class TestSMCFinalizeGroup(CustomTestCase):
         self.assertEqual(freed, ["g"])
 
     def test_finalize_picks_highest_log_weight(self):
-        """When log_weights differ, the heavier particle wins regardless
+        """When finalize_scores differ, the heavier particle wins regardless
         of output length."""
         slot_state = _build_slot_state(
             max_num_reqs=2,
@@ -301,8 +301,8 @@ class TestSMCFinalizeGroup(CustomTestCase):
         )
         slot_state.slot_to_req = {0: heavy, 1: light}
         slot_state.group_slot_lists = {"g": [0, 1]}
-        slot_state.log_weights[0] = 1.0    # heavier
-        slot_state.log_weights[1] = 0.0
+        slot_state.finalize_score[0] = 1.0    # heavier
+        slot_state.finalize_score[1] = 0.0
         slot_state.req_pool_indices[0] = 0
         slot_state.req_pool_indices[1] = 1
         slot_state.kv_allocated_lens[0] = 1
@@ -320,6 +320,99 @@ class TestSMCFinalizeGroup(CustomTestCase):
         self.assertIs(finalized, parent_req)
         self.assertEqual(parent_req.output_ids, [1])
         self.assertEqual(parent_req.finished_len, 1)
+
+
+class TestSMCResetAndFinalizeScore(CustomTestCase):
+    """S1 (docs/smc/async_bonus_design.md §2c + B1 repair): `finalize_score` is
+    a net-new lifetime accumulator never touched by reset/collect, and
+    `reset_interval_weights` zeros only `interval_weights`."""
+
+    def _accumulate(self, slot_state, active, d):
+        """Mirror process_batch_result step (e): all three accumulators += d."""
+        slot_state.log_weights[active] += d
+        slot_state.interval_weights[active] += d
+        slot_state.finalize_score[active] += d
+
+    def test_reset_zeros_interval_leaves_finalize_score(self):
+        slot_state = _build_slot_state(max_num_reqs=4, rows=[[0]] * 4, n_particles=2)
+        active = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+
+        # Accumulate known weights across two windows (like two decode steps).
+        self._accumulate(slot_state, active, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        self._accumulate(slot_state, active, torch.tensor([0.5, 0.5, 0.5, 0.5]))
+
+        lifetime = torch.tensor([1.5, 2.5, 3.5, 4.5], dtype=torch.float64)
+        self.assertTrue(torch.allclose(slot_state.interval_weights[active], lifetime))
+        self.assertTrue(torch.allclose(slot_state.finalize_score[active], lifetime))
+
+        # Simulate a resample: the fused kernel zeros interval_weights AND
+        # log_weights on the resampled rows (slots 0,1).  reset_interval_weights
+        # then extends the interval zero to ALL active rows.
+        resampled = torch.tensor([0, 1], dtype=torch.int64)
+        slot_state.interval_weights[resampled] = 0.0
+        slot_state.log_weights[resampled] = 0.0
+
+        slot_state.reset_interval_weights(active)
+
+        # interval_weights zeroed everywhere; finalize_score untouched.
+        self.assertTrue(torch.all(slot_state.interval_weights[active] == 0.0))
+        self.assertTrue(torch.allclose(slot_state.finalize_score[active], lifetime))
+        # log_weights zeroed only on resampled rows (kernel behavior); reset
+        # does NOT touch log_weights on non-resampled rows.
+        self.assertTrue(torch.all(slot_state.log_weights[resampled] == 0.0))
+        self.assertTrue(
+            torch.allclose(
+                slot_state.log_weights[torch.tensor([2, 3])],
+                torch.tensor([3.5, 4.5], dtype=torch.float64),
+            )
+        )
+
+    def test_finalize_selects_on_true_lifetime_score(self):
+        """After a reset zeros log_weights, finalize must pick the particle with
+        the highest TRUE LIFETIME score — NOT the (kernel-zeroed) log_weights.
+        Reference: argmax over the lifetime sum accumulated across all windows."""
+        slot_state = _build_slot_state(max_num_reqs=2, rows=[[0]] * 2, n_particles=2)
+        active = torch.tensor([0, 1], dtype=torch.int64)
+
+        # Slot 0 is the true lifetime winner (3.0 vs 1.0).
+        self._accumulate(slot_state, active, torch.tensor([3.0, 1.0]))
+
+        # A resample zeros slot 0's interval AND log weight (it resampled);
+        # slot 1 did not.  Now log_weights would WRONGLY favor slot 1.
+        slot_state.interval_weights[torch.tensor([0])] = 0.0
+        slot_state.log_weights[torch.tensor([0])] = 0.0
+        slot_state.reset_interval_weights(active)
+
+        # Sanity: the void selector (log_weights) would pick the wrong slot.
+        self.assertGreater(
+            float(slot_state.log_weights[1]), float(slot_state.log_weights[0])
+        )
+
+        req0 = _FakeReq(
+            rid="g_p0", particle_idx=0, req_pool_idx=0,
+            output_ids=[1], kv_indices=[1],
+            finished_reason=SimpleNamespace(type="stop"), finished_len=1,
+        )
+        req1 = _FakeReq(
+            rid="g_p1", particle_idx=1, req_pool_idx=1,
+            output_ids=[2], kv_indices=[2],
+            finished_reason=SimpleNamespace(type="stop"), finished_len=1,
+        )
+        slot_state.slot_to_req = {0: req0, 1: req1}
+        slot_state.group_slot_lists = {"g": [0, 1]}
+        slot_state.token_counts[0] = 1
+        slot_state.token_counts[1] = 1
+        slot_state.free_group_slots = lambda group_id: None
+
+        parent_req = SimpleNamespace(
+            output_ids=[], finished_reason=None, finished_len=None
+        )
+        slot_state.finalize_group("g", parent_req)
+
+        # Reference: the slot maximizing the true lifetime score is slot 0.
+        ref_best = max([0, 1], key=lambda s: float(slot_state.finalize_score[s]))
+        self.assertEqual(ref_best, 0)
+        self.assertEqual(parent_req.output_ids, [1])  # slot 0's output
 
 
 if __name__ == "__main__":

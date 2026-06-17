@@ -5,7 +5,7 @@ Usage:
   python scripts/smc/quick_quality_check.py --temperature 0.8
   python scripts/smc/quick_quality_check.py --temperature 0.0 --mode smc
   python scripts/smc/quick_quality_check.py --mode both
-"""
+"""t
 
 import argparse
 import sglang as sgl

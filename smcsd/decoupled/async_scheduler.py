@@ -78,7 +78,19 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         super().__init__(*args, **kwargs)
         from sglang.srt.utils import get_bool_env_var
 
-        if not get_bool_env_var("SMCSD_DROP_BONUS", "false"):
+        # SMCSD_ASYNC_BONUS (default off): the async/staggered FULL-bonus decode path
+        # (see docs/smc/async_bonus_design.md). It commits the exact target bonus on
+        # every anchor, so the verifier does NOT need the no-bonus "drafter-known
+        # anchor" invariant below — but the drafter must still emit gamma+1 columns
+        # (SMCSD_DROP_BONUS=1 stays set in the env) so the bet x_g1 = tokens[:, gamma]
+        # exists for the run-ahead.
+        self._async_bonus = get_bool_env_var("SMCSD_ASYNC_BONUS", "false")
+        # Optional KV/no-op-proof assertions (SMCSD_ASYNC_BONUS_DEBUG=1): assert
+        # the ragged verify ctx matches the baseline frontier and stays inside
+        # allocated KV (docs/smc/async_bonus_design.md §S2 test).
+        self._async_bonus_debug = get_bool_env_var("SMCSD_ASYNC_BONUS_DEBUG", "false")
+
+        if not get_bool_env_var("SMCSD_DROP_BONUS", "false") and not self._async_bonus:
             raise RuntimeError(
                 "AsyncDecoupledSMCScheduler requires no-bonus mode "
                 "(SMCSD_DROP_BONUS=1): the next-round anchor must be "
@@ -112,6 +124,45 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 "SBP fires the barrier window-0 speculatively before verify, so the "
                 "post-verify target bonus is not available in time."
             )
+        # Bonus-bet modes: fire the next window on the drafter-known x_g1 (overlap),
+        # but COMMIT the exact target bonus b on every window (db=False, the
+        # barrier-bonus path applied to interior windows too).  BET_KEEP keeps the
+        # speculative window on a miss (1-token drafter seam, reweighted — full
+        # overlap, max accuracy IF the seam variance is cheap); BET_DISCARD drains
+        # and re-drafts every particle from b on a miss (no drift = lockstep+bonus
+        # accuracy, but pays a serial re-draft).
+        self._bet_discard = get_bool_env_var("SMCSD_BET_DISCARD", "false")
+        self._bet_keep = get_bool_env_var("SMCSD_BET_KEEP", "false")
+        self._bet = self._bet_discard or self._bet_keep
+        _on = [
+            n
+            for n, v in (
+                ("SMCSD_SPEC_BARRIER", self._spec_barrier),
+                ("SMCSD_BARRIER_BONUS", self._barrier_bonus),
+                ("SMCSD_BET_DISCARD", self._bet_discard),
+                ("SMCSD_BET_KEEP", self._bet_keep),
+                ("SMCSD_ASYNC_BONUS", self._async_bonus),
+            )
+            if v
+        ]
+        if len(_on) > 1:
+            raise RuntimeError(f"Mutually exclusive SMC mode flags set: {_on}")
+        self._bet_stats = get_bool_env_var("SMCSD_BET_STATS", "false")
+        self._bet_n = 0
+        self._bet_miss_n = 0
+        self._n_redraft = 0
+        # Fused S4 (docs/smc/async_bonus_design.md §S4 + the FUSED control-flow
+        # override): per-particle frontier STAGGER.  One in-flight drafted window
+        # per active particle (depth D=1), tagged 'runahead' (seeded by the bet
+        # x_g1) or 'redraft' (seeded by the bonus b).  Each round fires ONE ragged
+        # draft StepReq that advances matched particles to a new window AND
+        # re-drafts the mismatched minority in place — one pass advances everyone.
+        self._fused = self._async_bonus and get_bool_env_var("SMCSD_FUSED_S4", "true")
+        self._inflight = 0
+        # Throughput proof (docs/smc/async_bonus_design.md §PROFILE): drafter
+        # StepReqs sent / windows committed = passes/window (fused≈1.0, ModeA≈1.34).
+        self._passes_sent = 0
+        self._windows_committed = 0
         # Optional timing decomposition (SMCSD_TIMING=1): how long the verifier
         # blocks on the drafter (recv wait = drafter-bound signal) vs its own
         # work (verify dispatch + writeback + prepare + barrier).
@@ -148,6 +199,18 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             ):
                 self._commit_spec_standalone()
 
+            # Fused S4 drain guard (analog of the SBP guard above): the fused
+            # train fully drains its in-flight windows at every resample barrier,
+            # so _inflight is 0 between trains.  This guard is the belt-and-braces
+            # drain in case a future path leaves a window in flight before a
+            # prefill/pause/idle (docs/smc/async_bonus_design.md §3 / §7.4).
+            if self._inflight > 0 and (
+                self._engine_paused
+                or self.waiting_groups
+                or self.slot_state.is_empty()
+            ):
+                self._commit_async_bonus_standalone()
+
             if self._engine_paused:
                 self.cancel_bubble_timer()
                 continue
@@ -168,7 +231,12 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                         continue
 
             if not self.slot_state.is_empty():
-                self._run_decode_train()
+                if self._fused:
+                    self._run_fused_bonus_train()
+                elif self._async_bonus:
+                    self._run_async_bonus_train()
+                else:
+                    self._run_decode_train()
             else:
                 self.cur_batch = None
                 self.self_check_during_idle()
@@ -182,6 +250,586 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         result = self.run_batch(batch)
         self._process_prefill_result(batch, result)
         self.last_batch = tracking_batch
+
+    def _run_async_bonus_train(self) -> None:
+        """Async/staggered FULL-bonus decode (SMCSD_ASYNC_BONUS).
+
+        S3 (docs/smc/async_bonus_design.md §S3): ALWAYS-bonus commit, synchronous
+        (no run-ahead overlap yet — that is S4).  Built on the S2 ragged-verify
+        mirror, with the always-bonus accuracy lever added: every window calls
+        `finish_decode(..., drop_bonus=False)`, so the committed anchor is the
+        EXACT target bonus `b = result.next_draft_input.verified_id` (weighting
+        gamma columns), NOT the drafter's bet `tokens[:, gamma]`.
+
+        The train stays synchronous via a full re-draft on any bet miss — exactly
+        `SMCSD_BET_DISCARD`'s mechanics (`_run_decode_train:438-457`): the next
+        window is still prefetched off the drafter-known bet `x_g1` to overlap the
+        verify, but if ANY particle's `x_g1 != b` the speculative window is drained
+        and the WHOLE active set is re-drafted from `b` with `rollback=gamma+1`.
+        At S3 this is BET_DISCARD behavior routed through the async-bonus loop +
+        the `_build_ragged_ctx` verify ctx; the per-particle SUBSET re-draft is S4.
+
+        `prepare_for_decode`'s KV ALLOCATION is KEPT (`_prepare_decode_batch` /
+        `_prepare_decode_batch_fixed` still run); only the verify-ctx construction
+        is swapped (S2 contract).  Flag-off stays byte-identical.
+        """
+        worker = self.draft_worker
+        client = self._draft_client
+        K = self.barrier_k
+        tm = self._timing
+
+        # ── Window 0: cold-prepare (KEEP the allocation), ragged verify ctx ──
+        batch = self._prepare_decode_batch()
+        if batch is None:
+            return
+        active_list = list(batch.spec_info.active_slots_cpu)
+        active_t = torch.tensor(active_list, dtype=torch.int64, device=self.device)
+        tracking_batch = self._make_runtime_tracking_batch(batch)
+        self.cur_batch = tracking_batch
+        self.running_batch = (
+            tracking_batch if tracking_batch is not None else ScheduleBatch(reqs=[])
+        )
+        epoch = next(self._epoch)
+        tag = next(self._tag)
+        # Allocation already done by _prepare_decode_batch; swap ONLY the verify
+        # ctx.  start_decode fires the StepReq from the ragged ctx's
+        # orig_seq_lens_cpu (== baseline on a uniform frontier).
+        ragged_batch, _ = self._build_ragged_ctx(active_t, active_list)
+        pending = worker.start_decode(ragged_batch, tag=tag, epoch=epoch)
+
+        # ── Windows 0..K-1: prefetch overlap, barrier resample ──
+        for w in range(K):
+            t0 = time.perf_counter() if tm else 0.0
+            resp = client.recv_step_resp()
+            if tm:
+                self._t["recv"] += time.perf_counter() - t0
+            if resp.tag != pending.tag or resp.epoch != pending.epoch:
+                raise RuntimeError(
+                    f"Async-bonus step reply tag/epoch mismatch: got "
+                    f"({resp.tag},{resp.epoch}), expected "
+                    f"({pending.tag},{pending.epoch})"
+                )
+            is_last = w == K - 1
+
+            next_tag = None
+            seq_lens_next = None
+            if not is_last:
+                # Prefetch the next window off the drafter-known x_g1 (the bet) so
+                # the drafter computes it while we verify this window — the overlap.
+                # We COMMIT the exact target bonus b below; the bet "wins" per
+                # particle iff x_g1 == b, else the speculative window is re-drafted.
+                anchor_next = torch.from_numpy(resp.tokens)[:, self.gamma].tolist()
+                seq_lens_next = self.slot_state.seq_lens[active_t].tolist()
+                next_tag = next(self._tag)
+                worker.send_step_req(
+                    active_list, anchor_next, seq_lens_next,
+                    tag=next_tag, epoch=epoch,
+                )
+
+            t0 = time.perf_counter() if tm else 0.0
+            # S3: ALWAYS-bonus — drop_bonus=False commits the exact target sample
+            # b (weighting gamma columns), exactly like SMCSD_BET_DISCARD.
+            result = worker.finish_decode(pending, resp, drop_bonus=False)
+            self._writeback_window(result, active_t)
+
+            if not is_last:
+                # The next window was already fired off the drafter's bet x_g1; we
+                # just committed the exact target bonus b.  Per particle the bet
+                # "won" iff x_g1 == b.  (resp.tokens carries gamma+1 columns: the
+                # drafter runs no-bonus, so column gamma is its x_g1.)  On ANY miss,
+                # discard the speculative window and re-draft EVERY particle from b
+                # — synchronous BET_DISCARD mechanics (S4 makes this a subset).
+                x_g1 = torch.from_numpy(resp.tokens)[:, self.gamma]
+                b_cpu = result.next_draft_input.verified_id.cpu()
+                if self._async_bonus_debug:
+                    # The committed anchor MUST be the bonus sample b, never the
+                    # bet tokens[:, gamma] (the S3 accuracy lever).  finish_decode
+                    # with drop_bonus=False sets verified_id from the target
+                    # multinomial, so b == the writeback's committed anchor
+                    # (verified_ids is int32; compare on int64).
+                    committed = self.slot_state.verified_ids[active_t].cpu().to(torch.int64)
+                    if not torch.equal(committed, b_cpu.to(torch.int64)):
+                        raise RuntimeError(
+                            "ASYNC_BONUS S3: committed anchor != target bonus "
+                            f"(committed[:8]={committed[:8].tolist()}, "
+                            f"b[:8]={b_cpu[:8].tolist()})"
+                        )
+                bet_miss = x_g1 != b_cpu
+                if self._bet_stats:
+                    self._bet_n += int(bet_miss.numel())
+                    self._bet_miss_n += int(bet_miss.sum().item())
+                if bool(bet_miss.any()):
+                    # Drain the speculative StepResp (FIFO), then re-fire the whole
+                    # active set from b reusing seq_lens_next with rollback=gamma+1
+                    # so the drafter undoes the discarded window's seq_len advance
+                    # (its length assert passes; the discarded KV is overwritten in
+                    # place — slack reuse, no free, no leak).
+                    stale = client.recv_step_resp()
+                    if stale.tag != next_tag or stale.epoch != epoch:
+                        raise RuntimeError(
+                            f"ASYNC_BONUS drain tag/epoch mismatch: got "
+                            f"({stale.tag},{stale.epoch}), expected ({next_tag},{epoch})"
+                        )
+                    self._n_redraft += 1
+                    next_tag = next(self._tag)
+                    worker.send_step_req(
+                        active_list, b_cpu.tolist(), seq_lens_next,
+                        tag=next_tag, epoch=epoch, rollback=self.gamma + 1,
+                    )
+                if self._bet_stats and self._bet_n >= 500:
+                    print(
+                        f"[ASYNC_BONUS_BET] {self._bet_n} bets: "
+                        f"x_g1!=b={100*self._bet_miss_n/self._bet_n:.1f}% "
+                        f"redrafts={self._n_redraft}",
+                        flush=True,
+                    )
+                    self._bet_n = self._bet_miss_n = 0
+            if tm:
+                self._t["verify"] += time.perf_counter() - t0
+
+            if not is_last:
+                t0 = time.perf_counter() if tm else 0.0
+                # KEEP prepare_for_decode's allocation (advances seq_lens +
+                # allocs KV over the fixed set); swap ONLY the verify ctx.
+                self._prepare_decode_batch_fixed(active_t, active_list)
+                next_batch, next_ctx = self._build_ragged_ctx(active_t, active_list)
+                if tm:
+                    self._t["prep"] += time.perf_counter() - t0
+                pending = PendingDecodeStep(
+                    batch=next_batch,
+                    ctx=next_ctx,
+                    tag=next_tag,
+                    epoch=epoch,
+                )
+            self._t_windows += 1
+
+        # ── Barrier: resample (+ ragged-now reset-to-zero, flag-gated inside
+        #    _barrier_resample), rebuild, finalize-drain. ──
+        t0 = time.perf_counter() if tm else 0.0
+        self._barrier_resample()
+        self.slot_state.rebuild_active_slots()
+        self._drain_finished_groups()
+        if tm:
+            self._t["barrier"] += time.perf_counter() - t0
+            if self._t_windows >= 200:
+                tot = sum(self._t.values()) or 1.0
+                n = self._t_windows
+                print(
+                    f"[ASYNC_BONUS_TIMING] {n} windows: "
+                    f"recv(drafter-wait)={100*self._t['recv']/tot:.0f}% "
+                    f"verify={100*self._t['verify']/tot:.0f}% "
+                    f"prep={100*self._t['prep']/tot:.0f}% "
+                    f"barrier={100*self._t['barrier']/tot:.0f}% | per-window "
+                    f"recv={1e3*self._t['recv']/n:.2f}ms "
+                    f"verify={1e3*self._t['verify']/n:.2f}ms",
+                    flush=True,
+                )
+                self._t = {k: 0.0 for k in self._t}
+                self._t_windows = 0
+        self.last_batch = tracking_batch
+
+    # ── Fused S4: per-particle frontier STAGGER (the throughput slice) ──
+
+    def _fire_fused_window(self, active_list, active_t, verified_ids_cpu, rollback,
+                           tag, epoch):
+        """Fire ONE ragged draft StepReq advancing every in-flight window at its
+        own per-particle frontier, and snapshot the verify ctx for it.
+
+        `slot_state.seq_lens` already holds each window's IN-FLIGHT (advanced)
+        frontier (committed rows bumped +gamma+1 by the caller's
+        `prepare_for_decode`; re-drafted rows left in place — the drafter rewinds
+        via the per-slot `rollback`).  The StepReq's committed-prefix seq_lens are
+        `seq_lens - (gamma+1)` per slot (== the drafter mirror after rollback).
+        Returns the PendingDecodeStep covering this StepReq.  `_inflight += 1`."""
+        gamma = self.gamma
+        seq_lens = self.slot_state.seq_lens[active_t]
+        orig_cpu = (seq_lens - (gamma + 1)).cpu().tolist()
+        self._draft_client.send_step(
+            slots=active_list,
+            verified_ids=verified_ids_cpu,
+            seq_lens=orig_cpu,
+            tag=tag,
+            epoch=epoch,
+            rollback=rollback,
+        )
+        self._inflight += 1
+        self._passes_sent += 1
+        # The verify ctx is the per-particle ragged frontier (each slot scores its
+        # own in-flight window at orig = seq_lens-(gamma+1)).
+        ragged_batch, ragged_ctx = self._build_ragged_ctx(active_t, active_list)
+        return PendingDecodeStep(
+            batch=ragged_batch, ctx=ragged_ctx, tag=tag, epoch=epoch
+        )
+
+    def _prealloc_train_kv(self, active_t, budget: int) -> None:
+        """Grow each active slot's KV allocation to cover the WHOLE train's
+        `budget` tokens in ONE pass, so interior windows advance the frontier with
+        a cheap `seq_lens` scatter (no per-window `alloc_token_slots` /
+        `assign_req_to_token_pool_func`).  Mirrors `from_slot_gather`'s allocation
+        arithmetic (info.py:84-100) but bumps only `kv_allocated_lens`, NOT
+        `seq_lens` — the windows advance `seq_lens` themselves, exactly `budget`
+        over the train, so the last window lands slack-free
+        (`kv_allocated_lens == seq_lens`) for `_fused_resample`'s clone."""
+        from sglang.srt.mem_cache.common import alloc_token_slots
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+        ss = self.slot_state
+        bs = active_t.numel()
+        seq_lens = ss.seq_lens[active_t]
+        kv_alloc = ss.kv_allocated_lens[active_t]
+        # Allocate the gap between the current allocation and seq_lens+budget.
+        alloc_start = torch.maximum(kv_alloc, seq_lens)
+        new_alloc = torch.clamp(seq_lens + budget - alloc_start, min=0)
+        num_needed = int(new_alloc.sum().item())  # single GPU→CPU sync per TRAIN
+        if num_needed == 0:
+            return
+        nxt_kv_lens = alloc_start + new_alloc
+        out_cache_loc = alloc_token_slots(ss.tree_cache, num_needed)
+        assign_req_to_token_pool_func(
+            ss.req_pool_indices[active_t],
+            ss.req_to_token_pool.req_to_token,
+            alloc_start.to(torch.int32),
+            nxt_kv_lens.to(torch.int32),
+            out_cache_loc,
+            bs,
+        )
+        ss.kv_allocated_lens[active_t] = nxt_kv_lens
+
+    def _run_fused_bonus_train(self) -> None:
+        """Fused S4 (docs/smc/async_bonus_design.md §S4 + the FUSED override): the
+        run-ahead OVERLAP + per-particle SUBSET re-draft, the throughput slice.
+
+        The win over Mode A: Mode A fires one overlapped run-ahead off the bet x_g1,
+        then on ANY of the N particles missing (1-p^N ≈ 88%) re-drafts the WHOLE
+        active set — a second blocking drafter pass that dominates.  The FUSED loop
+        re-drafts ONLY the mismatched minority (~20%), folded with the matched
+        run-ahead rows into ONE merged verify (the "one pass advances everyone").
+
+        PER ROUND (overlap preserved — the run-ahead is fired BEFORE the verify off
+        the drafter-known bet x_g1):
+          1. recv the in-flight window; FIRE the next round's run-ahead off x_g1 for
+             EVERY active particle (one pass; overlaps the verify below).
+          2. RAGGED VERIFY this window (db=False -> commit the exact bonus b).
+          3. MATCH/SPLIT: x_g1 == b -> matched (the fired run-ahead stands);
+             else mismatched -> the fired run-ahead is invalid (seeded by x_g1, not
+             the committed anchor b).  Re-draft ONLY the mismatched subset in place
+             (rollback gamma+1, seeded by b) — one mixed StepReq — and MERGE the
+             matched run-ahead reply + the re-draft reply into the next verify ctx.
+             Frontiers stay UNIFORM (both sub-batches at the same advanced frontier)
+             — no stagger, no KV slack.
+          4. After K committed rounds: DRAIN the last in-flight, ESS resample
+             (reset-to-zero + finished-rider exclusion), rebuild, finalize-drain.
+        """
+        worker = self.draft_worker
+        client = self._draft_client
+        K = self.barrier_k
+        tm = self._timing
+        gamma = self.gamma
+
+        # ── Window 0: cold-prepare (advance + alloc), fire off committed anchor. ──
+        batch = self._prepare_decode_batch()
+        if batch is None:
+            return
+        active_list = list(batch.spec_info.active_slots_cpu)
+        active_t = torch.tensor(active_list, dtype=torch.int64, device=self.device)
+        bs = len(active_list)
+        tracking_batch = self._make_runtime_tracking_batch(batch)
+        self.cur_batch = tracking_batch
+        self.running_batch = (
+            tracking_batch if tracking_batch is not None else ScheduleBatch(reqs=[])
+        )
+        epoch = next(self._epoch)
+        tag = next(self._tag)
+        pending = self._fire_fused_window(
+            active_list, active_t,
+            self.slot_state.verified_ids[active_t].to(torch.int64).cpu().tolist(),
+            0, tag, epoch,
+        )
+
+        # PREP AMORTIZATION (docs/smc/async_bonus_design.md §S2 — keep prep cheap):
+        # window-0 cold-prepare allocated 1 window; grow each slot's KV to cover the
+        # remaining (K-1) interior windows in ONE pass now, so interior step-1 prep
+        # advances `seq_lens` with a cheap scatter + ragged gather instead of a
+        # per-window `alloc_token_slots`/`assign_req_to_token_pool_func`.  The train
+        # advances `seq_lens` exactly (K-1)*(gamma+1) more times, so the last window
+        # lands slack-free (`kv_allocated == seq_lens`) for `_fused_resample`.
+        if K > 1:
+            self._prealloc_train_kv(active_t, (K - 1) * (gamma + 1))
+
+        # When a miss round drains the run-ahead to re-draft + merge, the resulting
+        # window is already recv'd — stash it so the next round skips its recv (and
+        # nothing is in flight to overlap that round).  None => recv fresh (overlap).
+        stashed_resp = None
+        for w in range(K):
+            t0 = time.perf_counter() if tm else 0.0
+            if stashed_resp is not None:
+                resp = stashed_resp
+                stashed_resp = None
+            else:
+                resp = client.recv_step_resp()
+                self._inflight -= 1
+            if tm:
+                self._t["recv"] += time.perf_counter() - t0
+            if resp.tag != pending.tag or resp.epoch != pending.epoch:
+                raise RuntimeError(
+                    f"Fused-bonus step reply tag/epoch mismatch: got "
+                    f"({resp.tag},{resp.epoch}), expected "
+                    f"({pending.tag},{pending.epoch})"
+                )
+            is_last = w == K - 1
+            x_g1 = torch.from_numpy(resp.tokens)[:, gamma]              # (bs,) int64
+
+            # 1. OVERLAP: fire the next round's run-ahead off the drafter-known bet
+            #    x_g1 (no verify needed) for EVERY particle, BEFORE the verify, so
+            #    the drafter computes it while we verify locally.  ONE gather
+            #    (`prepare_for_decode` via `_prepare_decode_batch_fixed`) advances
+            #    the whole set uniformly (+gamma+1), allocs KV, and yields the verify
+            #    ctx in one shot (no second ragged gather — the S3-path prep, reused).
+            #    (Skipped on the last window — it drains into the barrier.)
+            ra_pending = None
+            if not is_last:
+                t0 = time.perf_counter() if tm else 0.0
+                self.slot_state.verified_ids[active_t] = x_g1.to(
+                    dtype=self.slot_state.verified_ids.dtype, device=self.device
+                )
+                # Interior prep is now ALLOCATION-FREE (KV pre-allocated for the
+                # whole train above): advance the frontier with a cheap scatter and
+                # gather the ragged verify ctx (no alloc).  `_build_ragged_ctx`
+                # reads `orig = seq_lens-(gamma+1)` == this window's committed
+                # prefix, identical to the old `_prepare_decode_batch_fixed` ctx.
+                self.slot_state.seq_lens[active_t] += gamma + 1
+                ra_batch, ra_ctx = self._build_ragged_ctx(active_t, active_list)
+                ra_tag = next(self._tag)
+                self._draft_client.send_step(
+                    slots=active_list, verified_ids=x_g1.tolist(),
+                    seq_lens=ra_ctx.orig_seq_lens_cpu.tolist(),
+                    tag=ra_tag, epoch=epoch, rollback=0,
+                )
+                self._inflight += 1
+                self._passes_sent += 1
+                ra_pending = PendingDecodeStep(
+                    batch=ra_batch, ctx=ra_ctx, tag=ra_tag, epoch=epoch,
+                )
+                if tm:
+                    self._t["prep"] += time.perf_counter() - t0
+
+            # 2. RAGGED VERIFY this window (db=False -> commit the exact bonus b).
+            t0 = time.perf_counter() if tm else 0.0
+            result = worker.finish_decode(pending, resp, drop_bonus=False)
+            self._writeback_window(result, active_t)
+            b_cpu = result.next_draft_input.verified_id.cpu().to(torch.int64)
+            self._windows_committed += 1
+            if tm:
+                self._t["verify"] += time.perf_counter() - t0
+
+            if is_last:
+                break
+
+            # 3. MATCH/SPLIT + SUBSET re-draft + MERGE.  Mismatched rows (x_g1 != b):
+            #    the run-ahead we fired off x_g1 is invalid (committed anchor is b).
+            #    Re-draft ONLY that subset from b in place (rollback gamma+1) — a
+            #    second pass over the minority — and MERGE the matched rows (from the
+            #    already-fired run-ahead reply) + the re-drafted rows into the next
+            #    verify ctx.  The miss subset re-draws its window at the SAME advanced
+            #    frontier (uniform, no slack); matched rows keep the run-ahead they
+            #    already drafted.  Mode A re-drafts the WHOLE set on ANY miss; the
+            #    FUSED loop re-drafts only the ~20% minority -> ~1 pass/window.
+            t0 = time.perf_counter() if tm else 0.0
+            miss_mask = x_g1 != b_cpu
+            n_miss = int(miss_mask.sum().item())
+            if self._bet_stats:
+                self._bet_n += bs
+                self._bet_miss_n += n_miss
+            if n_miss:
+                # MISS round: the run-ahead's miss rows were drafted off the wrong
+                # anchor (x_g1, not b).  DRAIN it (keep matched rows via the merge),
+                # re-draft ONLY the miss subset from b in place (rollback gamma+1),
+                # and MERGE.  The merged window is already recv'd (no overlap THIS
+                # round) — stashed for the next round.  Misses are the minority, so
+                # most rounds stay in the overlapped (matched) branch below.
+                self._n_redraft += 1
+                ra_resp = client.recv_step_resp()
+                self._inflight -= 1
+                if ra_resp.tag != ra_pending.tag or ra_resp.epoch != ra_pending.epoch:
+                    raise RuntimeError(
+                        f"Fused-bonus run-ahead drain tag/epoch mismatch: got "
+                        f"({ra_resp.tag},{ra_resp.epoch}), expected "
+                        f"({ra_pending.tag},{ra_pending.epoch})"
+                    )
+                miss_idx = miss_mask.nonzero(as_tuple=True)[0]
+                miss_list = [active_list[i] for i in miss_idx.tolist()]
+                b_miss = b_cpu[miss_idx]
+                miss_slots_t = active_t[miss_idx.to(self.device)]
+                orig_miss = (self.slot_state.seq_lens[miss_slots_t]
+                             - (gamma + 1)).cpu().tolist()
+                rd_tag = next(self._tag)
+                client.send_step(
+                    slots=miss_list, verified_ids=b_miss.tolist(),
+                    seq_lens=orig_miss, tag=rd_tag, epoch=epoch,
+                    rollback=gamma + 1,
+                )
+                self._inflight += 1
+                self._passes_sent += 1
+                rd_resp = client.recv_step_resp()
+                self._inflight -= 1
+                if rd_resp.tag != rd_tag or rd_resp.epoch != epoch:
+                    raise RuntimeError(
+                        f"Fused-bonus subset re-draft tag/epoch mismatch: got "
+                        f"({rd_resp.tag},{rd_resp.epoch}), expected ({rd_tag},{epoch})"
+                    )
+                # MERGE: matched rows ← run-ahead reply, miss rows ← re-draft reply.
+                merged_tokens = ra_resp.tokens.copy()
+                merged_logprobs = ra_resp.logprobs.copy()
+                miss_np = miss_idx.numpy()
+                merged_tokens[miss_np] = rd_resp.tokens
+                merged_logprobs[miss_np] = rd_resp.logprobs
+                stashed_resp = DraftStepResp(
+                    tokens=merged_tokens, logprobs=merged_logprobs,
+                    tag=rd_tag, epoch=epoch,
+                )
+                # The next verify ctx x0 must equal each row's drafter anchor
+                # (x_g1 matched / b missed).
+                next_anchor = torch.where(miss_mask, b_cpu, x_g1)
+                self.slot_state.verified_ids[active_t] = next_anchor.to(
+                    dtype=self.slot_state.verified_ids.dtype, device=self.device
+                )
+                ragged_batch, ragged_ctx = self._build_ragged_ctx(active_t, active_list)
+                pending = PendingDecodeStep(
+                    batch=ragged_batch, ctx=ragged_ctx, tag=rd_tag, epoch=epoch,
+                )
+            else:
+                # MATCHED round: the run-ahead we fired off x_g1 is valid and STAYS
+                # IN FLIGHT — the next round recvs it (the overlap).  Its verify ctx
+                # x0 is x_g1 (already written to verified_ids when fired).
+                pending = ra_pending
+            if tm:
+                self._t["prep"] += time.perf_counter() - t0
+            self._t_windows += 1
+
+            if self._bet_stats and self._bet_n >= 500:
+                print(
+                    f"[FUSED_S4] {self._bet_n} bets: "
+                    f"x_g1!=b={100*self._bet_miss_n/max(self._bet_n,1):.1f}% "
+                    f"subset_redrafts={self._n_redraft}",
+                    flush=True,
+                )
+                self._bet_n = self._bet_miss_n = 0
+
+        # ── Barrier: the last window already verified+committed above and fired no
+        #    run-ahead, so the pipeline is drained (_inflight == 0) and every
+        #    particle is at the SAME uniform frontier (slack-free).  ESS resample. ──
+        t0 = time.perf_counter() if tm else 0.0
+        self._fused_resample()
+        self.slot_state.rebuild_active_slots()
+        self._drain_finished_groups()
+        if tm:
+            self._t["barrier"] += time.perf_counter() - t0
+            if self._t_windows >= 200:
+                tot = sum(self._t.values()) or 1.0
+                n = self._t_windows
+                pw = (self._passes_sent / self._windows_committed
+                      if self._windows_committed else 0.0)
+                print(
+                    f"[FUSED_S4_TIMING] {n} windows: "
+                    f"recv(drafter-wait)={100*self._t['recv']/tot:.0f}% "
+                    f"verify={100*self._t['verify']/tot:.0f}% "
+                    f"prep={100*self._t['prep']/tot:.0f}% "
+                    f"barrier={100*self._t['barrier']/tot:.0f}% | per-window "
+                    f"recv={1e3*self._t['recv']/n:.2f}ms "
+                    f"verify={1e3*self._t['verify']/n:.2f}ms | "
+                    f"PASSES/WINDOW={pw:.3f} "
+                    f"(sent={self._passes_sent} committed={self._windows_committed})",
+                    flush=True,
+                )
+                self._t = {k: 0.0 for k in self._t}
+                self._t_windows = 0
+                self._passes_sent = 0
+                self._windows_committed = 0
+        self.last_batch = tracking_batch
+
+    def _commit_async_bonus_standalone(self) -> None:
+        """Event-loop drain guard (docs/smc/async_bonus_design.md §3 / §7.4): pop
+        and commit any in-flight fused window WITHOUT continuing into a train, so
+        its StepResp leaves the FIFO and its frontier advance is written back
+        before a prefill/pause/idle.  Loops on `_inflight` (>=1).  Steady state
+        leaves `_inflight == 0` at each barrier, so this is a belt-and-braces
+        drain — without a saved pending it can only discard, so it just drains the
+        FIFO replies (the frontier was already committed by the barrier)."""
+        while self._inflight > 0:
+            self._draft_client.recv_step_resp()
+            self._inflight -= 1
+
+    def _fused_live_row_mask(self) -> torch.Tensor:
+        """A `(max_groups,)` bool: True iff the in-use group row holds NO finished
+        particle.  Used to exclude finished-rider groups from a barrier's collect
+        so resampling never picks a dead particle as a survivor (§4 3d-i)."""
+        ss = self.slot_state
+        gts = ss.group_to_slots.to(torch.int64)          # (max_groups, N), -1 = empty
+        valid = gts >= 0
+        gather_idx = torch.where(valid, gts, torch.zeros_like(gts))
+        fin = ss.finished_mask[gather_idx] & valid        # (max_groups, N)
+        any_finished = fin.any(dim=1)
+        return ss.row_in_use & ~any_finished
+
+    def _fused_resample(self) -> None:
+        """Ragged-now ESS resample for the fused path (docs/smc/async_bonus_design.md
+        §S5).  Collect / dispatch / commit + reset-to-zero, with finished-rider
+        exclusion + the src-slack-free KV guard.  `_inflight` is 0 here (the last
+        train window fired no run-ahead and drained naturally), so every particle is
+        committed at the SAME uniform frontier and slack-free; the clone carries each
+        particle's committed window for free.
+
+        Finished-rider exclusion (§4, review 2 3d-i): a particle that hit EOS mid-
+        train rides along in `group_to_slots`, so systematic resampling could pick
+        it as a SURVIVOR (src), cloning dead KV onto a live slot that then decodes
+        past EOS.  We EXCLUDE any group row that holds a finished rider from this
+        barrier's collect (a `row_mask`); such a group simply resamples at a later
+        barrier once the rider is dropped by `rebuild_active_slots` (or the group
+        finalizes).  Simple + robust: never clones a dead particle."""
+        row_mask = self._fused_live_row_mask()
+        plan = self.coordinator.collect_resample_jobs_batch(
+            self.slot_state, row_mask=row_mask
+        )
+        if plan.n_jobs == 0:
+            return
+        if self._async_bonus_debug:
+            src = plan.src_slots.to(torch.int64)
+            # src-slack-free guard (the CORRECT §4 invariant for the fused stagger):
+            # `batched_resample_kv` copies src's block table [0, seq_lens[src]) into
+            # dst (in-bounds in the full-width req_to_token row, refcount-shared) and
+            # dispatch sets kv_allocated[dst]=kv_allocated[src].  This is consistent
+            # IFF src carries NO speculative slack (kv_allocated[src]==seq_lens[src]),
+            # so dst's whole claimed allocation is backed by copied entries.  The
+            # drain commits every final-round window (misses re-drafted in place), so
+            # every particle is slack-free here.  Ragged frontiers across particles
+            # (the stagger) are fine — dst_alloc only governs phase-1 dec-ref.
+            slack = int((self.slot_state.kv_allocated_lens[src]
+                         != self.slot_state.seq_lens[src]).sum().item())
+            if slack:
+                raise RuntimeError(
+                    f"FUSED_S4: {slack} resample src slots carry KV slack "
+                    "(kv_allocated != seq_lens) — clone would leave dst's claimed "
+                    "allocation backed by uncopied block-table entries."
+                )
+            # Finished-rider exclusion (§4): no resample job may pick a finished
+            # particle as src (cloning a dead particle's KV onto a live slot would
+            # decode past EOS).
+            if bool(self.slot_state.finished_mask[src].any().item()):
+                raise RuntimeError(
+                    "FUSED_S4: resample picked a FINISHED src (finished-rider "
+                    "survivor) — would clone dead KV onto a live slot."
+                )
+        self.coordinator.dispatch_resample_batch(
+            plan, self.slot_state, rebuild_active=False,
+        )
+        self._draft_client.send_commit(
+            dst_slots=plan.dst_slots.tolist(),
+            src_slots=plan.src_slots.tolist(),
+        )
+        # Reset-to-zero over the post-rebuild active set (extend the kernel's
+        # resampled-row interval_weights zero to all active rows).  finalize_score
+        # left intact (B1 repair).
+        self.slot_state.reset_interval_weights(self.slot_state.active_slots)
 
     # ── Decode train: K windows, prefetch overlap, barrier resample ──
 
@@ -260,9 +908,55 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             # Barrier bonus: the last window is drained (no prefetch fired off it),
             # so override to the exact target-sampled anchor; its bonus becomes the
             # next train's window-0 anchor (set by the writeback's verified_ids).
-            db = False if (is_last and self._barrier_bonus) else None
+            if self._bet:
+                db = False  # Mode A/B: commit the exact target bonus b every window
+            elif is_last and self._barrier_bonus:
+                db = False
+            else:
+                db = None
             result = worker.finish_decode(pending, resp, drop_bonus=db)
             self._writeback_window(result, active_t)
+
+            if self._bet and not is_last:
+                # The next window was already fired (above) on the drafter's x_g1;
+                # we just committed the exact target bonus b.  Per particle the bet
+                # "won" iff x_g1 == b.  (resp.tokens carries gamma+1 columns: the
+                # drafter runs no-bonus, so column gamma is its x_g1.)
+                x_g1 = torch.from_numpy(resp.tokens)[:, self.gamma]
+                b_cpu = result.next_draft_input.verified_id.cpu()
+                bet_miss = x_g1 != b_cpu
+                if self._bet_stats:
+                    self._bet_n += int(bet_miss.numel())
+                    self._bet_miss_n += int(bet_miss.sum().item())
+                if self._bet_discard and bool(bet_miss.any()):
+                    # Discard the speculative next window (fired on x_g1) and
+                    # re-draft EVERY particle from the committed bonus b.  Drain the
+                    # in-flight StepResp first (FIFO), then re-fire reusing the
+                    # original window's seq_lens_next with rollback=gamma+1 so the
+                    # drafter undoes the discarded window's seq_len advance and its
+                    # length assertion passes (the discarded KV is overwritten in
+                    # place — slack reuse, no free, no leak).
+                    stale = client.recv_step_resp()
+                    if stale.tag != next_tag or stale.epoch != epoch:
+                        raise RuntimeError(
+                            f"BET_DISCARD drain tag/epoch mismatch: got "
+                            f"({stale.tag},{stale.epoch}), expected ({next_tag},{epoch})"
+                        )
+                    self._n_redraft += 1
+                    next_tag = next(self._tag)
+                    worker.send_step_req(
+                        active_list, b_cpu.tolist(), seq_lens_next,
+                        tag=next_tag, epoch=epoch, rollback=self.gamma + 1,
+                    )
+                if self._bet_stats and self._bet_n >= 500:
+                    mode = "DISCARD" if self._bet_discard else "KEEP"
+                    print(
+                        f"[BET_{mode}] {self._bet_n} bets: "
+                        f"x_g1!=b={100*self._bet_miss_n/self._bet_n:.1f}% "
+                        f"redrafts={self._n_redraft}",
+                        flush=True,
+                    )
+                    self._bet_n = self._bet_miss_n = 0
             if tm:
                 self._t["verify"] += time.perf_counter() - t0
 
@@ -458,6 +1152,60 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             draft_input, active=active_t, active_list=active_list
         )
 
+    def _build_ragged_ctx(self, active_t, active_list):
+        """Hand-build a verify PendingDecodeStep over a per-particle-ragged
+        frontier (docs/smc/async_bonus_design.md §S2/§4).
+
+        Each slot's own committed frontier is `seq_lens[slot] - (gamma+1)` — the
+        prefix BEFORE the in-flight window's advance.  This GATHERS the existing
+        slot tensors into a verify ctx; it does NOT allocate KV (`from_slot_gather`
+        allocates, a gather does not — info.py:92-100).  For the uniform
+        no-run-ahead case the allocation already happened in the train's
+        `prepare_for_decode`, so this is allocation-free and, on a uniform active
+        set, bit-identical to `from_slot_gather`'s ctx (the S2 no-op proof).
+
+        Clone of the `_build_spec_a1` ctx-construction pattern, minus the
+        ancestor remap (the gather here is identity — each slot scores its own
+        frontier).
+        """
+        gamma = self.gamma
+        seq_lens = self.slot_state.seq_lens[active_t]
+        orig = seq_lens - (gamma + 1)
+        if self._async_bonus_debug:
+            # No-op proof guard: over a uniform active set, this ctx's
+            # orig_seq_lens MUST equal the baseline `prepare_for_decode`/
+            # from_slot_gather ctx (= current seq_lens - (gamma+1)), and the
+            # frontier must stay inside allocated KV.  A violation means the
+            # gather diverged from the allocating prep — a KV-maintenance bug.
+            alloc = self.slot_state.kv_allocated_lens[active_t]
+            bad_orig = int((orig < 0).sum().item())
+            bad_alloc = int((alloc < seq_lens).sum().item())
+            if bad_orig or bad_alloc:
+                raise RuntimeError(
+                    f"ASYNC_BONUS ragged-ctx invariant violated: {bad_orig} slots "
+                    f"orig<0, {bad_alloc} slots kv_allocated<seq_len "
+                    f"(min orig={int(orig.min().item())}, "
+                    f"min slack={int((alloc - seq_lens).min().item())}). "
+                    f"active={active_list[:8]}"
+                )
+        ctx = SMCDecodeContext(
+            orig_seq_lens=orig,
+            orig_seq_lens_cpu=orig.cpu(),
+            orig_seq_lens_sum=int(orig.sum().item()),
+            new_seq_lens=seq_lens,
+            gamma=gamma,
+        )
+        draft_input = SMCDraftInput(
+            verified_id=self.slot_state.verified_ids[active_t],
+            num_tokens_per_req=gamma + 1,
+            decode_ctx=ctx,
+        )
+        draft_input.active_slots_cpu = active_list
+        batch = self.slot_state.build_model_worker_batch(
+            draft_input, active=active_t, active_list=active_list
+        )
+        return batch, ctx
+
     def _writeback_window(self, result, active_t) -> None:
         if result.copy_done is not None:
             result.copy_done.synchronize()
@@ -490,6 +1238,12 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 dst_slots=plan.dst_slots.tolist(),
                 src_slots=plan.src_slots.tolist(),
             )
+            if self._async_bonus:
+                # Ragged-now reset-to-zero (docs/smc/async_bonus_design.md §2c/§4):
+                # extend the kernel's resampled-row interval_weights zero to ALL
+                # active rows.  finalize_score is left intact.  Inert in every
+                # existing mode (gated on the flag).
+                self.slot_state.reset_interval_weights(self.slot_state.active_slots)
             if self._spec is not None:
                 # SBP ancestry a(i): retired slot i adopts survivor src[i]; every
                 # other slot maps to itself. Slot-indexed; consumed in train T+1

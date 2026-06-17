@@ -100,6 +100,7 @@ class DraftEngineClient:
         seq_lens: List[int],
         tag: int = 0,
         epoch: int = 0,
+        rollback: "int | List[int]" = 0,
     ) -> None:
         """Fire a draft round without waiting for the reply (pipelined path)."""
         self.send_to_drafter.send_pyobj(
@@ -109,6 +110,7 @@ class DraftEngineClient:
                 seq_lens=seq_lens,
                 tag=tag,
                 epoch=epoch,
+                rollback=rollback,
             )
         )
 
@@ -294,6 +296,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
         seq_lens_cpu: List[int],
         tag: int = 0,
         epoch: int = 0,
+        rollback: "int | List[int]" = 0,
     ) -> None:
         """Fire one draft round on the drafter (no slot_state dependency).
 
@@ -306,6 +309,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
             seq_lens=seq_lens_cpu,
             tag=tag,
             epoch=epoch,
+            rollback=rollback,
         )
 
     def start_decode(
