@@ -405,6 +405,88 @@ tokens 37964**.
 
 ---
 
+## 5b. DEPTH-2 — folding the serial re-draft (attempted; NEGATIVE at K=2)
+
+**Context.** The committed depth-1 fused loop (`_run_fused_bonus_train`) measures, on the
+validation config (`--particles 12 --gamma 8`, `SMCSD_RESAMPLE_INTERVAL=2`, GPUs 0,1, 100q):
+**72.0% @ 93.0 tok/s, PASSES/WINDOW = 1.31**, timing buckets `recv 33% / verify 42% / prep 24% /
+barrier 1%`. The `prep` 24% bucket is **not** CPU prep (CPU prep ≈ 0.56ms) — it is the **serial
+re-draft on miss rounds**: on a bet miss (`x_g1 != b`, ≈84% of rounds with 12 particles at a
+~14%/particle miss rate) the loop drains the wrong run-ahead and fires a **blocking** subset
+re-draft from the post-verify bonus `b`. That +0.31 passes/window is the depth-1 wall.
+
+**Depth-2 goal.** Fold the re-draft into the pipeline so PASSES/WINDOW → 1.0 and beat Mode A
+(106 tok/s).
+
+### Variant A — VERIFY-FIRST single-fire (`SMCSD_ASYNC_BONUS_DEPTH2=1`, shipped, flag-gated)
+
+Verify each window FIRST (commit the exact bonus `b`), THEN fire the next window directly off `b`
+in one merged full-width pass. No bet → no miss → no re-draft. **PASSES/WINDOW = 1.000** (exact:
+sent 400 = committed 400; `prep` bucket → 0%). The committed anchor is always the target bonus —
+**identical SMC semantics to Mode A / S3** (the §6(d) MATCHED branch on every window).
+
+**Measured (100q, GPUs 0,1):** **68.0% @ 92.3 tok/s, PASSES/WINDOW = 1.000**, buckets
+`recv 58% / verify 40% / prep 0% / barrier 1%` (per-window recv 87.2ms vs depth-1's 47.5ms).
+
+**Verdict — does NOT beat Mode A.** Folding the re-draft to 1.0 passes is real, but verify-first
+**loses the run-ahead overlap**: the next draft cannot start until this window's verify finishes,
+so the drafter-wait (`recv`) nearly doubles (33% → 58%) and exactly cancels the saved re-draft.
+Net ≈ depth-1 (92 vs 93 tok/s), below Mode A's 106. Accuracy 68% is within 100q noise of the
+71% Mode-A class (the always-bonus anchor is exact), i.e. the **accuracy gate holds** — it is the
+**throughput** that the trade does not deliver at K=2.
+
+### Variant B — DEFERRED-OVERLAP (attempted, removed)
+
+Keep depth-1's run-ahead fired off the bet `x_g1` BEFORE the verify (overlap preserved); on a
+miss, DEFER the subset re-draft into the NEXT round's single merged pass (per-slot `rollback`:
+leaders rollback 0 / laggards rollback γ+1), so the re-draft OVERLAPS the verify. The miss row
+commits one window late (lag ≤ 1, the depth-2 bound; the ragged verify scores each row at its own
+frontier).
+
+**Why it fails at K=2.** The deferral makes a miss row lag one window, which it can only catch up
+in a LATER interior round. With `SMCSD_RESAMPLE_INTERVAL=2` there is only **K−1 = 1 interior
+overlap window per train** — no room to amortise the lag. The catch-up needs an extra round, and
+holding the drafter's 1-fire:1-recv invariant forces full-width (partly drained) tail passes →
+PASSES/WINDOW *rises* (and the train-tail/catch-up frontier bookkeeping is genuinely intricate).
+Measured throughput was **worse (~70 tok/s)** and overlap was preserved (`recv 44%`) but the extra
+passes dominated. Removed (does not beat depth-1; the tail bookkeeping is not production-clean).
+
+### Conclusion (the K-sweep settles it — depth-2 is dominated at ALL K)
+
+The earlier conjecture was that the fold would pay off at **K ≫ 2** (more interior windows to
+amortise the lost overlap over). **A K-sweep disproves it** (verify-first depth-2 vs Mode A, 100q,
+GPUs 0,1):
+
+| K | depth-2 (acc / tok/s) | Mode A (acc / tok/s) | PASSES/WINDOW (d2) |
+|---|---|---|---|
+| 2 | 68.0% / 91.9 | 69.0% / 104.4 | 1.000 |
+| 4 | 63.0% / 87.2 | 69.0% / 99.6  | 1.000 |
+| 8 | 58.0% / 75.8 | 62.0% / 88.4  | 1.000 |
+
+The fold is mechanically perfect (`PASSES/WINDOW = 1.000` at every K — zero re-drafts), yet depth-2
+**loses to Mode A at every K, and the gap widens** (it gets *slower* with K, not faster). Two facts
+kill the K≫2 escape:
+
+1. **Overlap is worth more than avoiding the re-draft.** Verify-first buys 1.0 passes but idles the
+   drafter through every verify (`recv` 33%→58%); Mode A keeps the run-ahead overlap and just eats
+   the re-draft. The trade is not close — overlap wins outright. (This is also why depth-1 fused at
+   93 and depth-2 at 92 both sit *below* Mode A's ~104–107: the async machinery's per-round overhead
+   costs more than its better overlap recovers vs the simpler synchronous Mode A train.)
+2. **Larger K lowers throughput, not raises it.** Fewer resamples → worse particles → longer/rambling
+   generations → longer KV → slower per-token forward. The accuracy degradation feeds *back* into
+   speed, so both modes slow with K — the opposite of the amortisation the hypothesis assumed.
+
+**Definitive result: beating Mode A at full-bonus accuracy is not achievable.** Confirmed across the
+whole space — Mode A, depth-1 fused, depth-2 fold, × K ∈ {2,4,8}. **Mode A (~71% @ ~107) is the
+full-bonus throughput optimum.** The async-bonus design *matches* its accuracy (+5pt over no-bonus —
+the real, banked win) but cannot exceed its throughput. The only remaining throughput levers all
+**leave** the full-accuracy target: large K (trades accuracy, see table), a deep open-loop pipeline
+decoupled from K (= SBP territory: −4.4pt coupling, already have it at 177 tok/s), or an orthogonal
+drafter-floor cut (GRAPH_AR / faster draft model) that lifts *every* config equally and so never
+makes fused *win*. The throughput investigation is closed at the frontier.
+
+---
+
 ## 6. Correctness verdicts (the four required + repairs)
 
 ### (a) Reset-to-zero unbiasedness — **VALID for the target; CONDITIONAL on the finalize fix (B1)**
@@ -522,6 +604,13 @@ footgun.)
 - **Accuracy slice** (S3): **~71%** (Mode A), throughput ~107-109.
 - **Throughput slices** (S4-S5): accuracy holds **~71%**, throughput **~130-135** tok/s.
 - **Final target:** **~71% @ ~130-135** tok/s (S5).
+
+> **OUTCOME (not met — see §5b).** The accuracy target held (~71%, full bonus) but the throughput
+> target did **not**: depth-1 fused (~93) and depth-2 fold (~92) both land *below* Mode A (~107),
+> and the K-sweep shows depth-2 is dominated at every K. **Mode A (~71% @ ~107) is the full-bonus
+> throughput optimum; ~130-135 at full bonus is not achievable** (the re-draft is memory-bound and
+> fires on a majority of rounds, and overlap ⊥ fold). The async-bonus loop is retained as a
+> validated, flag-gated implementation that *matches* Mode A's accuracy; it does not beat its speed.
 
 > **Mandatory empirical next step (review 1):** run **S2** (`SMCSD_ASYNC_BONUS=1`, no run-ahead,
 > 200q then 1000q) and confirm it reproduces no-bonus async tokens **37964 / 191522** bit-identically.

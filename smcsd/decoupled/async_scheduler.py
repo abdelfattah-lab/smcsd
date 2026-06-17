@@ -158,6 +158,20 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         # draft StepReq that advances matched particles to a new window AND
         # re-drafts the mismatched minority in place — one pass advances everyone.
         self._fused = self._async_bonus and get_bool_env_var("SMCSD_FUSED_S4", "true")
+        # Depth-2 re-draft folding (docs/smc/async_bonus_design.md §DEPTH-2),
+        # SMCSD_ASYNC_BONUS_DEPTH2=1 (off by default — the committed depth-1 fused
+        # path stays byte-identical): VERIFY-FIRST single-fire.  Verify each window
+        # FIRST (commit the exact bonus b), THEN fire the next window directly off b
+        # in ONE merged pass — no bet, no miss, no re-draft, so PASSES/WINDOW -> 1.0
+        # (folds away the depth-1 serial re-draft, the +0.31 passes / `prep` bucket).
+        # The trade is the lost run-ahead OVERLAP (the next draft cannot start until
+        # this verify finishes); at K=2 the lost overlap eats the win (the recv
+        # drafter-wait grows 33%->58%; see the report).  Measured ~92 tok/s (≈ Mode A
+        # accuracy but NOT Mode A's 106 throughput): depth-2 needs K>2 interior
+        # windows to amortise the lag — at K=2 the fold cannot beat the overlap.
+        self._depth2 = self._fused and get_bool_env_var(
+            "SMCSD_ASYNC_BONUS_DEPTH2", "false"
+        )
         self._inflight = 0
         # Throughput proof (docs/smc/async_bonus_design.md §PROFILE): drafter
         # StepReqs sent / windows committed = passes/window (fused≈1.0, ModeA≈1.34).
@@ -231,7 +245,9 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                         continue
 
             if not self.slot_state.is_empty():
-                if self._fused:
+                if self._depth2:
+                    self._run_fused_bonus_train_depth2()
+                elif self._fused:
                     self._run_fused_bonus_train()
                 elif self._async_bonus:
                     self._run_async_bonus_train()
@@ -731,6 +747,154 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                       if self._windows_committed else 0.0)
                 print(
                     f"[FUSED_S4_TIMING] {n} windows: "
+                    f"recv(drafter-wait)={100*self._t['recv']/tot:.0f}% "
+                    f"verify={100*self._t['verify']/tot:.0f}% "
+                    f"prep={100*self._t['prep']/tot:.0f}% "
+                    f"barrier={100*self._t['barrier']/tot:.0f}% | per-window "
+                    f"recv={1e3*self._t['recv']/n:.2f}ms "
+                    f"verify={1e3*self._t['verify']/n:.2f}ms | "
+                    f"PASSES/WINDOW={pw:.3f} "
+                    f"(sent={self._passes_sent} committed={self._windows_committed})",
+                    flush=True,
+                )
+                self._t = {k: 0.0 for k in self._t}
+                self._t_windows = 0
+                self._passes_sent = 0
+                self._windows_committed = 0
+        self.last_batch = tracking_batch
+
+    def _run_fused_bonus_train_depth2(self) -> None:
+        """Fused S4 + DEPTH-2 re-draft folding (docs/smc/async_bonus_design.md
+        §DEPTH-2): FOLD the per-round re-draft into ONE merged draft pass by firing
+        each round's window off the EXACT committed anchor `b` (verify-first), so the
+        re-draft never happens — there is no bet to miss.  PASSES/WINDOW → 1.0.
+
+        The depth-1 cost is the SERIAL re-draft on a miss: depth-1 fires the next
+        run-ahead off the drafter-known bet x_g1 BEFORE the verify (overlap), but the
+        committed anchor b is only known AFTER the verify, so on a miss (≈84% of
+        rounds, any of N) it must DRAIN the wrong run-ahead and fire a BLOCKING
+        subset re-draft from b — a second, non-overlapped drafter pass (the +0.31
+        passes/window).
+
+        Depth-2 removes the bet entirely: it VERIFIES this round's window first
+        (committing the exact bonus b), THEN fires the next window's draft directly
+        off b in ONE merged full-width pass.  No bet, no miss, no re-draft, no drain:
+        exactly ONE draft pass per committed window.  The cost is the lost run-ahead
+        OVERLAP (the next draft cannot start until this verify finishes); the win is
+        eliminating the ≈84%-of-rounds serial re-draft.  Net is measured against
+        Mode A's 106 tok/s.
+
+        PER ROUND:
+          1. recv the in-flight window (fired off the correct anchor last round).
+          2. RAGGED VERIFY it (db=False → commit the exact bonus b).
+          3. FIRE the next window off b for the WHOLE active set (one pass), unless
+             this was the last (Kth) window — then drain into the barrier.
+        At the barrier every particle committed exactly K windows at a uniform
+        slack-free frontier (every fire advances +gamma+1; no in-place re-draft),
+        so `_fused_resample` runs unchanged.
+        """
+        worker = self.draft_worker
+        client = self._draft_client
+        K = self.barrier_k
+        tm = self._timing
+        gamma = self.gamma
+        G = gamma + 1
+
+        # ── Window 0: cold-prepare (advance + alloc), fire off committed anchor. ──
+        batch = self._prepare_decode_batch()
+        if batch is None:
+            return
+        active_list = list(batch.spec_info.active_slots_cpu)
+        active_t = torch.tensor(active_list, dtype=torch.int64, device=self.device)
+        tracking_batch = self._make_runtime_tracking_batch(batch)
+        self.cur_batch = tracking_batch
+        self.running_batch = (
+            tracking_batch if tracking_batch is not None else ScheduleBatch(reqs=[])
+        )
+        epoch = next(self._epoch)
+        tag = next(self._tag)
+        pending = self._fire_fused_window(
+            active_list, active_t,
+            self.slot_state.verified_ids[active_t].to(torch.int64).cpu().tolist(),
+            0, tag, epoch,
+        )
+        # Pre-grow KV to cover the whole train in one pass (interior prep is then an
+        # allocation-free scatter, same as depth-1).  Every fire advances seq_lens
+        # by exactly gamma+1 (no in-place re-draft), so the train advances seq_lens
+        # exactly K times total → budget (K-1)*(gamma+1) beyond window-0's one window.
+        if K > 1:
+            self._prealloc_train_kv(active_t, (K - 1) * G)
+
+        for w in range(K):
+            t0 = time.perf_counter() if tm else 0.0
+            resp = client.recv_step_resp()
+            self._inflight -= 1
+            if tm:
+                self._t["recv"] += time.perf_counter() - t0
+            if resp.tag != pending.tag or resp.epoch != pending.epoch:
+                raise RuntimeError(
+                    f"Fused-depth2 step reply tag/epoch mismatch: got "
+                    f"({resp.tag},{resp.epoch}), expected "
+                    f"({pending.tag},{pending.epoch})"
+                )
+            is_last = w == K - 1
+
+            # ── 1. VERIFY this window (db=False → commit the exact bonus b) ──
+            t0 = time.perf_counter() if tm else 0.0
+            result = worker.finish_decode(pending, resp, drop_bonus=False)
+            self._writeback_window(result, active_t)
+            b_cpu = result.next_draft_input.verified_id.cpu().to(torch.int64)
+            self._windows_committed += 1
+            if tm:
+                self._t["verify"] += time.perf_counter() - t0
+
+            if is_last:
+                break
+
+            # ── 2. FIRE the next window off the exact committed anchor b ──
+            # ONE merged full-width pass, rollback 0 (a fresh window).  No bet, so no
+            # miss and no re-draft — the depth-2 fold.  `process_batch_result` already
+            # set verified_ids = b (step b); re-affirm it, advance the frontier, and
+            # build the ragged verify ctx for this fire's window.
+            t0 = time.perf_counter() if tm else 0.0
+            self.slot_state.verified_ids[active_t] = b_cpu.to(
+                dtype=self.slot_state.verified_ids.dtype, device=self.device
+            )
+            self.slot_state.seq_lens[active_t] += G
+            ra_batch, ra_ctx = self._build_ragged_ctx(active_t, active_list)
+            ra_tag = next(self._tag)
+            self._draft_client.send_step(
+                slots=active_list, verified_ids=b_cpu.tolist(),
+                seq_lens=ra_ctx.orig_seq_lens_cpu.tolist(),
+                tag=ra_tag, epoch=epoch, rollback=0,
+            )
+            self._inflight += 1
+            self._passes_sent += 1
+            pending = PendingDecodeStep(
+                batch=ra_batch, ctx=ra_ctx, tag=ra_tag, epoch=epoch,
+            )
+            if tm:
+                self._t["prep"] += time.perf_counter() - t0
+            self._t_windows += 1
+
+        # ── Barrier: every active row committed exactly K windows and the pipeline
+        #    is drained (_inflight == 0 — the last window fired no run-ahead).
+        #    Frontiers are uniform + slack-free (every fire advanced seq_lens by
+        #    exactly gamma+1, K times total → kv_allocated == seq_lens).  ESS
+        #    resample (reset-to-zero + finished-rider exclusion). ──
+        t0 = time.perf_counter() if tm else 0.0
+        self._fused_resample()
+        self.slot_state.rebuild_active_slots()
+        self._drain_finished_groups()
+        if tm:
+            self._t["barrier"] += time.perf_counter() - t0
+            if self._t_windows >= 200:
+                tot = sum(self._t.values()) or 1.0
+                n = self._t_windows
+                pw = (self._passes_sent / self._windows_committed
+                      if self._windows_committed else 0.0)
+                print(
+                    f"[FUSED_S4_TIMING] {n} windows (DEPTH2): "
                     f"recv(drafter-wait)={100*self._t['recv']/tot:.0f}% "
                     f"verify={100*self._t['verify']/tot:.0f}% "
                     f"prep={100*self._t['prep']/tot:.0f}% "
