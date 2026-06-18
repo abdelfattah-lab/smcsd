@@ -117,6 +117,8 @@ class SMCCoordinator:
         self.device = device
         self.resample_threshold = resample_threshold
         self._step_counter = 0
+        self._collect_buffers = None
+        self._collect_buffer_shape = None
         logger.info(
             "SMCCoordinator: resample_threshold=%s (fused systematic kernel)",
             resample_threshold,
@@ -146,6 +148,18 @@ class SMCCoordinator:
         row_in_use = slot_state.row_in_use
         if row_mask is not None:
             row_in_use = row_in_use & row_mask
+        max_groups, n_particles = slot_state.group_to_slots.shape
+        flat_cap = max_groups * n_particles
+        shape = (slot_state.log_weights.device, max_groups, n_particles, flat_cap)
+        if self._collect_buffer_shape != shape:
+            self._collect_buffers = {
+                "dst": torch.empty(flat_cap, dtype=torch.int32, device=self.device),
+                "src": torch.empty(flat_cap, dtype=torch.int32, device=self.device),
+                "rows": torch.empty(flat_cap, dtype=torch.int32, device=self.device),
+                "counter": torch.empty(1, dtype=torch.int32, device=self.device),
+                "mask": torch.empty(max_groups, dtype=torch.int32, device=self.device),
+            }
+            self._collect_buffer_shape = shape
         return batched_collect_fused(
             slot_state.log_weights,
             slot_state.interval_weights,
@@ -153,6 +167,7 @@ class SMCCoordinator:
             row_in_use,
             self.resample_threshold,
             step_counter=self._step_counter,
+            buffers=self._collect_buffers,
         )
 
     def dispatch_resample_batch(
@@ -161,15 +176,19 @@ class SMCCoordinator:
         slot_state: "ScheduleBatchSMC",
         *,
         rebuild_active: bool = True,
-    ) -> None:
+    ) -> tuple[list[int], list[int]]:
         """Apply a ``BatchedResampleResult`` plan.
 
         Fused KV copy + per-slot state copies + Req-metadata loop.  No-op on
         an empty plan.  ``rebuild_active`` may be deferred by the caller if
         other membership changes are about to happen in the same cycle.
+
+        Returns the CPU dst/src slot lists already materialized for Req metadata
+        so lag-1 can mirror the same resample plan to the drafter without another
+        GPU→CPU list conversion.
         """
         if plan.n_jobs == 0:
-            return
+            return [], []
 
         from smcsd.core.kernels.fused_resample_kv import batched_resample_kv
 
@@ -185,6 +204,7 @@ class SMCCoordinator:
         src_pool_indices = slot_state.req_pool_indices[src_idx].to(torch.int32)
         dst_alloc_lens = slot_state.kv_allocated_lens[dst_idx].to(torch.int32)
         src_seq_lens = slot_state.seq_lens[src_idx].to(torch.int32)
+        src_alloc_lens = slot_state.kv_allocated_lens[src_idx].to(torch.int32)
 
         to_free = batched_resample_kv(
             slot_state.req_to_token_pool.req_to_token,
@@ -207,15 +227,35 @@ class SMCCoordinator:
 
         # Req-level metadata is Python-only (output_ids list, finished_reason
         # object, etc.) — unavoidable per-copy loop.
-        for dst_slot, src_slot in zip(
-            dst_idx.tolist(), src_idx.tolist(), strict=True
+        dst_slots_cpu = dst_idx.tolist()
+        src_slots_cpu = src_idx.tolist()
+        new_seq_lens_cpu = src_seq_lens.cpu().tolist()
+        new_alloc_lens_cpu = src_alloc_lens.cpu().tolist()
+        for dst_slot, src_slot, new_seq_len, new_alloc_len in zip(
+            dst_slots_cpu,
+            src_slots_cpu,
+            new_seq_lens_cpu,
+            new_alloc_lens_cpu,
+            strict=True,
         ):
-            slot_state.copy_req_metadata(dst_slot, src_slot)
+            slot_state.seq_lens_cpu[dst_slot] = int(new_seq_len)
+            slot_state.kv_allocated_lens_cpu[dst_slot] = int(new_alloc_len)
+            slot_state.verified_ids_cpu[dst_slot] = slot_state.verified_ids_cpu[src_slot]
+            slot_state.token_counts_cpu[dst_slot] = slot_state.token_counts_cpu[src_slot]
+            slot_state.finished_mask_cpu[dst_slot] = slot_state.finished_mask_cpu[src_slot]
+            slot_state.copy_req_metadata(
+                dst_slot,
+                src_slot,
+                kv_committed_len=new_seq_len,
+                kv_allocated_len=new_alloc_len,
+            )
 
         # Resampling can copy finished ancestors into previously active
         # slots, flipping the live set.
         if rebuild_active:
             slot_state.rebuild_active_slots()
+
+        return dst_slots_cpu, src_slots_cpu
 
 
 class SMCScheduler(Scheduler):

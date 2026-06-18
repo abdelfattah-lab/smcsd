@@ -49,6 +49,8 @@ class SMCDecodeContext:
     orig_seq_lens_sum: int  # scalar sum
     new_seq_lens: torch.Tensor  # (bs,) AFTER advance by gamma+1
     gamma: int  # speculative steps (gamma, NOT gamma+1)
+    new_seq_lens_cpu: Optional[torch.Tensor] = None  # CPU copy of new_seq_lens
+    new_seq_lens_sum: Optional[int] = None  # scalar sum of new_seq_lens
 
     @staticmethod
     def from_slot_gather(
@@ -58,6 +60,7 @@ class SMCDecodeContext:
         gamma_plus_1: int,
         req_to_token_pool: ReqToTokenPool,
         tree_cache,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> Tuple["SMCDecodeContext", torch.Tensor]:
         """Vectorized KV allocation — replaces the Python loop in
         SMCDraftInput.prepare_for_decode (smc_info.py L203-217).
@@ -77,9 +80,11 @@ class SMCDecodeContext:
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = len(seq_lens)
-        seq_lens_cpu = seq_lens.cpu()
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.cpu()
         orig_seq_lens = seq_lens.clone()
         orig_seq_lens_sum = int(seq_lens_cpu.sum().item())
+        new_seq_lens_cpu = seq_lens_cpu + gamma_plus_1
 
         # Vectorized allocation (replaces per-req Python loop)
         alloc_start = torch.maximum(kv_allocated_lens, seq_lens)
@@ -107,6 +112,8 @@ class SMCDecodeContext:
             orig_seq_lens_sum=orig_seq_lens_sum,
             new_seq_lens=new_seq_lens,
             gamma=gamma_plus_1 - 1,
+            new_seq_lens_cpu=new_seq_lens_cpu,
+            new_seq_lens_sum=orig_seq_lens_sum + bs * gamma_plus_1,
         )
         return ctx, nxt_kv_lens
 

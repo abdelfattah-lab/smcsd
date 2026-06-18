@@ -203,6 +203,7 @@ def batched_collect_fused(
     threshold: float,
     *,
     step_counter: int,
+    buffers: Optional[dict[str, torch.Tensor]] = None,
 ) -> BatchedResampleResult:
     """Launch the fused collect kernel against slot-major weights.
 
@@ -232,23 +233,28 @@ def batched_collect_fused(
         (tagged with its source row in ``row_of_job[i]``).
         ``resample_mask[r]`` flags rows that actually resampled this step.
 
-    Notes
-    -----
-    The kernel's output buffers are allocated locally on each call.
-    ``5 × torch.empty((max_slots,), int32)`` is microseconds against a
-    ~10 ms decode step — not worth pre-allocating.  The buffers outlive
-    the call only via the slice views carried by the returned
-    ``BatchedResampleResult``.
+    buffers:
+        Optional reusable output storage with keys ``dst``, ``src``, ``rows``,
+        ``counter``, and ``mask``.  Passing buffers avoids hot-path tensor
+        allocation in schedulers that call collect every decode cycle.
     """
     device = log_weights.device
     max_groups, N = group_to_slots.shape
     flat_cap = max_groups * N
 
-    plan_dst = torch.empty(flat_cap, dtype=torch.int32, device=device)
-    plan_src = torch.empty(flat_cap, dtype=torch.int32, device=device)
-    plan_rows = torch.empty(flat_cap, dtype=torch.int32, device=device)
-    plan_counter = torch.zeros(1, dtype=torch.int32, device=device)
-    plan_mask = torch.zeros(max_groups, dtype=torch.int32, device=device)
+    if buffers is None:
+        plan_dst = torch.empty(flat_cap, dtype=torch.int32, device=device)
+        plan_src = torch.empty(flat_cap, dtype=torch.int32, device=device)
+        plan_rows = torch.empty(flat_cap, dtype=torch.int32, device=device)
+        plan_counter = torch.empty(1, dtype=torch.int32, device=device)
+        plan_mask = torch.empty(max_groups, dtype=torch.int32, device=device)
+    else:
+        plan_dst = buffers["dst"]
+        plan_src = buffers["src"]
+        plan_rows = buffers["rows"]
+        plan_counter = buffers["counter"]
+        plan_mask = buffers["mask"]
+    plan_counter.zero_()
 
     BLOCK = max(triton.next_power_of_2(N), 16)
     _fused_collect_kernel[(max_groups,)](

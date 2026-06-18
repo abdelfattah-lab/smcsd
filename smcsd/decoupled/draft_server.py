@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 import time
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import psutil
@@ -156,6 +157,11 @@ class SMCDraftServer:
                 f"{type(self.token_to_kv_pool_allocator).__name__}"
             )
         self.device = self.req_to_token_pool.device
+        self._torch_profiler = None
+        self._torch_profile_step_n = 0
+        self._torch_profile_total_steps = 0
+        self._torch_profile_stopped = False
+        self._init_torch_profiler("draft")
         self.tree_cache = ChunkCache(
             CacheInitParams(
                 disable=True,
@@ -194,11 +200,73 @@ class SMCDraftServer:
     #  Event loop
     # ────────────────────────────────────────────────────────
 
+    def _init_torch_profiler(self, role: str) -> None:
+        out_dir = os.environ.get("SMCSD_TORCH_PROFILE_DIR")
+        if not out_dir:
+            return
+        roles = {
+            part.strip()
+            for part in os.environ.get("SMCSD_TORCH_PROFILE_ROLES", "target,draft").split(",")
+            if part.strip()
+        }
+        if role not in roles:
+            return
+        wait = max(int(os.environ.get("SMCSD_TORCH_PROFILE_WAIT", "5")), 0)
+        active = max(int(os.environ.get("SMCSD_TORCH_PROFILE_ACTIVE", "20")), 1)
+        with_stack = os.environ.get("SMCSD_TORCH_PROFILE_WITH_STACK", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        role_dir = os.path.join(out_dir, role)
+        os.makedirs(role_dir, exist_ok=True)
+        self._torch_profile_total_steps = wait + active
+        self._torch_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=wait, warmup=0, active=active, repeat=1
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                role_dir, worker_name=f"{role}-{os.getpid()}"
+            ),
+            record_shapes=False,
+            with_stack=with_stack,
+        )
+        self._torch_profiler.start()
+        print(
+            "[TORCH_PROFILE] "
+            f"role={role} dir={role_dir} wait={wait} active={active} "
+            f"with_stack={with_stack}",
+            flush=True,
+        )
+
+    def _torch_record(self, name: str):
+        if self._torch_profiler is None or self._torch_profile_stopped:
+            return nullcontext()
+        return torch.profiler.record_function(name)
+
+    def _torch_profile_step(self) -> None:
+        if self._torch_profiler is None or self._torch_profile_stopped:
+            return
+        self._torch_profiler.step()
+        self._torch_profile_step_n += 1
+        if self._torch_profile_step_n >= self._torch_profile_total_steps:
+            self._torch_profiler.stop()
+            self._torch_profile_stopped = True
+            print("[TORCH_PROFILE] role=draft stopped", flush=True)
+
     def event_loop(self) -> None:
         while True:
             msg = self.recv_from_verifier.recv_pyobj()
             if isinstance(msg, DraftStepReq):
-                self.send_to_verifier.send_pyobj(self._handle_step(msg))
+                with self._torch_record("draft_handle_step"):
+                    resp = self._handle_step(msg)
+                self._torch_profile_step()
+                self.send_to_verifier.send_pyobj(resp)
             elif isinstance(msg, DraftCommitResample):
                 self._handle_commit(msg)
             elif isinstance(msg, DraftPrefillReq):
@@ -387,7 +455,8 @@ class SMCDraftServer:
             self.seq_lens[active] -= msg.rollback
 
         seq_g = self.seq_lens[active]
-        seq_cpu = seq_g.cpu().tolist()
+        seq_cpu_t = seq_g.cpu()
+        seq_cpu = seq_cpu_t.tolist()
         if seq_cpu != list(msg.seq_lens):
             raise RuntimeError(
                 "Drafter/verifier seq_lens divergence: "
@@ -405,6 +474,7 @@ class SMCDraftServer:
             gamma_plus_1=gamma + 1,
             req_to_token_pool=self.req_to_token_pool,
             tree_cache=self.tree_cache,
+            seq_lens_cpu=seq_cpu_t,
         )
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
@@ -519,7 +589,10 @@ class SMCDraftServer:
                 out=prof_out,
             )
         return DraftStepResp(
-            tokens=tokens_np, logprobs=logprobs_np, tag=msg.tag, epoch=msg.epoch
+            tokens=tokens_np,
+            logprobs=logprobs_np,
+            tag=msg.tag,
+            epoch=msg.epoch,
         )
 
     def _truncate_step_kv_if_requested(self, active: torch.Tensor, truncate_kv) -> None:
@@ -558,7 +631,14 @@ class SMCDraftServer:
         samples explicitly)."""
         bs = active.numel()
         seq_lens = ctx.new_seq_lens
-        seq_lens_cpu = seq_lens.cpu()
+        seq_lens_cpu = ctx.new_seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.cpu()
+        seq_lens_sum = (
+            int(ctx.new_seq_lens_sum)
+            if ctx.new_seq_lens_sum is not None
+            else int(seq_lens_cpu.sum().item())
+        )
         sampling_info = SamplingBatchInfo(
             temperatures=torch.ones(bs, 1, dtype=torch.float32, device=self.device),
             top_ps=torch.ones(bs, dtype=torch.float32, device=self.device),
@@ -577,7 +657,7 @@ class SMCDraftServer:
             seq_lens=seq_lens,
             out_cache_loc=None,
             seq_lens_cpu=seq_lens_cpu,
-            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            seq_lens_sum=seq_lens_sum,
             return_logprob=False,
             top_logprobs_nums=[0] * bs,
             token_ids_logprobs=None,

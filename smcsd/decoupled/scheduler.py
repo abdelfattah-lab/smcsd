@@ -12,16 +12,18 @@ from __future__ import annotations
 import logging
 import os
 import signal
+from contextlib import nullcontext
 from typing import Optional
 
 import psutil
 import torch
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import configure_scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import kill_itself_when_parent_died
+from sglang.srt.utils import DynamicGradMode, kill_itself_when_parent_died
 from sglang.utils import get_exception_traceback
 
 from smcsd.core.scheduler import SequenceGroup, SMCScheduler
@@ -34,6 +36,15 @@ DRAFT_IPC_ENV = "SMCSD_DRAFT_IPC"
 
 class DecoupledSMCScheduler(SMCScheduler):
     """SMC scheduler whose draft engine runs in a separate process."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._torch_profiler = None
+        self._torch_profile_step_n = 0
+        self._torch_profile_total_steps = 0
+        self._torch_profile_stopped = False
+        if type(self) is DecoupledSMCScheduler:
+            self._init_torch_profiler("target")
 
     # ── Worker override: RPC draft worker instead of colocated SMCWorker ──
 
@@ -64,6 +75,97 @@ class DecoupledSMCScheduler(SMCScheduler):
             return None
         draft_input.active_slots_cpu = list(self.slot_state._active_slots_list)
         return self.slot_state.build_model_worker_batch(draft_input)
+
+    def _init_torch_profiler(self, role: str) -> None:
+        out_dir = os.environ.get("SMCSD_TORCH_PROFILE_DIR")
+        if not out_dir:
+            return
+        roles = {
+            part.strip()
+            for part in os.environ.get("SMCSD_TORCH_PROFILE_ROLES", "target,draft").split(",")
+            if part.strip()
+        }
+        if role not in roles:
+            return
+        wait = max(int(os.environ.get("SMCSD_TORCH_PROFILE_WAIT", "5")), 0)
+        active = max(int(os.environ.get("SMCSD_TORCH_PROFILE_ACTIVE", "20")), 1)
+        with_stack = os.environ.get("SMCSD_TORCH_PROFILE_WITH_STACK", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        role_dir = os.path.join(out_dir, role)
+        os.makedirs(role_dir, exist_ok=True)
+        self._torch_profile_total_steps = wait + active
+        self._torch_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=wait, warmup=0, active=active, repeat=1
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                role_dir, worker_name=f"{role}-{os.getpid()}"
+            ),
+            record_shapes=False,
+            with_stack=with_stack,
+        )
+        self._torch_profiler.start()
+        print(
+            "[TORCH_PROFILE] "
+            f"role={role} dir={role_dir} wait={wait} active={active} "
+            f"with_stack={with_stack}",
+            flush=True,
+        )
+
+    def _torch_record(self, name: str):
+        if self._torch_profiler is None or self._torch_profile_stopped:
+            return nullcontext()
+        return torch.profiler.record_function(name)
+
+    def _torch_profile_step(self) -> None:
+        if self._torch_profiler is None or self._torch_profile_stopped:
+            return
+        self._torch_profiler.step()
+        self._torch_profile_step_n += 1
+        if self._torch_profile_step_n >= self._torch_profile_total_steps:
+            self._torch_profiler.stop()
+            self._torch_profile_stopped = True
+            print("[TORCH_PROFILE] role=target stopped", flush=True)
+
+    @DynamicGradMode()
+    def _event_loop(self) -> None:
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                self.cancel_bubble_timer()
+                continue
+
+            batch, batch_kind = self._get_next_batch()
+            tracking_batch = self._make_runtime_tracking_batch(batch)
+            self.cur_batch = tracking_batch
+            self.running_batch = (
+                tracking_batch if tracking_batch is not None else ScheduleBatch(reqs=[])
+            )
+
+            if batch is not None:
+                if batch_kind == "decode":
+                    with self._torch_record("target_exact_decode_cycle"):
+                        result = self.run_batch(batch)
+                        self._process_decode_result(result)
+                    self._torch_profile_step()
+                else:
+                    result = self.run_batch(batch)
+                    self._process_prefill_result(batch, result)
+            else:
+                self.self_check_during_idle()
+
+            self.last_batch = tracking_batch
+            if hasattr(self, "waiting_queue"):
+                self.waiting_queue = []
 
     # ── Group bootstrap: mirror materialize / early-finish to the drafter ──
 

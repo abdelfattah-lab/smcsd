@@ -29,8 +29,9 @@ import logging
 import os
 import signal
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 import psutil
@@ -77,6 +78,64 @@ class SpecState:
     redraw_tag: Optional[int] = None
 
 
+@dataclass(slots=True)
+class LagWindowMeta:
+    """Per-slot metadata for one drafted window in the lag-1 bonus pipeline."""
+
+    orig_seq_len: int
+    new_seq_len: int
+    anchor_id: int
+
+
+@dataclass(slots=True)
+class LagReadyWindow:
+    """A valid drafted window that can be target-verified later."""
+
+    tokens: np.ndarray
+    logprobs: np.ndarray
+    meta: LagWindowMeta
+
+
+@dataclass(slots=True)
+class LagPendingWindow:
+    """One mixed draft StepReq in flight for the lag-1 bonus pipeline.
+
+    Metadata and validity are aligned with `active_list_T`.  For catch-up/cold
+    rows validity is known when the StepReq is fired; for run-ahead rows it is
+    filled in after the predecessor window is verified and the target bonus is
+    known.
+    """
+
+    active_list_T: List[int]
+    tag: int
+    epoch: int
+    metas: List[LagWindowMeta]
+    valid_by_pos: List[int]  # -1 unknown, 0 invalid/stale, 1 valid/ready
+    pos_by_slot: Dict[int, int]
+    ancestor: Optional[np.ndarray] = None
+
+
+@dataclass(slots=True)
+class LagPreparedStep:
+    """Verifier-side metadata needed to launch one mixed lag-1 draft StepReq."""
+
+    ordered: List[int]
+    verified_ids: List[int]
+    seq_lens: List[int]
+    rollback_payload: object
+    truncate_kv_payload: object
+    metas: List[LagWindowMeta]
+    valid_by_pos: List[int]
+    pos_by_slot: Dict[int, int]
+    advance_slots: List[int]
+    advance_orig: List[int]
+    advance_new: List[int]
+    advance_num_needed: int
+    private_slots: List[int]
+    private_orig: List[int]
+    private_seq: List[int]
+
+
 class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
     """Decoupled SMC scheduler with prefetch overlap + barrier resampling."""
 
@@ -91,18 +150,35 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         # (SMCSD_DROP_BONUS=1 stays set in the env) so the bet x_g1 = tokens[:, gamma]
         # exists for the run-ahead.
         self._async_bonus = get_bool_env_var("SMCSD_ASYNC_BONUS", "false")
+        # Bounded-lag full-bonus pipeline (SMCSD_LAG1_BONUS=1): keep the exact
+        # target bonus, but make mismatch repair per-particle and non-blocking.
+        # Rows whose run-ahead anchor misses spend one cycle catching up from the
+        # exact bonus while matched/ready rows continue drafting.  Verification is
+        # gated so committed frontiers within a group differ by at most one window.
+        self._lag1_bonus = get_bool_env_var("SMCSD_LAG1_BONUS", "false")
         # Optional KV/no-op-proof assertions (SMCSD_ASYNC_BONUS_DEBUG=1): assert
         # the ragged verify ctx matches the baseline frontier and stays inside
         # allocated KV (docs/smc/async_bonus_design.md §S2 test).
         self._async_bonus_debug = get_bool_env_var("SMCSD_ASYNC_BONUS_DEBUG", "false")
 
-        if not get_bool_env_var("SMCSD_DROP_BONUS", "false") and not self._async_bonus:
+        drop_bonus_env = get_bool_env_var("SMCSD_DROP_BONUS", "false")
+        if self._lag1_bonus and not drop_bonus_env:
+            raise RuntimeError(
+                "SMCSD_LAG1_BONUS requires SMCSD_DROP_BONUS=1 so the drafter "
+                "emits the gamma+1 anchor column used for run-ahead matching."
+            )
+        if not drop_bonus_env and not (self._async_bonus or self._lag1_bonus):
             raise RuntimeError(
                 "AsyncDecoupledSMCScheduler requires no-bonus mode "
                 "(SMCSD_DROP_BONUS=1): the next-round anchor must be "
                 "drafter-known for the prefetch to be valid."
             )
         self.barrier_k = max(int(os.environ.get(RESAMPLE_INTERVAL_ENV, "2")), 1)
+        if self._lag1_bonus and self.barrier_k != 1:
+            raise RuntimeError(
+                "SMCSD_LAG1_BONUS currently requires SMCSD_RESAMPLE_INTERVAL=1 "
+                "so every verify cycle can resample mixed horizons explicitly."
+            )
         self.gamma = self.server_args.speculative_num_steps
         self._tag = itertools.count(1)
         # Per-train epoch (fail-fast fence). Every StepReq in a train carries the
@@ -185,6 +261,7 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 ("SMCSD_BET_DISCARD", self._bet_discard),
                 ("SMCSD_BET_KEEP", self._bet_keep),
                 ("SMCSD_ASYNC_BONUS", self._async_bonus),
+                ("SMCSD_LAG1_BONUS", self._lag1_bonus),
                 ("SMCSD_COPYAHEAD_RESAMPLE", self._copyahead),
                 ("SMCSD_COPYAHEAD_REDRAW", self._copyahead_redraw),
             )
@@ -218,6 +295,41 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             "SMCSD_ASYNC_BONUS_DEPTH2", "false"
         )
         self._inflight = 0
+        self._torch_profiler = None
+        self._torch_profile_step_n = 0
+        self._torch_profile_total_steps = 0
+        self._torch_profile_stopped = False
+        self._init_torch_profiler("target")
+        self._lag_ready: Dict[int, LagReadyWindow] = {}
+        self._lag_stale: Set[int] = set()
+        self._lag_stale_shared: Set[int] = set()
+        self._lag_pending: Optional[LagPendingWindow] = None
+        self._lag_just_verified = torch.zeros(
+            self.slot_state.max_slots, dtype=torch.bool, device=self.device
+        )
+        self._lag_window_offsets = torch.arange(
+            self.gamma + 1, dtype=torch.int64, device=self.device
+        )
+        self._lag_sync_resample = get_bool_env_var(
+            "SMCSD_LAG1_SYNC_RESAMPLE", "false"
+        )
+        self._lag_safe_resample = True
+        self._lag_verify_leaders = get_bool_env_var(
+            "SMCSD_LAG1_VERIFY_LEADERS", "false"
+        )
+        self._lag_profile = get_bool_env_var("SMCSD_LAG1_PROFILE", "false")
+        self._lp = {
+            "cycles": 0,
+            "active_rows": 0,
+            "ready_rows": 0,
+            "verify_rows": 0,
+            "held_ready_rows": 0,
+            "catchup_rows": 0,
+            "cold_rows": 0,
+            "eligible_rows": 0,
+            "resample_jobs": 0,
+            "max_lag_windows": 0,
+        }
         # Throughput proof (docs/smc/async_bonus_design.md §PROFILE): drafter
         # StepReqs sent / windows committed = passes/window (fused≈1.0, ModeA≈1.34).
         self._passes_sent = 0
@@ -226,7 +338,14 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         # blocks on the drafter (recv wait = drafter-bound signal) vs its own
         # work (verify dispatch + writeback + prepare + barrier).
         self._timing = get_bool_env_var("SMCSD_TIMING", "false")
-        self._t = {"recv": 0.0, "verify": 0.0, "prep": 0.0, "barrier": 0.0}
+        self._t = {
+            "recv": 0.0,
+            "select": 0.0,
+            "prep": 0.0,
+            "ready": 0.0,
+            "verify": 0.0,
+            "barrier": 0.0,
+        }
         self._t_windows = 0
         self._copyahead_profile = get_bool_env_var("SMCSD_COPYAHEAD_PROFILE", "false")
         self._cp = {
@@ -285,12 +404,24 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 or self.slot_state.is_empty()
             ):
                 self._commit_async_bonus_standalone()
+            if self._lag1_bonus and self._lag_pending is not None and (
+                self._engine_paused
+                or self.waiting_groups
+                or self.slot_state.is_empty()
+            ):
+                self._lag_receive_pending()
+                self.slot_state.rebuild_active_slots()
+                self._lag_prune_metadata()
+                self._lag_drain_finished_groups()
 
             if self._engine_paused:
                 self.cancel_bubble_timer()
                 continue
 
-            self._drain_finished_groups()
+            if self._lag1_bonus:
+                self._lag_drain_finished_groups()
+            else:
+                self._drain_finished_groups()
 
             # Prefill admission (the decode train is always drained at its
             # barrier, so no in-flight StepReq to reconcile here).
@@ -306,7 +437,11 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                         continue
 
             if not self.slot_state.is_empty():
-                if self._depth2:
+                if self._lag1_bonus:
+                    with self._torch_record("target_lag1_cycle"):
+                        self._run_lag1_bonus_train()
+                    self._torch_profile_step()
+                elif self._depth2:
                     self._run_fused_bonus_train_depth2()
                 elif self._fused:
                     self._run_fused_bonus_train()
@@ -355,6 +490,1014 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             flush=True,
         )
         self._cp = {k: 0.0 if isinstance(v, float) else 0 for k, v in self._cp.items()}
+
+    def _init_torch_profiler(self, role: str) -> None:
+        out_dir = os.environ.get("SMCSD_TORCH_PROFILE_DIR")
+        if not out_dir:
+            return
+        roles = {
+            part.strip()
+            for part in os.environ.get("SMCSD_TORCH_PROFILE_ROLES", "target,draft").split(",")
+            if part.strip()
+        }
+        if role not in roles:
+            return
+        wait = max(int(os.environ.get("SMCSD_TORCH_PROFILE_WAIT", "5")), 0)
+        active = max(int(os.environ.get("SMCSD_TORCH_PROFILE_ACTIVE", "20")), 1)
+        with_stack = os.environ.get("SMCSD_TORCH_PROFILE_WITH_STACK", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        role_dir = os.path.join(out_dir, role)
+        os.makedirs(role_dir, exist_ok=True)
+        self._torch_profile_total_steps = wait + active
+        self._torch_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=wait, warmup=0, active=active, repeat=1
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                role_dir, worker_name=f"{role}-{os.getpid()}"
+            ),
+            record_shapes=False,
+            with_stack=with_stack,
+        )
+        self._torch_profiler.start()
+        print(
+            "[TORCH_PROFILE] "
+            f"role={role} dir={role_dir} wait={wait} active={active} "
+            f"with_stack={with_stack}",
+            flush=True,
+        )
+
+    def _torch_record(self, name: str):
+        if self._torch_profiler is None or self._torch_profile_stopped:
+            return nullcontext()
+        return torch.profiler.record_function(name)
+
+    def _torch_profile_step(self) -> None:
+        if self._torch_profiler is None or self._torch_profile_stopped:
+            return
+        self._torch_profiler.step()
+        self._torch_profile_step_n += 1
+        if self._torch_profile_step_n >= self._torch_profile_total_steps:
+            self._torch_profiler.stop()
+            self._torch_profile_stopped = True
+            print("[TORCH_PROFILE] role=target stopped", flush=True)
+
+    # ── Lag-1 full-bonus pipeline (SMCSD_LAG1_BONUS) ──
+
+    def _lag_refresh_membership_masks(self) -> None:
+        return None
+
+    def _lag_prune_metadata(self) -> None:
+        live = set(self.slot_state._active_slots_list)
+        self._lag_ready = {
+            slot: ready for slot, ready in self._lag_ready.items() if slot in live
+        }
+        self._lag_stale.intersection_update(live)
+        self._lag_stale_shared.intersection_update(live)
+        self._lag_refresh_membership_masks()
+
+    def _lag_drain_finished_groups(self) -> None:
+        protected = set()
+        if self._lag_pending is not None:
+            protected.update(self._lag_pending.active_list_T)
+
+        remaining: List[object] = []
+        finalized = False
+        for group in self.running_groups:
+            if self.slot_state.group_has_active(group.group_id):
+                remaining.append(group)
+                continue
+            slots = self.slot_state.group_slot_lists.get(group.group_id, [])
+            if protected.intersection(slots):
+                remaining.append(group)
+                continue
+            self._finalize_group(group)
+            finalized = True
+        self.running_groups = remaining
+        if finalized:
+            self._lag_prune_metadata()
+
+    def _lag_receive_pending(self) -> None:
+        pending = self._lag_pending
+        if pending is None:
+            return
+
+        tm = self._timing
+        t0 = time.perf_counter() if tm else 0.0
+        resp = self._draft_client.recv_step_resp()
+        if tm:
+            self._t["recv"] += time.perf_counter() - t0
+        if resp.tag != pending.tag or resp.epoch != pending.epoch:
+            raise RuntimeError(
+                f"LAG1_BONUS step reply tag/epoch mismatch: got "
+                f"({resp.tag},{resp.epoch}), expected "
+                f"({pending.tag},{pending.epoch})"
+            )
+
+        pos_by_slot = pending.pos_by_slot
+        active_now = self.slot_state._active_slots_list
+        src_ref_counts: Dict[int, int] = {}
+        mapped_rows: List[tuple[int, int, int]] = []
+        for slot in active_now:
+            src = int(pending.ancestor[slot]) if pending.ancestor is not None else slot
+            row = pos_by_slot.get(src)
+            if row is not None:
+                mapped_rows.append((slot, src, row))
+                src_ref_counts[src] = src_ref_counts.get(src, 0) + 1
+        for slot, src, row in mapped_rows:
+            valid = pending.valid_by_pos[row]
+            if valid < 0:
+                raise RuntimeError(
+                    "LAG1_BONUS pending row has unknown validity at receive: "
+                    f"slot={slot} src={src} active_T={pending.active_list_T[:8]}"
+                )
+            meta = pending.metas[row]
+            if valid:
+                self._lag_ready[slot] = LagReadyWindow(
+                    tokens=resp.tokens[row],
+                    logprobs=resp.logprobs[row],
+                    meta=meta,
+                )
+                self._lag_stale.discard(slot)
+                self._lag_stale_shared.discard(slot)
+            else:
+                self._lag_ready.pop(slot, None)
+                self._lag_stale.add(slot)
+                if src_ref_counts.get(src, 0) > 1:
+                    self._lag_stale_shared.add(slot)
+                else:
+                    self._lag_stale_shared.discard(slot)
+
+        self._lag_pending = None
+        self._lag_refresh_membership_masks()
+
+    def _lag_select_ready_slots(self, active_list: List[int]) -> List[int]:
+        if not self._lag_ready:
+            return []
+        ss = self.slot_state
+        # Conservative one-window lag rule: rows at the live group minimum may
+        # advance.  With SMCSD_LAG1_VERIFY_LEADERS=1, also advance ready rows
+        # that are one window ahead, but only when every minimum row is ready and
+        # will advance in the same target batch.  After verify, the group still
+        # differs by at most one committed window.
+        G = self.gamma + 1
+        active = getattr(ss, "_active_slots_set", None)
+        if active is None or len(active) != len(active_list):
+            active = set(active_list)
+        ready = self._lag_ready
+        eligible: Set[int] = set()
+        counts = ss.token_counts_cpu
+        finished = ss.finished_mask_cpu
+        for group_slots in ss.group_slot_lists.values():
+            live: List[int] = []
+            min_count: Optional[int] = None
+            for slot in group_slots:
+                if slot not in active or finished[slot]:
+                    continue
+                count = counts[slot]
+                live.append(slot)
+                if min_count is None or count < min_count:
+                    min_count = count
+            if min_count is None:
+                continue
+            all_min_ready = True
+            for slot in live:
+                if counts[slot] <= min_count:
+                    eligible.add(slot)
+                    if slot not in ready:
+                        all_min_ready = False
+            if not self._lag_verify_leaders:
+                continue
+            if all_min_ready:
+                eligible.update(
+                    s for s in live if counts[s] <= min_count + G
+                )
+        return [s for s in active_list if s in self._lag_ready and s in eligible]
+
+    def _lag_max_committed_lag_windows(self) -> int:
+        counts = self.slot_state.token_counts_cpu
+        finished = self.slot_state.finished_mask_cpu
+        G = self.gamma + 1
+        max_lag = 0
+        for slots in self.slot_state.group_slot_lists.values():
+            live_counts = [counts[s] for s in slots if not finished[s]]
+            if len(live_counts) < 2:
+                continue
+            max_lag = max(max_lag, (max(live_counts) - min(live_counts)) // G)
+        return int(max_lag)
+
+    def _lag_profile_add(
+        self,
+        *,
+        active_rows: int,
+        ready_rows: int,
+        verify_rows: int,
+        held_ready_rows: int,
+        catchup_rows: int,
+        cold_rows: int,
+    ) -> None:
+        if not self._lag_profile:
+            return
+        self._lp["cycles"] += 1
+        self._lp["active_rows"] += active_rows
+        self._lp["ready_rows"] += ready_rows
+        self._lp["verify_rows"] += verify_rows
+        self._lp["held_ready_rows"] += held_ready_rows
+        self._lp["catchup_rows"] += catchup_rows
+        self._lp["cold_rows"] += cold_rows
+        self._lp["max_lag_windows"] = max(
+            int(self._lp["max_lag_windows"]), self._lag_max_committed_lag_windows()
+        )
+
+    def _lag_profile_report(self) -> None:
+        if not self._lag_profile:
+            return
+        n = int(self._lp["cycles"])
+        if n < 200:
+            return
+        print(
+            "[LAG1_PROFILE] "
+            f"cycles={n} "
+            f"active_rows={self._lp['active_rows']/n:.1f} "
+            f"ready_rows={self._lp['ready_rows']/n:.1f} "
+            f"verify_rows={self._lp['verify_rows']/n:.1f} "
+            f"held_ready_rows={self._lp['held_ready_rows']/n:.1f} "
+            f"catchup_rows={self._lp['catchup_rows']/n:.1f} "
+            f"cold_rows={self._lp['cold_rows']/n:.1f} "
+            f"eligible_rows={self._lp['eligible_rows']/n:.1f} "
+            f"resample_jobs={self._lp['resample_jobs']/n:.2f}/cycle "
+            f"max_lag_windows={int(self._lp['max_lag_windows'])}",
+            flush=True,
+        )
+        self._lp = {k: 0 for k in self._lp}
+
+    def _lag_resample_row_mask(
+        self, verify_slots: Optional[List[int]] = None
+    ) -> torch.Tensor:
+        ss = self.slot_state
+        gts = ss.group_to_slots_i64
+        valid = gts >= 0
+        gather_idx = gts.clamp_min(0)
+        finished = ss.finished_mask[gather_idx] & valid
+        row_mask = ss.row_in_use & ~finished.any(dim=1)
+
+        if self._lag_safe_resample:
+            # Only resample a group at a clean commit boundary: every live row in
+            # the group just verified a ready window in this cycle.  This avoids
+            # cloning while some particles carry held-ready or catch-up windows.
+            just_verified = self._lag_just_verified
+            just_verified.zero_()
+            if verify_slots:
+                just_verified[
+                    torch.as_tensor(verify_slots, dtype=torch.int64, device=self.device)
+                ] = True
+            live = valid & ~finished
+            all_live_verified = (~live | just_verified[gather_idx]).all(dim=1)
+            row_mask = row_mask & all_live_verified
+
+        if not self._lag_sync_resample:
+            return row_mask
+
+        counts = ss.token_counts[gather_idx]
+        max_counts = torch.where(valid, counts, torch.zeros_like(counts)).max(dim=1).values
+        min_fill = torch.full_like(counts, torch.iinfo(counts.dtype).max)
+        min_counts = torch.where(valid, counts, min_fill).min(dim=1).values
+        return row_mask & (max_counts == min_counts)
+
+    def _lag_prepare_advance_slots(
+        self, slots: List[int]
+    ) -> tuple[List[int], List[int], int]:
+        if not slots:
+            return [], [], 0
+        G = self.gamma + 1
+        ss = self.slot_state
+        seq_cpu = ss.seq_lens_cpu
+        alloc_cpu = ss.kv_allocated_lens_cpu
+        orig: List[int] = []
+        new: List[int] = []
+        num_needed = 0
+        for slot in slots:
+            old_seq = seq_cpu[slot]
+            old_alloc = alloc_cpu[slot]
+            new_seq = old_seq + G
+            orig.append(old_seq)
+            new.append(new_seq)
+            if old_alloc == old_seq:
+                num_needed += G
+            else:
+                num_needed += max(new_seq - max(old_alloc, old_seq), 0)
+        return orig, new, num_needed
+
+    def _lag_commit_advance_slots(
+        self,
+        slots: List[int],
+        orig: List[int],
+        new: List[int],
+        num_needed: int,
+    ) -> None:
+        if not slots:
+            return
+        G = self.gamma + 1
+        ss = self.slot_state
+        active_t = torch.as_tensor(slots, dtype=torch.int64, device=self.device)
+        seq = ss.seq_lens[active_t]
+        if self._async_bonus_debug:
+            seq_cpu = [int(x) for x in seq.cpu().tolist()]
+            if seq_cpu != orig:
+                raise RuntimeError(
+                    "LAG1_BONUS seq_lens CPU mirror diverged before advance: "
+                    f"slots={slots[:8]} mirror={orig[:8]} tensor={seq_cpu[:8]}"
+                )
+        new_seq = seq + G
+        new_kv_alloc = ss.allocate_kv_for_slots(
+            active_t, seq, G, num_needed=num_needed
+        )
+        ss.kv_allocated_lens[active_t] = new_kv_alloc
+        ss.seq_lens[active_t] = new_seq
+        seq_cpu = ss.seq_lens_cpu
+        alloc_cpu = ss.kv_allocated_lens_cpu
+        for slot, new_seq_len in zip(slots, new, strict=True):
+            seq_cpu[slot] = int(new_seq_len)
+            alloc_cpu[slot] = int(max(alloc_cpu[slot], new_seq_len))
+
+    def _lag_advance_slots(self, slots: List[int]) -> tuple[List[int], List[int]]:
+        orig, new, num_needed = self._lag_prepare_advance_slots(slots)
+        self._lag_commit_advance_slots(slots, orig, new, num_needed)
+        return orig, new
+
+    def _lag_prepare_stale_suffix(
+        self, slots: List[int]
+    ) -> tuple[
+        List[int],
+        List[int],
+        List[int],
+        List[bool],
+        bool,
+        bool,
+        List[int],
+        List[int],
+        List[int],
+    ]:
+        """Make stale catch-up suffix KV private before re-drafting it.
+
+        A stale row may have inherited its future suffix through a resample while
+        the StepReq was in flight.  Reusing that shared suffix for catch-up would
+        let one clone overwrite another clone's draft/verify KV.  The fix mirrors
+        COPYAHEAD_REDRAW: drop this row's ownership of [S, S+G), allocate fresh
+        verifier cells for the same range, and ask the drafter to do the same via
+        per-row truncate_kv=True.
+        """
+        if not slots:
+            return [], [], [], [], False, False, [], [], []
+        G = self.gamma + 1
+        ss = self.slot_state
+        seq_mirror = ss.seq_lens_cpu
+        alloc_mirror = ss.kv_allocated_lens_cpu
+        verified_mirror = ss.verified_ids_cpu
+        shared = self._lag_stale_shared
+        has_shared = bool(shared)
+        seq_cpu: List[int] = []
+        orig_cpu: List[int] = []
+        anchors: List[int] = []
+        truncate_flags: List[bool] = [False] * len(slots)
+        private_slots: List[int] = []
+        private_orig: List[int] = []
+        private_seq: List[int] = []
+        any_truncate = False
+        all_truncate = has_shared
+        for i, slot in enumerate(slots):
+            seq_len = seq_mirror[slot]
+            alloc_len = alloc_mirror[slot]
+            orig_len = seq_len - G
+            if orig_len < 0:
+                raise RuntimeError(
+                    "LAG1_BONUS stale suffix privatize found negative committed "
+                    f"frontier: slot={slot} seq={seq_len}"
+                )
+            if alloc_len < seq_len:
+                raise RuntimeError(
+                    "LAG1_BONUS cannot privatize stale suffix from short allocation: "
+                    f"slot={slot} alloc={alloc_len} seq={seq_len}"
+                )
+            seq_cpu.append(seq_len)
+            orig_cpu.append(orig_len)
+            anchors.append(verified_mirror[slot])
+            if not has_shared:
+                continue
+            do_truncate = slot in shared
+            if do_truncate:
+                truncate_flags[i] = True
+            else:
+                all_truncate = False
+            if do_truncate:
+                any_truncate = True
+                private_slots.append(slot)
+                private_orig.append(orig_len)
+                private_seq.append(seq_len)
+        self._lag_check_stale_suffix_privacy(slots, truncate_flags)
+        return (
+            orig_cpu,
+            seq_cpu,
+            anchors,
+            truncate_flags,
+            any_truncate,
+            all_truncate,
+            private_slots,
+            private_orig,
+            private_seq,
+        )
+
+    def _lag_check_stale_suffix_privacy(
+        self, slots: List[int], truncate_flags: List[bool]
+    ) -> None:
+        if not self._async_bonus_debug or not slots:
+            return
+        G = self.gamma + 1
+        ss = self.slot_state
+        active_t = torch.as_tensor(slots, dtype=torch.int64, device=self.device)
+        seq = ss.seq_lens[active_t]
+        committed = seq - G
+        suffix_pos = committed.unsqueeze(1) + self._lag_window_offsets.unsqueeze(0)
+        pool_idx = ss.req_pool_indices[active_t].unsqueeze(1)
+        suffix_kv = ss.req_to_token_pool.req_to_token[pool_idx, suffix_pos].to(
+            torch.int64
+        )
+        needs_private = (
+            ss.token_to_kv_pool_allocator.slot_ref_count[suffix_kv] > 1
+        ).any(dim=1)
+        actual_flags = [bool(x) for x in needs_private.cpu().tolist()]
+        if actual_flags != truncate_flags:
+            raise RuntimeError(
+                "LAG1_BONUS stale suffix sharing provenance mismatch: "
+                f"slots={slots[:8]} expected={truncate_flags[:8]} "
+                f"actual={actual_flags[:8]}"
+            )
+
+    def _lag_commit_stale_suffix_privatize(
+        self,
+        private_slots: List[int],
+        private_orig: List[int],
+        private_seq: List[int],
+    ) -> None:
+        if not private_slots:
+            return
+        G = self.gamma + 1
+        ss = self.slot_state
+        private_t = torch.as_tensor(
+            private_slots, dtype=torch.int64, device=self.device
+        )
+        private_committed = torch.as_tensor(
+            private_orig, dtype=ss.seq_lens.dtype, device=self.device
+        )
+        ss.truncate_kv_allocations(private_t, private_committed)
+        new_alloc = ss.allocate_kv_for_slots(
+            private_t, private_committed, G, num_needed=len(private_slots) * G
+        )
+        ss.kv_allocated_lens[private_t] = new_alloc
+        for slot, seq_len in zip(private_slots, private_seq, strict=True):
+            ss.kv_allocated_lens_cpu[slot] = int(seq_len)
+
+    def _lag_privatize_stale_suffix(
+        self, slots: List[int]
+    ) -> tuple[List[int], List[int], List[int], List[bool]]:
+        (
+            orig_cpu,
+            seq_cpu,
+            anchors,
+            truncate_flags,
+            _any_truncate,
+            _all_truncate,
+            private_slots,
+            private_orig,
+            private_seq,
+        ) = self._lag_prepare_stale_suffix(slots)
+        self._lag_commit_stale_suffix_privatize(
+            private_slots, private_orig, private_seq
+        )
+        return orig_cpu, seq_cpu, anchors, truncate_flags
+
+    def _lag_commit_mixed_allocations(
+        self,
+        advance_slots: List[int],
+        advance_orig: List[int],
+        advance_new: List[int],
+        advance_num_needed: int,
+        private_slots: List[int],
+        private_orig: List[int],
+        private_seq: List[int],
+    ) -> None:
+        """Commit verifier KV changes needed before firing one mixed StepReq."""
+        if not advance_slots and not private_slots:
+            return
+        if not private_slots:
+            self._lag_commit_advance_slots(
+                advance_slots,
+                advance_orig,
+                advance_new,
+                advance_num_needed,
+            )
+            return
+
+        G = self.gamma + 1
+        ss = self.slot_state
+        device = self.device
+
+        private_t = torch.as_tensor(private_slots, dtype=torch.int64, device=device)
+        private_committed = torch.as_tensor(
+            private_orig, dtype=ss.seq_lens.dtype, device=device
+        )
+        ss.truncate_kv_allocations(private_t, private_committed)
+
+        alloc_slots = advance_slots + private_slots
+        alloc_seq_cpu = advance_orig + private_orig
+        active_t = torch.as_tensor(alloc_slots, dtype=torch.int64, device=device)
+        alloc_seq = torch.as_tensor(
+            alloc_seq_cpu, dtype=ss.seq_lens.dtype, device=device
+        )
+        num_needed = advance_num_needed + len(private_slots) * G
+
+        if self._async_bonus_debug and advance_slots:
+            seq = ss.seq_lens[active_t[: len(advance_slots)]]
+            seq_cpu = [int(x) for x in seq.cpu().tolist()]
+            if seq_cpu != advance_orig:
+                raise RuntimeError(
+                    "LAG1_BONUS seq_lens CPU mirror diverged before mixed advance: "
+                    f"slots={advance_slots[:8]} mirror={advance_orig[:8]} "
+                    f"tensor={seq_cpu[:8]}"
+                )
+
+        new_alloc = ss.allocate_kv_for_slots(
+            active_t, alloc_seq, G, num_needed=num_needed
+        )
+        ss.kv_allocated_lens[active_t] = new_alloc
+        if advance_slots:
+            advance_t = active_t[: len(advance_slots)]
+            ss.seq_lens[advance_t] = alloc_seq[: len(advance_slots)] + G
+
+        seq_cpu = ss.seq_lens_cpu
+        alloc_cpu = ss.kv_allocated_lens_cpu
+        for slot, new_seq_len in zip(advance_slots, advance_new, strict=True):
+            seq_cpu[slot] = int(new_seq_len)
+            alloc_cpu[slot] = int(max(alloc_cpu[slot], new_seq_len))
+        for slot, seq_len in zip(private_slots, private_seq, strict=True):
+            alloc_cpu[slot] = int(seq_len)
+
+    def _lag_build_ready_pending(self, slots: List[int]):
+        gamma = self.gamma
+        device = self.device
+        active_t = torch.as_tensor(slots, dtype=torch.int64, device=device)
+        ready = [self._lag_ready[s] for s in slots]
+        orig_cpu = torch.tensor([r.meta.orig_seq_len for r in ready], dtype=torch.int64)
+        new_cpu = torch.tensor([r.meta.new_seq_len for r in ready], dtype=torch.int64)
+        orig = orig_cpu.to(device=device)
+        new = new_cpu.to(device=device)
+        alloc_cpu = [self.slot_state.kv_allocated_lens_cpu[s] for s in slots]
+        new_cpu_list = [int(x) for x in new_cpu.tolist()]
+        if any(a < n for a, n in zip(alloc_cpu, new_cpu_list, strict=True)):
+            raise RuntimeError(
+                "LAG1_BONUS ready window is outside allocated verifier KV: "
+                f"slots={slots[:8]} alloc={alloc_cpu[:8]} "
+                f"new={new_cpu_list[:8]}"
+            )
+        anchors = torch.tensor(
+            [r.meta.anchor_id for r in ready], dtype=torch.int32, device=device
+        )
+        ctx = SMCDecodeContext(
+            orig_seq_lens=orig,
+            orig_seq_lens_cpu=orig_cpu,
+            orig_seq_lens_sum=int(orig_cpu.sum().item()),
+            new_seq_lens=new,
+            gamma=gamma,
+            new_seq_lens_cpu=new_cpu,
+            new_seq_lens_sum=int(new_cpu.sum().item()),
+        )
+        draft_input = SMCDraftInput(
+            verified_id=anchors,
+            num_tokens_per_req=gamma + 1,
+            decode_ctx=ctx,
+        )
+        draft_input.active_slots_cpu = slots
+        batch = self.slot_state.build_model_worker_batch(
+            draft_input, active=active_t, active_list=slots
+        )
+        pending = PendingDecodeStep(batch=batch, ctx=ctx, tag=0, epoch=0)
+        resp = DraftStepResp(
+            tokens=np.stack([r.tokens for r in ready], axis=0),
+            logprobs=np.stack([r.logprobs for r in ready], axis=0),
+            tag=0,
+            epoch=0,
+        )
+        return active_t, pending, resp
+
+    def _lag_prepare_mixed_launch(
+        self,
+        verify_slots: List[int],
+        stale_slots: List[int],
+        cold_slots: List[int],
+    ) -> Optional[LagPreparedStep]:
+        gamma = self.gamma
+        G = gamma + 1
+        ss = self.slot_state
+        seq_cpu_mirror = ss.seq_lens_cpu
+        alloc_cpu_mirror = ss.kv_allocated_lens_cpu
+        verified_cpu = ss.verified_ids_cpu
+        ready = self._lag_ready
+        shared = self._lag_stale_shared
+        has_shared = bool(shared)
+
+        ordered: List[int] = []
+        verified_ids: List[int] = []
+        seq_lens: List[int] = []
+        metas: List[LagWindowMeta] = []
+        valid_by_pos: List[int] = []
+        pos_by_slot: Dict[int, int] = {}
+
+        advance_slots: List[int] = []
+        advance_orig: List[int] = []
+        advance_new: List[int] = []
+        advance_num_needed = 0
+
+        private_slots: List[int] = []
+        private_orig: List[int] = []
+        private_seq: List[int] = []
+
+        stale_truncate: List[bool] = []
+        truncate_rows: Optional[List[bool]] = [] if stale_slots and has_shared else None
+        any_truncate = False
+        all_truncate = bool(stale_slots) and has_shared
+
+        for slot in verify_slots:
+            orig = seq_cpu_mirror[slot]
+            old_alloc = alloc_cpu_mirror[slot]
+            new = orig + G
+            advance_slots.append(slot)
+            advance_orig.append(orig)
+            advance_new.append(new)
+            if old_alloc == orig:
+                advance_num_needed += G
+            else:
+                advance_num_needed += max(new - max(old_alloc, orig), 0)
+            ready_window = ready[slot]
+            if orig != ready_window.meta.new_seq_len:
+                raise RuntimeError(
+                    "LAG1_BONUS runahead does not start at ready window end: "
+                    f"slot={slot} orig={orig} ready_end={ready_window.meta.new_seq_len}"
+                )
+            anchor = int(ready_window.tokens[gamma])
+            pos_by_slot[slot] = len(ordered)
+            ordered.append(slot)
+            verified_ids.append(anchor)
+            seq_lens.append(orig)
+            metas.append(LagWindowMeta(orig, new, anchor))
+            valid_by_pos.append(-1)
+            if truncate_rows is not None:
+                truncate_rows.append(False)
+
+        for slot in stale_slots:
+            seq_len = seq_cpu_mirror[slot]
+            alloc_len = alloc_cpu_mirror[slot]
+            orig = seq_len - G
+            if orig < 0:
+                raise RuntimeError(
+                    "LAG1_BONUS stale suffix privatize found negative committed "
+                    f"frontier: slot={slot} seq={seq_len}"
+                )
+            if alloc_len < seq_len:
+                raise RuntimeError(
+                    "LAG1_BONUS cannot privatize stale suffix from short allocation: "
+                    f"slot={slot} alloc={alloc_len} seq={seq_len}"
+                )
+            do_truncate = has_shared and slot in shared
+            stale_truncate.append(do_truncate)
+            if truncate_rows is not None:
+                truncate_rows.append(do_truncate)
+            if do_truncate:
+                any_truncate = True
+                private_slots.append(slot)
+                private_orig.append(orig)
+                private_seq.append(seq_len)
+            else:
+                all_truncate = False
+
+            anchor = int(verified_cpu[slot])
+            pos_by_slot[slot] = len(ordered)
+            ordered.append(slot)
+            verified_ids.append(anchor)
+            seq_lens.append(orig)
+            metas.append(LagWindowMeta(orig, seq_len, anchor))
+            valid_by_pos.append(1)
+
+        for slot in cold_slots:
+            orig = seq_cpu_mirror[slot]
+            old_alloc = alloc_cpu_mirror[slot]
+            new = orig + G
+            advance_slots.append(slot)
+            advance_orig.append(orig)
+            advance_new.append(new)
+            if old_alloc == orig:
+                advance_num_needed += G
+            else:
+                advance_num_needed += max(new - max(old_alloc, orig), 0)
+            anchor = int(verified_cpu[slot])
+            pos_by_slot[slot] = len(ordered)
+            ordered.append(slot)
+            verified_ids.append(anchor)
+            seq_lens.append(orig)
+            metas.append(LagWindowMeta(orig, new, anchor))
+            valid_by_pos.append(1)
+            if truncate_rows is not None:
+                truncate_rows.append(False)
+
+        if not ordered:
+            return None
+
+        if stale_slots:
+            self._lag_check_stale_suffix_privacy(stale_slots, stale_truncate)
+
+        if not stale_slots:
+            rollback_payload = 0
+        elif len(stale_slots) == len(ordered):
+            rollback_payload = G
+        else:
+            n_verify = len(verify_slots)
+            n_stale = len(stale_slots)
+            n_cold = len(cold_slots)
+            rollback_payload = [0] * n_verify + [G] * n_stale + [0] * n_cold
+
+        if not any_truncate:
+            truncate_kv_payload = False
+        elif len(stale_slots) == len(ordered) and all_truncate:
+            truncate_kv_payload = True
+        elif len(stale_slots) == len(ordered):
+            truncate_kv_payload = stale_truncate
+        else:
+            truncate_kv_payload = truncate_rows
+
+        return LagPreparedStep(
+            ordered=ordered,
+            verified_ids=verified_ids,
+            seq_lens=seq_lens,
+            rollback_payload=rollback_payload,
+            truncate_kv_payload=truncate_kv_payload,
+            metas=metas,
+            valid_by_pos=valid_by_pos,
+            pos_by_slot=pos_by_slot,
+            advance_slots=advance_slots,
+            advance_orig=advance_orig,
+            advance_new=advance_new,
+            advance_num_needed=advance_num_needed,
+            private_slots=private_slots,
+            private_orig=private_orig,
+            private_seq=private_seq,
+        )
+
+    def _lag_fire_mixed_step(
+        self,
+        verify_slots: List[int],
+        stale_slots: List[int],
+        cold_slots: List[int],
+    ) -> None:
+        if self._lag_pending is not None:
+            raise RuntimeError("LAG1_BONUS attempted to fire with a StepReq in flight")
+        prepared = self._lag_prepare_mixed_launch(
+            verify_slots, stale_slots, cold_slots
+        )
+        if prepared is None:
+            return
+
+        tag = next(self._tag)
+        epoch = next(self._epoch)
+        self._lag_commit_mixed_allocations(
+            prepared.advance_slots,
+            prepared.advance_orig,
+            prepared.advance_new,
+            prepared.advance_num_needed,
+            prepared.private_slots,
+            prepared.private_orig,
+            prepared.private_seq,
+        )
+        self._draft_client.send_step(
+            slots=prepared.ordered,
+            verified_ids=prepared.verified_ids,
+            seq_lens=prepared.seq_lens,
+            tag=tag,
+            epoch=epoch,
+            rollback=prepared.rollback_payload,
+            truncate_kv=prepared.truncate_kv_payload,
+        )
+        for slot in stale_slots:
+            self._lag_stale.discard(slot)
+            self._lag_stale_shared.discard(slot)
+        self._lag_pending = LagPendingWindow(
+            active_list_T=prepared.ordered,
+            tag=tag,
+            epoch=epoch,
+            metas=prepared.metas,
+            valid_by_pos=prepared.valid_by_pos,
+            pos_by_slot=prepared.pos_by_slot,
+        )
+        self._passes_sent += 1
+
+    def _lag_verify_ready(
+        self, slots: List[int], *, update_pending: bool = True
+    ) -> List[int]:
+        if not slots:
+            return []
+        tm = self._timing
+        t0 = time.perf_counter() if tm else 0.0
+        active_t, pending, resp = self._lag_build_ready_pending(slots)
+        if tm:
+            self._t["ready"] += time.perf_counter() - t0
+        tracking_batch = self._make_runtime_tracking_batch(pending.batch)
+        self.cur_batch = tracking_batch
+        self.running_batch = (
+            tracking_batch if tracking_batch is not None else ScheduleBatch(reqs=[])
+        )
+
+        t0 = time.perf_counter() if tm else 0.0
+        result = self.draft_worker.finish_decode(pending, resp, drop_bonus=False)
+        newly_finished = self._writeback_window(result, active_t)
+        if tm:
+            self._t["verify"] += time.perf_counter() - t0
+        self._windows_committed += 1
+
+        x_g1 = torch.tensor(
+            [int(self._lag_ready[s].tokens[self.gamma]) for s in slots],
+            dtype=torch.int64,
+        )
+        b_cpu = result.next_draft_input.verified_id.cpu().to(torch.int64)
+        match = x_g1 == b_cpu
+        b_list = [int(x) for x in b_cpu.tolist()]
+        match_list = [bool(x) for x in match.tolist()]
+        for slot, bonus_id in zip(slots, b_list, strict=True):
+            self.slot_state.token_counts_cpu[slot] += self.gamma + 1
+            self.slot_state.verified_ids_cpu[slot] = bonus_id
+        if self._bet_stats:
+            self._bet_n += int(match.numel())
+            self._bet_miss_n += int((~match).sum().item())
+        if update_pending and self._lag_pending is not None:
+            for slot, ok in zip(slots, match_list, strict=True):
+                row = self._lag_pending.pos_by_slot.get(slot)
+                if row is not None:
+                    self._lag_pending.valid_by_pos[row] = 1 if ok else 0
+        for slot, ok in zip(slots, match_list, strict=True):
+            self._lag_ready.pop(slot, None)
+        if self._bet_stats and self._bet_n >= 500:
+            print(
+                f"[LAG1_BONUS] {self._bet_n} bets: "
+                f"x_g1!=b={100*self._bet_miss_n/max(self._bet_n,1):.1f}% "
+                f"passes_sent={self._passes_sent} committed={self._windows_committed}",
+                flush=True,
+            )
+            self._bet_n = self._bet_miss_n = 0
+        return newly_finished
+
+    def _lag_apply_resample_plan(self, dsts: List[int], srcs: List[int]) -> None:
+        if self._lag_pending is not None:
+            max_slots = self.slot_state.seq_lens.shape[0]
+            a = (
+                self._lag_pending.ancestor.copy()
+                if self._lag_pending.ancestor is not None
+                else np.arange(max_slots, dtype=np.int64)
+            )
+            a[np.asarray(dsts, dtype=np.int64)] = np.asarray(srcs, dtype=np.int64)
+            self._lag_pending.ancestor = a
+
+        for dst, src in zip(dsts, srcs, strict=True):
+            src_ready = self._lag_ready.get(src)
+            self._lag_ready.pop(dst, None)
+            if src_ready is not None:
+                self._lag_ready[dst] = LagReadyWindow(
+                    tokens=src_ready.tokens,
+                    logprobs=src_ready.logprobs,
+                    meta=src_ready.meta,
+                )
+            self._lag_stale.discard(dst)
+            self._lag_stale_shared.discard(dst)
+            if src in self._lag_stale:
+                self._lag_stale.add(dst)
+                self._lag_stale_shared.add(src)
+                self._lag_stale_shared.add(dst)
+
+    def _lag_resample(self, verify_slots: Optional[List[int]] = None) -> bool:
+        row_mask = self._lag_resample_row_mask(verify_slots)
+        if self._lag_profile:
+            self._lp["eligible_rows"] += int(row_mask.sum().item())
+        plan = self.coordinator.collect_resample_jobs_batch(
+            self.slot_state, row_mask=row_mask
+        )
+        if self._lag_profile:
+            self._lp["resample_jobs"] += int(plan.n_jobs)
+        if plan.n_jobs == 0:
+            return False
+        dsts, srcs = self.coordinator.dispatch_resample_batch(
+            plan, self.slot_state, rebuild_active=False,
+        )
+        self._draft_client.send_commit(dst_slots=dsts, src_slots=srcs)
+        self._lag_apply_resample_plan(dsts, srcs)
+        return True
+
+    def _run_lag1_bonus_train(self) -> None:
+        """Bounded-lag exact-bonus pipeline.
+
+        Each event-loop pass consumes at most one mixed draft reply, verifies the
+        ready rows that are allowed by the per-group one-window lag cap, then
+        fires the next mixed draft batch before target verify so draft and verify
+        overlap.  Rows whose run-ahead anchor mismatches are not verified from the
+        stale reply; they are queued for a catch-up draft from the exact target
+        bonus and rejoin on the following cycle.
+        """
+        tm = self._timing
+        self._lag_receive_pending()
+        active_list = list(self.slot_state._active_slots_list)
+        if not active_list:
+            self._lag_drain_finished_groups()
+            return
+
+        t0 = time.perf_counter() if tm else 0.0
+        verify_slots = self._lag_select_ready_slots(active_list)
+        verify_set = set(verify_slots) if verify_slots else None
+        stale_slots: List[int] = []
+        cold_slots: List[int] = []
+        ready_rows = 0
+        ready = self._lag_ready
+        stale = self._lag_stale
+        for slot in active_list:
+            is_ready = slot in ready
+            if is_ready:
+                ready_rows += 1
+            if verify_set is not None and slot in verify_set:
+                continue
+            if slot in stale:
+                stale_slots.append(slot)
+            elif not is_ready:
+                cold_slots.append(slot)
+        held_ready_rows = ready_rows - len(verify_slots)
+        self._lag_profile_add(
+            active_rows=len(active_list),
+            ready_rows=ready_rows,
+            verify_rows=len(verify_slots),
+            held_ready_rows=held_ready_rows,
+            catchup_rows=len(stale_slots),
+            cold_rows=len(cold_slots),
+        )
+        if tm:
+            self._t["select"] += time.perf_counter() - t0
+
+        t0 = time.perf_counter() if tm else 0.0
+        self._lag_fire_mixed_step(verify_slots, stale_slots, cold_slots)
+        if tm:
+            self._t["prep"] += time.perf_counter() - t0
+
+        if verify_slots:
+            newly_finished = self._lag_verify_ready(verify_slots)
+            resample_verify_slots = list(verify_slots)
+            t0 = time.perf_counter() if tm else 0.0
+            did_resample = self._lag_resample(resample_verify_slots)
+            if newly_finished or did_resample:
+                self.slot_state.rebuild_active_slots()
+                self._lag_prune_metadata()
+                self._lag_drain_finished_groups()
+            if tm:
+                self._t["barrier"] += time.perf_counter() - t0
+                self._t_windows += 1
+                if self._t_windows >= 200:
+                    tot = sum(self._t.values()) or 1.0
+                    n = self._t_windows
+                    pw = (
+                        self._passes_sent / self._windows_committed
+                        if self._windows_committed
+                        else 0.0
+                    )
+                    print(
+                        f"[LAG1_BONUS_TIMING] {n} cycles: "
+                        f"recv(drafter-wait)={100*self._t['recv']/tot:.0f}% "
+                        f"select={100*self._t['select']/tot:.0f}% "
+                        f"prep={100*self._t['prep']/tot:.0f}% "
+                        f"ready={100*self._t['ready']/tot:.0f}% "
+                        f"verify={100*self._t['verify']/tot:.0f}% "
+                        f"barrier={100*self._t['barrier']/tot:.0f}% | per-cycle "
+                        f"recv={1e3*self._t['recv']/n:.2f}ms "
+                        f"select={1e3*self._t['select']/n:.2f}ms "
+                        f"prep={1e3*self._t['prep']/n:.2f}ms "
+                        f"ready={1e3*self._t['ready']/n:.2f}ms "
+                        f"verify={1e3*self._t['verify']/n:.2f}ms "
+                        f"resampled={int(did_resample)} | PASSES/CYCLE={pw:.3f}",
+                        flush=True,
+                    )
+                    self._t = {k: 0.0 for k in self._t}
+                    self._t_windows = 0
+                    self._passes_sent = 0
+                    self._windows_committed = 0
+            self._lag_profile_report()
 
     def _run_async_bonus_train(self) -> None:
         """Async/staggered FULL-bonus decode (SMCSD_ASYNC_BONUS).
@@ -1880,12 +3023,16 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                     f"min slack={int((alloc - seq_lens).min().item())}). "
                     f"active={active_list[:8]}"
                 )
+        orig_cpu = orig.cpu()
+        orig_sum = int(orig_cpu.sum().item())
         ctx = SMCDecodeContext(
             orig_seq_lens=orig,
-            orig_seq_lens_cpu=orig.cpu(),
-            orig_seq_lens_sum=int(orig.sum().item()),
+            orig_seq_lens_cpu=orig_cpu,
+            orig_seq_lens_sum=orig_sum,
             new_seq_lens=seq_lens,
             gamma=gamma,
+            new_seq_lens_cpu=orig_cpu + (gamma + 1),
+            new_seq_lens_sum=orig_sum + len(active_list) * (gamma + 1),
         )
         draft_input = SMCDraftInput(
             verified_id=self.slot_state.verified_ids[active_t],
@@ -1911,7 +3058,7 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             )
         )
         bonus_ids = result.next_draft_input.verified_id
-        self.slot_state.process_batch_result(
+        return self.slot_state.process_batch_result(
             next_token_ids=result.next_token_ids,
             accept_lens=result.accept_lens,
             logprob_diff=logprob_diff,
@@ -2010,12 +3157,16 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                     f"min slack={int((alloc_a1 - seq_lens_a1).min().item())}) "
                     f"— would read outside allocated KV. a1={a1_list[:8]}"
                 )
+        orig_a1_cpu = orig_a1.cpu()
+        orig_a1_sum = int(orig_a1_cpu.sum().item())
         ctx_a1 = SMCDecodeContext(
             orig_seq_lens=orig_a1,
-            orig_seq_lens_cpu=orig_a1.cpu(),
-            orig_seq_lens_sum=int(orig_a1.sum().item()),
+            orig_seq_lens_cpu=orig_a1_cpu,
+            orig_seq_lens_sum=orig_a1_sum,
             new_seq_lens=seq_lens_a1,
             gamma=gamma,
+            new_seq_lens_cpu=orig_a1_cpu + (gamma + 1),
+            new_seq_lens_sum=orig_a1_sum + len(a1_list) * (gamma + 1),
         )
         draft_input_a1 = SMCDraftInput(
             verified_id=anchor_a1,

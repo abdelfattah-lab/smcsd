@@ -37,9 +37,11 @@ from typing import TYPE_CHECKING, Deque, Dict, List, Optional
 import torch
 
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
+from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from smcsd.core.info import SMCDecodeContext, SMCDraftInput
 from smcsd.mem_cache.allocator import truncate_block_table_allocations
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -177,7 +179,17 @@ class ScheduleBatchSMC:
         # per-element `.item()` syncs.
         self.active_slots = torch.empty(0, dtype=torch.int64, device=device)
         self._active_slots_list: List[int] = []
+        self._active_slots_set: set[int] = set()
         self.num_active: int = 0
+
+        # CPU mirrors for scalar slot metadata used by the lag-1 async
+        # pre-draft path. They avoid small synchronizing GPU→CPU reads when
+        # constructing the wire-format DraftStepReq.
+        self.seq_lens_cpu: List[int] = [0] * self.max_slots
+        self.kv_allocated_lens_cpu: List[int] = [0] * self.max_slots
+        self.verified_ids_cpu: List[int] = [0] * self.max_slots
+        self.token_counts_cpu: List[int] = [0] * self.max_slots
+        self.finished_mask_cpu: List[bool] = [False] * self.max_slots
 
         # ── Group tracking ──
         # Per-group slot list (CPU authoritative view) — kept for O(1) Python
@@ -193,6 +205,10 @@ class ScheduleBatchSMC:
         self.group_to_slots = torch.full(
             (self.max_groups, self.n_particles), -1,
             dtype=torch.int32, device=device,
+        )
+        self.group_to_slots_i64 = torch.full(
+            (self.max_groups, self.n_particles), -1,
+            dtype=torch.int64, device=device,
         )
         self.row_in_use = torch.zeros(
             self.max_groups, dtype=torch.bool, device=device,
@@ -248,9 +264,16 @@ class ScheduleBatchSMC:
             self.req_pool_indices[slot] = req.req_pool_idx
             self.seq_lens[slot] = shared_seq_len
             self.kv_allocated_lens[slot] = shared_seq_len
-            self.verified_ids[slot] = req.output_ids[-1] if req.output_ids else 0
-            self.token_counts[slot] = len(req.output_ids)
+            verified_id = req.output_ids[-1] if req.output_ids else 0
+            token_count = len(req.output_ids)
+            self.verified_ids[slot] = verified_id
+            self.token_counts[slot] = token_count
             self.finished_mask[slot] = False
+            self.seq_lens_cpu[slot] = int(shared_seq_len)
+            self.kv_allocated_lens_cpu[slot] = int(shared_seq_len)
+            self.verified_ids_cpu[slot] = int(verified_id)
+            self.token_counts_cpu[slot] = int(token_count)
+            self.finished_mask_cpu[slot] = False
             self.ignore_eos_t[slot] = bool(req.sampling_params.ignore_eos)
             self.max_new_tokens_t[slot] = req.sampling_params.max_new_tokens
 
@@ -285,7 +308,9 @@ class ScheduleBatchSMC:
 
         # Populate the device-side group lookup row and zero this row's
         # cumulative weights in one shot.
-        slots_t = torch.as_tensor(slots, dtype=torch.int32, device=self.device)
+        slots_t64 = torch.as_tensor(slots, dtype=torch.int64, device=self.device)
+        self.group_to_slots_i64[row, :n] = slots_t64
+        slots_t = slots_t64.to(torch.int32)
         self.group_to_slots[row, :n] = slots_t
         self.row_in_use[row] = True
         slot_idx64 = slots_t.to(torch.int64)
@@ -309,6 +334,7 @@ class ScheduleBatchSMC:
         if row is not None:
             self.row_to_group_id.pop(row, None)
             self.group_to_slots[row] = -1
+            self.group_to_slots_i64[row] = -1
             self.row_in_use[row] = False
             self._free_rows.append(row)
 
@@ -331,6 +357,11 @@ class ScheduleBatchSMC:
             self.verified_ids[slot] = 0
             self.token_counts[slot] = 0
             self.finished_mask[slot] = False
+            self.seq_lens_cpu[slot] = 0
+            self.kv_allocated_lens_cpu[slot] = 0
+            self.verified_ids_cpu[slot] = 0
+            self.token_counts_cpu[slot] = 0
+            self.finished_mask_cpu[slot] = False
             self.ignore_eos_t[slot] = False
             self.log_weights[slot] = 0.0
             self.interval_weights[slot] = 0.0
@@ -367,6 +398,7 @@ class ScheduleBatchSMC:
             active_list, dtype=torch.int64, device=self.device
         )
         self._active_slots_list = active_list
+        self._active_slots_set = set(active_list)
         self.num_active = len(active_list)
 
     def is_empty(self) -> bool:
@@ -422,6 +454,44 @@ class ScheduleBatchSMC:
         upstream code.  The slot-based design only applies to decode."""
         pass
 
+    def allocate_kv_for_slots(
+        self,
+        active: torch.Tensor,
+        seq_lens: torch.Tensor,
+        gamma_plus_1: int,
+        *,
+        num_needed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Allocate verifier KV for ``[seq_lens, seq_lens + gamma_plus_1)``.
+
+        This is the allocation-only subset of ``SMCDecodeContext.from_slot_gather``.
+        Lag-1 uses it before launching draft RPCs, where constructing a full
+        decode context and CPU seq-len summaries would be wasted metadata work.
+        """
+        if active.numel() == 0:
+            return self.kv_allocated_lens[active]
+
+        kv_allocated_lens = self.kv_allocated_lens[active]
+        alloc_start = torch.maximum(kv_allocated_lens, seq_lens)
+        needed_len = seq_lens + gamma_plus_1
+        new_alloc = torch.clamp(needed_len - alloc_start, min=0)
+        if num_needed is None:
+            num_needed = int(new_alloc.sum().item())
+        nxt_kv_lens = alloc_start + new_alloc
+
+        if num_needed > 0:
+            out_cache_loc = alloc_token_slots(self.tree_cache, num_needed)
+            assign_req_to_token_pool_func(
+                self.req_pool_indices[active],
+                self.req_to_token_pool.req_to_token,
+                alloc_start.to(torch.int32),
+                nxt_kv_lens.to(torch.int32),
+                out_cache_loc,
+                int(active.numel()),
+            )
+
+        return nxt_kv_lens
+
     # ────────────────────────────────────────────────────────
     #  Build ModelWorkerBatch (slot-major → contiguous gather)
     # ────────────────────────────────────────────────────────
@@ -448,8 +518,12 @@ class ScheduleBatchSMC:
 
         req_pool_indices = self.req_pool_indices[active]
         seq_lens = ctx.new_seq_lens if ctx is not None else self.seq_lens[active]
-        seq_lens_cpu = seq_lens.cpu()
-        seq_lens_sum = int(seq_lens_cpu.sum().item())
+        if ctx is not None and ctx.new_seq_lens_cpu is not None:
+            seq_lens_cpu = ctx.new_seq_lens_cpu
+            seq_lens_sum = int(ctx.new_seq_lens_sum)
+        else:
+            seq_lens_cpu = seq_lens.cpu()
+            seq_lens_sum = int(seq_lens_cpu.sum().item())
 
         reqs = [self.slot_to_req[s] for s in active_list]
 
@@ -587,6 +661,7 @@ class ScheduleBatchSMC:
             for idx in finished_indices.tolist():
                 slot = int(active[idx].item())
                 newly_finished.append(slot)
+                self.finished_mask_cpu[slot] = True
                 req = self.slot_to_req[slot]
                 count = int(self.token_counts[slot].item())
                 req.kv_committed_len = int(self.seq_lens[slot].item())
@@ -652,9 +727,14 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[dst_slot] = self.kv_allocated_lens[src_slot]
         self.verified_ids[dst_slot] = self.verified_ids[src_slot]
         self.finished_mask[dst_slot] = self.finished_mask[src_slot]
+        self.seq_lens_cpu[dst_slot] = self.seq_lens_cpu[src_slot]
+        self.kv_allocated_lens_cpu[dst_slot] = self.kv_allocated_lens_cpu[src_slot]
+        self.verified_ids_cpu[dst_slot] = self.verified_ids_cpu[src_slot]
+        self.finished_mask_cpu[dst_slot] = self.finished_mask_cpu[src_slot]
 
         src_count = int(self.token_counts[src_slot].item())
         self.token_counts[dst_slot] = src_count
+        self.token_counts_cpu[dst_slot] = int(src_count)
         if src_count > 0:
             self.all_token_ids[dst_slot, :src_count] = (
                 self.all_token_ids[src_slot, :src_count]
@@ -701,7 +781,14 @@ class ScheduleBatchSMC:
         )
         self.kv_allocated_lens[slots] = new_alloc_lens
 
-    def copy_req_metadata(self, dst_slot: int, src_slot: int) -> None:
+    def copy_req_metadata(
+        self,
+        dst_slot: int,
+        src_slot: int,
+        *,
+        kv_committed_len: Optional[int] = None,
+        kv_allocated_len: Optional[int] = None,
+    ) -> None:
         """Copy the Req-level text state from src to dst.
 
         Invoked by the fast-path dispatcher after the fused kernel has
@@ -720,8 +807,12 @@ class ScheduleBatchSMC:
         # src advances its slot seq_len each window without updating its Req
         # field, so src_req.kv_committed_len can lag.  Keeps the invariant
         # req.kv_committed_len == seq_lens[slot] that the rest of the code relies on.
-        dst_req.kv_committed_len = int(self.seq_lens[dst_slot].item())
-        dst_req.kv_allocated_len = int(self.kv_allocated_lens[dst_slot].item())
+        if kv_committed_len is None:
+            kv_committed_len = int(self.seq_lens[dst_slot].item())
+        if kv_allocated_len is None:
+            kv_allocated_len = int(self.kv_allocated_lens[dst_slot].item())
+        dst_req.kv_committed_len = int(kv_committed_len)
+        dst_req.kv_allocated_len = int(kv_allocated_len)
         dst_req.decoded_text = src_req.decoded_text
         dst_req.surr_offset = src_req.surr_offset
         dst_req.read_offset = src_req.read_offset
@@ -789,7 +880,7 @@ class ScheduleBatchSMC:
 
     def group_has_active(self, group_id: str) -> bool:
         slots = self.group_slot_lists.get(group_id, [])
-        return any(not self.finished_mask[s].item() for s in slots)
+        return any(s in self._active_slots_set for s in slots)
 
     def active_particle_count(self) -> int:
         return self.num_active

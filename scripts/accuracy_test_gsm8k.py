@@ -19,6 +19,8 @@ Usage:
 """
 
 import argparse
+from contextlib import nullcontext
+import json
 import re
 import time
 from typing import Optional
@@ -128,7 +130,8 @@ def run_smc_engine_eval(args, prompts, labels):
         "ignore_eos": args.ignore_eos,
     }
 
-    with SMCEngine(**engine_kwargs) as engine:
+    dump_cm = open(args.dump_jsonl, "w") if args.dump_jsonl else nullcontext()
+    with SMCEngine(**engine_kwargs) as engine, dump_cm as dump_f:
         preds = []
         total_output_tokens = 0
         tic = time.perf_counter()
@@ -144,8 +147,24 @@ def run_smc_engine_eval(args, prompts, labels):
                     print(f"--- Q{qi} ({ntok} tokens) ---")
                     print(output["text"][:400])
                     print()
-                preds.append(extract_answer(output["text"]))
+                pred = extract_answer(output["text"])
+                preds.append(pred)
                 total_output_tokens += output["completion_tokens"]
+                if dump_f is not None:
+                    dump_f.write(
+                        json.dumps(
+                            {
+                                "q": qi,
+                                "pred": pred,
+                                "label": labels[qi],
+                                "correct": pred == labels[qi],
+                                "completion_tokens": output["completion_tokens"],
+                                "text": output["text"],
+                            }
+                        )
+                        + "\n"
+                    )
+                    dump_f.flush()
             elapsed = time.perf_counter() - tic
             correct = sum(
                 p == l for p, l in zip(preds, labels[: len(preds)])
@@ -340,6 +359,12 @@ if __name__ == "__main__":
     bench.add_argument("--num-questions", type=int, default=80)
     bench.add_argument("--max-new-tokens", type=int, default=512)
     bench.add_argument("--batch-size", type=int, default=1)
+    bench.add_argument(
+        "--dump-jsonl",
+        type=str,
+        default=None,
+        help="write per-question predictions and raw text to this JSONL path",
+    )
     bench.add_argument(
         "--ignore-eos",
         action=argparse.BooleanOptionalAction,
