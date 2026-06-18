@@ -92,6 +92,11 @@ class DraftStepReq:
     # a per-slot ``List[int]`` is given, the drafter subtracts it element-wise from its
     # mirror; a scalar ``int`` broadcasts (the existing modes are wire-unchanged).
     rollback: Union[int, List[int]] = 0
+    # COPYAHEAD_REDRAW only: after applying rollback, also lower the drafter mirror's
+    # kv_allocated_lens to the rolled-back seq_len before allocation.  This forces
+    # from_slot_gather to allocate private suffix cells instead of reusing a
+    # refcount-shared inherited run-ahead window.
+    truncate_kv: Union[bool, List[bool]] = False
 
 
 @dataclass

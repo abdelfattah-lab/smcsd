@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from smcsd.core.info import SMCDecodeContext, SMCDraftInput
+from smcsd.mem_cache.allocator import truncate_block_table_allocations
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
@@ -679,6 +680,26 @@ class ScheduleBatchSMC:
             self.token_to_kv_pool_allocator.inc_ref(src_indices)
 
         self.copy_req_metadata(dst_slot, src_slot)
+
+    def truncate_kv_allocations(
+        self, slots: torch.Tensor, new_alloc_lens: torch.Tensor
+    ) -> None:
+        """Release each slot's block-table ownership after ``new_alloc_lens``."""
+        if slots.numel() == 0:
+            return
+        slots = slots.to(device=self.device, dtype=torch.int64)
+        new_alloc_lens = new_alloc_lens.to(
+            device=self.device, dtype=self.kv_allocated_lens.dtype
+        )
+        old_alloc_lens = self.kv_allocated_lens[slots].clone()
+        truncate_block_table_allocations(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.req_pool_indices[slots],
+            old_alloc_lens,
+            new_alloc_lens,
+        )
+        self.kv_allocated_lens[slots] = new_alloc_lens
 
     def copy_req_metadata(self, dst_slot: int, src_slot: int) -> None:
         """Copy the Req-level text state from src to dst.

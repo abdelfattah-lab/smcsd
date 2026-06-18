@@ -108,9 +108,15 @@ class _FakeAllocator:
 
     def inc_ref(self, indices):
         self.inc_calls.append(indices.clone())
+        self.slot_ref_count[indices.to(torch.int64)] += 1
 
     def dec_ref_and_free(self, indices):
         self.dec_calls.append(indices.clone())
+        idx = indices.to(torch.int64)
+        self.slot_ref_count[idx] -= 1
+        to_free = idx[self.slot_ref_count[idx] == 0]
+        if to_free.numel() > 0:
+            self.free(to_free)
 
     def free(self, indices):
         self.free_calls.append(indices.clone())
@@ -413,6 +419,83 @@ class TestSMCResetAndFinalizeScore(CustomTestCase):
         ref_best = max([0, 1], key=lambda s: float(slot_state.finalize_score[s]))
         self.assertEqual(ref_best, 0)
         self.assertEqual(parent_req.output_ids, [1])  # slot 0's output
+
+
+class TestScheduleBatchSMCKVTruncate(CustomTestCase):
+    def test_truncate_kv_allocations_drops_only_suffix_ownership_per_row(self):
+        """Redraw clones must drop inherited suffix refs without touching prefix refs."""
+        slot_state = _build_slot_state(
+            max_num_reqs=3,
+            rows=[
+                [10, 11, 30, 31, 0, 0],
+                [10, 11, 30, 31, 0, 0],
+                [10, 11, 30, 31, 0, 0],
+            ],
+            n_particles=3,
+        )
+        slot_state.req_pool_indices[0] = 0
+        slot_state.req_pool_indices[1] = 1
+        slot_state.req_pool_indices[2] = 2
+        slot_state.kv_allocated_lens[:] = torch.tensor([4, 4, 4])
+
+        clones = torch.tensor([1, 2], dtype=torch.int64)
+        slot_state.truncate_kv_allocations(
+            clones, torch.tensor([2, 2], dtype=torch.int64)
+        )
+
+        self.assertEqual(slot_state.kv_allocated_lens.tolist(), [4, 2, 2])
+        dec_calls = [
+            call.tolist()
+            for call in slot_state.token_to_kv_pool_allocator.dec_calls
+        ]
+        self.assertEqual(dec_calls, [[30, 31], [30, 31]])
+
+    def test_truncate_kv_allocations_keeps_survivor_shared_suffix_alive(self):
+        """Two redraw clones dropping a shared suffix must leave survivor refs live."""
+        slot_state = _build_slot_state(
+            max_num_reqs=3,
+            rows=[
+                [10, 11, 30, 31, 0, 0],
+                [10, 11, 30, 31, 0, 0],
+                [10, 11, 30, 31, 0, 0],
+            ],
+            n_particles=3,
+        )
+        slot_state.req_pool_indices[:] = torch.tensor([0, 1, 2])
+        slot_state.kv_allocated_lens[:] = torch.tensor([4, 4, 4])
+        slot_state.token_to_kv_pool_allocator.slot_ref_count[
+            torch.tensor([10, 11, 30, 31])
+        ] = 3
+
+        slot_state.truncate_kv_allocations(
+            torch.tensor([1, 2], dtype=torch.int64),
+            torch.tensor([2, 2], dtype=torch.int64),
+        )
+
+        ref = slot_state.token_to_kv_pool_allocator.slot_ref_count
+        self.assertEqual(int(ref[10].item()), 3)
+        self.assertEqual(int(ref[11].item()), 3)
+        self.assertEqual(int(ref[30].item()), 1)
+        self.assertEqual(int(ref[31].item()), 1)
+        self.assertEqual(
+            [call.tolist() for call in slot_state.token_to_kv_pool_allocator.free_calls],
+            [],
+        )
+
+    def test_truncate_kv_allocations_rejects_growth(self):
+        slot_state = _build_slot_state(
+            max_num_reqs=1,
+            rows=[[10, 11, 0, 0]],
+            n_particles=1,
+        )
+        slot_state.req_pool_indices[0] = 0
+        slot_state.kv_allocated_lens[0] = 2
+
+        with self.assertRaises(ValueError):
+            slot_state.truncate_kv_allocations(
+                torch.tensor([0], dtype=torch.int64),
+                torch.tensor([3], dtype=torch.int64),
+            )
 
 
 if __name__ == "__main__":

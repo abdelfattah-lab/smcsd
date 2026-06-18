@@ -69,6 +69,12 @@ class SpecState:
     tag: int                        # FIFO tag of the spec StepReq
     epoch: int                      # train counter (fail-fast fence)
     ancestor: Optional[np.ndarray]  # a(i): identity survivors, src retired; None=no-resample
+    # COPYAHEAD_REDRAW only: the clone (resample-dst) slots that re-drew their own
+    # next window post-barrier, and the FIFO tag of that clone-subset re-draw StepReq.
+    # The consume recvs this reply AFTER the carried survivor reply and sources each
+    # clone row's verify columns from it (instead of the inherited survivor window).
+    redraw_clone_slots: Optional[List[int]] = None
+    redraw_tag: Optional[int] = None
 
 
 class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
@@ -124,6 +130,17 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 "SBP fires the barrier window-0 speculatively before verify, so the "
                 "post-verify target bonus is not available in time."
             )
+        # Bonus-coverage knob (SMCSD_BONUS_WINDOWS=B, default 1): under
+        # SMCSD_BARRIER_BONUS, reclaim the exact target bonus on the LAST B windows
+        # of each K-train (committed db=False, DRAINED — each drafted on-demand from
+        # the prior window's verified b, no prefetch overlap), and PREFETCH the first
+        # K-B windows off x_g1 (db=None, overlapped).  B=1 == today's barrier-bonus
+        # (only the last window drained, still prefetched off window K-2's x_g1);
+        # B=K == full bonus (every window drained, no overlap).  Each bonus window
+        # costs the next window's prefetch overlap.  Clamped to [1, K].
+        self._bonus_windows = min(
+            max(int(os.environ.get("SMCSD_BONUS_WINDOWS", "1")), 1), self.barrier_k
+        )
         # Bonus-bet modes: fire the next window on the drafter-known x_g1 (overlap),
         # but COMMIT the exact target bonus b on every window (db=False, the
         # barrier-bonus path applied to interior windows too).  BET_KEEP keeps the
@@ -134,6 +151,32 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         self._bet_discard = get_bool_env_var("SMCSD_BET_DISCARD", "false")
         self._bet_keep = get_bool_env_var("SMCSD_BET_KEEP", "false")
         self._bet = self._bet_discard or self._bet_keep
+        # Streaming copy-ahead (SMCSD_COPYAHEAD_RESAMPLE=1): BET_DISCARD's overlapped
+        # bet + re-draft-on-miss FULL-bonus decode, but the per-window (K=1) ESS
+        # resample does NOT drain the in-flight run-ahead — it COPY-AHEADs it into the
+        # cloned/retired slots via the SBP frontier-clone (the run-ahead StepReq is
+        # fired across the barrier BEFORE the resample's send_commit, so the clone
+        # copies each survivor's pre-drafted next window + its KV into descendants),
+        # then remaps it onto the post-rebuild survivors at consume time via the SBP
+        # ancestor map.  No drain, no stall.  Intended at K=1 (RESAMPLE_INTERVAL=1):
+        # every window is a barrier, the copy-ahead coupling is depth-1 (one in-flight
+        # window).  Reuses the SBP machinery (SpecState / _build_spec_a1 /
+        # _barrier_resample's ancestor capture) + BET_DISCARD's miss re-draft.
+        self._copyahead = get_bool_env_var("SMCSD_COPYAHEAD_RESAMPLE", "false")
+        # Copy-ahead RE-DRAW (SMCSD_COPYAHEAD_REDRAW=1): same cross-barrier OVERLAP as
+        # copy-ahead (survivors keep their in-flight run-ahead window fired across the
+        # resample barrier), but the resampled CLONES do NOT inherit the survivor's
+        # in-flight window — they re-DRAW their own next window independently (fresh
+        # multinomial draw) so they diverge from the parent immediately (the diversity
+        # win, no inherit-coupling, no ancestor-map remap of an inherited window).
+        # Reconciliation is UNIFORM-CATCHUP (a): at the barrier the clone's inherited
+        # run-ahead suffix [S, S+G) is first dropped from its block table/refcounts,
+        # then private verifier and drafter cells are allocated for a fresh clone
+        # re-draw from the committed bonus b.  The frontier remains uniform at S+G for
+        # the next train's window-0.  Routes through _run_copyahead_train; the redraw
+        # branch lives in _fire_copyahead_spec / _barrier_resample /
+        # _consume_copyahead_window0.  Full bonus (db=False), K=1.
+        self._copyahead_redraw = get_bool_env_var("SMCSD_COPYAHEAD_REDRAW", "false")
         _on = [
             n
             for n, v in (
@@ -142,6 +185,8 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 ("SMCSD_BET_DISCARD", self._bet_discard),
                 ("SMCSD_BET_KEEP", self._bet_keep),
                 ("SMCSD_ASYNC_BONUS", self._async_bonus),
+                ("SMCSD_COPYAHEAD_RESAMPLE", self._copyahead),
+                ("SMCSD_COPYAHEAD_REDRAW", self._copyahead_redraw),
             )
             if v
         ]
@@ -183,6 +228,22 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         self._timing = get_bool_env_var("SMCSD_TIMING", "false")
         self._t = {"recv": 0.0, "verify": 0.0, "prep": 0.0, "barrier": 0.0}
         self._t_windows = 0
+        self._copyahead_profile = get_bool_env_var("SMCSD_COPYAHEAD_PROFILE", "false")
+        self._cp = {
+            "windows": 0,
+            "carried_recv": 0.0,
+            "redraw_recv": 0.0,
+            "spec_drain_recv": 0.0,
+            "verify": 0.0,
+            "barrier": 0.0,
+            "spec_fires": 0,
+            "spec_fire_rows": 0,
+            "full_redrafts": 0,
+            "full_redraft_rows": 0,
+            "redraws": 0,
+            "redraw_rows": 0,
+            "resample_jobs": 0,
+        }
         logger.info(
             "AsyncDecoupledSMCScheduler: prefetch overlap, resample barrier K=%d, "
             "spec_barrier=%s",
@@ -251,6 +312,8 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                     self._run_fused_bonus_train()
                 elif self._async_bonus:
                     self._run_async_bonus_train()
+                elif self._copyahead or self._copyahead_redraw:
+                    self._run_copyahead_train()
                 else:
                     self._run_decode_train()
             else:
@@ -266,6 +329,32 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         result = self.run_batch(batch)
         self._process_prefill_result(batch, result)
         self.last_batch = tracking_batch
+
+    def _copyahead_profile_report(self, *, force: bool = False) -> None:
+        if not self._copyahead_profile:
+            return
+        n = int(self._cp["windows"])
+        if n == 0 or (not force and n < 50):
+            return
+        denom = max(n, 1)
+        redraws = max(int(self._cp["redraws"]), 1)
+        fires = max(int(self._cp["spec_fires"]), 1)
+        full_redrafts = max(int(self._cp["full_redrafts"]), 1)
+        print(
+            "[COPYAHEAD_PROFILE_VERIFY] "
+            f"windows={n} "
+            f"carried_recv={1e3*self._cp['carried_recv']/denom:.2f}ms/w "
+            f"redraw_recv={1e3*self._cp['redraw_recv']/denom:.2f}ms/w "
+            f"spec_drain_recv={1e3*self._cp['spec_drain_recv']/denom:.2f}ms/w "
+            f"verify={1e3*self._cp['verify']/denom:.2f}ms/w "
+            f"barrier={1e3*self._cp['barrier']/denom:.2f}ms/w "
+            f"spec_rows={self._cp['spec_fire_rows']/fires:.1f} "
+            f"redraw_rows={self._cp['redraw_rows']/redraws:.1f} "
+            f"full_redraft_rows={self._cp['full_redraft_rows']/full_redrafts:.1f} "
+            f"resample_jobs={self._cp['resample_jobs']/denom:.1f}/w",
+            flush=True,
+        )
+        self._cp = {k: 0.0 if isinstance(v, float) else 0 for k, v in self._cp.items()}
 
     def _run_async_bonus_train(self) -> None:
         """Async/staggered FULL-bonus decode (SMCSD_ASYNC_BONUS).
@@ -1042,8 +1131,15 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             is_last = w == K - 1
             fire_spec = is_last and self._spec_barrier
 
+            # Fire the prefetch for w+1 off x_g1 ONLY if window w commits db=None
+            # (anchor = x_g1, consistent with the prefetch).  Under barrier-bonus the
+            # last B windows commit db=False (anchor = bonus b), so window w prefetches
+            # w+1 iff w < K-B; for B=1 this is exactly `not is_last` (byte-identical).
+            fire_prefetch = (
+                w < K - self._bonus_windows if self._barrier_bonus else not is_last
+            )
             next_tag = None
-            if not is_last:
+            if fire_prefetch:
                 # Prefetch the next window from raw lists (no slot_state mutation)
                 # so the drafter computes it while we verify the current window.
                 anchor_next = torch.from_numpy(resp.tokens)[:, self.gamma].tolist()
@@ -1074,7 +1170,7 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             # next train's window-0 anchor (set by the writeback's verified_ids).
             if self._bet:
                 db = False  # Mode A/B: commit the exact target bonus b every window
-            elif is_last and self._barrier_bonus:
+            elif self._barrier_bonus and w >= K - self._bonus_windows:
                 db = False
             else:
                 db = None
@@ -1124,7 +1220,7 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
             if tm:
                 self._t["verify"] += time.perf_counter() - t0
 
-            if not is_last:
+            if fire_prefetch:
                 t0 = time.perf_counter() if tm else 0.0
                 next_batch = self._prepare_decode_batch_fixed(active_t, active_list)
                 if tm:
@@ -1134,6 +1230,20 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                     ctx=next_batch.spec_info.decode_ctx,
                     tag=next_tag,
                     epoch=epoch,
+                )
+            elif self._barrier_bonus and not is_last:
+                # Drained bonus window with a successor (B>=2, w in [K-B, K-2]): no
+                # prefetch was fired, so draft w+1 ON-DEMAND off the committed bonus b.
+                # _writeback_window (above) wrote b into verified_id[active_t];
+                # _prepare_decode_batch_fixed advances the frontier + allocs KV, and
+                # start_decode fires the StepReq off b — exactly the next-train
+                # window-0 path (a verify-first stall, no overlap).
+                t0 = time.perf_counter() if tm else 0.0
+                next_batch = self._prepare_decode_batch_fixed(active_t, active_list)
+                if tm:
+                    self._t["prep"] += time.perf_counter() - t0
+                pending = worker.start_decode(
+                    next_batch, tag=next(self._tag), epoch=epoch
                 )
             elif fire_spec:
                 # Prep the verifier side of the spec window (advance V S+KG ->
@@ -1187,6 +1297,401 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 self._t = {k: 0.0 for k in self._t}
                 self._t_windows = 0
         self.last_batch = tracking_batch
+
+    def _run_copyahead_train(self) -> None:
+        """Streaming copy-ahead full-bonus decode (SMCSD_COPYAHEAD_RESAMPLE).
+
+        BET_DISCARD's overlapped bet + re-draft-on-miss (commit the exact target
+        bonus b every window, db=False), but the per-window ESS resample does NOT
+        drain the in-flight run-ahead.  Instead the next window's run-ahead is fired
+        across the barrier — BEFORE _barrier_resample's send_commit — so the SBP
+        frontier-clone copies each survivor's pre-drafted window + its KV into the
+        retired/cloned descendants, and the SBP ancestor map remaps it onto the
+        post-rebuild survivors at consume time (_consume_copyahead_window0).  No
+        drain, no stall: the copy-ahead coupling is depth-1 (one in-flight window).
+
+        Intended at K=1 (RESAMPLE_INTERVAL=1): every window is a barrier, so the
+        train is exactly { consume-or-cold window 0 ; fire the next copy-ahead ;
+        resample }.  For K>1 the interior windows 1..K-2 run the BET_DISCARD
+        prefetch+commit+redraft loop, and only the LAST window fires the copy-ahead
+        across the barrier (one in-flight window carried per train).
+        """
+        worker = self.draft_worker
+        client = self._draft_client
+        K = self.barrier_k
+        tm = self._timing
+        gamma = self.gamma
+
+        # ── Window 0: consume a carried copy-ahead spec window, or cold-prepare ──
+        if self._spec is not None:
+            state = self._consume_copyahead_window0()
+            if state is None:
+                return  # active emptied during the consume (group finished)
+            epoch, active_list, active_t, tracking_batch, last_resp = state
+            # The consume handled window 0 (recv + commit); `last_resp` is its reply,
+            # consumed by the w==0 iteration below (which then prefetches/fires w+1).
+            pending = None
+        else:
+            batch = self._prepare_decode_batch()
+            if batch is None:
+                return
+            active_list = list(batch.spec_info.active_slots_cpu)
+            active_t = torch.tensor(
+                active_list, dtype=torch.int64, device=self.device
+            )
+            tracking_batch = self._make_runtime_tracking_batch(batch)
+            self.cur_batch = tracking_batch
+            self.running_batch = (
+                tracking_batch if tracking_batch is not None else ScheduleBatch(reqs=[])
+            )
+            epoch = next(self._epoch)
+            tag = next(self._tag)
+            pending = worker.start_decode(batch, tag=tag, epoch=epoch)
+            last_resp = None  # cold path: the loop recvs + commits window 0 itself
+
+        # ── Windows 0..K-1: interior = BET_DISCARD prefetch; last = copy-ahead ──
+        for w in range(K):
+            is_last = w == K - 1
+            if last_resp is not None:
+                # The consume already recv'd + committed window 0 and returned its
+                # reply; reuse it as this window's reply (only happens for w_start=1).
+                resp = last_resp
+                last_resp = None
+            else:
+                t0 = time.perf_counter() if tm else 0.0
+                resp = client.recv_step_resp()
+                if tm:
+                    self._t["recv"] += time.perf_counter() - t0
+                if resp.tag != pending.tag or resp.epoch != pending.epoch:
+                    raise RuntimeError(
+                        f"Copy-ahead step reply tag/epoch mismatch: got "
+                        f"({resp.tag},{resp.epoch}), expected "
+                        f"({pending.tag},{pending.epoch})"
+                    )
+                # Interior (non-consumed) windows verify + commit the EXACT bonus b
+                # (db=False) here; the consume path already committed window 0's bonus.
+                t0 = time.perf_counter() if tm else 0.0
+                result = worker.finish_decode(pending, resp, drop_bonus=False)
+                self._writeback_window(result, active_t)
+                if tm:
+                    self._t["verify"] += time.perf_counter() - t0
+                self._t_windows += 1
+
+            if is_last:
+                # Fire the next window's run-ahead ACROSS the barrier off this
+                # window's x_g1, advance the verifier frontier + alloc its verify KV,
+                # and stash the SpecState — all BEFORE _barrier_resample's send_commit
+                # so the clone copies the in-flight run-ahead into descendants.
+                self._fire_copyahead_spec(resp, active_t, active_list)
+                break
+
+            # Interior window with a successor: prefetch w+1 off x_g1 (BET_DISCARD).
+            t0 = time.perf_counter() if tm else 0.0
+            anchor_next = torch.from_numpy(resp.tokens)[:, gamma].tolist()
+            seq_lens_next = self.slot_state.seq_lens[active_t].tolist()
+            next_tag = next(self._tag)
+            worker.send_step_req(
+                active_list, anchor_next, seq_lens_next, tag=next_tag, epoch=epoch,
+            )
+            # Did the bet win?  We committed the exact bonus b above; on a miss drain
+            # the speculative window and re-draft the whole set from b (rollback).
+            x_g1 = torch.from_numpy(resp.tokens)[:, gamma]
+            b_cpu = self.slot_state.verified_ids[active_t].cpu().to(torch.int64)
+            bet_miss = x_g1 != b_cpu
+            if self._bet_stats:
+                self._bet_n += int(bet_miss.numel())
+                self._bet_miss_n += int(bet_miss.sum().item())
+            if bool(bet_miss.any()):
+                stale = client.recv_step_resp()
+                if stale.tag != next_tag or stale.epoch != epoch:
+                    raise RuntimeError(
+                        f"COPYAHEAD interior drain tag/epoch mismatch: got "
+                        f"({stale.tag},{stale.epoch}), expected ({next_tag},{epoch})"
+                    )
+                self._n_redraft += 1
+                next_tag = next(self._tag)
+                worker.send_step_req(
+                    active_list, b_cpu.tolist(), seq_lens_next,
+                    tag=next_tag, epoch=epoch, rollback=gamma + 1,
+                )
+            next_batch = self._prepare_decode_batch_fixed(active_t, active_list)
+            pending = PendingDecodeStep(
+                batch=next_batch,
+                ctx=next_batch.spec_info.decode_ctx,
+                tag=next_tag,
+                epoch=epoch,
+            )
+            if tm:
+                self._t["prep"] += time.perf_counter() - t0
+
+        # ── Barrier: resample (captures the ancestor map onto self._spec — the
+        #    copy-ahead remap), rebuild, finalize-drain.  The copy-ahead run-ahead
+        #    is in flight; _barrier_resample's send_commit clones it into descendants
+        #    (FIFO: the run-ahead StepReq was already sent above). ──
+        t0 = time.perf_counter() if tm else 0.0
+        cp_t0 = time.perf_counter() if self._copyahead_profile else 0.0
+        self._barrier_resample()
+        self.slot_state.rebuild_active_slots()
+        self._drain_finished_groups()
+        if self._copyahead_profile:
+            self._cp["barrier"] += time.perf_counter() - cp_t0
+            self._copyahead_profile_report()
+        if tm:
+            self._t["barrier"] += time.perf_counter() - t0
+            if self._t_windows >= 200:
+                tot = sum(self._t.values()) or 1.0
+                n = self._t_windows
+                print(
+                    f"[COPYAHEAD_TIMING] {n} windows: "
+                    f"recv(drafter-wait)={100*self._t['recv']/tot:.0f}% "
+                    f"verify={100*self._t['verify']/tot:.0f}% "
+                    f"prep={100*self._t['prep']/tot:.0f}% "
+                    f"barrier={100*self._t['barrier']/tot:.0f}% | per-window "
+                    f"recv={1e3*self._t['recv']/n:.2f}ms "
+                    f"verify={1e3*self._t['verify']/n:.2f}ms",
+                    flush=True,
+                )
+                self._t = {k: 0.0 for k in self._t}
+                self._t_windows = 0
+        self.last_batch = tracking_batch
+
+    def _fire_copyahead_spec(self, resp, active_t, active_list) -> None:
+        """Fire the next window's run-ahead ACROSS the resample barrier off the
+        drafter-known bet x_g1 (resp.tokens[:, gamma]), the copy-ahead.
+
+        The verifier has already committed this window's exact bonus b when this
+        runs.  If every row's bet x_g1 equals b, fire from x_g1.  If any row missed,
+        skip the stale x_g1 pass and fire the carried full window directly from b.
+        This is equivalent to BET_DISCARD's drain+re-draft final state without the
+        wasted stale drafter pass.  We then advance the verifier frontier + alloc
+        the run-ahead's verify KV (_prepare_decode_batch_fixed) so _barrier_resample's
+        clone copies the ADVANCED verifier KV into descendants, and stash the
+        SpecState for the one live in-flight StepReq."""
+        worker = self.draft_worker
+        gamma = self.gamma
+
+        spec_epoch = next(self._epoch)
+        spec_tag = next(self._tag)
+        x_g1 = torch.from_numpy(resp.tokens)[:, gamma]
+        seq_lens_next = self.slot_state.seq_lens[active_t].tolist()
+
+        # Bet check: we committed the exact bonus b on this window
+        # (verified_ids[active] == b after the commit's writeback).  On any miss, send
+        # the carried window from b directly.  The older implementation first fired
+        # x_g1, drained it, then re-fired b with rollback=gamma+1; that final state is
+        # identical but costs a full useless drafter pass at this post-verify boundary.
+        b_cpu = self.slot_state.verified_ids[active_t].cpu().to(torch.int64)
+        bet_miss = x_g1 != b_cpu
+        if self._bet_stats:
+            self._bet_n += int(bet_miss.numel())
+            self._bet_miss_n += int(bet_miss.sum().item())
+        send_ids = x_g1.tolist()
+        if bool(bet_miss.any()):
+            self._n_redraft += 1
+            send_ids = b_cpu.tolist()
+            if self._copyahead_profile:
+                self._cp["full_redrafts"] += 1
+                self._cp["full_redraft_rows"] += len(active_list)
+        if self._copyahead_profile:
+            self._cp["spec_fires"] += 1
+            self._cp["spec_fire_rows"] += len(active_list)
+        worker.send_step_req(
+            active_list, send_ids, seq_lens_next, tag=spec_tag, epoch=spec_epoch,
+        )
+        if self._bet_stats and self._bet_n >= 500:
+            print(
+                f"[COPYAHEAD] {self._bet_n} bets: "
+                f"x_g1!=b={100*self._bet_miss_n/self._bet_n:.1f}% "
+                f"redrafts={self._n_redraft}",
+                flush=True,
+            )
+            self._bet_n = self._bet_miss_n = 0
+
+        # Advance the verifier frontier S+? -> S+?+G over the FULL fired set + alloc
+        # the run-ahead's verify KV (load-bearing: process_batch_result does NOT
+        # advance seq_lens; only this does, mirroring the drafter's _handle_step).
+        # The snapshot freezes ctx.orig_seq_lens for the consume's verify cache_locs.
+        spec_batch = self._prepare_decode_batch_fixed(active_t, active_list)
+        self._spec = SpecState(
+            pending=PendingDecodeStep(
+                batch=spec_batch,
+                ctx=spec_batch.spec_info.decode_ctx,
+                tag=spec_tag,
+                epoch=spec_epoch,
+            ),
+            active_list_T=active_list,
+            active_t_T=active_t,
+            tag=spec_tag,
+            epoch=spec_epoch,
+            ancestor=None,
+        )
+
+    def _fire_copyahead_redraw(self, plan) -> None:
+        """RE-DRAW the resample clones (SMCSD_COPYAHEAD_REDRAW).  Run inside
+        _barrier_resample AFTER send_commit, so on the FIFO the clone re-draw
+        StepReq follows the carried survivor run-ahead StepReq and its commit.
+
+        The dispatch just set seq_lens[dst]=seq_lens[src]=S+G and copied src's full
+        S+G KV into each clone (committed prefix [0,S) shared with the survivor +
+        the inherited in-flight window cells [S,S+G)).  Instead of letting the clone
+        ADOPT the survivor's window (the copy-ahead consume's ancestor gather), drop
+        the clone's ownership of [S,S+G), allocate private verifier cells there, then
+        fire a clone-SUBSET StepReq seeded by each clone's committed bonus b (= the
+        survivor's b, copied to verified_ids[dst]) with seq_lens=S and rollback=G.
+        The drafter mirrors the same truncation before allocating its redraw cells.
+        No ancestor remap of an inherited window — the clone draws independently."""
+        gamma = self.gamma
+        spec = self._spec
+        dst_slots = plan.dst_slots.tolist()
+        dst_t = plan.dst_slots.to(torch.int64)
+        if self._copyahead_profile:
+            self._cp["redraws"] += 1
+            self._cp["redraw_rows"] += len(dst_slots)
+        # Committed frontier S = (S+G) - (gamma+1): the prefix BEFORE the inherited
+        # in-flight window.  This is what the drafter must match after rollback.
+        committed_t = self.slot_state.seq_lens[dst_t] - (gamma + 1)
+        self._make_copyahead_redraw_kv_private(dst_t, committed_t)
+        committed = committed_t.cpu().tolist()
+        b_clone = self.slot_state.verified_ids[dst_t].cpu().to(torch.int64).tolist()
+        redraw_tag = next(self._tag)
+        self.draft_worker.send_step_req(
+            dst_slots, b_clone, committed,
+            tag=redraw_tag, epoch=spec.epoch, rollback=gamma + 1, truncate_kv=True,
+        )
+        self._n_redraft += 1
+        # The clones already sit at seq_lens[dst]=S+G (set by dispatch); only their
+        # [S,S+G) block-table entries changed.  The consume reads orig=S for verify.
+        spec.redraw_clone_slots = dst_slots
+        spec.redraw_tag = redraw_tag
+
+    def _make_copyahead_redraw_kv_private(
+        self, dst_t: torch.Tensor, committed_t: torch.Tensor
+    ) -> None:
+        """Give redraw clones private verifier KV cells for their in-flight suffix."""
+        if dst_t.numel() == 0:
+            return
+        gamma_plus_1 = self.gamma + 1
+        seq_lens = self.slot_state.seq_lens[dst_t]
+        expected = committed_t + gamma_plus_1
+        if not torch.equal(seq_lens, expected):
+            raise RuntimeError(
+                "COPYAHEAD_REDRAW seq_len invariant violated before KV privatize: "
+                f"seq_lens={seq_lens.cpu().tolist()} expected={expected.cpu().tolist()}"
+            )
+        alloc_lens = self.slot_state.kv_allocated_lens[dst_t]
+        if bool((alloc_lens < seq_lens).any().item()):
+            raise RuntimeError(
+                "COPYAHEAD_REDRAW cannot privatize from short allocation: "
+                f"alloc={alloc_lens.cpu().tolist()} seq={seq_lens.cpu().tolist()}"
+            )
+
+        self.slot_state.truncate_kv_allocations(dst_t, committed_t)
+        _, new_alloc = SMCDecodeContext.from_slot_gather(
+            seq_lens=committed_t,
+            kv_allocated_lens=self.slot_state.kv_allocated_lens[dst_t],
+            req_pool_indices=self.slot_state.req_pool_indices[dst_t],
+            gamma_plus_1=gamma_plus_1,
+            req_to_token_pool=self.slot_state.req_to_token_pool,
+            tree_cache=self.slot_state.tree_cache,
+        )
+        self.slot_state.kv_allocated_lens[dst_t] = new_alloc
+
+    def _consume_copyahead_window0(self):
+        """Adopt the carried copy-ahead run-ahead as this train's window 0, commit
+        its EXACT target bonus b (db=False), and return the loop state + the recv'd
+        reply (so the train can fire the next copy-ahead off this window's x_g1).
+
+        Mirrors _consume_spec_window0's ancestor-remap gather onto the post-rebuild
+        active set A1, but commits db=False (full bonus) and does NOT itself fire the
+        next window — the copy-ahead train does that uniformly on its last window.
+        Returns (epoch, a1_list, a1_t, tracking_batch, resp_a1) or None if no
+        survivors remain (group finished during the carried window)."""
+        spec = self._spec
+        tm = self._timing
+        worker = self.draft_worker
+        client = self._draft_client
+
+        t0 = time.perf_counter() if tm else 0.0
+        cp_t0 = time.perf_counter() if self._copyahead_profile else 0.0
+        resp = client.recv_step_resp()
+        if self._copyahead_profile:
+            self._cp["carried_recv"] += time.perf_counter() - cp_t0
+        if tm:
+            self._t["recv"] += time.perf_counter() - t0
+        if resp.tag != spec.tag or resp.epoch != spec.epoch:
+            raise RuntimeError(
+                f"COPYAHEAD spec reply tag/epoch mismatch: got "
+                f"({resp.tag},{resp.epoch}), expected ({spec.tag},{spec.epoch})"
+            )
+        epoch = spec.epoch
+
+        a1_list = list(self.slot_state._active_slots_list)
+        tracking_batch = self._make_runtime_tracking_batch(spec.pending.batch)
+        self.cur_batch = tracking_batch
+        self.running_batch = (
+            tracking_batch if tracking_batch is not None else ScheduleBatch(reqs=[])
+        )
+        if not a1_list:
+            if spec.redraw_tag is not None:
+                # Drain the in-flight clone re-draw off the FIFO before returning
+                # (a following RPC's recv would otherwise pop it and crash).
+                stale = client.recv_step_resp()
+                if stale.tag != spec.redraw_tag or stale.epoch != spec.epoch:
+                    raise RuntimeError(
+                        f"COPYAHEAD_REDRAW empty-A1 clone drain tag/epoch mismatch: "
+                        f"got ({stale.tag},{stale.epoch}), expected "
+                        f"({spec.redraw_tag},{spec.epoch})"
+                    )
+            self._t_windows += 1
+            self._spec = None
+            self.last_batch = tracking_batch
+            return None
+
+        a1_t = torch.tensor(a1_list, dtype=torch.int64, device=self.device)
+        pending_a1, resp_a1, _ = self._build_spec_a1(spec, resp, a1_list, a1_t)
+
+        if spec.redraw_tag is not None:
+            # RE-DRAW: a clone-subset re-draft was fired post-barrier (FIFO: after
+            # the survivor carried run-ahead above).  Recv it and SPLICE each clone
+            # A1 row's columns from this fresh independent draw — replacing the
+            # inherited survivor window that _build_spec_a1's ancestor gather put
+            # there.  Survivor A1 rows keep their carried run-ahead (the overlap).
+            t0 = time.perf_counter() if tm else 0.0
+            cp_t0 = time.perf_counter() if self._copyahead_profile else 0.0
+            redraw_resp = client.recv_step_resp()
+            if self._copyahead_profile:
+                self._cp["redraw_recv"] += time.perf_counter() - cp_t0
+            if tm:
+                self._t["recv"] += time.perf_counter() - t0
+            if redraw_resp.tag != spec.redraw_tag or redraw_resp.epoch != spec.epoch:
+                raise RuntimeError(
+                    f"COPYAHEAD_REDRAW clone reply tag/epoch mismatch: got "
+                    f"({redraw_resp.tag},{redraw_resp.epoch}), expected "
+                    f"({spec.redraw_tag},{spec.epoch})"
+                )
+            redraw_row = {s: r for r, s in enumerate(spec.redraw_clone_slots)}
+            # The clones diverge from their parent immediately: each clone A1 row's
+            # gamma+1 columns come from its OWN re-draw, not the survivor's window.
+            for a1_row, slot in enumerate(a1_list):
+                r = redraw_row.get(slot)
+                if r is not None:
+                    resp_a1.tokens[a1_row] = redraw_resp.tokens[r]
+                    resp_a1.logprobs[a1_row] = redraw_resp.logprobs[r]
+
+        # Verify window 0 over A1 and commit the EXACT target bonus b (full-bonus).
+        t0 = time.perf_counter() if tm else 0.0
+        result = worker.finish_decode(pending_a1, resp_a1, drop_bonus=False)
+        self._writeback_window(result, a1_t)
+        if self._copyahead_profile:
+            self._cp["verify"] += time.perf_counter() - t0
+            self._cp["windows"] += 1
+        if tm:
+            self._t["verify"] += time.perf_counter() - t0
+        self._t_windows += 1
+        self._spec = None
+        # The reply is returned so the train's last-window copy-ahead fires off this
+        # window's x_g1; resp_a1 is the A1-remapped reply (gamma+1 columns).
+        return epoch, a1_list, a1_t, tracking_batch, resp_a1
 
     def _consume_spec_window0(self):
         """Adopt the carried SBP spec window as this train's window 0.
@@ -1294,11 +1799,34 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 f"SBP standalone-commit tag/epoch mismatch: got "
                 f"({resp.tag},{resp.epoch}), expected ({spec.tag},{spec.epoch})"
             )
+        # RE-DRAW: a clone-subset re-draft may also be in flight (fired post-barrier).
+        # Drain it off the FIFO unconditionally (else a following RPC's recv pops it
+        # and crashes), and splice the clone rows below if we score this window.
+        redraw_resp = None
+        if spec.redraw_tag is not None:
+            redraw_resp = client.recv_step_resp()
+            if redraw_resp.tag != spec.redraw_tag or redraw_resp.epoch != spec.epoch:
+                raise RuntimeError(
+                    f"COPYAHEAD_REDRAW standalone clone tag/epoch mismatch: got "
+                    f"({redraw_resp.tag},{redraw_resp.epoch}), expected "
+                    f"({spec.redraw_tag},{spec.epoch})"
+                )
         a1_list = list(self.slot_state._active_slots_list)
         if a1_list:
             a1_t = torch.tensor(a1_list, dtype=torch.int64, device=self.device)
             pending_a1, resp_a1, _ = self._build_spec_a1(spec, resp, a1_list, a1_t)
-            result = worker.finish_decode(pending_a1, resp_a1)
+            if redraw_resp is not None:
+                redraw_row = {s: r for r, s in enumerate(spec.redraw_clone_slots)}
+                for a1_row, slot in enumerate(a1_list):
+                    r = redraw_row.get(slot)
+                    if r is not None:
+                        resp_a1.tokens[a1_row] = redraw_resp.tokens[r]
+                        resp_a1.logprobs[a1_row] = redraw_resp.logprobs[r]
+            # Copy-ahead / re-draw are FULL-bonus modes: commit the exact target bonus
+            # b even when draining the carried run-ahead standalone (else the boundary
+            # window silently reverts to the no-bonus anchor).
+            db = False if (self._copyahead or self._copyahead_redraw) else None
+            result = worker.finish_decode(pending_a1, resp_a1, drop_bonus=db)
             self._writeback_window(result, a1_t)
             self._t_windows += 1
         self._spec = None
@@ -1394,6 +1922,8 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
 
     def _barrier_resample(self) -> None:
         plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
+        if self._copyahead_profile:
+            self._cp["resample_jobs"] += int(plan.n_jobs)
         if plan.n_jobs > 0:
             self.coordinator.dispatch_resample_batch(
                 plan, self.slot_state, rebuild_active=False,
@@ -1416,6 +1946,18 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
                 a = np.arange(max_slots, dtype=np.int64)
                 a[plan.dst_slots.cpu().numpy()] = plan.src_slots.cpu().numpy()
                 self._spec.ancestor = a
+                if self._copyahead_redraw:
+                    # RE-DRAW: the clone (dst) slots just inherited the SURVIVOR's
+                    # in-flight run-ahead window (the resample copied src's full S+G
+                    # KV).  Isolate "overlap + re-draw diversity" by making each clone
+                    # re-draw its OWN next window instead: reset the clone's frontier
+                    # to the COMMITTED prefix S = seq_lens[src]-(gamma+1) and re-draft
+                    # it from its committed bonus b (= verified_ids[dst], copied from
+                    # src).  The inherited window-KV at [S, S+G) is refcount-dropped
+                    # on the clone and replaced with private cells on both verifier
+                    # and drafter.  Survivors are never a dst, so they keep their
+                    # full S+G in-flight window (the overlap is preserved).
+                    self._fire_copyahead_redraw(plan)
         # n_jobs == 0: leave self._spec.ancestor = None (identity gather).
 
     def _spec_a1_source_rows(self, spec: SpecState, a1_list: List[int]) -> np.ndarray:

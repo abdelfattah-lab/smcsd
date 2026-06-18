@@ -101,6 +101,7 @@ class DraftEngineClient:
         tag: int = 0,
         epoch: int = 0,
         rollback: "int | List[int]" = 0,
+        truncate_kv: "bool | List[bool]" = False,
     ) -> None:
         """Fire a draft round without waiting for the reply (pipelined path)."""
         self.send_to_drafter.send_pyobj(
@@ -111,6 +112,7 @@ class DraftEngineClient:
                 tag=tag,
                 epoch=epoch,
                 rollback=rollback,
+                truncate_kv=truncate_kv,
             )
         )
 
@@ -297,6 +299,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
         tag: int = 0,
         epoch: int = 0,
         rollback: "int | List[int]" = 0,
+        truncate_kv: "bool | List[bool]" = False,
     ) -> None:
         """Fire one draft round on the drafter (no slot_state dependency).
 
@@ -310,6 +313,7 @@ class DecoupledSMCWorker(BaseSpecWorker):
             tag=tag,
             epoch=epoch,
             rollback=rollback,
+            truncate_kv=truncate_kv,
         )
 
     def start_decode(

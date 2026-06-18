@@ -54,7 +54,11 @@ from smcsd.decoupled.io_struct import (
     DraftStepResp,
 )
 from smcsd.managers.smc_tp_worker import SMCTpModelWorker
-from smcsd.mem_cache.allocator import SMCRefCountedTokenAllocator, copy_block_table
+from smcsd.mem_cache.allocator import (
+    SMCRefCountedTokenAllocator,
+    copy_block_table,
+    truncate_block_table_allocations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +96,13 @@ class SMCDraftServer:
         self._timing = get_bool_env_var("SMCSD_TIMING", "false")
         self._t_draft = {"alloc": 0.0, "ar": 0.0, "out": 0.0}
         self._t_draft_n = 0
+        self._copyahead_profile = get_bool_env_var("SMCSD_COPYAHEAD_PROFILE", "false")
+        self._cp_draft = {
+            "full": {"n": 0, "rows": 0, "wall": 0.0, "alloc": 0.0, "ar": 0.0, "out": 0.0},
+            "rollback": {"n": 0, "rows": 0, "wall": 0.0, "alloc": 0.0, "ar": 0.0, "out": 0.0},
+            "redraw": {"n": 0, "rows": 0, "wall": 0.0, "alloc": 0.0, "ar": 0.0, "out": 0.0},
+            "commit": {"n": 0, "rows": 0, "wall": 0.0, "alloc": 0.0, "ar": 0.0, "out": 0.0},
+        }
 
         # -- Draft model worker (own pools; SMCModelRunner installs the
         #    refcounted allocator since is_draft_worker=False here) --
@@ -305,10 +316,61 @@ class SMCDraftServer:
     #  Decode round (gamma+1 AR steps; last step only writes x_gamma's KV)
     # ────────────────────────────────────────────────────────
 
+    def _profile_step_kind(self, msg: DraftStepReq) -> str:
+        truncate = msg.truncate_kv
+        truncate_on = any(truncate) if isinstance(truncate, list) else bool(truncate)
+        if truncate_on:
+            return "redraw"
+        rollback = msg.rollback
+        rollback_on = any(rollback) if isinstance(rollback, list) else bool(rollback)
+        return "rollback" if rollback_on else "full"
+
+    def _copyahead_profile_add(
+        self,
+        kind: str,
+        *,
+        rows: int,
+        wall: float,
+        alloc: float = 0.0,
+        ar: float = 0.0,
+        out: float = 0.0,
+    ) -> None:
+        if not self._copyahead_profile:
+            return
+        b = self._cp_draft[kind]
+        b["n"] += 1
+        b["rows"] += rows
+        b["wall"] += wall
+        b["alloc"] += alloc
+        b["ar"] += ar
+        b["out"] += out
+        total = sum(int(v["n"]) for v in self._cp_draft.values())
+        if total < 100:
+            return
+        parts = []
+        for name in ("full", "rollback", "redraw", "commit"):
+            s = self._cp_draft[name]
+            n = max(int(s["n"]), 1)
+            parts.append(
+                f"{name}:n={int(s['n'])} rows={s['rows']/n:.1f} "
+                f"wall={1e3*s['wall']/n:.2f}ms "
+                f"alloc={1e3*s['alloc']/n:.2f}ms "
+                f"ar={1e3*s['ar']/n:.2f}ms "
+                f"out={1e3*s['out']/n:.2f}ms"
+            )
+        print("[COPYAHEAD_PROFILE_DRAFT] " + " | ".join(parts), flush=True)
+        for s in self._cp_draft.values():
+            for k in s:
+                s[k] = 0.0
+
     def _handle_step(self, msg: DraftStepReq) -> DraftStepResp:
         active = torch.tensor(msg.slots, dtype=torch.int64, device=self.device)
         bs = len(msg.slots)
         gamma = self.gamma
+        prof = self._copyahead_profile
+        prof_kind = self._profile_step_kind(msg) if prof else "full"
+        prof_wall_t0 = time.perf_counter() if prof else 0.0
+        prof_alloc = prof_ar = prof_out = 0.0
 
         if isinstance(msg.rollback, list):
             # Fused S4 (SMCSD_ASYNC_BONUS): per-slot rewind — committed rows roll
@@ -331,9 +393,11 @@ class SMCDraftServer:
                 "Drafter/verifier seq_lens divergence: "
                 f"mirror={seq_cpu} verifier={list(msg.seq_lens)} slots={msg.slots}"
             )
+        self._truncate_step_kv_if_requested(active, msg.truncate_kv)
 
         tm = self._timing
-        t0 = time.perf_counter() if tm else 0.0
+        measure = tm or prof
+        t0 = time.perf_counter() if measure else 0.0
         ctx, new_kv_alloc = SMCDecodeContext.from_slot_gather(
             seq_lens=seq_g,
             kv_allocated_lens=self.kv_allocated_lens[active],
@@ -344,8 +408,10 @@ class SMCDraftServer:
         )
         self.kv_allocated_lens[active] = new_kv_alloc
         self.seq_lens[active] = ctx.new_seq_lens
-        if tm:
-            self._t_draft["alloc"] += time.perf_counter() - t0
+        if measure:
+            prof_alloc = time.perf_counter() - t0
+            if tm:
+                self._t_draft["alloc"] += prof_alloc
 
         verified = torch.tensor(
             msg.verified_ids, dtype=torch.int32, device=self.device
@@ -384,7 +450,7 @@ class SMCDraftServer:
         current_ids = verified
         tokens: List[torch.Tensor] = []
         logprobs: List[torch.Tensor] = []
-        t0 = time.perf_counter() if tm else 0.0
+        t0 = time.perf_counter() if measure else 0.0
         for step in range(gamma + 1):
             draft_fb.input_ids = current_ids
             draft_fb.positions = all_positions[:, step].contiguous()
@@ -417,16 +483,20 @@ class SMCDraftServer:
                 logprobs.append(token_logprob)
             current_ids = next_token
 
-        if tm:
+        if measure:
             torch.cuda.synchronize()
-            self._t_draft["ar"] += time.perf_counter() - t0
+            prof_ar = time.perf_counter() - t0
+            if tm:
+                self._t_draft["ar"] += prof_ar
             t0 = time.perf_counter()
         tokens_np = torch.stack(tokens, dim=1).cpu().numpy()
         logprobs_np = (
             torch.stack(logprobs, dim=1).to(torch.float32).cpu().numpy()
         )
+        if measure:
+            prof_out = time.perf_counter() - t0
         if tm:
-            self._t_draft["out"] += time.perf_counter() - t0
+            self._t_draft["out"] += prof_out
             self._t_draft_n += 1
             if self._t_draft_n >= 200:
                 per = {k: 1e3 * v / self._t_draft_n for k, v in self._t_draft.items()}
@@ -439,9 +509,43 @@ class SMCDraftServer:
                 )
                 self._t_draft = {k: 0.0 for k in self._t_draft}
                 self._t_draft_n = 0
+        if prof:
+            self._copyahead_profile_add(
+                prof_kind,
+                rows=bs,
+                wall=time.perf_counter() - prof_wall_t0,
+                alloc=prof_alloc,
+                ar=prof_ar,
+                out=prof_out,
+            )
         return DraftStepResp(
             tokens=tokens_np, logprobs=logprobs_np, tag=msg.tag, epoch=msg.epoch
         )
+
+    def _truncate_step_kv_if_requested(self, active: torch.Tensor, truncate_kv) -> None:
+        if isinstance(truncate_kv, list):
+            if len(truncate_kv) != int(active.numel()):
+                raise RuntimeError(
+                    "DraftStepReq.truncate_kv length mismatch: "
+                    f"{len(truncate_kv)} flags for {int(active.numel())} slots"
+                )
+            mask = torch.tensor(truncate_kv, dtype=torch.bool, device=self.device)
+            if not bool(mask.any().item()):
+                return
+            active = active[mask]
+        elif not truncate_kv:
+            return
+
+        new_alloc_lens = self.seq_lens[active].clone()
+        old_alloc_lens = self.kv_allocated_lens[active].clone()
+        truncate_block_table_allocations(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.req_pool_indices[active],
+            old_alloc_lens,
+            new_alloc_lens,
+        )
+        self.kv_allocated_lens[active] = new_alloc_lens
 
     def _build_decode_batch(
         self,
@@ -509,6 +613,7 @@ class SMCDraftServer:
     def _handle_commit(self, msg: DraftCommitResample) -> None:
         if not msg.dst_slots:
             return
+        prof_t0 = time.perf_counter() if self._copyahead_profile else 0.0
         dst = torch.tensor(msg.dst_slots, dtype=torch.int64, device=self.device)
         src = torch.tensor(msg.src_slots, dtype=torch.int64, device=self.device)
 
@@ -525,6 +630,13 @@ class SMCDraftServer:
 
         self.seq_lens[dst] = self.seq_lens[src]
         self.kv_allocated_lens[dst] = self.kv_allocated_lens[src]
+        if self._copyahead_profile:
+            torch.cuda.synchronize()
+            self._copyahead_profile_add(
+                "commit",
+                rows=len(msg.dst_slots),
+                wall=time.perf_counter() - prof_t0,
+            )
 
     def _handle_close(self, msg: DraftCloseGroup) -> None:
         parent = self.pending_parents.pop(msg.group_id, None)
