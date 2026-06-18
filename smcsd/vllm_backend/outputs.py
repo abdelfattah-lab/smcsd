@@ -17,5 +17,7 @@ class SMCModelRunnerOutput(ModelRunnerOutput):
     )
     # group_id -> ancestor_indices [N_i] (CPU int64, resampled groups only)
     resampled_groups: dict[str, torch.Tensor] = field(default_factory=dict)
+    # group_id -> block ids [N_i][num_blocks] after full-block remap.
+    resampled_block_ids: dict[str, list[list[int]]] = field(default_factory=dict)
     # group_id -> logprob_diff[A]: sum_t log(p_target(x_t)/p_draft(x_t)) per active particle
     smc_logprob_diffs: dict[str, torch.Tensor] = field(default_factory=dict)
