@@ -384,6 +384,19 @@ class SMCVLLMScheduler(Scheduler):
                     state.particle_finished[p]              = new_finished[p]
                     state.particle_num_computed_tokens[p]   = new_seq_lens[p]
 
+                remapped_block_ids = model_runner_output.resampled_block_ids.get(group_id)
+                if remapped_block_ids is not None:
+                    if len(remapped_block_ids) != state.n_particles:
+                        raise RuntimeError(
+                            f"Resample block remap for {group_id} has "
+                            f"{len(remapped_block_ids)} rows, expected "
+                            f"{state.n_particles}."
+                        )
+                    for p, block_ids in enumerate(remapped_block_ids):
+                        self.kv_cache_manager.remap_blocks(
+                            state.particle_req_ids[p], block_ids
+                        )
+
             if all(state.particle_finished):
                 self._finish_group(group_id, state, result)
             else:
