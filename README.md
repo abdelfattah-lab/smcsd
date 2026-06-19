@@ -10,14 +10,14 @@ Paper: [*Faster LLM Inference via Sequential Monte Carlo*](https://arxiv.org/abs
 
 ## Installation
 
-This repo vendors a patched SGLang as a git submodule at `3rdparty/sglang`. Two branches are available:
+This repo vendors a patched SGLang as a git submodule at `3rdparty/sglang`.
 
-- **`main`** — pins SGLang at `smc_v2_clean` (older upstream snapshot, torch ~2.5, CUDA 12.4). Stable.
-- **`upstream`** — pins SGLang at `smc_v2_clean-upstream-sync-2` (smc_v2_clean + latest `upstream/main` merged in). Requires **CUDA 13**, `torch==2.11.0`, and `sglang-kernel==0.4.2` (formerly `sgl-kernel`; same import path, new pip name).
+- **`main`** — pins SGLang at `smc_v2_clean-upstream-sync-2` (`smc_v2_clean` + latest `upstream/main` merged in). Requires **CUDA 13**, `torch==2.11.0`, and `sglang-kernel==0.4.2` (formerly `sgl-kernel`; same import path, new pip name).
+- **`upstream`** — development/tracking branch for the same `smc_v2_clean-upstream-sync-2` snapshot.
 
-Pick one before installing.
+For a CUDA 12 / `torch ~2.9` build, point the submodule at the older `smc_v2_clean` snapshot instead (`git -C 3rdparty/sglang checkout smc_v2_clean`).
 
-**Host requirements (`upstream` branch only):** CUDA 13 toolkit installed (provides `libnvrtc.so.13`). On CUDA 12 systems the prebuilt `sglang-kernel` wheel will fail to load with an undefined-symbol or `libnvrtc.so.13: cannot open shared object file` error. The Python deps (`torch==2.11.0`, `sglang-kernel==0.4.2`) are pinned by the SGLang submodule's `pyproject.toml` and will be resolved automatically.
+**Host requirements:** CUDA 13 toolkit installed (provides `libnvrtc.so.13`). On CUDA 12 systems the prebuilt `sglang-kernel` wheel will fail to load with an undefined-symbol or `libnvrtc.so.13: cannot open shared object file` error. The Python deps (`torch==2.11.0`, `sglang-kernel==0.4.2`) are pinned by the SGLang submodule's `pyproject.toml` and will be resolved automatically.
 
 `SMCEngine` will not import until the patched SGLang submodule is both checked out and installed. If you hit `ModuleNotFoundError: No module named 'sglang'`, run:
 
