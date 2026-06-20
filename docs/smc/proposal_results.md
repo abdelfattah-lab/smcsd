@@ -146,6 +146,27 @@ HumanEval accuracy% (tok/s):
   (HumanEval N8γ8 1678 vs base 1787 tps). The throughput win is realized only
   where you can lower N — i.e. math/reasoning, not code, at this draft size.
 
+## Round 3 — second on-policy iteration (continue-train on renyi2_gen rollouts)
+
+Re-collected the general mix with the round-2 `renyi2_gen` draft (on-policy:
+its rr is higher than base's — chat 0.78→0.89, code 0.49→0.61 — the
+mass-covering signature again), then continue-trained it at lr 5e-6
+(`renyi2_gen2`). Accuracy% (tps):
+
+| draft | GSM8K N8 | GSM8K N4 | HumanEval N8 | MBPP N8 |
+|-------|:---:|:---:|:---:|:---:|
+| base | 69.0 | 63.5 | 60.4 | 45.0 |
+| renyi2_gen (rd 1) | 82.5 | 78.0 | 61.6 | 49.0 |
+| **renyi2_gen2 (rd 2)** | 82.0 | 76.0 | **65.9** | **52.5** |
+
+The second round compounds **where headroom remained**: HumanEval +4.3pp and
+MBPP +3.5pp over round 1, with GSM8K flat (already at its N=8 plateau). The
+half-particle GSM8K win holds (N=4 = 76.0 > base N=8 = 69.0). Caveat: GSM8K N=4
+dipped 78.0→76.0 (≈ noise); HumanEval's 164-question gain is ~7 problems —
+directionally consistent with MBPP but worth confirming at larger N-questions.
+Net: on-policy iteration is a cheap, positive lever, concentrated on the
+not-yet-saturated domains.
+
 ## Recommendation
 
 1. **Objective: χ² (Rényi-2), not reverse-KL.** It generalizes across domains
