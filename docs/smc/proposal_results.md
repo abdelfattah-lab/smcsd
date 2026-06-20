@@ -167,12 +167,44 @@ directionally consistent with MBPP but worth confirming at larger N-questions.
 Net: on-policy iteration is a cheap, positive lever, concentrated on the
 not-yet-saturated domains.
 
+## Round 4 — objective sweep (fixing low-N code with a mode-seeking mix)
+
+Pure χ² (mass-covering) collapses at very low N on code (it needs particles to
+represent a peaked distribution). The Rényi-β family exposes the knob to fix
+this: lower β and/or `--renyi-kl-mix` (a reverse-KL base term) add mode-seeking.
+Trained on the same round-1 general data + `--balance-domains`, only the
+objective varies. Accuracy%:
+
+| objective | gsm8k N8 | gsm8k N4 | HE N8 | HE N4 | **HE N2** | mbpp N8 |
+|-----------|:---:|:---:|:---:|:---:|:---:|:---:|
+| base | 65.5 | 59.5 | 61.6 | 57.9 | 44.5 | 43.5 |
+| β2 (χ²) | 81.5 | 76.5 | 65.2 | 53.0 | **26.8** | 50.5 |
+| β1.5 | 82.0 | 82.5 | 62.8 | 54.9 | 26.8 | 49.0 |
+| β2 + klmix0.5 | 81.0 | 78.0 | 64.6 | 59.1 | 42.1 | 49.0 |
+| β2 + klmix1 | 78.0 | 76.0 | 67.1 | 58.5 | 42.7 | 47.5 |
+| **β1.5 + klmix0.5** | 82.5 | 78.0 | 66.5 | 59.8 | **45.7** | 47.0 |
+
+- **The kl-mix, not lower β, fixes the low-N code collapse.** Pure χ² (and β1.5)
+  crater at N=2 on HumanEval (26.8); any `--renyi-kl-mix` restores it to 42–46%
+  (β1.5+klmix0.5 = 45.7, *above* base). The reverse-KL term anchors the proposal
+  to the target mode so it stays usable when particles are scarce.
+- **β1.5 + klmix0.5 is the best general operating point**: dominates base at
+  every (task, N) point — GSM8K 82.5/78.0, HE 66.5/59.8/45.7 (N8/N4/N2), MBPP
+  47.0 — keeping the math half-particle win *and* low-N code robustness.
+- **β1.5 alone** gives the best single GSM8K-N4 (82.5, +17pp over base at half
+  particles) but does not fix low-N code.
+- Cost of mode-seeking: MBPP-N8 drifts down (χ² 50.5 → ~47); the sweet spot is
+  moderate (klmix ≈ 0.5). (HumanEval is 164 q, so ±3–4pp single-run noise.)
+
 ## Recommendation
 
-1. **Objective: χ² (Rényi-2), not reverse-KL.** It generalizes across domains
-   and recovers target-fidelity accuracy; reverse-KL mode-collapses and craters
-   held-out code. Use `--loss renyi --renyi-beta 2`; `anneal` (β 1→2) is a
-   slightly safer default (regresses least where there's no headroom).
+1. **Objective: Rényi-β with a small reverse-KL mix** — `--loss renyi
+   --renyi-beta 1.5 --renyi-kl-mix 0.5`. Pure χ² (β=2) generalizes and recovers
+   target-fidelity accuracy (reverse-KL alone mode-collapses and craters held-out
+   code), but pure χ² is mass-covering and collapses at very low N on code. A
+   small kl-mix anchors it: β1.5+klmix0.5 keeps the math half-particle win *and*
+   stays robust to N=2 on code (round 4). Pure χ² (klmix 0) is marginally better
+   if you will never run N<4.
 2. **Train on a token-balanced multi-domain mix** (perfectblend non-math + MBPP +
    small GSM8K), with `--balance-domains`. This fixed the round-1 code regression
    (HumanEval 52.4 → 68.9) — the balancing lever is what recovers the
