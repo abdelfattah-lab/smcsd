@@ -241,6 +241,38 @@ What the locked draft delivers (vs the base 0.6B draft):
 **Deploy:** one general draft, operating point per domain — **N=4 (γ=8–16) for
 math/reasoning** (the speed win), **N=8 for code** (accuracy + low-N safety).
 
+## Round 6 — high-γ scale-up (γ=16-matched collection, 5.3k prompts)
+
+To make high γ (the bs=1 speed lever) accuracy-viable, collect+train at the
+deployment γ. Collected 5,274 token-balanced general prompts at **N=12, γ=16**
+(base-draft rr ≈ 0.81 — high headroom), trained two drafts fresh from base with
+`--balance-domains`: `big_chi2` (β=2) and `big_prod` (β1.5+klmix0.5). bs=1
+GSM8K, perf flags on, acc%(tok/s):
+
+| draft | N12 γ8 | N12 γ16 | N16 γ8 | N16 γ16 |
+|-------|:---:|:---:|:---:|:---:|
+| **big_chi2** | 84.4 (440) | 83.6 (477) | 86.3 (412) | **85.2 (444)** |
+| big_prod | 85.2 (450) | 81.2 (479) | 87.5 (418) | 82.4 (454) |
+
+Generality at N=16 γ=16 (bs=1): big_chi2 HumanEval 62.8 / MBPP 52.0; big_prod
+63.4 / 48.5. (Prior γ=8-trained N16γ16 = 84.8; EAGLE3 92.5%@509.)
+
+- **γ-matching + scale + pure χ² flattens the high-γ degradation**: `big_chi2`
+  loses only −1.1pp γ=8→16 (86.3→85.2) vs −3 to −7pp for γ=8-trained drafts.
+  High γ is now nearly free in accuracy — the stated goal.
+- **Pure χ² > kl-mix at high γ** (85.2 vs 82.4 at N16γ16): χ² is the
+  block-variance-optimal objective; mode-seeking (kl-mix) hurts the mass-covering
+  needed across a long γ-block. (kl-mix is still preferred only when you must run
+  very low N on code.)
+- **One generally-strong high-γ draft**: GSM8K 85, HumanEval 63, MBPP 52 at
+  N16γ16 ≈ 444 tok/s.
+- **Ceiling**: absolute γ=16 accuracy plateaus ~85% (vs ~90% target ceiling,
+  91.4% at N16γ4). More general data flattened the γ-curve but didn't lift the
+  level — the remaining gap is a draft-capacity / target-sharpness issue, not a
+  data-volume one. Levers: (a) α>1 / lower-T sampling (sharpen toward the more
+  accurate greedy mode — untapped, α=1 throughout); (b) a larger draft (1.7B)
+  for more capacity to model the 8B target at high γ.
+
 ## Recommendation
 
 1. **Objective: Rényi-β with a small reverse-KL mix** — `--loss renyi
