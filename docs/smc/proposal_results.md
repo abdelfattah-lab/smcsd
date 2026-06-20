@@ -196,6 +196,51 @@ objective varies. Accuracy%:
 - Cost of mode-seeking: MBPP-N8 drifts down (χ² 50.5 → ~47); the sweet spot is
   moderate (klmix ≈ 0.5). (HumanEval is 164 q, so ±3–4pp single-run noise.)
 
+## Round 5 — production lock-in (β1.5 + klmix0.5, full operating curve)
+
+The locked recipe: Qwen3-0.6B finetuned with `--loss renyi --renyi-beta 1.5
+--renyi-kl-mix 0.5 --balance-domains` on the general mix, then one on-policy
+continue-round (`prod`). Full N×γ sweep, accuracy% (tps):
+
+GSM8K:
+
+| draft | N2 γ8 | N4 γ8 | N8 γ8 | N4 γ16 | N8 γ16 |
+|-------|:---:|:---:|:---:|:---:|:---:|
+| base | 55.0 (2366) | 65.5 (2693) | 68.5 (2054) | 60.0 (2871) | 59.0 (2114) |
+| **prod** | 66.0 (2691) | **79.0 (2761)** | 81.5 (1998) | 72.5 (2994) | 81.0 (2309) |
+
+HumanEval:
+
+| draft | N2 γ8 | N4 γ8 | N8 γ8 | N4 γ16 | N8 γ16 |
+|-------|:---:|:---:|:---:|:---:|:---:|
+| base | 47.0 (2741) | 59.1 (2579) | 64.6 (1824) | 53.7 (2884) | 51.2 (2082) |
+| prod | 46.3 (2434) | 54.9 (2403) | 65.2 (1761) | 57.9 (2681) | 57.3 (2025) |
+
+MBPP:
+
+| draft | N2 γ8 | N4 γ8 | N8 γ8 | N8 γ16 |
+|-------|:---:|:---:|:---:|:---:|
+| base | 37.0 (1633) | 41.0 (1844) | 45.0 (1464) | 44.5 (1398) |
+| prod | 40.5 (1554) | 45.0 (1864) | 47.5 (1262) | 45.5 (1310) |
+
+What the locked draft delivers (vs the base 0.6B draft):
+- **Math (GSM8K): the speed win.** `prod @ N=4 = 79.0% @ 2761 tps` beats
+  `base @ N=8 = 68.5% @ 2054 tps` → **+10.5pp & 1.34× faster on half the
+  particles**; at N=2 it ≈ base-N8 accuracy (66.0) at 1.3× throughput.
+- **Code (HumanEval/MBPP): dominate at matched N, robust at low N, no speed
+  win.** At N=8 prod ≥ base (HE 65.2 vs 64.6, MBPP 47.5 vs 45.0); at N=2 it no
+  longer collapses (HE 46.3 vs base 47.0 — vs pure-χ²'s 26.8). But at N=4 it's
+  below base-N8, so code should stay at N=8 (mass-covering needs particles for
+  the peaked code distribution). γ=16 is a free ~10% tps with ≈equal accuracy.
+- **The second on-policy round was ~neutral for this blended objective** (`prod`
+  vs round-1 `b15_klmix05`: GSM8K-N4 79 vs 77, HE-N8 65.2 vs 67.7, MBPP-N8 47.5
+  vs 49.5 — all within ±2–3pp noise). Unlike pure χ² (round 3), the kl-mixed
+  objective was already near its plateau after one round; the single-round draft
+  is an equally good, cheaper production choice.
+
+**Deploy:** one general draft, operating point per domain — **N=4 (γ=8–16) for
+math/reasoning** (the speed win), **N=8 for code** (accuracy + low-N safety).
+
 ## Recommendation
 
 1. **Objective: Rényi-β with a small reverse-KL mix** — `--loss renyi

@@ -129,14 +129,17 @@ python scripts/collect_proposal_data.py \
 #    power alpha are read from the dump's meta line); --loss wsft is a
 #    cheaper posterior-weighted SFT baseline. Saves merged bf16 HF
 #    checkpoints (epoch_K/ and final/).
-#    NOTE: prefer the SMC-direct objective --loss renyi --renyi-beta 2
-#    (log-chi^2) over reverse KL — it generalizes across domains and
-#    recovers target-level accuracy; see the objective family below.
+#    Production recipe (Qwen3-8B/0.6B study): the SMC-direct Renyi objective
+#    with a small reverse-KL mix + token-balanced domains. beta=2 alone
+#    (log-chi^2) is mass-covering and recovers target-level accuracy but
+#    collapses at very low N on code; --renyi-kl-mix anchors it. Collect on a
+#    token-balanced multi-domain mix (see make_prompt_sets.py --recipe general)
+#    with per-record "domain" labels.
 python scripts/train_proposal.py \
-    --data /data/proposal_data/gsm8k_train_N8g8.jsonl \
-    --output-dir /data/proposal_ckpts/llama1b-renyi \
-    --loss renyi --renyi-beta 2.0 --renyi-beta-start 1.0 \
-    --epochs 1 --batch-size 4 --grad-accum 8 --lr 1e-5
+    --data /data/proposal_data/gen_*.jsonl \
+    --output-dir /data/proposal_ckpts/draft-prod \
+    --loss renyi --renyi-beta 1.5 --renyi-kl-mix 0.5 --balance-domains \
+    --epochs 1 --batch-size 8 --grad-accum 4 --lr 1e-5
 
 # 3. Evaluate: quality on GSM8K test + the proposal-health diagnostics.
 python scripts/accuracy_test_gsm8k.py --mode smc_engine \
