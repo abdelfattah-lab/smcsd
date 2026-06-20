@@ -129,10 +129,14 @@ python scripts/collect_proposal_data.py \
 #    power alpha are read from the dump's meta line); --loss wsft is a
 #    cheaper posterior-weighted SFT baseline. Saves merged bf16 HF
 #    checkpoints (epoch_K/ and final/).
+#    NOTE: prefer the SMC-direct objective --loss renyi --renyi-beta 2
+#    (log-chi^2) over reverse KL — it generalizes across domains and
+#    recovers target-level accuracy; see the objective family below.
 python scripts/train_proposal.py \
     --data /data/proposal_data/gsm8k_train_N8g8.jsonl \
-    --output-dir /data/proposal_ckpts/llama1b-kl \
-    --loss kl --epochs 1 --batch-size 4 --grad-accum 8 --lr 1e-5
+    --output-dir /data/proposal_ckpts/llama1b-renyi \
+    --loss renyi --renyi-beta 2.0 --renyi-beta-start 1.0 \
+    --epochs 1 --batch-size 4 --grad-accum 8 --lr 1e-5
 
 # 3. Evaluate: quality on GSM8K test + the proposal-health diagnostics.
 python scripts/accuracy_test_gsm8k.py --mode smc_engine \
@@ -142,12 +146,20 @@ python scripts/accuracy_test_gsm8k.py --mode smc_engine \
 
 Per-request diagnostics ride the engine's particle side channel:
 `smc_n_cycles`, `smc_n_resamples` (always on), and `smc_mean_ess`
-(scheduler env `SMC_TRACK_ESS=1`). A better proposal shows up as a lower
-resample rate / higher mean ESS *before* it shows up in task accuracy —
-re-collect with the finetuned draft and compare, then iterate
-(collect → train → collect) since the on-policy data distribution shifts
-as the proposal improves. The payoff experiment is re-sweeping gamma / N:
-a closer proposal should hold quality at higher gamma and lower N.
+(scheduler env `SMC_TRACK_ESS=1`). The payoff experiment is re-sweeping
+gamma / N: a better proposal holds quality at higher gamma and lower N
+(measured below: a χ²-finetuned 0.6B draft at N=4 beats the base draft at
+N=8 on GSM8K accuracy *and* throughput).
+
+> **Caveat — resample rate / ESS is a misleading proxy.** Reverse KL lowers
+> rr / raises ESS the most, but by *mode-collapsing* the draft onto the
+> target mode, which loses sample diversity and **hurts task accuracy**
+> (held-out HumanEval −28pp in the Qwen3 study). The χ² (Rényi-2) objective
+> is mass-covering: worse rr/ESS, but it recovers target-level accuracy and
+> generalizes across domains. **Gate on task accuracy across domains, not
+> rr/ESS.** See [docs/smc/proposal_objective.md](../docs/smc/proposal_objective.md)
+> (objective + theory) and [docs/smc/proposal_results.md](../docs/smc/proposal_results.md)
+> (Qwen3-8B/0.6B numbers across GSM8K / MATH / HumanEval / MBPP).
 
 Constraints: the draft checkpoint must be a merged HF directory (no LoRA
 adapters) sharing the target's vocab; `train_proposal.py` saves exactly

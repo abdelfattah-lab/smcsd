@@ -19,6 +19,15 @@ Two losses:
   Temperatures and alpha default to the values recorded in the dump's meta
   line.
 
+* ``--loss renyi`` — SMC-direct Renyi-beta divergence ``D_beta(p_tilde||q)``
+  against the same tempered-power target.  ``--renyi-beta 2`` is log-chi^2,
+  the divergence that governs importance-weight variance / ESS
+  (``E[N/ESS] ~ 1 + chi^2``) and compounds multiplicatively over the
+  gamma-block, so it directly targets "quality at lower N / higher gamma".
+  ``beta -> 1`` recovers ``--loss kl --kl-direction reverse``, so this
+  strictly generalizes the prior recipe.  See
+  ``docs/smc/proposal_objective.md``.
+
 * ``--loss wsft`` — posterior-weighted SFT baseline: plain cross-entropy on
   each particle's trajectory, weighted by the particle's normalized final
   weight ``softmax(log_w_tilde)``.  No teacher forward needed (much
@@ -76,7 +85,7 @@ def load_dumps(paths):
     return meta, records
 
 
-def build_examples(records, *, max_seq_len, dedup, weighting):
+def build_examples(records, *, max_seq_len, dedup, weighting, balance_domains=False):
     """Flatten records into per-particle training examples.
 
     Each example: (input_ids, prompt_len, weight).  ``weight`` is the
@@ -86,14 +95,23 @@ def build_examples(records, *, max_seq_len, dedup, weighting):
     ``dedup``, identical (prompt, output) pairs are merged by summing
     weights — without it duplicates simply appear multiple times, which
     represents the same empirical distribution.
+
+    ``balance_domains`` rescales weights so every ``domain`` (from the dump's
+    per-record ``domain`` field) contributes equal *completion-token mass*
+    ``sum(weight * n_completion_tokens)``.  This is the fix for a skewed
+    collection mix: long reasoning rollouts otherwise dominate the gradient
+    even when prompt counts are balanced.  No-op if records lack domains.
     """
     examples = []
+    ex_domain, ex_ctoks = [], []  # parallel to examples (kept out of the
+    # example tuple so collate's 3-field unpack is untouched)
     n_skipped = 0
     for rec in records:
         prompt_ids = rec["prompt_ids"]
         if len(prompt_ids) >= max_seq_len - 1:
             n_skipped += len(rec["particle_output_ids"])
             continue
+        domain = rec.get("domain", "unknown")
         log_w = torch.tensor(rec["log_w_tilde"], dtype=torch.float64)
         n = len(rec["particle_output_ids"])
         if weighting == "posterior":
@@ -103,6 +121,7 @@ def build_examples(records, *, max_seq_len, dedup, weighting):
         seen = {}
         for out_ids, wi in zip(rec["particle_output_ids"], w):
             ids = (prompt_ids + out_ids)[:max_seq_len]
+            ctoks = max(0, len(ids) - len(prompt_ids))
             if dedup:
                 key = (id(rec), tuple(ids))
                 if key in seen:
@@ -110,8 +129,25 @@ def build_examples(records, *, max_seq_len, dedup, weighting):
                     continue
                 seen[key] = len(examples)
             examples.append([ids, len(prompt_ids), wi])
+            ex_domain.append(domain)
+            ex_ctoks.append(ctoks)
     if n_skipped:
         print(f"Skipped {n_skipped} particles (prompt >= max_seq_len)")
+
+    if balance_domains:
+        from collections import defaultdict
+        mass = defaultdict(float)
+        for ex, d, c in zip(examples, ex_domain, ex_ctoks):
+            mass[d] += ex[2] * c
+        mass = {d: m for d, m in mass.items() if m > 0}
+        if len(mass) > 1:
+            target = sum(mass.values()) / len(mass)  # equalize per-domain mass
+            for ex, d in zip(examples, ex_domain):
+                if mass.get(d, 0.0) > 0:
+                    ex[2] *= target / mass[d]
+            print("  domain balance (token-mass share, pre -> post equal):")
+            for d in sorted(mass):
+                print(f"    {d:18s} {mass[d] / sum(mass.values()):.3f}")
     return examples
 
 
@@ -198,6 +234,57 @@ def kl_loss(student_logits, teacher_logits, comp_mask, weights, cfg):
     return loss, loss.detach()
 
 
+def renyi_loss(student_logits, teacher_logits, comp_mask, weights, cfg,
+               beta=None):
+    """Per-token Renyi-beta divergence ``D_beta(p_tilde || q)`` over completion
+    positions -- the SMC-direct objective (docs/smc/proposal_objective.md).
+
+    Same teacher/student as ``kl_loss``: ``p_tilde = softmax(alpha * z_t /
+    T_target)`` is the EXACT tempered-power target the engine weights and
+    bonus-samples against; ``q = softmax(z_s / T_draft)`` is the draft
+    proposal.  The Renyi divergence of order beta is
+
+        D_beta = 1/(beta-1) * logsumexp_x[ beta*log p_tilde(x) + (1-beta)*log q(x) ].
+
+    * ``beta = 2``  is log-chi^2 (Renyi-2).  For self-normalized importance
+      sampling ``E[N/ESS] ~ 1 + chi^2(p_tilde || q)`` and the per-token second
+      moment factorizes multiplicatively over the gamma-block, so minimizing
+      it *directly* targets ESS / weight-variance growth with gamma -- the
+      SMC-optimal objective, tighter than reverse KL.
+    * ``beta -> 1`` is the limit ``reverse KL(q || p_tilde)``; we switch to the
+      exact reverse-KL form near beta=1 to skip the 1/(beta-1) singularity, so
+      this loss strictly generalizes ``--loss kl --kl-direction reverse``.
+
+    Stability: ``D_beta`` is non-negative and its gradient w.r.t. the student
+    logits is the logsumexp softmax (bounded in [0,1] per vocab entry), so the
+    heavy chi^2 ``p^2/q`` tail inflates the loss *value* but not the gradient
+    magnitude -- grad clipping handles the rest, no hard clamp needed.
+    ``cfg.renyi_kl_mix`` optionally adds a reverse-KL base term as an extra
+    stabilizer (composite ``D_beta + lambda * KL(q||p)``).
+
+    Returns (loss, mean_token_divergence).
+    """
+    if beta is None:
+        beta = cfg.renyi_beta
+    p_log = F.log_softmax(
+        cfg.power_alpha * teacher_logits.float() / cfg.target_temperature,
+        dim=-1,
+    )
+    q_log = F.log_softmax(student_logits.float() / cfg.draft_temperature, dim=-1)
+    if abs(beta - 1.0) < 1e-3:
+        div = (q_log.exp() * (q_log - p_log)).sum(-1)  # reverse-KL limit
+    else:
+        # exponent (B, L-1, V); logsumexp is numerically safe (max-subtracted).
+        e = beta * p_log + (1.0 - beta) * q_log
+        div = torch.logsumexp(e, dim=-1) / (beta - 1.0)  # (B, L-1)
+    if cfg.renyi_kl_mix and cfg.renyi_kl_mix > 0:
+        div = div + cfg.renyi_kl_mix * (q_log.exp() * (q_log - p_log)).sum(-1)
+    w = comp_mask * weights.unsqueeze(1)
+    denom = w.sum().clamp_min(1.0)
+    loss = (div * w).sum() / denom
+    return loss, loss.detach()
+
+
 def wsft_loss(student_logits, input_ids, comp_mask, weights):
     """Posterior-weighted cross-entropy on completion tokens."""
     targets = input_ids[:, 1:]
@@ -225,11 +312,18 @@ def run_eval(model, teacher, examples, batches, pad_id, device, args, cfg):
             )
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 s_logits = model(input_ids, attention_mask=attn).logits[:, :-1]
-                if args.loss == "kl":
+                if args.loss in ("kl", "renyi"):
                     t_logits = teacher(input_ids, attention_mask=attn).logits[
                         :, :-1
                     ]
-                    loss, _ = kl_loss(s_logits, t_logits, comp_mask, weights, cfg)
+                    if args.loss == "kl":
+                        loss, _ = kl_loss(
+                            s_logits, t_logits, comp_mask, weights, cfg
+                        )
+                    else:
+                        loss, _ = renyi_loss(
+                            s_logits, t_logits, comp_mask, weights, cfg
+                        )
                 else:
                     loss, _ = wsft_loss(s_logits, input_ids, comp_mask, weights)
             ntok = comp_mask.sum().item()
@@ -252,6 +346,9 @@ def main(args):
         if args.power_alpha is not None
         else meta["power_alpha"],
         kl_direction=args.kl_direction,
+        renyi_beta=args.renyi_beta,
+        renyi_beta_start=args.renyi_beta_start,
+        renyi_kl_mix=args.renyi_kl_mix,
     )
     init_from = args.init_from or meta["draft_model"]
     teacher_path = args.teacher or meta["model"]
@@ -267,7 +364,7 @@ def main(args):
 
     train_examples = build_examples(
         train_records, max_seq_len=args.max_seq_len, dedup=args.dedup,
-        weighting=args.weighting,
+        weighting=args.weighting, balance_domains=args.balance_domains,
     )
     val_examples = build_examples(
         val_records, max_seq_len=args.max_seq_len, dedup=args.dedup,
@@ -289,7 +386,7 @@ def main(args):
         model.config.use_cache = False
 
     teacher = None
-    if args.loss == "kl":
+    if args.loss in ("kl", "renyi"):
         teacher = AutoModelForCausalLM.from_pretrained(
             teacher_path, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
         ).to(device)
@@ -357,14 +454,31 @@ def main(args):
             )
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 s_logits = model(input_ids, attention_mask=attn).logits[:, :-1]
-                if args.loss == "kl":
+                if args.loss in ("kl", "renyi"):
                     with torch.no_grad():
                         t_logits = teacher(
                             input_ids, attention_mask=attn
                         ).logits[:, :-1]
-                    loss, metric = kl_loss(
-                        s_logits, t_logits, comp_mask, weights, cfg
-                    )
+                    if args.loss == "kl":
+                        loss, metric = kl_loss(
+                            s_logits, t_logits, comp_mask, weights, cfg
+                        )
+                    else:
+                        # Optionally anneal beta from renyi_beta_start ->
+                        # renyi_beta over training (stable warm-up near reverse
+                        # KL, then sharpen toward chi^2).
+                        if cfg.renyi_beta_start is None:
+                            cur_beta = cfg.renyi_beta
+                        else:
+                            frac = step / max(1, total_steps - 1)
+                            cur_beta = (
+                                cfg.renyi_beta_start
+                                + frac * (cfg.renyi_beta - cfg.renyi_beta_start)
+                            )
+                        loss, metric = renyi_loss(
+                            s_logits, t_logits, comp_mask, weights, cfg,
+                            beta=cur_beta,
+                        )
                 else:
                     loss, metric = wsft_loss(
                         s_logits, input_ids, comp_mask, weights
@@ -410,12 +524,25 @@ if __name__ == "__main__":
     parser.add_argument("--data", nargs="+", required=True,
                         help="collection dump(s) from collect_proposal_data.py")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--loss", choices=["kl", "wsft"], default="kl")
+    parser.add_argument("--loss", choices=["kl", "renyi", "wsft"], default="kl")
     parser.add_argument("--kl-direction", choices=["forward", "reverse", "both"],
                         default="forward",
                         help="divergence for --loss kl: forward=KL(p||q) "
                              "(coverage), reverse=KL(q||p) (precision, targets "
                              "particle death), both=mean of the two")
+    # --loss renyi: SMC-direct Renyi-beta divergence (see
+    # docs/smc/proposal_objective.md).  beta=2 is log-chi^2 (ESS-optimal);
+    # beta->1 reduces to reverse KL.
+    parser.add_argument("--renyi-beta", type=float, default=2.0,
+                        help="Renyi order for --loss renyi (2.0 = log-chi^2, "
+                             "the ESS/weight-variance objective; 1.0 = reverse KL)")
+    parser.add_argument("--renyi-beta-start", type=float, default=None,
+                        help="if set, linearly anneal beta from this value to "
+                             "--renyi-beta over training (e.g. 1.0 -> 2.0 for a "
+                             "reverse-KL warm-up before sharpening to chi^2)")
+    parser.add_argument("--renyi-kl-mix", type=float, default=0.0,
+                        help="add this * reverse-KL(q||p) as a stabilizing base "
+                             "term to the Renyi loss (composite objective)")
     parser.add_argument("--init-from", type=str, default=None,
                         help="student init (default: dump meta draft_model)")
     parser.add_argument("--teacher", type=str, default=None,
@@ -427,6 +554,10 @@ if __name__ == "__main__":
     parser.add_argument("--dedup", action="store_true", default=True,
                         help="merge duplicate post-resample particles")
     parser.add_argument("--no-dedup", dest="dedup", action="store_false")
+    parser.add_argument("--balance-domains", action="store_true", default=False,
+                        help="reweight examples so each dump 'domain' contributes "
+                             "equal completion-token mass (fixes a skewed "
+                             "collection mix, e.g. math-heavy)")
 
     # Loss config — default to the dump's engine config.
     parser.add_argument("--draft-temperature", type=float, default=None)
@@ -450,5 +581,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     if args.weighting is None:
-        args.weighting = "uniform" if args.loss == "kl" else "posterior"
+        # token-level distillation losses (kl, renyi) reweight via the teacher,
+        # so default to uniform particle weighting; wsft is sequence-level and
+        # needs the posterior weights.
+        args.weighting = "posterior" if args.loss == "wsft" else "uniform"
     main(args)

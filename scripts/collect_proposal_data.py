@@ -54,8 +54,9 @@ def load_prompts(tokenizer, args):
         n = min(args.num_prompts, len(dataset))
         questions = [s["question"] for s in dataset.select(range(n))]
         instructions = [format_instruction(q) for q in questions]
-    else:  # jsonl file with {"question": ...} or {"prompt": ...} per line
-        questions, instructions = [], []
+        domains = ["gsm8k"] * len(questions)
+    else:  # jsonl file with {"question"|"prompt": ..., "domain": ...} per line
+        questions, instructions, domains = [], [], []
         with open(args.dataset) as f:
             for line in f:
                 if len(questions) >= args.num_prompts:
@@ -64,6 +65,7 @@ def load_prompts(tokenizer, args):
                 q = rec.get("question") or rec["prompt"]
                 questions.append(q)
                 instructions.append(q if args.raw_prompts else format_instruction(q))
+                domains.append(rec.get("domain", "unknown"))
 
     chat_template_kwargs = {}
     if args.disable_thinking:
@@ -77,7 +79,7 @@ def load_prompts(tokenizer, args):
         )
         for ins in instructions
     ]
-    return questions, prompts
+    return questions, prompts, domains
 
 
 def main(args):
@@ -85,7 +87,7 @@ def main(args):
         np.random.seed(args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    questions, prompts = load_prompts(tokenizer, args)
+    questions, prompts, domains = load_prompts(tokenizer, args)
     # Encode here exactly like SMCEngine.generate does for str prompts, and
     # pass input_ids through — the recorded prompt_ids are then guaranteed
     # to be the ids the engine conditioned on.
@@ -160,6 +162,7 @@ def main(args):
                 rec = {
                     "i": qi,
                     "question": questions[qi],
+                    "domain": domains[qi],
                     "prompt_ids": ids_batch[i],
                     "particle_output_ids": out["smc_particle_output_ids"],
                     "log_w_tilde": out["smc_log_w_tilde"],
