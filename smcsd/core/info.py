@@ -75,6 +75,11 @@ class SMCDecodeContext:
     orig_seq_lens_sum: int  # scalar sum
     new_seq_lens: torch.Tensor  # (bs,) AFTER advance by gamma+1
     gamma: int  # speculative steps (gamma, NOT gamma+1)
+    # (bs, gamma+1) cache locations of this cycle's freshly-allocated pages,
+    # carried from the fused prepare kernel (the allocation IS the per-row
+    # cache-locs table under the kv_allocated == seq invariant).  None only
+    # for legacy callers of from_slot_gather, which re-read the block table.
+    cache_locs: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_slot_gather(
@@ -164,19 +169,24 @@ class SMCDecodeContext:
         device = orig_seq_lens.device
         gamma = self.gamma
 
-        # Assign cache locations for gamma+1 new tokens
-        out_cache_loc = torch.empty(
-            bs * (gamma + 1), dtype=torch.int64, device=device
-        )
-        assign_smc_cache_locs_kernel[(bs,)](
-            batch.req_pool_indices,
-            req_to_token_pool.req_to_token,
-            orig_seq_lens,
-            out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
-            gamma + 1,
-        )
-        cache_locs = out_cache_loc.reshape(bs, gamma + 1)
+        # Cache locations for the gamma+1 new tokens: carried from the fused
+        # prepare kernel when available; legacy fallback re-reads the block
+        # table.
+        if self.cache_locs is not None:
+            cache_locs = self.cache_locs
+        else:
+            out_cache_loc = torch.empty(
+                bs * (gamma + 1), dtype=torch.int64, device=device
+            )
+            assign_smc_cache_locs_kernel[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                orig_seq_lens,
+                out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                gamma + 1,
+            )
+            cache_locs = out_cache_loc.reshape(bs, gamma + 1)
 
         # Pre-compute all positions and seq_lens on GPU — no CPU sync
         step_offsets = torch.arange(gamma + 1, device=device)

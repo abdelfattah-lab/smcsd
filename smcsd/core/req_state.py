@@ -126,6 +126,11 @@ class ScheduleBatchSMC:
         # the admission/teardown uploads are truly async.  See
         # ``_to_device_async``.
         self._pin_host = torch.device(device).type == "cuda"
+        # Fused write-back (one triton launch) on CUDA; torch fallback
+        # otherwise or via SMC_FUSED_WRITE_BACK=0.
+        self._use_fused_write_back = self._pin_host and bool(
+            int(os.environ.get("SMC_FUSED_WRITE_BACK", "1"))
+        )
 
         # ── Slot lifecycle (CPU) ──
         self.free_slots: Deque[int] = deque(range(self.max_slots))
@@ -237,6 +242,11 @@ class ScheduleBatchSMC:
         self.active_slots_cpu = torch.empty(0, dtype=torch.int64)
         self._active_slots_list: List[int] = []
         self.num_active: int = 0
+        # ModelWorkerBatch cache: everything but the per-cycle fields is
+        # static between membership changes (issue #14, host-op slimming).
+        self._membership_version: int = 0
+        self._mwb_cache = None
+        self._mwb_version: int = -1
 
         # ── Group tracking ──
         # Per-group slot list (CPU authoritative view) — kept for O(1) Python
@@ -594,6 +604,8 @@ class ScheduleBatchSMC:
         self.active_slots_cpu = torch.tensor(active_list, dtype=torch.int64)
         self._active_slots_list = active_list
         self.num_active = len(active_list)
+        # Invalidate the cached ModelWorkerBatch (membership changed).
+        self._membership_version += 1
 
     def is_empty(self) -> bool:
         return self.num_active == 0
@@ -603,8 +615,17 @@ class ScheduleBatchSMC:
     # ────────────────────────────────────────────────────────
 
     def prepare_for_decode(self) -> SMCDraftInput:
-        """Gather the live slot tensors, vectorised KV allocation, scatter
-        back, and return a ready-to-use ``SMCDraftInput`` for the worker.
+        """Allocate KV for the cycle and produce the worker's inputs via
+        ONE fused kernel (issue #14, host-op slimming).
+
+        The fused kernel does, per active row: the slot gathers
+        (seq/verified/prev), the block-table write of the freshly-allocated
+        pages, and the seq/kv-alloc advance — replacing the ~12 separate
+        ops of the previous gather → assign → scatter sequence.  Under the
+        ``kv_allocated_lens == seq_lens`` invariant every row takes exactly
+        ``gamma+1`` pages, so the allocated page tensor IS the per-row
+        cache-locs table (carried on the ctx; nothing re-reads the block
+        table).
         """
         if self.num_active == 0:
             return SMCDraftInput(
@@ -612,35 +633,41 @@ class ScheduleBatchSMC:
                 num_tokens_per_req=self.gamma_plus_1,
             )
 
-        active = self.active_slots
+        from sglang.srt.mem_cache.common import alloc_token_slots
+        from smcsd.core.kernels.fused_prepare import fused_prepare_decode
 
-        seq_lens_g = self.seq_lens[active]
-        kv_alloc_g = self.kv_allocated_lens[active]
-        pool_idx_g = self.req_pool_indices[active]
-        verified_g = self.verified_ids[active]
-        prev_last_draft_g = self.prev_last_draft_ids[active]
+        active = self.active_slots
+        bs = self.num_active
 
         # Host shadow gather — provides every CPU-side scalar the batch
         # build needs without reading the device tensors (which, under
         # overlapped scheduling, may not be computed yet).
         seq_lens_cpu_g = self.seq_lens_host[self.active_slots_cpu]
 
-        ctx, new_kv_alloc = SMCDecodeContext.from_slot_gather(
-            seq_lens=seq_lens_g,
-            seq_lens_cpu=seq_lens_cpu_g,
-            kv_allocated_lens=kv_alloc_g,
-            req_pool_indices=pool_idx_g,
-            gamma_plus_1=self.gamma_plus_1,
-            req_to_token_pool=self.req_to_token_pool,
-            tree_cache=self.tree_cache,
+        pages = alloc_token_slots(self.tree_cache, bs * self.gamma_plus_1)
+        orig_seq_lens, verified_g, prev_last_draft_g = fused_prepare_decode(
+            active,
+            self.seq_lens,
+            self.kv_allocated_lens,
+            self.req_pool_indices,
+            self.verified_ids,
+            self.prev_last_draft_ids,
+            pages,
+            self.req_to_token_pool.req_to_token,
+            self.gamma_plus_1,
         )
-
-        self.kv_allocated_lens[active] = new_kv_alloc
-        self.seq_lens[active] = ctx.new_seq_lens
         self.seq_lens_host[self.active_slots_cpu] = (
             seq_lens_cpu_g + self.gamma_plus_1
         )
 
+        ctx = SMCDecodeContext(
+            orig_seq_lens=orig_seq_lens,
+            orig_seq_lens_cpu=seq_lens_cpu_g,
+            orig_seq_lens_sum=int(seq_lens_cpu_g.sum().item()),
+            new_seq_lens=orig_seq_lens + self.gamma_plus_1,
+            gamma=self.gamma_plus_1 - 1,
+            cache_locs=pages.view(bs, self.gamma_plus_1),
+        )
         return SMCDraftInput(
             verified_id=verified_g,
             prev_last_draft_id=prev_last_draft_g,
@@ -661,19 +688,39 @@ class ScheduleBatchSMC:
         self,
         draft_input: SMCDraftInput,
     ) -> ModelWorkerBatch:
-        """Assemble a contiguous ``ModelWorkerBatch`` for the worker from
-        the live subset of slot-indexed tensors."""
-        active = self.active_slots
-        bs = self.num_active
-        ctx = draft_input.decode_ctx
+        """Assemble a contiguous ``ModelWorkerBatch`` for the worker.
 
-        req_pool_indices = self.req_pool_indices[active]
-        seq_lens = ctx.new_seq_lens if ctx is not None else self.seq_lens[active]
+        Under static membership everything except the per-cycle fields
+        (input_ids / seq_lens / seq_lens_cpu / seq_lens_sum / spec_info) is
+        identical between membership changes, so the batch object — incl.
+        the req_pool_indices gather, the Python ``reqs`` list, and the stub
+        SamplingBatchInfo — is cached and only those five fields are
+        refreshed per cycle (issue #14, host-op slimming).  Safe to mutate
+        in place: the previous cycle's consumers never read the batch after
+        launch (the overlap queue stores it only for prefill entries).
+        """
+        ctx = draft_input.decode_ctx
         # CPU values from the host shadow — no device read.  The shadow was
         # already advanced by prepare_for_decode, so it equals new_seq_lens.
         seq_lens_cpu = self.seq_lens_host[self.active_slots_cpu]
         seq_lens_sum = int(seq_lens_cpu.sum().item())
 
+        cached = self._mwb_cache
+        if cached is not None and self._mwb_version == self._membership_version:
+            cached.input_ids = draft_input.verified_id
+            cached.seq_lens = (
+                ctx.new_seq_lens if ctx is not None
+                else self.seq_lens[self.active_slots]
+            )
+            cached.seq_lens_cpu = seq_lens_cpu
+            cached.seq_lens_sum = seq_lens_sum
+            cached.spec_info = draft_input
+            return cached
+
+        active = self.active_slots
+        bs = self.num_active
+        req_pool_indices = self.req_pool_indices[active]
+        seq_lens = ctx.new_seq_lens if ctx is not None else self.seq_lens[active]
         reqs = [self.slot_to_req[s] for s in self._active_slots_list]
 
         # Stub SamplingBatchInfo — SMC worker does its own sampling under
@@ -691,7 +738,8 @@ class ScheduleBatchSMC:
             vocab_size=self.vocab_size,
         )
 
-        return ModelWorkerBatch(
+        self._mwb_version = self._membership_version
+        self._mwb_cache = ModelWorkerBatch(
             forward_mode=ForwardMode.DECODE,
             input_ids=draft_input.verified_id,
             req_pool_indices=req_pool_indices,
@@ -726,6 +774,7 @@ class ScheduleBatchSMC:
             capture_hidden_mode=CaptureHiddenMode.NULL,
             reqs=reqs,
         )
+        return self._mwb_cache
 
     # ────────────────────────────────────────────────────────
     #  Process Batch Result (write-back from forward pass)
@@ -757,7 +806,37 @@ class ScheduleBatchSMC:
            are NOT touched; ``finalize_group`` reads the tensors lazily.
         d. Accumulate ``logprob_diff`` into the slot-indexed
            ``log_weights`` / ``interval_weights``.
+
+        On CUDA this is ONE fused triton launch (one program per row); the
+        torch implementation below remains as the reference / CPU fallback
+        (kill-switch: SMC_FUSED_WRITE_BACK=0).
         """
+        if self._use_fused_write_back:
+            from smcsd.core.kernels.fused_write_back import fused_write_back
+
+            fused_write_back(
+                self.active_slots,
+                next_token_ids,
+                logprob_diff,
+                bonus_ids,
+                prev_last_draft_ids,
+                all_token_ids=self.all_token_ids,
+                token_counts=self.token_counts,
+                verified_ids=self.verified_ids,
+                prev_ids=self.prev_last_draft_ids,
+                finished_mask=self.finished_mask,
+                finished_len=self.finished_len,
+                finish_reason_code=self.finish_reason_code,
+                matched_eos_token=self.matched_eos_token,
+                ignore_eos=self.ignore_eos_t,
+                max_new_tokens=self.max_new_tokens_t,
+                eos_token_ids=self.eos_token_ids_t,
+                log_weights=self.log_weights,
+                interval_weights=self.interval_weights,
+                gamma_plus_1=self.gamma_plus_1,
+            )
+            return
+
         active = self.active_slots
         bs = self.num_active
         stride = self.gamma_plus_1
