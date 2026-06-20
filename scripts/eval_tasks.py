@@ -355,6 +355,46 @@ def run_baseline(args, prompts):
     return texts, total_tok, latency
 
 
+def run_eagle3(args, prompts):
+    """EAGLE3 speculative decoding via sglang (lossless; for SMC comparison)."""
+    import sglang as sgl
+
+    # EAGLE tree attention needs a tree-capable backend; let sglang pick its
+    # default (flashinfer/fa3 on supported HW) unless explicitly overridden.
+    engine_kwargs = dict(
+        model_path=args.model, trust_remote_code=True,
+        mem_fraction_static=args.mem_fraction_static,
+        speculative_algorithm="EAGLE3",
+        speculative_draft_model_path=args.eagle_draft_model,
+        speculative_num_steps=args.spec_num_steps,
+        speculative_eagle_topk=args.spec_topk,
+        speculative_num_draft_tokens=args.spec_num_draft_tokens,
+        cuda_graph_max_bs=max(args.batch_size, 1),
+    )
+    if args.seed is not None:
+        engine_kwargs["random_seed"] = args.seed
+    sp = {"max_new_tokens": args.max_new_tokens, "temperature": args.temperature}
+    texts, total_tok, accept_cts, verify_cts = [], 0, 0, 0
+    with sgl.Engine(**engine_kwargs) as engine:
+        tic = time.perf_counter()
+        for start in range(0, len(prompts), args.batch_size):
+            outs = engine.generate(prompts[start : start + args.batch_size], sp)
+            for o in outs:
+                texts.append(o["text"])
+                ct = o["meta_info"]["completion_tokens"]
+                total_tok += ct
+                vc = o["meta_info"].get("spec_verify_ct") or 0
+                verify_cts += vc
+                accept_cts += ct
+            print(f"\r[gen {len(texts)}/{len(prompts)}] "
+                  f"tps={total_tok / (time.perf_counter() - tic):.0f}", end="", flush=True)
+        latency = time.perf_counter() - tic
+    print()
+    if verify_cts:
+        print(f"  EAGLE3 mean accept length: {accept_cts / verify_cts:.2f} tokens/verify")
+    return texts, total_tok, latency
+
+
 def main(args):
     if args.seed is not None:
         np.random.seed(args.seed)
@@ -362,6 +402,9 @@ def main(args):
     if args.mode == "smc_engine":
         print(f"  draft={args.draft_model} N={args.particles} g={args.gamma} "
               f"temp={args.temperature}")
+    elif args.mode == "eagle3":
+        print(f"  eagle_draft={args.eagle_draft_model} steps={args.spec_num_steps} "
+              f"topk={args.spec_topk} draft_tokens={args.spec_num_draft_tokens}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     instructions, refs, score = TASKS[args.task](args.num_questions)
     prompts = build_prompts(tokenizer, instructions, args.disable_thinking)
@@ -369,6 +412,8 @@ def main(args):
 
     if args.mode == "smc_engine":
         texts, total_tok, latency = run_smc_engine(args, prompts)
+    elif args.mode == "eagle3":
+        texts, total_tok, latency = run_eagle3(args, prompts)
     else:
         texts, total_tok, latency = run_baseline(args, prompts)
 
@@ -389,7 +434,7 @@ if __name__ == "__main__":
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--task", choices=list(TASKS), required=True)
-    p.add_argument("--mode", choices=["smc_engine", "baseline"], default="smc_engine")
+    p.add_argument("--mode", choices=["smc_engine", "baseline", "eagle3"], default="smc_engine")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--draft-model", default=DEFAULT_DRAFT_MODEL)
     p.add_argument("--particles", "-N", type=int, default=8)
@@ -401,6 +446,11 @@ if __name__ == "__main__":
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--disable-thinking", action="store_true", default=False)
     p.add_argument("--attention-backend", default="triton", choices=["triton", "fa3"])
+    # EAGLE3 speculative-decoding baseline (sglang)
+    p.add_argument("--eagle-draft-model", default="Tengyunw/qwen3_8b_eagle3")
+    p.add_argument("--spec-num-steps", type=int, default=6)
+    p.add_argument("--spec-topk", type=int, default=10)
+    p.add_argument("--spec-num-draft-tokens", type=int, default=32)
     p.add_argument("--mem-fraction-static", type=float, default=0.4)
     p.add_argument("--max-running-requests", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
