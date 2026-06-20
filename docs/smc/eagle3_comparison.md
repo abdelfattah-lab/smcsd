@@ -42,12 +42,28 @@ best-speed one. At bs=1:
 | SMC — prod draft (β1.5+klmix0.5), N=4 | 79.0 | 460 |
 | SMC — best draft (round-1 χ², math), N=8 | 84.4 | 441 |
 
-**At bs=1, EAGLE3 strictly dominates SMC** — more accurate *and* faster than
-every SMC config (best SMC 84.4%/441 vs EAGLE3 92.5%/509: −8pp and ~15% slower).
-SMC is Pareto-dominated in the latency regime. (Note: the 86.5% GSM8K figure
-reported elsewhere is the round-1 math-specialized χ² draft at N=8, ≈84–86% on
-256 q; the production *general* draft trades ~5pp GSM8K for code/low-N
-robustness, and N=4 trades another ~2.5pp for speed.)
+**Important: the first SMC numbers were run WITHOUT the perf flags.** Enabling
+`SMC_CYCLE_GRAPH=1 SMC_ENABLE_OVERLAP=1 SMC_DEFER_BONUS=1` (full-cycle CUDA graph
++ overlapped scheduler + deferred bonus, from the `bs1-deferred-cycle-graph`
+work, merged here) gives ~+11–12% and closes the speed gap:
+
+| method | accuracy | tok/s |
+|--------|:---:|:---:|
+| EAGLE3 | **92.5** | 509 |
+| SMC renyi2 (math χ²) N=8 + perf | 83.6 | 491 |
+| SMC prod (general) N=8 + perf | 82.4 | 480 |
+| SMC prod N=4 + perf | 77.3 | **514** |
+| *(SMC renyi2 N=8, no flags)* | *84.4* | *441* |
+| *(SMC prod N=4, no flags)* | *79.0* | *460* |
+
+**Revised bs=1 verdict:** with the perf flags, **SMC is speed-competitive with
+EAGLE3** (491–514 vs 509 tok/s — faster at N=4, ~match at N=8). The original
+"slower" finding was a missing-implementation artifact. The remaining gap is
+**accuracy** (~84% best-SMC vs 92.5% lossless EAGLE3). Since SMC's accuracy
+ceiling at α=1/T=0.7 is the target's own ~90%, more proposal finetuning (+ an
+α>1 / lower-T sharpening sweep) can narrow — not erase — this gap; EAGLE3 is
+already at the ceiling losslessly. (The 86.5% GSM8K figure quoted elsewhere is
+the round-1 math χ² draft at N=8 on 200 q; ≈84% on 256 q, within noise.)
 
 ## Findings (honest)
 
