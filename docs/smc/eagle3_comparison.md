@@ -30,6 +30,25 @@ requests (batch size); accuracy in parentheses.
 | 1  | 252 (84.1) | **499 (84.1)** | 437 (65.9) |
 | 32 | 2724 (82.9) | **3075 (83.5)** | 1792 (65.9) |
 
+## bs=1 (single-stream latency) — best-vs-best, GSM8K
+
+The headline comparison should use SMC's *best-accuracy* config, not its
+best-speed one. At bs=1:
+
+| method | accuracy | tok/s |
+|--------|:---:|:---:|
+| vanilla | 91.0 | 264 |
+| **EAGLE3** | **92.5** | **509** |
+| SMC — prod draft (β1.5+klmix0.5), N=4 | 79.0 | 460 |
+| SMC — best draft (round-1 χ², math), N=8 | 84.4 | 441 |
+
+**At bs=1, EAGLE3 strictly dominates SMC** — more accurate *and* faster than
+every SMC config (best SMC 84.4%/441 vs EAGLE3 92.5%/509: −8pp and ~15% slower).
+SMC is Pareto-dominated in the latency regime. (Note: the 86.5% GSM8K figure
+reported elsewhere is the round-1 math-specialized χ² draft at N=8, ≈84–86% on
+256 q; the production *general* draft trades ~5pp GSM8K for code/low-N
+robustness, and N=4 trades another ~2.5pp for speed.)
+
 ## Findings (honest)
 
 1. **EAGLE3 is near-lossless** (≈ vanilla accuracy, accept length ≈ 4.6) and
