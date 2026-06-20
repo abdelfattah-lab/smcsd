@@ -305,6 +305,7 @@ def run_smc_engine(args, prompts):
         page_size=1,
         attention_backend=args.attention_backend,
         mem_fraction_static=args.mem_fraction_static,
+        power_alpha=args.power_alpha,
         max_running_requests=args.max_running_requests or max(args.particles + 4, 16),
     )
     if args.seed is not None:
@@ -440,6 +441,8 @@ if __name__ == "__main__":
     p.add_argument("--particles", "-N", type=int, default=8)
     p.add_argument("--gamma", "-g", type=int, default=8)
     p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--power-alpha", type=float, default=1.0,
+                   help="SMC tempered-power exponent alpha (>1 sharpens the target)")
     p.add_argument("--resample-threshold", type=float, default=None)
     p.add_argument("--num-questions", type=int, default=200)
     p.add_argument("--max-new-tokens", type=int, default=768)

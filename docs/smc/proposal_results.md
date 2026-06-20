@@ -273,6 +273,34 @@ Generality at N=16 γ=16 (bs=1): big_chi2 HumanEval 62.8 / MBPP 52.0; big_prod
   accurate greedy mode — untapped, α=1 throughout); (b) a larger draft (1.7B)
   for more capacity to model the 8B target at high γ.
 
+## Round 7 — N-at-γ16 + inference-knob sweep (big_chi2, bs=1, perf flags)
+
+GSM8K, big_chi2 draft. **N is the only accuracy lever; sharpening knobs hurt.**
+
+N at γ=16 (α=1, T=0.7): the speed↔accuracy dial.
+
+| N | accuracy | tok/s |
+|---|:---:|:---:|
+| 4 | 73.0 | 572 |
+| 8 | 79.7 | 525 |
+| 12 | 83.6 | 476 |
+| 16 | 85.2 | 444 |
+
+N=8 γ=16 = 79.7% @ 525 tok/s — *faster than EAGLE3* (509) but ~13pp less
+accurate. Fewer particles at high γ trade accuracy for speed monotonically.
+
+Inference knobs at N=8 γ=16 (all came back negative):
+- α (power, sharpen target): 1→2→4 = 79.7 → 77.3 → 75.8 (higher α hurts).
+- temperature: 0.7→0.3→0.1 = 79.7 → 76.6 → 70.7 (lower T hurts).
+- resample threshold: 0.25/0.5/1.0 = 77.7/79.7/79.3 (default best).
+
+**Why sharpening hurts (SMC-specific):** higher α / lower T both increase the
+proposal↔target mismatch and collapse particle diversity; SMC needs diversity
+for the filter, so greedy-style tricks that help single-stream decoding hurt
+here. Defaults (α=1, T=0.7, thr=0.5) are optimal. The accuracy ceiling at fixed
+proposal is set by N; pushing past N=16 γ=16's 85% needs a better/larger draft,
+not inference tuning.
+
 ## Recommendation
 
 1. **Objective: Rényi-β with a small reverse-KL mix** — `--loss renyi
