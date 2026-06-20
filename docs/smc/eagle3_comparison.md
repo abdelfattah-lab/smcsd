@@ -65,6 +65,32 @@ ceiling at α=1/T=0.7 is the target's own ~90%, more proposal finetuning (+ an
 already at the ceiling losslessly. (The 86.5% GSM8K figure quoted elsewhere is
 the round-1 math χ² draft at N=8 on 200 q; ≈84% on 256 q, within noise.)
 
+## bs=1 N×γ frontier (perf flags on, best χ² draft) — high-γ viability
+
+GSM8K accuracy% (tok/s), best draft (round-1 math χ²), perf flags on:
+
+| | γ=4 | γ=8 | γ=16 |
+|---|:---:|:---:|:---:|
+| N=12 | 87.5 (377) | 87.1 (439) | 82.4 (473) |
+| N=16 | **91.4 (357)** | 87.9 (410) | 84.8 (450) |
+
+EAGLE3: 92.5% @ 509.
+
+- **Higher N reaches the accuracy ceiling**: N=16 γ=4 = 91.4% ≈ EAGLE3's 92.5%
+  (within noise) — SMC can now match target-fidelity accuracy, at a speed cost
+  (357 tok/s).
+- **Higher γ buys speed but the current draft loses accuracy** (N=16: 91.4 →
+  87.9 → 84.8 as γ = 4 → 8 → 16). This is the γ-block weight-variance
+  compounding the χ² objective targets: per-token proposal error accumulates
+  over γ draft tokens before each verify, so accuracy at high γ is a direct read
+  on proposal quality.
+- **Verdict**: high γ (the speed lever) is *not yet* accuracy-viable with a draft
+  collected/trained at γ=8. The fix is a proposal trained at the deployment γ
+  (collect + χ² train on γ=16 rollouts) + more data — which lowers per-token χ²
+  and slows the γ-compounding. Target config for bs=1 parity with EAGLE3:
+  **N=16 γ=16 at ~90%** (~450 tok/s ≈ EAGLE speed, and SMC also wins the
+  high-batch crossover). Currently 84.8% there — ~5pp to close.
+
 ## Findings (honest)
 
 1. **EAGLE3 is near-lossless** (≈ vanilla accuracy, accept length ≈ 4.6) and
