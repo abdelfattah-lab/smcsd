@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import re
 import time
 from decimal import Decimal, InvalidOperation
@@ -46,6 +47,17 @@ def normalize_numeric_answer(value: str) -> Optional[str]:
     if dec == dec.to_integral_value():
         return str(dec.quantize(Decimal(1)))
     return format(dec.normalize(), "f")
+
+def normalize_numeric_answer(value: str) -> Optional[str]:
+    """Normalize equivalent numeric strings, e.g. 75.00 -> 75."""
+    try:
+        dec = Decimal(value.replace(",", ""))
+    except InvalidOperation:
+        return None
+    if dec == dec.to_integral_value():
+        return str(dec.quantize(Decimal(1)))
+    return format(dec.normalize(), "f")
+
 
 def extract_answer(text: str) -> Optional[str]:
     """Extract numeric answer from model output or gold answer."""
@@ -322,8 +334,8 @@ if __name__ == "__main__":
 
     # SMC parameters (used by smc_engine mode)
     smc_grp = parser.add_argument_group("SMC parameters")
-    smc_grp.add_argument("--particles", "-N", type=int, default=4)
-    smc_grp.add_argument("--gamma", "-g", type=int, default=4)
+    smc_grp.add_argument("--particles", "-N", type=int, default=12)
+    smc_grp.add_argument("--gamma", "-g", type=int, default=8)
     smc_grp.add_argument(
         "--temperature",
         type=float,
@@ -341,7 +353,7 @@ if __name__ == "__main__":
     bench = parser.add_argument_group("benchmark")
     bench.add_argument("--num-questions", type=int, default=80)
     bench.add_argument("--max-new-tokens", type=int, default=512)
-    bench.add_argument("--batch-size", type=int, default=1)
+    bench.add_argument("--batch-size", type=int, default=4)
     bench.add_argument(
         "--ignore-eos",
         action=argparse.BooleanOptionalAction,
