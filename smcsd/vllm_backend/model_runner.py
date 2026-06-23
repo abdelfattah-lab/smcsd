@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import math
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -34,6 +33,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, post_update
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from smcsd.vllm_backend.scheduler import (
+    COWBlockRepair,
     NewParticleGroupData,
     SMCGroupBatch,
     SMCSchedulerOutput,
@@ -520,6 +520,47 @@ class SMCGPUModelRunner(GPUModelRunner):
         group = self.particle_groups.pop(group_id)
         for p_id in group.particle_req_ids:
             self.req_states.remove_request(p_id)
+
+    def _apply_cow_block_repairs(
+        self,
+        repaired_block_ids: dict[str, list[tuple[int, list[int]]]],
+        block_repairs: list[COWBlockRepair],
+    ) -> None:
+        """Apply scheduler-planned COW block repairs before SMC writes."""
+        if repaired_block_ids:
+            for group_id, rows in repaired_block_ids.items():
+                group = self.particle_groups.get(group_id)
+                if group is None:
+                    continue
+                for particle_index, block_ids in rows:
+                    row = group.particle_rows[particle_index]
+                    self.block_tables.append_block_ids(
+                        row,
+                        tuple(
+                            list(block_ids)
+                            for _ in range(self.block_tables.num_kv_cache_groups)
+                        ),
+                        overwrite=True,
+                    )
+            self.block_tables.apply_staged_writes()
+
+        copy_repairs = [repair for repair in block_repairs if repair.copy_required]
+        if not copy_repairs:
+            return
+
+        src_blocks = torch.tensor(
+            [repair.old_block_id for repair in copy_repairs],
+            dtype=torch.long,
+            device=self.device,
+        )
+        dst_blocks = torch.tensor(
+            [repair.new_block_id for repair in copy_repairs],
+            dtype=torch.long,
+            device=self.device,
+        )
+        for kv_cache in list(self.draft_kv_caches) + list(self.kv_caches):
+            snapshot = self._copy_kv_blocks(kv_cache, src_blocks)
+            self._write_kv_blocks(kv_cache, dst_blocks, snapshot)
 
     @torch.inference_mode()
     def _run_batched_target_verify(
@@ -1032,45 +1073,39 @@ class SMCGPUModelRunner(GPUModelRunner):
 
             src_rows = all_rows[ancestor_indices]                       # [N]
 
-            # Full completed blocks are shared by remapping block ids; only
-            # the partial tail block, if any, needs a KV byte copy. The
-            # destination keeps its old private tail and future blocks.
+            # Used ancestor blocks, including a partial tail block, are
+            # remapped read-only. The next scheduler step repairs writable
+            # shared blocks with lazy COW before any particle writes again.
             all_rows_np = all_rows.cpu().numpy()
             all_seq_lens_np = self.req_states.num_computed_tokens_np[all_rows_np]
             bt_tuple = self._gather_block_tables(all_rows)
             bt = bt_tuple[0]
 
             new_block_rows: list[list[int]] = []
-            tail_copy_pairs: list[tuple[int, int]] = []
             ancestor_indices_cpu = ancestor_indices.cpu().tolist()
             for di, si in enumerate(ancestor_indices_cpu):
                 dst_row = int(all_rows_np[di])
                 src_seq_len = int(all_seq_lens_np[si])
-                num_full_blocks = src_seq_len // block_size
-                has_tail = (src_seq_len % block_size) != 0
+                num_used_blocks = (src_seq_len + block_size - 1) // block_size
                 dst_num_blocks = int(self.block_tables.num_blocks.np[0, dst_row])
+                src_row = int(all_rows_np[si])
+                src_num_blocks = int(self.block_tables.num_blocks.np[0, src_row])
 
                 old_dst_ids = [int(x) for x in bt[di, :dst_num_blocks].cpu().tolist()]
-                src_ids = [int(x) for x in bt[si, :dst_num_blocks].cpu().tolist()]
-                if num_full_blocks > dst_num_blocks:
+                src_ids = [int(x) for x in bt[si, :src_num_blocks].cpu().tolist()]
+                if num_used_blocks > src_num_blocks:
                     raise RuntimeError(
-                        f"SMC resample needs {num_full_blocks} full blocks "
-                        f"for particle {di}, but only {dst_num_blocks} are allocated."
+                        f"SMC resample needs {num_used_blocks} used blocks "
+                        f"from ancestor {si}, but only {src_num_blocks} are allocated."
                     )
-                if has_tail and num_full_blocks >= dst_num_blocks:
+                if num_used_blocks > dst_num_blocks:
                     raise RuntimeError(
-                        f"SMC resample needs a tail block at index {num_full_blocks} "
-                        f"for particle {di}, but only {dst_num_blocks} are allocated."
+                        f"SMC resample needs {num_used_blocks} destination block "
+                        f"slots for particle {di}, but only {dst_num_blocks} are allocated."
                     )
 
-                new_ids = src_ids[:num_full_blocks] + old_dst_ids[num_full_blocks:]
+                new_ids = src_ids[:num_used_blocks] + old_dst_ids[num_used_blocks:]
                 new_block_rows.append(new_ids)
-
-                if di != si and has_tail:
-                    src_tail = src_ids[num_full_blocks]
-                    dst_tail = old_dst_ids[num_full_blocks]
-                    if src_tail != dst_tail:
-                        tail_copy_pairs.append((src_tail, dst_tail))
 
             for row, block_ids in zip(group.particle_rows, new_block_rows):
                 self.block_tables.append_block_ids(
@@ -1083,21 +1118,6 @@ class SMCGPUModelRunner(GPUModelRunner):
                 )
             self.block_tables.apply_staged_writes()
             resampled_block_ids[group_id] = new_block_rows
-
-            if tail_copy_pairs:
-                kv_all = list(self.draft_kv_caches) + list(self.kv_caches)
-                plan: list[tuple[torch.Tensor, list[torch.Tensor]]] = []
-                for src_tail, dst_tail in tail_copy_pairs:
-                    src_flat = torch.tensor([src_tail], dtype=torch.long, device=self.device)
-                    dst_flat = torch.tensor([dst_tail], dtype=torch.long, device=self.device)
-                    plan.append((
-                        dst_flat,
-                        [self._copy_kv_blocks(kv, src_flat) for kv in kv_all],
-                    ))
-
-                for dst_flat, snapshots in plan:
-                    for kv, snapshot in zip(kv_all, snapshots):
-                        self._write_kv_blocks(kv, dst_flat, snapshot)
 
             # Copy GPU runner bookkeeping for all N particles.
             rows_l = all_rows.long()
@@ -1175,6 +1195,11 @@ class SMCGPUModelRunner(GPUModelRunner):
                 decode_block_ids=new_group.decode_block_ids,
                 temperature=new_group.temperature,
             )
+
+        self._apply_cow_block_repairs(
+            scheduler_output.cow_repaired_block_ids,
+            scheduler_output.cow_block_repairs,
+        )
 
         if scheduler_output.new_particle_groups:
             self._run_batched_draft_prefill(scheduler_output.new_particle_groups)

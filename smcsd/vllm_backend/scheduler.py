@@ -74,9 +74,24 @@ class SMCGroupBatch:
 
 
 @dataclass
+class COWBlockRepair:
+    """Worker-side KV copy needed after scheduler COW block repair."""
+    group_id: str
+    particle_index: int
+    logical_block_idx: int
+    old_block_id: int
+    new_block_id: int
+    copy_required: bool
+
+
+@dataclass
 class SMCSchedulerOutput(SchedulerOutput):
     new_particle_groups: list[NewParticleGroupData] = field(default_factory=list)
     ongoing_smc_groups: list[SMCGroupBatch] = field(default_factory=list)
+    cow_block_repairs: list[COWBlockRepair] = field(default_factory=list)
+    cow_repaired_block_ids: dict[str, list[tuple[int, list[int]]]] = field(
+        default_factory=dict
+    )
 
 
 class SMCVLLMScheduler(Scheduler):
@@ -92,6 +107,7 @@ class SMCVLLMScheduler(Scheduler):
         self._completed_groups: dict[str, tuple[list[list[int]], list[float]]] = {}
         # Requests that finished prefill but are waiting for particle-group capacity.
         self._fork_waitlist: list[Request] = []
+        self._pending_cow_pin_block_ids: list[int] = []
         self.max_concurrent_groups: int = (
             self.scheduler_config.max_num_seqs // (self.smc_n_particles + 1)
         )
@@ -232,6 +248,60 @@ class SMCVLLMScheduler(Scheduler):
         """Remove CPU-side state for a completed group."""
         self.smc_groups.pop(group_id, None)
 
+    def _release_pending_cow_pins(self) -> None:
+        if not self._pending_cow_pin_block_ids:
+            return
+        self.kv_cache_manager.smc_release_pinned_blocks(
+            self._pending_cow_pin_block_ids
+        )
+        self._pending_cow_pin_block_ids = []
+
+    def _build_cow_block_repairs(
+        self,
+    ) -> tuple[list[COWBlockRepair], dict[str, list[tuple[int, list[int]]]]]:
+        """Make active particles private for the next SMC write range."""
+        repairs: list[COWBlockRepair] = []
+        repaired_block_ids: dict[str, list[tuple[int, list[int]]]] = {}
+
+        for group_id, state in self.smc_groups.items():
+            group_rows: list[tuple[int, list[int]]] = []
+            for p, particle_req_id in enumerate(state.particle_req_ids):
+                if state.particle_finished[p]:
+                    continue
+
+                seq_len = state.particle_num_computed_tokens[p]
+                first_block = seq_len // self.block_size
+                last_block = (seq_len + self.smc_gamma) // self.block_size
+                logical_indices = list(range(first_block, last_block + 1))
+                copy_required_indices = (
+                    {first_block} if (seq_len % self.block_size) != 0 else set()
+                )
+
+                block_ids, copy_repairs, pinned_ids = (
+                    self.kv_cache_manager.smc_make_write_blocks_private(
+                        particle_req_id, logical_indices, copy_required_indices
+                    )
+                )
+                self._pending_cow_pin_block_ids.extend(pinned_ids)
+                group_rows.append((p, block_ids))
+
+                for logical_idx, old_id, new_id, copy_required in copy_repairs:
+                    repairs.append(
+                        COWBlockRepair(
+                            group_id=group_id,
+                            particle_index=p,
+                            logical_block_idx=logical_idx,
+                            old_block_id=old_id,
+                            new_block_id=new_id,
+                            copy_required=copy_required,
+                        )
+                    )
+
+            if group_rows:
+                repaired_block_ids[group_id] = group_rows
+
+        return repairs, repaired_block_ids
+
     def process_prefill_result(
         self,
         parent_req_id: str,
@@ -285,6 +355,13 @@ class SMCVLLMScheduler(Scheduler):
             )
             new_particle_groups.append(new_group)
 
+        cow_block_repairs, cow_repaired_block_ids = self._build_cow_block_repairs()
+        new_block_ids_to_zero = base_output.new_block_ids_to_zero
+        if self.needs_kv_cache_zeroing:
+            smc_new_block_ids = self.kv_cache_manager.take_new_block_ids()
+            if smc_new_block_ids:
+                new_block_ids_to_zero = (new_block_ids_to_zero or []) + smc_new_block_ids
+
         return SMCSchedulerOutput(
             scheduled_new_reqs=base_output.scheduled_new_reqs,
             scheduled_cached_reqs=base_output.scheduled_cached_reqs,
@@ -301,9 +378,11 @@ class SMCVLLMScheduler(Scheduler):
             num_invalid_spec_tokens=base_output.num_invalid_spec_tokens,
             kv_connector_metadata=base_output.kv_connector_metadata,
             ec_connector_metadata=base_output.ec_connector_metadata,
-            new_block_ids_to_zero=base_output.new_block_ids_to_zero,
+            new_block_ids_to_zero=new_block_ids_to_zero,
             new_particle_groups=new_particle_groups,
             ongoing_smc_groups=ongoing_smc_groups,
+            cow_block_repairs=cow_block_repairs,
+            cow_repaired_block_ids=cow_repaired_block_ids,
         )
 
     def update_from_output(
@@ -313,6 +392,7 @@ class SMCVLLMScheduler(Scheduler):
     ) -> dict[int, EngineCoreOutputs]:
         from smcsd.vllm_backend.outputs import SMCModelRunnerOutput
 
+        self._release_pending_cow_pins()
         result = super().update_from_output(scheduler_output, model_runner_output)
 
         if not isinstance(model_runner_output, SMCModelRunnerOutput):
