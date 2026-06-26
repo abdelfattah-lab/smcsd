@@ -234,6 +234,62 @@ class SMCWorker(BaseSpecWorker):
                 self.draft_runner
             )
 
+        # Full-cycle CUDA graph (issue #14): SMC_CYCLE_GRAPH=1 captures the
+        # whole worker cycle in one launch per bs bucket — all gamma+1 draft
+        # forwards + in-graph Gumbel sampling, then TARGET_VERIFY + weight diff
+        # + bonus — replacing gamma+1 separate decode-graph replays + eager
+        # sampling + an eager verify (~25% GPU idle from host dispatch at
+        # bs=32).  Opt-in; the per-step path stays as the fallback for
+        # oversized batches / long contexts.  (The draft-phase-only capture
+        # lives on as SMCFullCycleGraphRunner's base class, not as a separate
+        # user-facing flag — it was within run-to-run noise of the full cycle.)
+        self.cycle_graph_runner = None
+        want_cycle = bool(int(os.environ.get("SMC_CYCLE_GRAPH", "0")))
+        if want_cycle:
+            from sglang.srt.layers.attention.triton_backend import (
+                TritonAttnBackend,
+                TritonMultiStepDraftBackend,
+            )
+
+            reasons = []
+            if backup_disable_cuda_graph:
+                reasons.append("cuda graph disabled")
+            if not self.smc_draft_temperature > 0:
+                reasons.append("greedy draft (temperature 0)")
+            if not isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend):
+                reasons.append(
+                    f"unsupported multi-step backend "
+                    f"{type(self.draft_attn_backend).__name__} (triton only)"
+                )
+            if self.score_runner.hybrid_gdn_config is not None:
+                reasons.append(
+                    "hybrid target (cycle graph cannot capture the "
+                    "post-verify mamba state commit)"
+                )
+            if not isinstance(self.score_runner.attn_backend, TritonAttnBackend):
+                reasons.append(
+                    f"unsupported target backend "
+                    f"{type(self.score_runner.attn_backend).__name__} "
+                    "(triton only)"
+                )
+            if reasons:
+                logger.warning("SMC_CYCLE_GRAPH=1 ignored: %s", "; ".join(reasons))
+            else:
+                from smcsd.model_executor.smc_draft_phase_graph_runner import (
+                    SMCDeferredCycleGraphRunner,
+                    SMCFullCycleGraphRunner,
+                )
+
+                # With SMC_DEFER_BONUS=1 the cycle capture uses the deferred
+                # draft schedule (2-token head + gamma-1 singles): one fewer
+                # draft forward per cycle.
+                runner_cls = (
+                    SMCDeferredCycleGraphRunner
+                    if self.smc_defer_bonus
+                    else SMCFullCycleGraphRunner
+                )
+                self.cycle_graph_runner = runner_cls(self)
+
     def _dense_hybrid_state_shape(self) -> Optional[Tuple[Tuple, Tuple]]:
         target_cfg = getattr(self.score_runner, "hybrid_gdn_config", None)
         draft_cfg = getattr(self.draft_runner, "hybrid_gdn_config", None)
@@ -482,19 +538,36 @@ class SMCWorker(BaseSpecWorker):
 
     # ── DECODE ──
 
-    def _sample_draft_token(self, logits):
-        """Sample one draft token + its log-prob at the draft temperature.
+    def _sample_draft_token(self, logits, need_logprob: bool = True):
+        """Sample one draft token (+ its log-prob) at the draft temperature.
 
-        Identical to the per-step sampling in the legacy AR loop, factored out
-        so the deferred-bonus path reuses it verbatim.
+        Gumbel-max sampling: ``argmax(logits/T + g)`` with ``g ~ Gumbel(0,1)``
+        draws exactly from ``softmax(logits/T)`` — the same distribution as
+        the previous ``log_softmax → exp → multinomial`` chain, without the
+        multi-kernel multinomial.  The Gumbel noise drives only the
+        *selection*; the token's logprob comes from the noise-free scaled
+        logits, ``logp = (logits/T)[idx] - logsumexp(logits/T)``, which is
+        what the importance weight requires.  Used by both the legacy AR
+        loop and the deferred-bonus head path.
         """
-        scaled = logits / self.smc_draft_temperature
-        log_probs = torch.log_softmax(scaled, dim=-1)
         if self.smc_draft_temperature > 0:
-            idx = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
+            scaled = logits / self.smc_draft_temperature
+            gumbel = -torch.log(
+                -torch.log(
+                    torch.rand_like(scaled).clamp_min_(
+                        torch.finfo(scaled.dtype).tiny
+                    )
+                )
+            )
+            idx = torch.argmax(scaled + gumbel, dim=-1)
         else:
+            # Greedy: noise-free argmax (scale-invariant in the logits).
+            scaled = logits
             idx = torch.argmax(logits, dim=-1)
-        lp = log_probs.gather(1, idx.unsqueeze(1)).squeeze(1)
+        if not need_logprob:
+            return idx, None
+        chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
+        lp = chosen - torch.logsumexp(scaled, dim=-1)
         return idx, lp
 
     def _draft_ar_deferred(
@@ -602,6 +675,84 @@ class SMCWorker(BaseSpecWorker):
         draft_logprobs_stacked = torch.stack(draft_logprobs, dim=1)  # (bs, gamma)
         return all_tokens, draft_logprobs_stacked
 
+    def _forward_decode_cycle_graph(
+        self,
+        batch: ModelWorkerBatch,
+        draft_input: SMCDraftInput,
+        ctx: SMCDecodeContext,
+    ) -> GenerationBatchResult:
+        """Run one decode cycle through the full-cycle CUDA graph.
+
+        Replaces prepare_for_draft + the draft AR loop + prepare_for_verify +
+        the target verify forward + logprob extraction + bonus sampling with
+        the staging copies, two metadata updates, and a single graph launch.
+        Output tensors are views into the runner's persistent buffers; every
+        consumer (scheduler write-back) is enqueued on the same stream before
+        the next cycle's staging copies, so reuse is safe under both the
+        sequential and overlapped event loops.
+        """
+        bs = len(ctx.orig_seq_lens)
+        gamma = self.gamma
+
+        # Carried from the fused prepare kernel (the cycle's fresh pages);
+        # legacy fallback re-reads the block table.
+        cache_locs = ctx.cache_locs
+        if cache_locs is None:
+            from smcsd.common.verify import assign_smc_cache_locs_kernel
+
+            r2t = self.req_to_token_pool.req_to_token
+            out_cache_loc = torch.empty(
+                bs * (gamma + 1), dtype=torch.int64, device=self.device
+            )
+            assign_smc_cache_locs_kernel[(bs,)](
+                batch.req_pool_indices,
+                r2t,
+                ctx.orig_seq_lens,
+                out_cache_loc,
+                r2t.shape[1],
+                gamma + 1,
+            )
+            cache_locs = out_cache_loc.reshape(bs, gamma + 1)
+
+        replay_kwargs = {}
+        if getattr(self.cycle_graph_runner, "deferred", False):
+            replay_kwargs["prev_last_draft_id"] = draft_input.prev_last_draft_id
+        (
+            tokens_out,
+            _draft_logprobs,
+            logprob_diff,
+            bonus,
+            next_tokens,
+        ) = self.cycle_graph_runner.replay(
+            draft_input.verified_id,
+            cache_locs,
+            ctx,
+            batch.req_pool_indices,
+            **replay_kwargs,
+        )
+
+        next_token_ids = next_tokens.reshape(-1)
+        accept_lens = torch.full(
+            (bs,), gamma + 1, dtype=torch.int32, device=self.device
+        )
+        # This step's last drafted token, deferred-bonus seed for next cycle.
+        prev_last_draft_id = tokens_out[:, gamma]
+
+        next_draft_input = SMCDraftInput(
+            verified_id=bonus,
+            prev_last_draft_id=prev_last_draft_id,
+            logprob_diff=logprob_diff,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+        )
+        return GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=next_token_ids,
+            accept_lens=accept_lens,
+            next_draft_input=next_draft_input,
+            logprob_diff=logprob_diff,
+            can_run_cuda_graph=True,
+        )
+
     def _forward_decode(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_idle():
             return self._forward_idle(batch)
@@ -615,6 +766,16 @@ class SMCWorker(BaseSpecWorker):
 
         if draft_input.verified_id is not None:
             draft_input.verified_id.record_stream(current_stream)
+
+        # ---- 0. Full-cycle graph (issue #14, stage 3) ----
+        # One launch covers draft AR + TARGET_VERIFY + weight diff + bonus,
+        # skipping both ForwardBatch.init_new constructions and all per-phase
+        # dispatch.  Falls through to the regular path when the batch exceeds
+        # the captured bs/context caps.
+        if self.cycle_graph_runner is not None and self.cycle_graph_runner.can_run(
+            len(ctx.orig_seq_lens), ctx
+        ):
+            return self._forward_decode_cycle_graph(batch, draft_input, ctx)
 
         # ---- 1. Prepare draft ----
         draft_fb, can_cuda_graph, cache_locs, all_positions, all_seq_lens = (
@@ -699,25 +860,17 @@ class SMCWorker(BaseSpecWorker):
 
                 logits = draft_out.logits_output.next_token_logits
 
-                scaled_logits = logits / self.smc_draft_temperature
-                log_probs = torch.log_softmax(scaled_logits, dim=-1)
-                if self.smc_draft_temperature > 0:
-                    draft_idx = torch.multinomial(
-                        log_probs.exp(), num_samples=1
-                    ).squeeze(-1)
-                else:
-                    draft_idx = torch.argmax(logits, dim=-1)
-
-                next_token = draft_idx
-
+                # Shared Gumbel-max + fused-logprob sampler; the over-draft
+                # step (step == gamma) skips the logprob reduction since its
+                # token never contributes to the importance weight.
+                draft_idx, token_logprob = self._sample_draft_token(
+                    logits, need_logprob=step < gamma
+                )
                 if step < gamma:
-                    token_logprob = log_probs.gather(
-                        1, draft_idx.unsqueeze(1)
-                    ).squeeze(1)
                     draft_logprobs.append(token_logprob)
 
-                all_tokens.append(next_token)
-                current_ids = next_token
+                all_tokens.append(draft_idx)
+                current_ids = draft_idx
 
             draft_logprobs_stacked = torch.stack(draft_logprobs, dim=1)
 
@@ -753,14 +906,23 @@ class SMCWorker(BaseSpecWorker):
             f"expected {expected_rows} (bs={bs}, gamma+1={gamma + 1}, "
             f"cuda_graph={can_run_cuda_graph})"
         )
-        score_log_probs = torch.log_softmax(
-            score_logits / self.smc_target_temperature, dim=-1
-        )
-        score_log_probs = score_log_probs.reshape(bs, gamma + 1, -1)
+        # Fused score-logprob extraction: we only need, per row, the logprob
+        # of one already-chosen token under the tempered target
+        # p_T = softmax(logits / T):
+        #   logp = (logits/T)[token] - logsumexp(logits/T)
+        # — one gather + one reduction instead of materializing the full
+        # (bs*(gamma+1), vocab) log_softmax tensor.
+        score_logits_3d = score_logits.reshape(bs, gamma + 1, -1)
         target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
-        score_logprobs_stacked = score_log_probs[:, :gamma, :].gather(
+        verify_scaled = (
+            score_logits_3d[:, :gamma, :] / self.smc_target_temperature
+        )
+        chosen_logits = verify_scaled.gather(
             2, target_tokens.unsqueeze(2)
         ).squeeze(2)
+        score_logprobs_stacked = chosen_logits - torch.logsumexp(
+            verify_scaled, dim=-1
+        )
 
         # ---- 5. Logprob diff ----
         # Per-position (bs, gamma) importance-weight increment, NOT summed
@@ -779,12 +941,22 @@ class SMCWorker(BaseSpecWorker):
         # ---- 6. Bonus token ----
         # Sample from the same p_{T_t}^alpha distribution targeted above so the
         # bonus and per-step draws come from one consistent target.
-        bonus_logits = score_logits.reshape(bs, gamma + 1, -1)[:, -1, :]
-        bonus_log_probs = torch.log_softmax(
-            self.smc_power_alpha * bonus_logits / self.smc_target_temperature,
-            dim=-1,
+        # Gumbel-max draw from the same p_T^alpha tempered-power target the
+        # per-step weights use — exactly equivalent to the previous
+        # log_softmax → exp → multinomial chain.
+        bonus_scaled = (
+            self.smc_power_alpha
+            * score_logits_3d[:, -1, :]
+            / self.smc_target_temperature
         )
-        bonus = torch.multinomial(bonus_log_probs.exp(), num_samples=1).squeeze(-1)
+        bonus_gumbel = -torch.log(
+            -torch.log(
+                torch.rand_like(bonus_scaled).clamp_min_(
+                    torch.finfo(bonus_scaled.dtype).tiny
+                )
+            )
+        )
+        bonus = torch.argmax(bonus_scaled + bonus_gumbel, dim=-1)
 
         # ---- 7. Output ----
         output_token_ids = torch.stack(

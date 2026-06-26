@@ -81,6 +81,40 @@ python scripts/accuracy_test_gsm8k.py \
 > [!NOTE] 
 > When using non-Hopper GPU (such as A100, A6000), specify `--attention-backend` to be `triton`
 
+### Performance flags (fastest known config)
+
+The decode hot path has three opt-in, env-gated optimizations (all require `--attention-backend triton`):
+
+| Flag | What it does |
+| --- | --- |
+| `SMC_CYCLE_GRAPH=1` | One CUDA graph per decode cycle: draft AR + target verify + weight diff + bonus |
+| `SMC_ENABLE_OVERLAP=1` | Overlapped scheduler loop: CPU postprocessing of step *t* runs while the GPU executes *t+1* |
+| `SMC_DEFER_BONUS=1` | Deferred-bonus draft schedule — γ draft forwards per cycle instead of γ+1 (captured in the cycle graph when both flags are set) |
+
+```bash
+# Fastest N=12, gamma=8 GSM8K config (single B300, Llama-3.1-8B + 3.2-1B)
+SMC_CYCLE_GRAPH=1 SMC_ENABLE_OVERLAP=1 SMC_DEFER_BONUS=1 \
+python scripts/accuracy_test_gsm8k.py \
+  --mode smc_engine \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --particles 12 --gamma 8 \
+  --temperature 0.7 \
+  --attention-backend triton \
+  --num-questions 400
+```
+
+Measured on GSM8K (200q, T=0.7, batch-size 1, B300; accuracy differences are within per-run noise):
+
+| Config (all with cycle graph + overlap) | tok/s | accuracy |
+| --- | --- | --- |
+| N=4, γ=4 | 485 | 68.5% |
+| N=8, γ=8 | **542** | 70.0% |
+| N=12, γ=8 | 500 | 71.0% |
+| N=12, γ=8 + `SMC_DEFER_BONUS=1` | 524 | 70.5% |
+
+At batch size 1 decode is weight-read-bound, so extra particles are nearly free up to N≈8 (use the headroom to raise γ); beyond that KV/attention traffic starts to cost — N=8 γ=8 is the fastest measured setting, N=12 γ=8 the most accurate. `SMC_DEFER_BONUS` helps short/medium generations (+5–9%) but can cost ~1–2% on very long (3k+ token) single streams.
+
 See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
 ## SMC-SD Parameters
