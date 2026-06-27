@@ -668,7 +668,7 @@ class TestFusedWriteBack(CustomTestCase):
 
     @staticmethod
     def _torch_reference(state, active, next_token_ids, logprob_diff,
-                         bonus_ids, prev, stride):
+                         bonus_ids, prev, stride, bonus_logz=None):
         dev = active.device
         bs = active.shape[0]
         accepted_2d = next_token_ids.reshape(bs, stride)
@@ -729,6 +729,10 @@ class TestFusedWriteBack(CustomTestCase):
         cols = torch.arange(gamma, device=dev).unsqueeze(0)
         keep = cols <= cutoff.unsqueeze(1)
         d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
+        if bonus_logz is not None:
+            eos_in_draft = eos_cut & (first_eos < gamma)
+            add_bonus = (~prev_fin & ~eos_in_draft).to(torch.float64)
+            d = d + bonus_logz.to(torch.float64) * add_bonus
         state["log_weights"][active] += d
         state["interval_weights"][active] += d
 
@@ -756,6 +760,16 @@ class TestFusedWriteBack(CustomTestCase):
             prev = torch.randint(
                 0, 60, (bs,), device=self.DEVICE, dtype=torch.int64
             )
+            # Per-particle bonus normalizer. Exercise both the present (SMC) and
+            # absent (legacy / non-SMC caller) cases across seeds; the absent
+            # case must reproduce the pre-change behaviour exactly.
+            bonus_logz = (
+                None
+                if seed == 1
+                else torch.randn(
+                    bs, device=self.DEVICE, dtype=torch.float32
+                )
+            )
 
             ref = self._make_state(max_slots, stride, seed=seed)
             fused = {
@@ -764,7 +778,8 @@ class TestFusedWriteBack(CustomTestCase):
             }
 
             self._torch_reference(
-                ref, active, next_tokens, logprob_diff, bonus, prev, stride
+                ref, active, next_tokens, logprob_diff, bonus, prev, stride,
+                bonus_logz=bonus_logz,
             )
             fused_write_back(
                 active, next_tokens, logprob_diff, bonus, prev,
@@ -782,6 +797,7 @@ class TestFusedWriteBack(CustomTestCase):
                 log_weights=fused["log_weights"],
                 interval_weights=fused["interval_weights"],
                 gamma_plus_1=stride,
+                bonus_logz=bonus_logz,
             )
 
             for name in ref:

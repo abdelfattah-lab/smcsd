@@ -41,6 +41,18 @@ def gumbel_argmax(logits: torch.Tensor, temperature: float, generator=None):
     return torch.argmax(scaled + gumbel, dim=-1)
 
 
+def bonus_logz(logits: torch.Tensor, alpha: float, temperature: float):
+    """Per-row bonus normalizer ``log Z = logsumexp(alpha*ℓ/T) - alpha*logsumexp(ℓ/T)``.
+
+    Mirrors ``SMCWorker._sample_target_power`` /
+    ``smc_draft_phase_graph_runner._verify_in_graph``.
+    """
+    base = logits / temperature
+    return torch.logsumexp(alpha * base, dim=-1) - alpha * torch.logsumexp(
+        base, dim=-1
+    )
+
+
 class TestLogprobIdentity(unittest.TestCase):
     def test_matches_log_softmax_gather(self):
         torch.manual_seed(0)
@@ -101,6 +113,139 @@ class TestGumbelSampling(unittest.TestCase):
         expected = logits.argmax(dim=-1)
         got = gumbel_argmax(logits, temperature=1e-4)
         self.assertTrue((got == expected).all())
+
+
+class TestBonusLogZ(unittest.TestCase):
+    """The bonus token's incremental importance weight under the joint-power
+    target is ``Z = sum_x p_T(x)^alpha`` (it is sampled from p_T^alpha / Z), i.e.
+    ``log Z = logsumexp(alpha*ℓ/T) - alpha*logsumexp(ℓ/T)``."""
+
+    def test_zero_at_alpha_one(self):
+        # At alpha=1, Z = sum_x p_T(x) = 1, so log Z == 0 exactly. This is what
+        # makes the fix a no-op for the default (non-power) path.
+        torch.manual_seed(4)
+        for temperature in (0.5, 0.7, 1.0, 1.3):
+            logits = torch.randn(8, 32000) * 3.0
+            lz = bonus_logz(logits, alpha=1.0, temperature=temperature)
+            self.assertLess(lz.abs().max().item(), 1e-4)
+
+    def test_matches_explicit_normalizer(self):
+        # log Z must equal log(sum_x p_T(x)^alpha) computed from the normalized
+        # tempered probabilities directly.
+        torch.manual_seed(5)
+        for alpha in (0.5, 2.0, 3.0):
+            for temperature in (0.7, 1.0):
+                logits = torch.randn(6, 5000) * 2.0
+                p = torch.softmax(logits / temperature, dim=-1)
+                explicit = torch.log((p**alpha).sum(dim=-1))
+                lz = bonus_logz(logits, alpha=alpha, temperature=temperature)
+                self.assertLess((lz - explicit).abs().max().item(), 1e-3)
+
+    def test_sign(self):
+        # For alpha>1 the power distribution sharpens: sum p^alpha <= 1 => logZ<=0.
+        # For alpha<1 it flattens: sum p^alpha >= 1 => logZ>=0.
+        torch.manual_seed(6)
+        logits = torch.randn(64, 1000) * 2.0
+        self.assertTrue((bonus_logz(logits, 2.0, 1.0) <= 1e-6).all())
+        self.assertTrue((bonus_logz(logits, 0.5, 1.0) >= -1e-6).all())
+
+
+def _weight_increment(logprob_diff, bonus_logz, first_eos, eos_hit,
+                      length_hit, prev_fin, gamma):
+    """Reimplements ``write_back_gpu``'s per-particle weight increment d,
+    including the bonus-normalizer gating. Pure CPU, mirrors req_state.py."""
+    cutoff = torch.full((logprob_diff.shape[0],), gamma - 1, dtype=torch.int64)
+    newly = (length_hit | eos_hit) & ~prev_fin
+    eos_cut = newly & eos_hit
+    cutoff = torch.where(eos_cut, first_eos.clamp(max=gamma - 1), cutoff)
+    cutoff = torch.where(prev_fin, torch.full_like(cutoff, -1), cutoff)
+    cols = torch.arange(gamma).unsqueeze(0)
+    keep = cols <= cutoff.unsqueeze(1)
+    d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
+    eos_in_draft = eos_cut & (first_eos < gamma)
+    add_bonus = (~prev_fin & ~eos_in_draft).to(torch.float64)
+    d = d + bonus_logz.to(torch.float64) * add_bonus
+    return d
+
+
+class TestBonusWeightGating(unittest.TestCase):
+    """The bonus normalizer is added iff the bonus token is actually emitted:
+    not when the particle was already finished, and not when EOS terminated the
+    sequence within the draft columns 0..gamma-1 (EOS in the bonus column still
+    emits the bonus)."""
+
+    def test_scenarios(self):
+        gamma, stride = 3, 4  # logprob_diff cols = 3, block = 4 (incl. bonus)
+        lpd = torch.tensor([1.0, 2.0, 4.0])  # distinct so cutoffs are visible
+        BZ = 10.0
+        draft_full = 1.0 + 2.0 + 4.0  # 7.0
+
+        # (first_eos, eos_hit, length_hit, prev_fin) -> expected d
+        cases = [
+            # no EOS, alive            -> full draft + bonus
+            ((stride, False, False, False), draft_full + BZ),
+            # EOS in draft col 1       -> cols 0..1, no bonus
+            ((1, True, False, False), 1.0 + 2.0),
+            # EOS in LAST draft col 2  -> cols 0..2, bonus is post-EOS -> dropped
+            ((2, True, False, False), draft_full),
+            # EOS in bonus col (==gamma) -> full draft + bonus (bonus emitted)
+            ((gamma, True, False, False), draft_full + BZ),
+            # already finished         -> nothing
+            ((stride, False, False, True), 0.0),
+            # length-only finish       -> full draft + bonus
+            ((stride, False, True, False), draft_full + BZ),
+        ]
+        for (fe, eh, lh, pf), expected in cases:
+            d = _weight_increment(
+                lpd.unsqueeze(0),
+                torch.tensor([BZ]),
+                torch.tensor([fe]),
+                torch.tensor([eh]),
+                torch.tensor([lh]),
+                torch.tensor([pf]),
+                gamma,
+            )
+            self.assertAlmostEqual(
+                d.item(), expected, places=6,
+                msg=f"first_eos={fe} eos={eh} len={lh} prev_fin={pf}",
+            )
+
+    def test_alpha_one_is_noop(self):
+        # At alpha=1 the bonus normalizer is 0, so the increment equals the
+        # pure draft-weight sum with no bonus contribution.
+        torch.manual_seed(8)
+        gamma, stride = 4, 5
+        lpd = torch.randn(7, gamma)
+        logits = torch.randn(7, 2000) * 2.0
+        bz = bonus_logz(logits, alpha=1.0, temperature=0.9)
+        d = _weight_increment(
+            lpd, bz,
+            torch.full((7,), stride),  # no EOS
+            torch.zeros(7, dtype=torch.bool),
+            torch.zeros(7, dtype=torch.bool),
+            torch.zeros(7, dtype=torch.bool),
+            gamma,
+        )
+        self.assertLess(
+            (d - lpd.to(torch.float64).sum(dim=1)).abs().max().item(), 1e-4
+        )
+
+
+class TestSampleTargetPower(unittest.TestCase):
+    """``_sample_target_power`` draws from softmax(alpha*logits/T)."""
+
+    def test_distribution_matches_power_target(self):
+        torch.manual_seed(7)
+        vocab = 50
+        logits = torch.randn(vocab) * 2.0
+        alpha, temperature = 2.0, 0.8
+        probs = torch.softmax(alpha * logits / temperature, dim=-1)
+        n = 1_000_000
+
+        # Gumbel-max over alpha*logits/T is exactly _sample_target_power's draw.
+        draws = gumbel_argmax(logits.expand(n, vocab), temperature / alpha)
+        freq = torch.bincount(draws, minlength=vocab).float() / n
+        self.assertLess((freq - probs).abs().max().item(), 0.01)
 
 
 if __name__ == "__main__":

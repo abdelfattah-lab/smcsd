@@ -389,6 +389,13 @@ class SMCDraftInput(SpecInput):
     # (continuous batching) are handled uniformly.
     prev_last_draft_id: Optional[torch.Tensor] = None
     logprob_diff: Optional[torch.Tensor] = None  # (bs, gamma) per-position, last step
+    # (bs,) per-particle log-normalizer of the bonus token's power draw,
+    # log Z = logsumexp(alpha*logits/T) - alpha*logsumexp(logits/T).  The bonus
+    # is sampled from the locally normalized power conditional p_T^alpha / Z, so
+    # under the joint-power target its incremental importance weight is Z (not 1).
+    # Identically 0 at alpha=1.  Accumulated alongside logprob_diff in
+    # write_back_gpu, gated by the same EOS/finish logic.
+    bonus_logz: Optional[torch.Tensor] = None  # (bs,) last step
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
 
