@@ -99,13 +99,22 @@ real but bounded.** Measure this first; it decides whether the headline is stron
 - Generality: ≥1 more (target, draft) pair / family so it's not one-system engineering.
 - Hardware: B200 primary; Hopper for portability if time.
 
-## De-risking roadmap (cheapest signal first)
-1. **Roofline measurement** of current graph (no build) — confirm headroom.
-2. **Draft-only megakernel** (1B, γ steps, in-kernel gumbel) vs draft-phase graph — isolates
-   AR-fusion win; validate with equivalence test. Fastest go/no-go.
-3. Add **verify** fused → full single-GPU 8B cycle.
-4. Fold **reweight/resample/bonus** → complete one-kernel cycle.
-5. **Hybrid** (draft-megakernel + target-graph) for 70B/TP → graceful scaling figure.
+## De-risking roadmap (cheapest signal first) — STATUS 2026-06-28
+1. **[DONE]** Roofline measurement of the bs=1 cycle — ~65% bubble, ~34% roofline efficiency → megakernel GO.
+2. **[DONE]** **Draft-only megakernel** (1B, γ steps, KV cache, in-kernel Gumbel) — BUILT + VALIDATED (4/4
+   tokens vs torch Gumbel ref, logit cos 0.9999) + OPTIMIZED 22.4× (62→2.76 ms/token). Code in `kernels/`,
+   best = `m5_draft_mega.py`. AR-fusion win proven end-to-end. (= milestones M0–M5; see HANDOFF.md.)
+3. **[NEXT = M6]** Add **verify** fused → full single-GPU 8B cycle. Run the target forward over the
+   `N×(γ+1)` drafted block IN the same persistent kernel, tokens flowing draft→verify in-graph; extract
+   tempered target logprobs (no sampling). Reuses the layer/barrier/warp-GEMV machinery. **The headline.**
+4. **[then = M7]** Fold **reweight/resample/bonus** → complete one-kernel cycle (α-weighted logprob diff →
+   normalize across N particles → resample → bonus). One launch = the whole worker cycle.
+5. **[regime]** **Hybrid** (draft-megakernel + target-graph) for 70B/TP, where the single-kernel property
+   breaks (in-kernel collectives) → graceful-scaling figure + the fuse-vs-disaggregate planner.
+
+Immediate perf sub-task before M6: **M5d** — shared-memory-stage the activation + parallelize attention to
+push the draft from 2.76 → ~1–1.5 ms/token (compute-bound on redundant activation reads, not barriers/BW).
+See HANDOFF.md §7.
 
 ## Tooling decision
 Hand-written (ThunderKittens/CUTLASS, Hazy-style) vs persistent-kernel compiler (Mirage/MPK).

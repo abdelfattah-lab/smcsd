@@ -3,13 +3,21 @@
 **Status (2026-06-28): BUILT, VALIDATED, OPTIMIZED 22.4×. Correctness done; perf has one clear lever left.**
 
 This directory contains a from-scratch **persistent CUDA megakernel** (written in the CUTLASS CuTe Python
-DSL) that runs the *entire* SMC draft decode cycle for Llama-3.2-1B — token embedding → 16 transformer
+DSL) that runs the *entire* SMC **draft** decode cycle for Llama-3.2-1B — token embedding → 16 transformer
 layers with a growing KV cache → lm_head → in-kernel Gumbel-max sampling → feed-back, looping γ steps —
 **in a single kernel launch**. It reproduces the real model's decode and is the prototype for the
 "megakernel" thesis of the planned MLSys paper (see `paper-outline.md`).
 
+**SCOPE — read this:** the **end goal is a megakernel for the WHOLE SMC cycle** (γ draft forwards + **target
+verify** + **reweight/resample/bonus**), all in one launch. What's built here is the **DRAFT phase — step 1
+of 3.** The draft was first because it holds the hard new mechanics (persistent kernel, grid barrier, AR
+loop, in-kernel sampling, KV cache) on the small 1B model; the remaining phases reuse that machinery. The
+full roadmap (M5d → **M6 verify** → **M7 resample/bonus** → integrate → measure) is in §7. The verify+resample
+fusion is the *novel* part — SMC's static no-rejection shape is what makes it possible (rejection-based SD
+can't fuse verify); draft-only undersells the thesis.
+
 If you're picking this up: read this file top to bottom, then run `kernels/m5_draft_mega.py` (the current
-best). The next concrete task is **M5d** (§7).
+best). The immediate task is **M5d** (finish draft perf); the bigger arc is **M6/M7** (§7).
 
 ---
 
@@ -143,9 +151,19 @@ So the kernel is **compute-bound in the layer GEMVs**, NOT barrier-bound and NOT
 
 ---
 
-## 7. NEXT STEPS (in priority order)
+## 7. ROADMAP — toward the FULL-CYCLE megakernel
 
-### M5d — the next perf lever (start here)
+**The end goal is ONE persistent kernel for the WHOLE SMC cycle:** γ draft forwards + **target verify** +
+**reweight/resample/bonus**. What's built so far (M0–M5) is the **DRAFT phase — step 1 of 3.** The draft was
+deliberately first: it holds all the hard new mechanics (persistent kernel, grid barrier, AR loop, in-kernel
+sampling, KV cache) on the small 1B model. The remaining phases (M6, M7) **reuse that machinery** and are what
+make the paper novel: SMC's *static, no-rejection* shape is what lets the **verify** fuse into the same
+kernel — rejection-based SD (EAGLE/Medusa) can't, because their accept-count is data-dependent. So fusing
+verify+resample is the headline, not the draft.
+
+Build order: **M5d (finish draft perf) → M6 (fuse verify) → M7 (resample/bonus) → integrate → measure.**
+
+### M5d — finish optimizing the draft (immediate; start here)
 1. **Stage the (normed) activation in shared memory once per block**, then GEMVs read it from smem instead
    of re-reading `gh`/`gg1` from global per output. This removes the dominant redundant traffic. This is
    **new DSL territory** (no smem used yet here) — study `reference_cutlass/rmsnorm.py` (it stages X in smem
@@ -156,18 +174,53 @@ So the kernel is **compute-bound in the layer GEMVs**, NOT barrier-bound and NOT
    you can fuse stages 1+2 and drop one barrier (5→4). Modest.
 4. Re-measure. Plausible target ~1–1.5 ms/token.
 
+### M6 — fuse the TARGET VERIFY phase (the big structural step; the headline)
+Run the **target/score model forward over the `N×(γ+1)` drafted tokens INSIDE the same persistent kernel**,
+with the draft's tokens flowing to the verify input **in-graph** (no host round-trip — this is the fusion
+that the static shape uniquely permits).
+- **Mechanically this is the transformer forward you already have** — reuse the layer/barrier/warp-GEMV
+  machinery from `m_kernels.py` / `m3b2_mega.py`. Differences vs the draft: (a) a **bigger model** (8B), (b)
+  it's a **prefill-shaped batched forward** over the static `N×(γ+1)`-token block (not 1 token/step), (c) **no
+  sampling** — instead extract the **tempered target logprob** per drafted position: `logp = (logits/T)[tok]
+  − logsumexp(logits/T)`.
+- The draft and verify weights are different models → the kernel streams both weight sets (two residency
+  regimes in one kernel; draft is small/reused, target streams). See `paper-outline.md` §5.
+- Start by validating the verify forward standalone (8B logprobs over a drafted block) vs HF, like M2e/M3a
+  did for the 1B draft; then fuse it after the draft phase in the persistent kernel (one barrier between
+  draft-done and verify-start).
+- **Large-target caveat:** for 70B + tensor parallelism the single-kernel property breaks (needs in-kernel
+  collectives). There the design is the **hybrid: draft-megakernel + target-CUDA-graph, disaggregated.** So
+  "everything in one kernel" is the **single-GPU / 8B-target latency regime**; the large-target case is the
+  hybrid. The paper presents both as the "fuse vs disaggregate" planner — don't try to force 70B/TP into one
+  kernel.
+
+### M7 — reweight / resample / bonus (closes the cycle)
+The SMC importance-weighting + resampling, fused as the final stages:
+- **per-position α-weighted logprob diff** → importance weights, shape `(bs, N)` (draft logprobs from M4 vs
+  verify logprobs from M6).
+- **normalize across the N particles** (cross-particle reduction), **resample** particle indices, **gather**
+  the surviving states.
+- **bonus draw**: Gumbel-max on the tempered target at the last position.
+- These are small cross-particle reductions — a handful of final stages + a couple of barriers.
+- After M7: **one launch covers the entire worker cycle** = the headline contribution.
+- Cross-check the estimator against the eager torch SMC path (the shipped code computes the same
+  `logprob_diff` / α-weighting — match it).
+
 ### Then: integration into the SMC worker
-- Wire the megakernel behind a flag (e.g. `SMC_DRAFT_MEGAKERNEL=1`) as an alternative to the draft-phase
-  CUDA graph in `smcsd/core/worker.py`. **IMPORTANT:** the barrier `arrive`/`sense` tensors must be ZEROED
-  before each launch (the `sense` flag persists across launches → a 2nd launch on dirty state DEADLOCKS).
+- Wire the megakernel behind a flag (e.g. `SMC_FULL_MEGAKERNEL=1`, with `SMC_DRAFT_MEGAKERNEL=1` for the
+  draft-only intermediate) as an alternative to the per-cycle CUDA graph in `smcsd/core/worker.py`.
+  **IMPORTANT:** the barrier `arrive`/`sense` tensors must be ZEROED before each launch (the `sense` flag
+  persists across launches → a 2nd launch on dirty state DEADLOCKS).
 - In production the draft only does γ decode steps (cache pre-populated by the target prefill), not the
   sequential prefill this prototype does. Adapt the entry to take an existing KV cache + start token.
 - Port the **graph-safe Philox RNG** from the shipped SMC work for the Gumbel noise (this prototype passes a
   precomputed uniform-noise table for deterministic validation).
 
 ### Then: the paper measurement
-- The headline comparison: **megakernel vs the draft-phase CUDA graph in the SAME config** at bs=1 — the
-  "bubble-closing" number. See `paper-outline.md` (megakernel-as-centerpiece, static-shape thesis).
+- Draft milestone: **draft-megakernel vs the draft-phase CUDA graph** at bs=1.
+- Headline: **full-cycle megakernel vs the full per-cycle CUDA graph** at bs=1 — the "bubble-closing" number
+  (recall the roofline: ~65% of the bs=1 cycle was bubble). See `paper-outline.md` (megakernel-as-centerpiece,
+  static-shape thesis, fuse-vs-disaggregate planner).
 
 ---
 
