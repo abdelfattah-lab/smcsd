@@ -150,10 +150,14 @@ def verifyN_k(gVtok,gEmb,gWq,gWk,gWv,gWo,gg1,gg2,gWg,gWu,gWd,gcos,gsin,
             gg=cute.make_fragment(R,F32); uu=cute.make_fragment(R,F32)
             for m in cutlass.range_constexpr(R): gg[m]=F32(0.0); uu[m]=F32(0.0)
             k=lane
+            wg=gWg[L,n,k].to(F32); wu=gWu[L,n,k].to(F32)        # software-pipeline: prefetch first weight
             while k<hid:
-                wg=gWg[L,n,k].to(F32); wu=gWu[L,n,k].to(F32)
+                kn=k+32
+                if kn>=hid: kn=k                                 # clamp (harmless reread on last iter)
+                wgn=gWg[L,n,kn].to(F32); wun=gWu[L,n,kn].to(F32) # prefetch NEXT weight (in flight under the FMAs)
                 for m in cutlass.range_constexpr(R):
                     y=gHN[m,k].to(F32); gg[m]=gg[m]+y*wg; uu[m]=uu[m]+y*wu
+                wg=wgn; wu=wun
                 k=k+32
             for m in cutlass.range_constexpr(R):
                 g=wreduce(gg[m]); u=wreduce(uu[m])
@@ -166,9 +170,13 @@ def verifyN_k(gVtok,gEmb,gWq,gWk,gWv,gWo,gg1,gg2,gWg,gWu,gWd,gcos,gsin,
             acc=cute.make_fragment(R,F32)
             for m in cutlass.range_constexpr(R): acc[m]=F32(0.0)
             k=lane
+            w=gWd[L,n,k].to(F32)                                # software-pipeline: prefetch first weight
             while k<I:
-                w=gWd[L,n,k].to(F32)
+                kn=k+32
+                if kn>=I: kn=k
+                wn=gWd[L,n,kn].to(F32)                           # prefetch NEXT weight (in flight under the FMAs)
                 for m in cutlass.range_constexpr(R): acc[m]=acc[m]+gAct[m,k].to(F32)*w
+                w=wn
                 k=k+32
             for m in cutlass.range_constexpr(R):
                 a=wreduce(acc[m])
@@ -194,8 +202,9 @@ vm=AutoModelForCausalLM.from_pretrained(vname,dtype=torch.bfloat16).cuda().eval(
 mv=vm.model; cfv=vm.config
 H=cfv.num_attention_heads; Hkv=cfv.num_key_value_heads; D=getattr(cfv,'head_dim',cfv.hidden_size//H)
 hid=cfv.hidden_size; I=cfv.intermediate_size; NL=cfv.num_hidden_layers; eps=cfv.rms_norm_eps; V=cfv.vocab_size
-GRP=H//Hkv; DH=D//2; scale=1.0/math.sqrt(D); B=148; BLK=256; NGEN=4; Np=4
-print(f"[verify-opt] N={Np} 8B hid={hid} NL={NL}  warp-per-output + norm-once")
+GRP=H//Hkv; DH=D//2; scale=1.0/math.sqrt(D); B=148; BLK=512; NGEN=4
+Np=int(sys.argv[1]) if len(sys.argv)>1 else 4   # particle count (= FMA work per weight load); diagnostic knob
+print(f"[verify-opt] N={Np} 8B hid={hid} NL={NL}  warp-per-output + norm-once  (M=N*Sv={Np*(SP+NGEN) if False else Np}*Sv rows)")
 
 prompt_ids=tok("The capital of France is",return_tensors="pt").input_ids.cuda()[0]
 SP=prompt_ids.shape[0]; Sv=SP+NGEN

@@ -45,8 +45,17 @@ compute of op N — the levers a graph fundamentally cannot pull.
 |---|---|---|
 | megakernel, naive kernels | 1733 ms | first correct fusion |
 | megakernel, verify optimized | 602 ms | warp-GEMV + norm-once + weight-reuse on the 8B verify |
-| **megakernel, draft+verify optimized** | **~165 ms** | both phases optimized (this is `m7b_full_cycle.py` today) |
+| megakernel, draft+verify optimized | ~165 ms | warp-GEMV + norm-once + weight-reuse |
+| **+ occupancy (BLK=512)** | **~128 ms** | latency-hiding (this is `m7b_full_cycle.py` today); **13.5× vs naive** |
 | production smcsd cycle-graph | ~10 ms | (roofline run: 465 tok/s ≈ 10.75 ms/cycle) |
+
+**Memory-bound diagnosis (measured — `m7c_verify_opt.py <N>`):** sweeping the particle count N (= FMA work per
+weight load) the verify time is **flat** — N=1→84 ms, N=2→84 ms, N=4→108 ms (4× the FMAs, +29% time). So the
+verify is **weight-read / memory-*latency*-bound**, not compute-bound (and at 0.16 TB/s it is latency-bound, not
+bandwidth-saturated). The right lever is therefore more in-flight loads: **occupancy BLK=512 gave 1.26× (108→86 ms)**
+and software-prefetch (issue next weight under the FMAs) a further ~5% — the compiler already does shallow
+prefetch, so the deep win needs **cp.async multi-stage buffering or 128-bit vectorized weight loads** (bigger
+transactions toward bandwidth), the substantial next step. BLK=1024 spills (243 ms).
 
 **Honest status:** the megakernel is **~16× slower than production in absolute terms today.** That is NOT a
 fusion problem — it is a *kernel-quality* problem: the in-kernel GEMVs are hand-written **CUDA-core** kernels

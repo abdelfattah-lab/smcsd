@@ -553,7 +553,7 @@ GRPd=Hd//Hkvd; DHd=Dd//2; scaled=1.0/math.sqrt(Dd)
 Hv=cfv.num_attention_heads; Hkvv=cfv.num_key_value_heads; Dv=getattr(cfv,'head_dim',cfv.hidden_size//Hv)
 hidv=cfv.hidden_size; Iv=cfv.intermediate_size; NLv=cfv.num_hidden_layers; epsv=cfv.rms_norm_eps; Vvoc=cfv.vocab_size
 GRPv=Hv//Hkvv; DHv=Dv//2; scalev=1.0/math.sqrt(Dv)
-B=148; BLK=256; NGEN=4; Np=4; T=0.7; alpha=0.7
+B=148; BLK=512; NGEN=4; Np=4; T=0.7; alpha=0.7   # BLK=512: occupancy hides the weight-load latency (memory-bound); 1024 spills
 prompt_ids=tok("The capital of France is",return_tensors="pt").input_ids.cuda()[0]
 SP=prompt_ids.shape[0]; Sv=SP+NGEN
 print(f"[full cycle] N={Np} gamma={NGEN} | draft 1B NL={NLd} | verify 8B NL={NLv}")
