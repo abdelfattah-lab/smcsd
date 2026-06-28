@@ -3,8 +3,9 @@
 **Status (2026-06-28): M5d done (draft +13%). M6 DONE — HEADLINE: draft(1B)+verify(8B) FUSED in ONE kernel,
 tokens flowing draft→verify in-graph. M7a DONE — in-kernel verify lm_head + tempered logprob. M7b DONE — the
 full N-particle SMC cycle (batched draft / per-particle masked verify / reweight / systematic resample / bonus)
-is built as megakernel stages, all validated, and the END-TO-END cycle matches the eager torch SMC estimator.
-Remaining: fuse the N-particle stages into ONE launch (mechanism already proven by M6c) + worker integration.**
+is FUSED into ONE persistent kernel launch (`m7b_full_cycle.py`), validated vs eager torch SMC (draft 16/16,
+ancestors+bonus EXACT, weights within bf16 floor). ONE LAUNCH = the whole worker cycle. Remaining = perf
+(smem-stage the verify GEMVs) + worker integration + the paper measurement.**
 
 > **M7b update (2026-06-28): the full N-particle SMC cycle works (validated end-to-end vs eager torch SMC).**
 > Built and validated as separate stages (the methodology), each on B200:
@@ -20,10 +21,20 @@ Remaining: fuse the N-particle stages into ONE launch (mechanism already proven 
 >   real logprobs)→bonus(Gumbel on tempered target) — **weights, ancestors, and bonus all match eager torch
 >   SMC** (max|ΔW|=1e-8, ancestors exact). Example: weights [.031,.007,0,.962] → ancestors [3,3,3,3] → bonus
 >   ' city'.
-> **What remains = engineering, not science:** fuse the N-particle stages into a single launch (the draft+verify
-> single-kernel fusion is already proven in `m6c`/`m7_cycle_mega.py`; M7b.1–.4 prove each N-particle stage works
-> as a megakernel stage and the estimator is exact), then wire behind the worker flag (zero `arr`/`sen` per
-> launch; port graph-safe Philox for the Gumbel noise; free-running feed-back instead of teacher-forcing).
+> - **M7b FUSED (2026-06-28)** `m7b_full_cycle.py`: **the ENTIRE N-particle SMC cycle in ONE persistent kernel
+>   launch** — draft(1B, N particles) + in-kernel draft logprob → verify(8B, per-particle block-diagonal mask) →
+>   in-kernel target logprob → reweight → systematic resample → **in-kernel bonus** (Gumbel-max on each
+>   ancestor's tempered target last-position logits). Validated vs eager torch SMC: draft **16/16**, **ancestors
+>   EXACT**, **bonus EXACT** (' city'), weights within the bf16 floor (6e-3; the resample arithmetic on identical
+>   logprobs is exact per M7b.3 — the 6e-3 is the kernel's own bf16 forward-logprob noise through softmax).
+>   ~1.7 s/launch (naive verify GEMVs — correctness milestone). **This is the complete headline: one launch =
+>   the whole worker cycle.**
+>
+> **What remains = perf + integration, not correctness:** the fused cycle uses naive thread-per-output verify
+> GEMVs (the draft has smem staging; the verify doesn't yet) — port the M5d smem-staging / warp-GEMV to the
+> verify+lm_head for speed. Then wire behind the worker flag (zero `arr`/`sen` per launch; port graph-safe
+> Philox for the Gumbel noise; switch teacher-forcing→free-running feed-back), and run the paper measurement
+> (full-cycle megakernel vs the per-cycle CUDA graph at bs=1).
 
 > **M6 update (2026-06-28): the fusion headline works.** Three steps, all validated on B200:
 > - **M6a** (`kernels/m6a_verify_ref.py`): 8B target verify forward + tempered-logprob via the per-op
@@ -126,7 +137,8 @@ Each kernel was validated against a reference before moving on. Run any of them 
 | `m7b_draft_N.py` | M7b.1 | **N-particle batched draft** (N AR streams, per-particle KV+Gumbel) | 16/16 vs torch, particles diverge |
 | `m7b2_verify_N.py` | M7b.2 | N-particle verify, **per-particle block-diagonal causal mask** | top1 100%/particle vs HF-8B |
 | `m7b3_resample.py` | M7b.3 | in-kernel **reweight + systematic resample** vs shipped SMC funcs | 200/200, 0 mismatches |
-| `m7b4_cycle_ref.py` | **M7b.4** | **end-to-end N-particle cycle + bonus** vs eager torch SMC | weights/ancestors/bonus exact |
+| `m7b4_cycle_ref.py` | M7b.4 | end-to-end N-particle cycle + bonus vs eager torch SMC | weights/ancestors/bonus exact |
+| `m7b_full_cycle.py` | **M7b FUSED** | **WHOLE N-particle SMC cycle in ONE launch** (draft+verify+reweight+resample+bonus) | draft 16/16, ancestors+bonus EXACT |
 
 `m2e_block.py` needs `ref_block.pt`, produced by running `m2e_capture_ref.py` first (writes it next to the
 script). All paths are script-relative.
