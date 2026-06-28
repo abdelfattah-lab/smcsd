@@ -72,34 +72,50 @@ def cycle_k(
             idx=idx+GT
         ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
         for L in cutlass.range(NLd):
-            idx=gtid
-            while idx < N*QWd:
-                p=idx//QWd; n=idx%QWd
-                ss=F32(0.0)
-                for k in cutlass.range(hidd):
-                    xv=ghd[p,k].to(F32); ss=ss+xv*xv
-                inv=cute.rsqrt(ss/F32(hidd)+F32(epsd))
-                acc=F32(0.0)
-                for k in cutlass.range(hidd):
-                    acc=acc+ghd[p,k].to(F32)*inv*gg1d[L,k].to(F32)*gWqd[L,n,k].to(F32)
-                gQd[p,n]=acc.to(gQd.element_type)
-                idx=idx+GT
-            idx=gtid
-            while idx < N*KWd:
-                p=idx//KWd; n=idx%KWd; kvh=n//Dd; d=n%Dd; part=n+DHd if d<DHd else n-DHd
-                ss=F32(0.0)
-                for k in cutlass.range(hidd):
-                    xv=ghd[p,k].to(F32); ss=ss+xv*xv
-                inv=cute.rsqrt(ss/F32(hidd)+F32(epsd))
-                km=F32(0.0); kp=F32(0.0); vv=F32(0.0)
-                for k in cutlass.range(hidd):
-                    yn=ghd[p,k].to(F32)*inv*gg1d[L,k].to(F32)
-                    km=km+yn*gWkd[L,n,k].to(F32); kp=kp+yn*gWkd[L,part,k].to(F32); vv=vv+yn*gWvd[L,n,k].to(F32)
-                cl=gcosd[t,d].to(F32); sl=gsind[t,d].to(F32); kr=F32(0.0)
-                if d<DHd: kr=km*cl-kp*sl
-                else: kr=km*cl+kp*sl
-                gKcd[L,p,t,n]=kr.to(gKcd.element_type); gVcd[L,p,t,n]=vv.to(gVcd.element_type)
-                idx=idx+GT
+            # norm-once: gHNd[p,k]=rmsnorm(ghd[p])[k]*g1[k] (warp per row)
+            r=wid
+            while r<N:
+                ss=F32(0.0); kk=lane
+                while kk<hidd: x=ghd[r,kk].to(F32); ss=ss+x*x; kk=kk+32
+                inv=cute.rsqrt(wreduce(ss)/F32(hidd)+F32(epsd)); kk=lane
+                while kk<hidd: gHNd[r,kk]=(ghd[r,kk].to(F32)*inv*gg1d[L,kk].to(F32)).to(gHNd.element_type); kk=kk+32
+                r=r+NW
+            ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
+            # Q (warp per output, weight reused over N rows)
+            n=wid
+            while n<QWd:
+                acc=cute.make_fragment(N,F32)
+                for p in cutlass.range_constexpr(N): acc[p]=F32(0.0)
+                k=lane
+                while k<hidd:
+                    w=gWqd[L,n,k].to(F32)
+                    for p in cutlass.range_constexpr(N): acc[p]=acc[p]+gHNd[p,k].to(F32)*w
+                    k=k+32
+                for p in cutlass.range_constexpr(N):
+                    a=wreduce(acc[p])
+                    if lane==0: gQd[p,n]=a.to(gQd.element_type)
+                n=n+NW
+            # K,V (warp per output, weight reused; RoPE on K + cache write per row)
+            n=wid
+            while n<KWd:
+                kvh=n//Dd; d=n%Dd; part=n+DHd if d<DHd else n-DHd
+                km=cute.make_fragment(N,F32); kp=cute.make_fragment(N,F32); vv=cute.make_fragment(N,F32)
+                for p in cutlass.range_constexpr(N): km[p]=F32(0.0); kp[p]=F32(0.0); vv[p]=F32(0.0)
+                k=lane
+                while k<hidd:
+                    wkn=gWkd[L,n,k].to(F32); wkp=gWkd[L,part,k].to(F32); wvn=gWvd[L,n,k].to(F32)
+                    for p in cutlass.range_constexpr(N):
+                        y=gHNd[p,k].to(F32); km[p]=km[p]+y*wkn; kp[p]=kp[p]+y*wkp; vv[p]=vv[p]+y*wvn
+                    k=k+32
+                cl=gcosd[t,d].to(F32); sl=gsind[t,d].to(F32)
+                for p in cutlass.range_constexpr(N):
+                    a=wreduce(km[p]); b=wreduce(kp[p]); cc=wreduce(vv[p])
+                    if lane==0:
+                        kr=F32(0.0)
+                        if d<DHd: kr=a*cl-b*sl
+                        else: kr=a*cl+b*sl
+                        gKcd[L,p,t,n]=kr.to(gKcd.element_type); gVcd[L,p,t,n]=cc.to(gVcd.element_type)
+                n=n+NW
             ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
             idx=gtid
             while idx < N*Hd:
@@ -123,58 +139,86 @@ def cycle_k(
                 for d in cutlass.range_constexpr(Dd): gAd[p,h*Dd+d]=(ac[d]/rsum).to(gAd.element_type)
                 idx=idx+GT
             ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
-            idx=gtid
-            while idx < N*hidd:
-                p=idx//hidd; n=idx%hidd
-                acc=ghd[p,n].to(F32)
-                for j in cutlass.range(QWd):
-                    acc=acc+gAd[p,j].to(F32)*gWod[L,n,j].to(F32)
-                gRd[p,n]=acc.to(gRd.element_type)
-                idx=idx+GT
+            # O + residual (warp per output, weight reused; reads gAd directly)
+            n=wid
+            while n<hidd:
+                acc=cute.make_fragment(N,F32)
+                for p in cutlass.range_constexpr(N): acc[p]=F32(0.0)
+                k=lane
+                while k<QWd:
+                    w=gWod[L,n,k].to(F32)
+                    for p in cutlass.range_constexpr(N): acc[p]=acc[p]+gAd[p,k].to(F32)*w
+                    k=k+32
+                for p in cutlass.range_constexpr(N):
+                    a=wreduce(acc[p])
+                    if lane==0: gRd[p,n]=(ghd[p,n].to(F32)+a).to(gRd.element_type)
+                n=n+NW
             ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
-            idx=gtid
-            while idx < N*Id:
-                p=idx//Id; n=idx%Id
-                ss=F32(0.0)
-                for k in cutlass.range(hidd):
-                    xv=gRd[p,k].to(BF).to(F32); ss=ss+xv*xv
-                inv=cute.rsqrt(ss/F32(hidd)+F32(epsd))
-                g=F32(0.0); u=F32(0.0)
-                for k in cutlass.range(hidd):
-                    yn=gRd[p,k].to(BF).to(F32)*inv*gg2d[L,k].to(F32)
-                    g=g+yn*gWgd[L,n,k].to(F32); u=u+yn*gWud[L,n,k].to(F32)
-                gActd[p,n]=(g/(F32(1.0)+cute.exp(-g))*u).to(gActd.element_type)
-                idx=idx+GT
+            # norm-once of res1: gHNd[p,k]=rmsnorm(gRd[p])[k]*g2[k]
+            r=wid
+            while r<N:
+                ss=F32(0.0); kk=lane
+                while kk<hidd: x=gRd[r,kk].to(BF).to(F32); ss=ss+x*x; kk=kk+32
+                inv=cute.rsqrt(wreduce(ss)/F32(hidd)+F32(epsd)); kk=lane
+                while kk<hidd: gHNd[r,kk]=(gRd[r,kk].to(BF).to(F32)*inv*gg2d[L,kk].to(F32)).to(gHNd.element_type); kk=kk+32
+                r=r+NW
             ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
-            idx=gtid
-            while idx < N*hidd:
-                p=idx//hidd; n=idx%hidd
-                acc=gRd[p,n].to(F32)
-                for j in cutlass.range(Id):
-                    acc=acc+gActd[p,j].to(F32)*gWdd[L,n,j].to(F32)
-                ghd[p,n]=acc.to(ghd.element_type)
-                idx=idx+GT
+            # gate/up + silu (warp per output, weights reused)
+            n=wid
+            while n<Id:
+                gg=cute.make_fragment(N,F32); uu=cute.make_fragment(N,F32)
+                for p in cutlass.range_constexpr(N): gg[p]=F32(0.0); uu[p]=F32(0.0)
+                k=lane
+                while k<hidd:
+                    wg=gWgd[L,n,k].to(F32); wu=gWud[L,n,k].to(F32)
+                    for p in cutlass.range_constexpr(N):
+                        y=gHNd[p,k].to(F32); gg[p]=gg[p]+y*wg; uu[p]=uu[p]+y*wu
+                    k=k+32
+                for p in cutlass.range_constexpr(N):
+                    g=wreduce(gg[p]); u=wreduce(uu[p])
+                    if lane==0: gActd[p,n]=(g/(F32(1.0)+cute.exp(-g))*u).to(gActd.element_type)
+                n=n+NW
+            ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
+            # down + residual (warp per output, weight reused; reads gActd directly)
+            n=wid
+            while n<hidd:
+                acc=cute.make_fragment(N,F32)
+                for p in cutlass.range_constexpr(N): acc[p]=F32(0.0)
+                k=lane
+                while k<Id:
+                    w=gWdd[L,n,k].to(F32)
+                    for p in cutlass.range_constexpr(N): acc[p]=acc[p]+gActd[p,k].to(F32)*w
+                    k=k+32
+                for p in cutlass.range_constexpr(N):
+                    a=wreduce(acc[p])
+                    if lane==0: ghd[p,n]=(gRd[p,n].to(F32)+a).to(ghd.element_type)
+                n=n+NW
             ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
         if t+1>=SP:
             ii=t+1-SP
-            idx=gtid
-            while idx < N*hidd:
-                p=idx//hidd; k=idx%hidd
-                ss=F32(0.0)
-                for kk in cutlass.range(hidd):
-                    xv=ghd[p,kk].to(F32); ss=ss+xv*xv
-                inv=cute.rsqrt(ss/F32(hidd)+F32(epsd))
-                gHNd[p,k]=(ghd[p,k].to(F32)*inv*gnormd[k].to(F32)).to(gHNd.element_type)
-                idx=idx+GT
+            # norm-once final: gHNd[p,k]=rmsnorm(ghd[p])[k]*gnorm[k] (warp per row)
+            r=wid
+            while r<N:
+                ss=F32(0.0); kk=lane
+                while kk<hidd: x=ghd[r,kk].to(F32); ss=ss+x*x; kk=kk+32
+                inv=cute.rsqrt(wreduce(ss)/F32(hidd)+F32(epsd)); kk=lane
+                while kk<hidd: gHNd[r,kk]=(ghd[r,kk].to(F32)*inv*gnormd[kk].to(F32)).to(gHNd.element_type); kk=kk+32
+                r=r+NW
             ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
-            idx=gtid
-            while idx < N*Vd:
-                p=idx//Vd; n=idx%Vd
-                acc=F32(0.0)
-                for k in cutlass.range(hidd):
-                    acc=acc+gHNd[p,k].to(F32)*gLMd[n,k].to(F32)
-                gLogd[p,ii,n]=acc
-                idx=idx+GT
+            # lm_head (warp per output, weight reused over N rows)
+            n=wid
+            while n<Vd:
+                acc=cute.make_fragment(N,F32)
+                for p in cutlass.range_constexpr(N): acc[p]=F32(0.0)
+                k=lane
+                while k<hidd:
+                    w=gLMd[n,k].to(F32)
+                    for p in cutlass.range_constexpr(N): acc[p]=acc[p]+gHNd[p,k].to(F32)*w
+                    k=k+32
+                for p in cutlass.range_constexpr(N):
+                    a=wreduce(acc[p])
+                    if lane==0: gLogd[p,ii,n]=a
+                n=n+NW
             ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
             # per-particle Gumbel-argmax + DRAFT logprob (logsumexp over V1)
             for p in cutlass.range(N):
