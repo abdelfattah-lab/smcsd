@@ -48,7 +48,7 @@ def cycle_k(
     ghd,gKcd,gVcd,gQd,gAd,gRd,gActd,gHNd,gLogd,gWBV,gWBI,gRed,
     # verify (8B)
     gEmbv,gWqv,gWkv,gWvv,gWov,gg1v,gg2v,gWgv,gWuv,gWdv,gcosv,gsinv,gnormv,gLMv,
-    ghv,gQv,gKv,gVv,gAv,gRv,gActv,gVlog,gVLast,
+    ghv,gHNv,gQv,gKv,gVv,gAv,gRv,gActv,gVlog,gVLast,
     N:cutlass.Constexpr,SP:cutlass.Constexpr,NGEN:cutlass.Constexpr,Sv:cutlass.Constexpr,
     NLd:cutlass.Constexpr,Hd:cutlass.Constexpr,Hkvd:cutlass.Constexpr,Dd:cutlass.Constexpr,hidd:cutlass.Constexpr,
     Id:cutlass.Constexpr,GRPd:cutlass.Constexpr,DHd:cutlass.Constexpr,Vd:cutlass.Constexpr,epsd:cutlass.Constexpr,scaled:cutlass.Constexpr,
@@ -245,31 +245,44 @@ def cycle_k(
         idx=idx+GT
     ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
     for L in cutlass.range(NLv):
-        idx=gtid
-        while idx < Rv*QWv:
-            m=idx//QWv; n=idx%QWv
-            ss=F32(0.0)
-            for k in cutlass.range(hidv):
-                xv=ghv[m,k].to(F32); ss=ss+xv*xv
-            inv=cute.rsqrt(ss/F32(hidv)+F32(epsv))
-            acc=F32(0.0)
-            for k in cutlass.range(hidv):
-                acc=acc+ghv[m,k].to(F32)*inv*gg1v[L,k].to(F32)*gWqv[L,n,k].to(F32)
-            gQv[m,n]=acc.to(gQv.element_type)
-            idx=idx+GT
-        idx=gtid
-        while idx < Rv*KWv:
-            m=idx//KWv; n=idx%KWv
-            ss=F32(0.0)
-            for k in cutlass.range(hidv):
-                xv=ghv[m,k].to(F32); ss=ss+xv*xv
-            inv=cute.rsqrt(ss/F32(hidv)+F32(epsv))
-            ak=F32(0.0); av=F32(0.0)
-            for k in cutlass.range(hidv):
-                yn=ghv[m,k].to(F32)*inv*gg1v[L,k].to(F32)
-                ak=ak+yn*gWkv[L,n,k].to(F32); av=av+yn*gWvv[L,n,k].to(F32)
-            gKv[m,n]=ak.to(gKv.element_type); gVv[m,n]=av.to(gVv.element_type)
-            idx=idx+GT
+        # norm-once: gHNv[m,k]=rmsnorm(ghv[m])[k]*g1[k] (warp per row)
+        r=wid
+        while r<Rv:
+            ss=F32(0.0); k=lane
+            while k<hidv: x=ghv[r,k].to(F32); ss=ss+x*x; k=k+32
+            inv=cute.rsqrt(wreduce(ss)/F32(hidv)+F32(epsv)); k=lane
+            while k<hidv: gHNv[r,k]=(ghv[r,k].to(F32)*inv*gg1v[L,k].to(F32)).to(gHNv.element_type); k=k+32
+            r=r+NW
+        ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
+        # Q (warp per output, weight reused across all Rv rows)
+        n=wid
+        while n<QWv:
+            acc=cute.make_fragment(Rv,F32)
+            for m in cutlass.range_constexpr(Rv): acc[m]=F32(0.0)
+            k=lane
+            while k<hidv:
+                w=gWqv[L,n,k].to(F32)
+                for m in cutlass.range_constexpr(Rv): acc[m]=acc[m]+gHNv[m,k].to(F32)*w
+                k=k+32
+            for m in cutlass.range_constexpr(Rv):
+                a=wreduce(acc[m])
+                if lane==0: gQv[m,n]=a.to(gQv.element_type)
+            n=n+NW
+        # K,V (warp per output, weight reused)
+        n=wid
+        while n<KWv:
+            ak=cute.make_fragment(Rv,F32); av=cute.make_fragment(Rv,F32)
+            for m in cutlass.range_constexpr(Rv): ak[m]=F32(0.0); av[m]=F32(0.0)
+            k=lane
+            while k<hidv:
+                wk=gWkv[L,n,k].to(F32); wv=gWvv[L,n,k].to(F32)
+                for m in cutlass.range_constexpr(Rv):
+                    y=gHNv[m,k].to(F32); ak[m]=ak[m]+y*wk; av[m]=av[m]+y*wv
+                k=k+32
+            for m in cutlass.range_constexpr(Rv):
+                a=wreduce(ak[m]); b=wreduce(av[m])
+                if lane==0: gKv[m,n]=a.to(gKv.element_type); gVv[m,n]=b.to(gVv.element_type)
+            n=n+NW
         ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
         idx=gtid
         while idx < Rv*Hv:
@@ -299,37 +312,60 @@ def cycle_k(
             for d in cutlass.range_constexpr(Dv): gAv[m,h*Dv+d]=(ac[d]/rsum).to(gAv.element_type)
             idx=idx+GT
         ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
-        idx=gtid
-        while idx < Rv*hidv:
-            m=idx//hidv; n=idx%hidv
-            acc=ghv[m,n].to(F32)
-            for j in cutlass.range(QWv):
-                acc=acc+gAv[m,j].to(F32)*gWov[L,n,j].to(F32)
-            gRv[m,n]=acc.to(gRv.element_type)
-            idx=idx+GT
+        # O + residual (warp per output, weight reused; reads gAv directly)
+        n=wid
+        while n<hidv:
+            acc=cute.make_fragment(Rv,F32)
+            for m in cutlass.range_constexpr(Rv): acc[m]=F32(0.0)
+            k=lane
+            while k<QWv:
+                w=gWov[L,n,k].to(F32)
+                for m in cutlass.range_constexpr(Rv): acc[m]=acc[m]+gAv[m,k].to(F32)*w
+                k=k+32
+            for m in cutlass.range_constexpr(Rv):
+                a=wreduce(acc[m])
+                if lane==0: gRv[m,n]=(ghv[m,n].to(F32)+a).to(gRv.element_type)
+            n=n+NW
         ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
-        idx=gtid
-        while idx < Rv*Iv:
-            m=idx//Iv; n=idx%Iv
-            ss=F32(0.0)
-            for k in cutlass.range(hidv):
-                xv=gRv[m,k].to(BF).to(F32); ss=ss+xv*xv
-            inv=cute.rsqrt(ss/F32(hidv)+F32(epsv))
-            g=F32(0.0); u=F32(0.0)
-            for k in cutlass.range(hidv):
-                yn=gRv[m,k].to(BF).to(F32)*inv*gg2v[L,k].to(F32)
-                g=g+yn*gWgv[L,n,k].to(F32); u=u+yn*gWuv[L,n,k].to(F32)
-            gActv[m,n]=(g/(F32(1.0)+cute.exp(-g))*u).to(gActv.element_type)
-            idx=idx+GT
+        # norm-once of res1: gHNv[m,k]=rmsnorm(gRv[m])[k]*g2[k]
+        r=wid
+        while r<Rv:
+            ss=F32(0.0); k=lane
+            while k<hidv: x=gRv[r,k].to(BF).to(F32); ss=ss+x*x; k=k+32
+            inv=cute.rsqrt(wreduce(ss)/F32(hidv)+F32(epsv)); k=lane
+            while k<hidv: gHNv[r,k]=(gRv[r,k].to(BF).to(F32)*inv*gg2v[L,k].to(F32)).to(gHNv.element_type); k=k+32
+            r=r+NW
         ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
-        idx=gtid
-        while idx < Rv*hidv:
-            m=idx//hidv; n=idx%hidv
-            acc=gRv[m,n].to(F32)
-            for j in cutlass.range(Iv):
-                acc=acc+gActv[m,j].to(F32)*gWdv[L,n,j].to(F32)
-            ghv[m,n]=acc.to(ghv.element_type)
-            idx=idx+GT
+        # gate/up + silu (warp per output, weights reused)
+        n=wid
+        while n<Iv:
+            gg=cute.make_fragment(Rv,F32); uu=cute.make_fragment(Rv,F32)
+            for m in cutlass.range_constexpr(Rv): gg[m]=F32(0.0); uu[m]=F32(0.0)
+            k=lane
+            while k<hidv:
+                wg=gWgv[L,n,k].to(F32); wu=gWuv[L,n,k].to(F32)
+                for m in cutlass.range_constexpr(Rv):
+                    y=gHNv[m,k].to(F32); gg[m]=gg[m]+y*wg; uu[m]=uu[m]+y*wu
+                k=k+32
+            for m in cutlass.range_constexpr(Rv):
+                g=wreduce(gg[m]); u=wreduce(uu[m])
+                if lane==0: gActv[m,n]=(g/(F32(1.0)+cute.exp(-g))*u).to(gActv.element_type)
+            n=n+NW
+        ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
+        # down + residual (warp per output, weight reused; reads gActv directly)
+        n=wid
+        while n<hidv:
+            acc=cute.make_fragment(Rv,F32)
+            for m in cutlass.range_constexpr(Rv): acc[m]=F32(0.0)
+            k=lane
+            while k<Iv:
+                w=gWdv[L,n,k].to(F32)
+                for m in cutlass.range_constexpr(Rv): acc[m]=acc[m]+gActv[m,k].to(F32)*w
+                k=k+32
+            for m in cutlass.range_constexpr(Rv):
+                a=wreduce(acc[m])
+                if lane==0: ghv[m,n]=(gRv[m,n].to(F32)+a).to(ghv.element_type)
+            n=n+NW
         ls=I32(1)-ls; gbar(arr,sen,ls,B,tx)
 
     # =================== PHASE C: TARGET logprob (drafted positions) + store last logits ===================
@@ -443,7 +479,7 @@ def cycle(gTokd,gVtok,gPred,gUg,gDlp,gTlp,gW,gAnc,gBonus,gUr,gUb,garr,gsen,
     gEmbd,gWqd,gWkd,gWvd,gWod,gg1d,gg2d,gWgd,gWud,gWdd,gcosd,gsind,gnormd,gLMd,
     ghd,gKcd,gVcd,gQd,gAd,gRd,gActd,gHNd,gLogd,gWBV,gWBI,gRed,
     gEmbv,gWqv,gWkv,gWvv,gWov,gg1v,gg2v,gWgv,gWuv,gWdv,gcosv,gsinv,gnormv,gLMv,
-    ghv,gQv,gKv,gVv,gAv,gRv,gActv,gVlog,gVLast,
+    ghv,gHNv,gQv,gKv,gVv,gAv,gRv,gActv,gVlog,gVLast,
     N:cutlass.Constexpr,SP:cutlass.Constexpr,NGEN:cutlass.Constexpr,Sv:cutlass.Constexpr,
     NLd:cutlass.Constexpr,Hd:cutlass.Constexpr,Hkvd:cutlass.Constexpr,Dd:cutlass.Constexpr,hidd:cutlass.Constexpr,
     Id:cutlass.Constexpr,GRPd:cutlass.Constexpr,DHd:cutlass.Constexpr,Vd:cutlass.Constexpr,epsd:cutlass.Constexpr,scaled:cutlass.Constexpr,
@@ -454,7 +490,7 @@ def cycle(gTokd,gVtok,gPred,gUg,gDlp,gTlp,gW,gAnc,gBonus,gUr,gUb,garr,gsen,
         gEmbd,gWqd,gWkd,gWvd,gWod,gg1d,gg2d,gWgd,gWud,gWdd,gcosd,gsind,gnormd,gLMd,
         ghd,gKcd,gVcd,gQd,gAd,gRd,gActd,gHNd,gLogd,gWBV,gWBI,gRed,
         gEmbv,gWqv,gWkv,gWvv,gWov,gg1v,gg2v,gWgv,gWuv,gWdv,gcosv,gsinv,gnormv,gLMv,
-        ghv,gQv,gKv,gVv,gAv,gRv,gActv,gVlog,gVLast,
+        ghv,gHNv,gQv,gKv,gVv,gAv,gRv,gActv,gVlog,gVLast,
         N,SP,NGEN,Sv,NLd,Hd,Hkvd,Dd,hidd,Id,GRPd,DHd,Vd,epsd,scaled,
         NLv,Hv,Hkvv,Dv,hidv,Iv,GRPv,DHv,Vv,epsv,scalev,
         invT,alpha,B,BLK,B*BLK//32).launch(grid=[B,1,1],block=[BLK,1,1],smem=hidv*4+256)
@@ -511,7 +547,8 @@ Qd=mk.f32(Np,Hd*Dd); Ad=mk.f32(Np,Hd*Dd); Rd=mk.f32(Np,hidd); Actd=mk.f32(Np,Id)
 NWv=B*BLK//32; WBV=mk.f32(NWv,1).reshape(NWv).contiguous(); WBI=torch.zeros(NWv,device='cuda',dtype=torch.int32); Red=mk.f32(4,1).reshape(4).contiguous()
 # verify scratch
 Rrows=Np*Sv
-ghv=mk.f32(Rrows,hidv).to(torch.bfloat16); Qv=mk.f32(Rrows,Hv*Dv); Kv=mk.f32(Rrows,Hkvv*Dv); Vvt=mk.f32(Rrows,Hkvv*Dv)
+ghv=mk.f32(Rrows,hidv).to(torch.bfloat16); HNv=mk.f32(Rrows,hidv).to(torch.bfloat16)
+Qv=mk.f32(Rrows,Hv*Dv); Kv=mk.f32(Rrows,Hkvv*Dv); Vvt=mk.f32(Rrows,Hkvv*Dv)
 Avt=mk.f32(Rrows,Hv*Dv); Rv=mk.f32(Rrows,hidv); Actv=mk.f32(Rrows,Iv)
 Vlog=mk.f32(Vvoc,1).reshape(Vvoc).contiguous(); VLast=mk.f32(Np,Vvoc)
 arr=torch.zeros(1,device="cuda",dtype=torch.int32); sen=torch.zeros(1,device="cuda",dtype=torch.int32)
@@ -522,7 +559,7 @@ args=[Tokd,Vtok,Pred,Ug,Dlp,Tlp,Wt,Anc,Bonus,Ur,Ub,arr,sen,
       Embd,WqdA,WkdA,WvdA,WodA,g1dA,g2dA,WgdA,WudA,WddA,cosd,sind,normd,LMd,
       ghd,Kcd,Vcd,Qd,Ad,Rd,Actd,HNd,Logd,WBV,WBI,Red,
       Embv,WqvA,WkvA,WvvA,WovA,g1vA,g2vA,WgvA,WuvA,WdvA,cosv,sinv,normv,LMv,
-      ghv,Qv,Kv,Vvt,Avt,Rv,Actv,Vlog,VLast]
+      ghv,HNv,Qv,Kv,Vvt,Avt,Rv,Actv,Vlog,VLast]
 mt=[from_dlpack(x) for x in args]
 cc=(Np,SP,NGEN,Sv,NLd,Hd,Hkvd,Dd,hidd,Id,GRPd,DHd,Vd,epsd,scaled,
     NLv,Hv,Hkvv,Dv,hidv,Iv,GRPv,DHv,Vvoc,epsv,scalev,1.0/T,alpha,B,BLK)
