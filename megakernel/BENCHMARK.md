@@ -57,19 +57,32 @@ tensor-core (tcgen05/WGMMA) GEMMs inside the persistent kernel. That is the rema
 it is exactly the rung the fusion ladder was built for: once the in-kernel compute is competitive, the 65%
 bubble the megakernel removes becomes the decisive margin.
 
-## Isolating the fusion benefit (apples-to-apples)
+## Isolating the fusion benefit (measured — `benchmarks/bench_fusion.py`)
 
-Absolute "megakernel vs production" conflates two things: kernel quality (tensor vs CUDA cores) and fusion
-(one launch vs many). To measure **just the fusion** — the megakernel's actual contribution — compare the same
-kernels run two ways:
+Absolute "megakernel vs production" conflates kernel quality (tensor vs CUDA cores) with fusion (one launch vs
+many). To isolate **just the fusion**, measure the orchestration unit on this B200:
 
-- **one launch** (the fused `m7b_full_cycle`), vs
-- **multi-launch**: the same draft / verify / resample kernels launched separately with a host sync and an
-  activation/KV re-read between each.
+| quantity | measured |
+|---|---|
+| per kernel-launch dispatch (no sync) | ~3.9 µs |
+| per op-boundary (launch + host sync) | ~8.5 µs |
 
-`T_multi − T_fused` = launch overhead + grid teardown + host orchestration + boundary HBM round-trips removed.
-At bs=1 this gap grows as the kernels approach roofline (the fraction that is overhead rises) — which is why
-the production stack, whose kernels are near-roofline, is 65% bubble and stands to gain the most from fusion.
+**Honest decomposition (this corrects a tempting overclaim):** launch+sync is *small*. Even a cycle with ~50 op
+boundaries is ~0.4 ms of pure launch/sync — that **does not** explain the measured 65% bubble (~6.7 ms of a
+10.75 ms cycle). The bubble is mostly **deeper** than launch overhead:
+
+- **(a)** small-batch kernel inefficiency — the per-op GEMMs run far below peak at bs=1 (the tensor-core sweep
+  above: only 0.6 TB/s at M=64);
+- **(b)** sequential dependency stalls between the γ+2 forwards;
+- **(c)** activation/KV round-trips to HBM at each op boundary;
+- **(d)** **no overlap** of op N+1's weight-load with op N's compute — each separate kernel/graph node starts cold.
+
+**What the megakernel uniquely removes:** the launch/sync (small), *and* — the thing a CUDA graph fundamentally
+cannot express — **software-pipelining across ops**: prefetch op N+1's weights while op N computes. Since the
+bs=1 cycle is *weight-read-bound*, that cross-op overlap is the **decisive** lever. The current prototype runs
+ops sequentially with grid barriers (no pipelining yet), so it has proven the fusion *structurally* (one correct
+launch, zero host bubble) but has **not yet realized the overlap** — that is the next real perf work, and it is
+the one lever unavailable to the graph baseline.
 
 ## Integration into the worker (for the real A/B)
 
@@ -132,5 +145,11 @@ tensor-core upside without the TMA/tcgen05 rewrite.
   estimator equivalence.
 - The megakernel **already does the whole cycle in one correct launch** and is **10.3× faster than its own
   naive version** (1733 → 165 ms).
-- It is **not yet faster than production** (CUDA-core vs tensor-core GEMMs); the remaining lever is tensor-core
-  in-kernel GEMMs, after which the fusion's bubble-elimination is the win.
+- It is **not yet faster than production** in absolute terms. Two measured findings reshape the perf strategy:
+  1. **Tensor cores are not the bs=1 lever** — at M≈40 the verify is weight-read-bound and even the validated
+     tensor-core ref only hits 0.6 TB/s (small-batch occupancy ceiling). ~5× bandwidth at best, still loses to
+     production. Tensor cores belong to the larger-N / batched / disaggregated regime.
+  2. **The 65% bubble is mostly NOT launch overhead** (~8.5 µs/boundary, small). It is small-batch inefficiency +
+     dependency stalls + no cross-op weight-load/compute overlap. The megakernel's decisive, graph-impossible
+     lever is **software-pipelining op N+1's weight-load under op N's compute** — proven *possible* by the fusion,
+     not yet *realized* in the prototype. That is the next real perf work.
