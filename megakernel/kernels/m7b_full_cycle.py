@@ -647,6 +647,22 @@ print(f"[weights]  mine={[round(x,3) for x in Wt.tolist()]}  ref={[round(x,3) fo
 print(f"[resample] ancestors mine={Anc.tolist()}  ref={anc_ref.tolist()}  match={anc_ok}")
 print(f"[bonus]    mine={Bonus.tolist()}  ref={bonus_ref.tolist()}  match={bonus_ok}  -> {[tok.decode([b]) for b in Bonus.tolist()]}")
 print(f"[ONE LAUNCH] full N={Np} SMC cycle (draft 1B + verify 8B + reweight + resample + bonus) = {dt*1000:.0f} ms")
+# ---- bs=1 TPS: a cycle advances the sequence by gamma+1 tokens (all gamma drafted accepted + 1 bonus) ----
+TOK_PER_CYCLE=NGEN+1
+mega_tps=TOK_PER_CYCLE/dt
+# this prototype's draft does SP prompt-prefill + NGEN gen steps; a production cycle drafts only the gamma
+# decode steps over an existing KV cache, so estimate a decode-only cycle (draft work scaled NGEN/(SP+NGEN-1)).
+draft_frac=0.32   # measured share of the cycle that is the draft phase (rest = verify+reductions)
+decode_only_dt=dt*((1-draft_frac)+draft_frac*NGEN/(SP+NGEN-1))
+mega_tps_decode=TOK_PER_CYCLE/decode_only_dt
+PROD_TPS=465.0    # measured production cycle-graph baseline, same config (bs=1, N=4, gamma=4, 8B+1B; roofline run)
+print(f"\n================ bs=1 THROUGHPUT (tokens/sec) ================")
+print(f"  WITHOUT megakernel (production sglang cycle-graph): {PROD_TPS:.0f} tok/s   (~10.75 ms/cycle)")
+print(f"  WITH megakernel (this prototype, as-measured):      {mega_tps:.0f} tok/s   ({dt*1000:.0f} ms/cycle, incl. prompt prefill)")
+print(f"  WITH megakernel (decode-only-adjusted):             {mega_tps_decode:.0f} tok/s   ({decode_only_dt*1000:.0f} ms/cycle)")
+print(f"  -> megakernel is ~{PROD_TPS/mega_tps_decode:.0f}x SLOWER at bs=1 (CUDA-core warp-GEMV at its ~0.18 TB/s")
+print(f"     ceiling vs production tensor-core kernels; the megakernel's value is the fusion, not bs=1 wall-clock).")
+print(f"==============================================================")
 # The SMC DECISIONS (ancestors, bonus) must match the eager path EXACTLY. The weights match only to the
 # bf16-forward logprob floor (~1e-2 through softmax): the kernel reweights from ITS OWN bf16 logprobs while
 # the reference uses HF's — the resample ARITHMETIC on identical logprobs is exact (m7b3 = 5e-7).

@@ -123,6 +123,37 @@ the one lever unavailable to the graph baseline.
 5. Run the existing equivalence + GSM8K harness with the flag on/off (accuracy-neutral check) and the latency
    harness above (per-cycle latency, sweep N and γ).
 
+## bs=1 throughput: WITH vs WITHOUT the megakernel (the headline number)
+
+Measured on B200, same config (bs=1, N=4 particles, γ=4, draft Llama-3.2-1B + target Llama-3.1-8B). A cycle
+advances the sequence by γ+1 = 5 tokens (SMC accepts all γ drafted + 1 bonus), so TPS = 5 / cycle-latency.
+
+| | cycle latency | **bs=1 TPS** |
+|---|---|---|
+| **WITHOUT megakernel** (production sglang cycle-graph) | ~10.75 ms | **~465 tok/s** |
+| **WITH megakernel** (this prototype, as-measured) | 128 ms | **~39 tok/s** |
+| WITH megakernel (decode-only-adjusted¹) | ~105 ms | ~48 tok/s |
+
+**The megakernel is ~10× SLOWER at bs=1.** This is expected and consistent with everything measured here: the
+in-kernel GEMVs are hand-written **CUDA-core** kernels at their ~0.18 TB/s warp-GEMV ceiling, while production
+uses **tensor-core** kernels (cuBLAS/FlashInfer). The megakernel's contribution is **not** bs=1 wall-clock — it
+is the *fusion* (first correct single-launch realization of the whole multi-model SMC cycle; 13.5× over its own
+naive version; zero host-orchestration bubble). Beating production in TPS would require tensor-core in-kernel
+GEMMs, which (per the sweep below) are themselves small-batch-bounded at bs=1 and properly belong to the
+batched/disaggregated regime.
+
+¹ This prototype's draft does SP prompt-prefill + γ gen steps; a production cycle drafts only the γ decode
+steps over an existing KV cache. The decode-only-adjusted row scales the draft phase accordingly. The production
+465 tok/s is the measured cycle-graph baseline from the roofline run on this exact config.
+
+> **Integration status:** the whole SMC cycle is already a *single callable kernel* (`m7b_full_cycle.py`,
+> validated estimator-exact). Wiring it behind `SMC_FULL_MEGAKERNEL=1` in the production sglang worker
+> (`smcsd/core/worker.py`) requires adapting it to sglang's **paged KV cache + model format** and to
+> **decode-over-existing-cache** (γ steps, not prompt prefill), plus the graph-safe Philox RNG and zeroing the
+> barrier tensors per launch — a substantial separate effort (the prototype uses HF models, its own stacked
+> weight + contiguous KV layouts, and teacher-forcing). Given the megakernel is ~10× slower at bs=1, that
+> integration is not the high-value next step until the in-kernel GEMMs are competitive.
+
 ## Do tensor-core GEMMs make it beat production? (measured — important)
 
 Before investing in the large tensor-core (tcgen05/TMA) integration, I measured the **validated** Ampere
