@@ -4,8 +4,12 @@
 tokens flowing draft→verify in-graph. M7a DONE — in-kernel verify lm_head + tempered logprob. M7b DONE — the
 full N-particle SMC cycle (batched draft / per-particle masked verify / reweight / systematic resample / bonus)
 is FUSED into ONE persistent kernel launch (`m7b_full_cycle.py`), validated vs eager torch SMC (draft 16/16,
-ancestors+bonus EXACT, weights within bf16 floor). ONE LAUNCH = the whole worker cycle. Remaining = perf
-(smem-stage the verify GEMVs) + worker integration + the paper measurement.**
+ancestors+bonus EXACT, weights within bf16 floor). PERF: optimized draft+verify GEMVs (warp-per-output +
+norm-once + weight-reuse-across-particle-rows) → **1733 → 165 ms/cycle (10.3×)**, still exact. Benchmark
+methodology + honest status in `BENCHMARK.md`: the megakernel is ~16× slower than the ~10 ms production cycle
+in ABSOLUTE terms because it uses CUDA-core (not tensor-core) GEMMs — the fusion is proven+correct; the lever
+to actually BEAT production is tensor-core in-kernel GEMMs. Remaining = tensor-core GEMMs + worker integration
++ the paper A/B.**
 
 > **M7b update (2026-06-28): the full N-particle SMC cycle works (validated end-to-end vs eager torch SMC).**
 > Built and validated as separate stages (the methodology), each on B200:

@@ -609,8 +609,13 @@ cc=(Np,SP,NGEN,Sv,NLd,Hd,Hkvd,Dd,hidd,Id,GRPd,DHd,Vd,epsd,scaled,
     NLv,Hv,Hkvv,Dv,hidv,Iv,GRPv,DHv,Vvoc,epsv,scalev,1.0/T,alpha,B,BLK)
 print("compiling FULL fused cycle kernel (large; be patient) ...")
 comp=cute.compile(cycle,*mt,*cc)
-arr.zero_(); sen.zero_()
-t0=time.time(); comp(*mt); torch.cuda.synchronize(); dt=time.time()-t0
+def runk(): arr.zero_(); sen.zero_(); comp(*mt)        # MUST zero barrier tensors each launch (sense persists)
+runk(); torch.cuda.synchronize()
+for _ in range(2): runk()
+torch.cuda.synchronize(); _e0=torch.cuda.Event(True); _e1=torch.cuda.Event(True); _e0.record()
+NIT=5
+for _ in range(NIT): runk()
+_e1.record(); torch.cuda.synchronize(); dt=_e0.elapsed_time(_e1)/NIT/1000.0
 
 # ===== eager torch SMC reference =====
 with torch.no_grad():
