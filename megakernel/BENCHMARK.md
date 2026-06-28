@@ -86,6 +86,46 @@ the production stack, whose kernels are near-roofline, is 65% bubble and stands 
 5. Run the existing equivalence + GSM8K harness with the flag on/off (accuracy-neutral check) and the latency
    harness above (per-cycle latency, sweep N and γ).
 
+## Do tensor-core GEMMs make it beat production? (measured — important)
+
+Before investing in the large tensor-core (tcgen05/TMA) integration, I measured the **validated** Ampere
+tensor-core GEMM reference (`ampere/tensorop_gemm.py`) at the verify's exact shapes and swept M (= N·Sv, the
+particle-row batch), N=K=4096:
+
+| M | time | TFLOP/s | weight-read BW |
+|---|---|---|---|
+| **64** (≈ our N=4,γ=4) | 55.8 µs | 39 | **0.60 TB/s** |
+| 128 | 56.2 µs | 76 | 0.60 TB/s |
+| 256 | 56.6 µs | 152 | 0.59 TB/s |
+| 512 | 57.2 µs | 300 | 0.59 TB/s |
+| 1024 | 102 µs | 335 | 0.33 TB/s |
+| 4096 | 331 µs | 416 | — |
+
+**Reading:** from M=64 to M=512 the GEMM takes the *same* ~56 µs — it is **weight-read-bound**, and even the
+tensor-core kernel only hits **0.6 TB/s (7.5% of the 8 TB/s HBM peak)** at small M, because there aren't enough
+tiles to fill 148 SMs. **Conclusion: at bs=1 / N=4 the verify's M≈40 is small-batch, weight-bandwidth-bound —
+the tensor cores' compute is already hidden under the weight read.** Tensor cores would buy a *bandwidth* win
+(better TMA/vectorized weight loads → my 0.12 TB/s up toward ~0.6 TB/s, ≈ 5× → verify ~20 ms), **not** the 50×
+compute win one might expect — and that ~0.6 TB/s itself is an occupancy ceiling intrinsic to small M. Even at
+that ceiling, verify ≈ 20 ms + draft (M=4, even more bandwidth-starved) ⇒ a full-tensor-core cycle would land
+**~40–60 ms — still ~4–6× the ~10 ms production cycle.** Production wins at bs=1 not by bigger GEMMs but by a
+deeply tuned small-batch path (FlashInfer/cuBLAS).
+
+**Therefore:** the large tensor-core/TMA megakernel integration (flagged in the notes as "the riskiest part, a
+large separate effort") is **high-effort, bounded-reward (~3× cycle), and still does not beat production at
+bs=1/N=4** — because that regime is fundamentally small-batch memory-bound for *everyone*. The honest, defensible
+contributions of this megakernel are therefore:
+1. **It exists and is correct** — first single-launch realization of the whole multi-model SMC cycle.
+2. **The fusion benefit** — closing the ~65% orchestration bubble (one-launch vs multi-launch, above), which is
+   independent of GEMM throughput and is the paper's actual thesis.
+3. Tensor cores pay off in the **larger-N / batched regime** (M grows → the table's right side, 300–416 TFLOP/s)
+   — exactly where the paper already plans to *disaggregate*. So tensor-core GEMMs belong with the
+   batched/disaggregated story, not the bs=1 single-kernel latency story.
+
+Cheaper partial lever if pursuing bs=1 perf anyway: **128-bit vectorized weight loads + higher occupancy** in
+the existing CUDA-core verify (chase the 0.12 → 0.6 TB/s bandwidth gap directly), which captures most of the
+tensor-core upside without the TMA/tcgen05 rewrite.
+
 ## TL;DR
 
 - The benchmark = per-cycle latency at bs=1, megakernel-one-launch vs production-cycle-graph, gated on
