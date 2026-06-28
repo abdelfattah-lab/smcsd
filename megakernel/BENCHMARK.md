@@ -52,10 +52,25 @@ compute of op N — the levers a graph fundamentally cannot pull.
 **Memory-bound diagnosis (measured — `m7c_verify_opt.py <N>`):** sweeping the particle count N (= FMA work per
 weight load) the verify time is **flat** — N=1→84 ms, N=2→84 ms, N=4→108 ms (4× the FMAs, +29% time). So the
 verify is **weight-read / memory-*latency*-bound**, not compute-bound (and at 0.16 TB/s it is latency-bound, not
-bandwidth-saturated). The right lever is therefore more in-flight loads: **occupancy BLK=512 gave 1.26× (108→86 ms)**
-and software-prefetch (issue next weight under the FMAs) a further ~5% — the compiler already does shallow
-prefetch, so the deep win needs **cp.async multi-stage buffering or 128-bit vectorized weight loads** (bigger
-transactions toward bandwidth), the substantial next step. BLK=1024 spills (243 ms).
+bandwidth-saturated). The right lever is more in-flight loads. **Full lever sweep on the standalone verify (all kept top1 100%):**
+
+| lever | verify time | verdict |
+|---|---|---|
+| baseline (warp-GEMV + norm-once + weight-reuse) | 108 ms | — |
+| **occupancy BLK=512** | **86 ms** | **the win (1.26×)** — more warps hide load latency |
+| + register software-prefetch | 82 ms | marginal (~5%; compiler already does shallow prefetch) |
+| + 128-bit vectorized weight loads | 165 ms | **dead-end** — its `gHN` input read goes uncoalesced (also confirms M5c) |
+| + cp.async double-buffer (gate/up) | 81 ms | **no gain** — smem round-trip cancels the async benefit |
+| BLK=1024 | 243 ms | spills |
+
+**Plateau finding:** the warp-per-output GEMV tops out at **~0.18 TB/s** for this small-M (R≈40) shape, and
+none of the standard latency-hiding levers (occupancy past 512, register prefetch, 128-bit vectorization,
+cp.async multi-stage) break past it — they're all limited by the same small-grid occupancy. The only structure
+that reaches higher (the reference tensor-core GEMM, 0.6 TB/s) uses the full **tiled-GEMM + TMA** reorganization
+(large tiles, warp-specialized producer/consumer) — which is the tensor-core path, itself capped at 0.6 TB/s at
+small M. **So the warp-GEMV approach is at its ceiling; the remaining headroom (~0.18→0.6 TB/s, ~3×) requires
+the full tiled-GEMM/TMA rewrite, and even that is bounded by the bs=1 small-batch regime.** Banked the occupancy
+win: full cycle **165 → 128 ms (13.5× vs naive)**.
 
 **Honest status:** the megakernel is **~16× slower than production in absolute terms today.** That is NOT a
 fusion problem — it is a *kernel-quality* problem: the in-kernel GEMVs are hand-written **CUDA-core** kernels
