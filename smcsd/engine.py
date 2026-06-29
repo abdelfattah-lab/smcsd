@@ -68,6 +68,7 @@ class SMCEngine:
         draft_temperature: float = 0.7,
         target_temperature: float = 1.0,
         power_alpha: float = 1.0,
+        alpha_ramp_tokens: int = 0,
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
         # Hardware
@@ -126,6 +127,15 @@ class SMCEngine:
         if power_alpha <= 0:
             raise ValueError("power_alpha must be > 0.")
         server_args.smc_power_alpha = float(power_alpha)
+        # Exponent-bridging (alpha-ramp) horizon (Power-SMC paper Sec. 5.3 / App.
+        # B); the schedule is always the paper's linear ramp. Same dynamic-attr
+        # mechanism as smc_power_alpha. T_ramp=0 disables the ramp (fixed alpha).
+        # Carried into the scheduler subprocess via the ServerArgs instance
+        # __dict__; SMCWorker reads it via getattr with a ramp-off default so
+        # non-SMCEngine launches are unaffected.
+        if alpha_ramp_tokens < 0:
+            raise ValueError("alpha_ramp_tokens must be >= 0 (0 disables the ramp).")
+        server_args.smc_alpha_ramp_tokens = int(alpha_ramp_tokens)
         # SMCEngine consumes SMCParticleOutput itself (both scheduler sockets
         # point back at this process), so opt in to the scheduler's particle
         # collection emission.  HTTP launches never set this: there the same

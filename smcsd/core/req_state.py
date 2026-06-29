@@ -643,6 +643,10 @@ class ScheduleBatchSMC:
             new_seq_lens=orig_seq_lens + self.gamma_plus_1,
             gamma=self.gamma_plus_1 - 1,
             cache_locs=pages.view(bs, self.gamma_plus_1),
+            # Per-row generated count BEFORE this block (the ramp's t). Snapshot
+            # now: token_counts is advanced later by write_back_gpu. The worker
+            # derives the exponent-bridging alpha(t) from this.
+            gen_lens=self.token_counts[active].clone(),
         )
         return SMCDraftInput(
             verified_id=verified_g,

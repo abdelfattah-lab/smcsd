@@ -103,6 +103,34 @@ class SMCWorker(BaseSpecWorker):
         # ServerArgs instance (keeps the vendored class unmodified); defaults
         # to 1.0 (plain p) for launches that don't go through SMCEngine.
         self.smc_power_alpha = float(getattr(server_args, "smc_power_alpha", 1.0))
+        # Exponent-bridging (alpha-ramp) config: the effective exponent rises
+        # from 1.0 to smc_power_alpha over the first smc_alpha_ramp_tokens
+        # generated tokens, then holds (Power-SMC paper Sec. 5.3 / App. B).
+        # 0 disables the ramp (fixed alpha). See _ramped_alpha().
+        self.smc_alpha_ramp_tokens = int(
+            getattr(server_args, "smc_alpha_ramp_tokens", 0)
+        )
+        if self.smc_alpha_ramp_tokens > 0:
+            # Steps 1-2 of the ramp are wired here: the per-row exponent
+            # alpha(t) flows into the proposal temperature, the per-token
+            # weight, and the bonus draw (cycle-graph path). The exact
+            # SMC-samplers boundary reweight (alpha(t)-alpha(t-1))*log p(y_{1:t})
+            # that makes the FINAL target precisely p^alpha (Step 3) is NOT in
+            # yet, so this is the *annealed-proposal* ramp: it bridges the
+            # proposal/weight exponent (the main anti-early-collapse mechanism)
+            # but the final target is approximate until the boundary term lands.
+            # Only the cycle-graph decode path implements it.
+            if not bool(int(os.environ.get("SMC_CYCLE_GRAPH", "0"))):
+                raise NotImplementedError(
+                    "alpha-ramp currently requires the cycle-graph decode path "
+                    "(set SMC_CYCLE_GRAPH=1); the eager path is not wired."
+                )
+            logger.warning(
+                "[SMC] alpha-ramp ON (T_ramp=%d, linear): annealed "
+                "proposal+weight; exact boundary reweight (final-target "
+                "preservation) not yet implemented.",
+                self.smc_alpha_ramp_tokens,
+            )
         # Debug-only: dump draft KV positions / cache-loc mapping for the first
         # few decode calls to confirm the prefill→step-0 position convention
         # before the deferred-bonus rework.  No behavior change when unset.
@@ -547,29 +575,40 @@ class SMCWorker(BaseSpecWorker):
     def _forward_extend(self, batch: ModelWorkerBatch):
         bs = len(batch.seq_lens)
 
-        # Dense AR draft + target prefill.
-        # Score model prefill
+        # Score model prefill — authoritative prompt KV + score state.
         score_result = self._target_worker.forward_batch_generation(batch)
 
-        # Draft model prefill.  Run for its side effect — populating the draft
-        # model's prompt KV, which the first decode step reads — but DISCARD its
-        # sampled token: x0 must come from the target, not the draft (see below).
+        # Draft model prefill — populate the draft's prompt KV; token discarded.
         draft_batch = self._make_clean_batch(batch)
         self._draft_worker.forward_batch_generation(draft_batch)
 
-        # Sample x0 from the TARGET power distribution p_T^alpha, the same draw
-        # every later block seed (the bonus) uses.  The draft's prefill sample
-        # was previously used here, which left the first emitted token following
-        # the draft instead of the target — biased at every alpha, and the lone
-        # block seed not drawn from the target.  x0 is shared across the group's
-        # particles (prefill is bs=1 on the parent; particles are cloned after),
-        # so it is shared conditioning and carries no per-particle weight.
-        target_logits = score_result.logits_output.next_token_logits
-        assert target_logits is not None, (
-            "SMC prefill requires target next_token_logits to sample x0 from "
-            "the power distribution"
+        # x0 seed from the TARGET's real first-token distribution.
+        #
+        # The SMC target's score/extend forward does not compute
+        # next_token_logits (the logits processor gets no sample position and
+        # returns an unwritten warmup buffer), so we recover the real
+        # distribution from the prompt's hidden states: one target forward with
+        # FULL hidden capture, then the lm_head on the last prompt token's
+        # (post-final-norm) hidden state. KV writes are idempotent (same prompt
+        # -> same out_cache_loc), so the score prefill above stays authoritative.
+        # x0 is shared conditioning across the group's particles and carries no
+        # per-particle weight; drawing it from the target power p_T^alpha makes
+        # the seed model-correct and draft-independent.
+        x0_batch = dataclasses.replace(
+            batch, spec_info=None, capture_hidden_mode=CaptureHiddenMode.FULL
         )
-        x0, _ = self._sample_target_power(target_logits)
+        x0_result = self._target_worker.forward_batch_generation(x0_batch)
+        hidden = x0_result.logits_output.hidden_states
+        assert hidden is not None, (
+            "FULL hidden-state capture did not populate hidden_states for x0"
+        )
+        last_idx = torch.cumsum(batch.seq_lens.to(torch.int64), dim=0) - 1
+        last_hidden = hidden[last_idx]  # last prompt token per request (post-norm)
+        lm_head = self.score_runner.model.lm_head
+        x0_logits = torch.matmul(
+            last_hidden.to(lm_head.weight.dtype), lm_head.weight.T
+        ).float()
+        x0, _ = self._sample_target_power(x0_logits)
         score_result.next_token_ids = x0
 
         # x0 KV is NOT written during prefill — first decode writes it.
@@ -615,6 +654,29 @@ class SMCWorker(BaseSpecWorker):
         chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
         lp = chosen - torch.logsumexp(scaled, dim=-1)
         return idx, lp
+
+    def _ramped_alpha(self, gen_lens):
+        """Per-row effective exponent under the exponent-bridging schedule.
+
+        ``gen_lens`` is a tensor of per-row generated-token counts (the prefix
+        length already committed for each particle). With ramp horizon
+        ``T = smc_alpha_ramp_tokens`` and final exponent ``a = smc_power_alpha``
+        the linear schedule (Power-SMC paper App. B) is::
+
+            alpha(t) = 1 + (a - 1) * min(t, T) / T      (T > 0)
+            alpha(t) = a                                (T == 0, ramp off)
+
+        Returns a float tensor shaped like ``gen_lens``. The caller uses
+        ``alpha(t)`` for the proposal temperature (T_target / alpha(t)), the
+        per-token weight, and the bonus draw; consecutive-step differences
+        ``alpha(t) - alpha(t-1)`` drive the SMC-samplers boundary reweight.
+        """
+        a = self.smc_power_alpha
+        T = self.smc_alpha_ramp_tokens
+        if T <= 0:
+            return torch.full_like(gen_lens, a, dtype=torch.float64)
+        frac = (gen_lens.to(torch.float64) / T).clamp_(max=1.0)
+        return 1.0 + (a - 1.0) * frac
 
     def _sample_target_power(self, logits):
         """Gumbel-max draw from the tempered-power target
@@ -790,6 +852,19 @@ class SMCWorker(BaseSpecWorker):
         replay_kwargs = {}
         if getattr(self.cycle_graph_runner, "deferred", False):
             replay_kwargs["prev_last_draft_id"] = draft_input.prev_last_draft_id
+        # Exponent-bridging: per-row alpha(t) + matching proposal temperature.
+        # Only sent when the ramp is on; otherwise the graph keeps its buffers at
+        # the baked (power_alpha, draft_temperature) constants, so the fixed-alpha
+        # path is byte-identical. temp(t) = draft_temp * power_alpha / alpha(t)
+        # makes ramp-off exact for any configured --draft-temperature and flattens
+        # the proposal early (alpha(t)->1) as the schedule intends.
+        if self.smc_alpha_ramp_tokens > 0 and ctx.gen_lens is not None:
+            alpha_vec = self._ramped_alpha(ctx.gen_lens)
+            draft_temp_vec = self.smc_draft_temperature * (
+                self.smc_power_alpha / alpha_vec
+            )
+            replay_kwargs["alpha_vec"] = alpha_vec.to(torch.float32)
+            replay_kwargs["draft_temp_vec"] = draft_temp_vec.to(torch.float32)
         (
             tokens_out,
             _draft_logprobs,
