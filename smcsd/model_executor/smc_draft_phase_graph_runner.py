@@ -258,23 +258,13 @@ class SMCDraftPhaseGraphRunner:
         tokens_out = self.tokens_out[:bs]
         logprobs_out = self.logprobs_out[:bs]
         tiny = torch.finfo(torch.float32).tiny
-        # Per-row proposal temperature for exponent-bridging. Only the cycle
-        # runner allocates draft_temp_buf; the standalone draft-phase runner has
-        # no exponent and falls back to the scalar self.temperature. Constant ==
-        # self.temperature when the ramp is off, so identical then.
-        draft_temp_buf = getattr(self, "draft_temp_buf", None)
-        draft_temp = (
-            draft_temp_buf[:bs].unsqueeze(1)
-            if draft_temp_buf is not None
-            else self.temperature
-        )
         for s in range(self.num_steps):
             fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
             # `forward` is the (patched) model.forward — returns a
             # LogitsProcessorOutput directly.
             logits = forward(input_ids, positions, fb).next_token_logits
-            scaled = logits / draft_temp
+            scaled = logits / self.temperature
             gumbel = -torch.log(
                 -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
             )
@@ -418,18 +408,6 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self.next_tokens_out = torch.zeros(
                 (self.max_bs, self.num_steps), dtype=torch.int64
             )
-            # Exponent-bridging (alpha-ramp) per-row buffers, READ INSIDE the
-            # captured graph (draft proposal temperature, verify weight, bonus
-            # draw). Initialised to the baked (alpha, draft temperature); the
-            # worker overwrites [:bs] before replay ONLY when the ramp is on, so
-            # with the ramp off the buffers stay constant and the capture is
-            # byte-identical to the fixed-alpha path. See SMCWorker._ramped_alpha.
-            self.alpha_buf = torch.full(
-                (self.max_bs,), self.alpha, dtype=torch.float32
-            )
-            self.draft_temp_buf = torch.full(
-                (self.max_bs,), self.temperature, dtype=torch.float32
-            )
         self.verify_fbs = {}
 
     def _setup_verify_capture(self, bs: int):
@@ -503,22 +481,16 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         logits3 = logits.view(bs, self.num_steps, -1)
 
         # Fused score logprobs under the tempered target p_T.
-        # Per-row exponent alpha(t) (exponent-bridging). Held in alpha_buf,
-        # which the worker stages before replay; constant == self.alpha when the
-        # ramp is off, so this is identical to the fixed-alpha path then.
-        alpha_col = self.alpha_buf[:bs].unsqueeze(1)  # (bs, 1)
-        alpha_row = self.alpha_buf[:bs]               # (bs,)
-
         verify_scaled = logits3[:, :gamma, :] / self.target_temperature
         chosen = verify_scaled.gather(
             2, tokens_out[:, 1 : gamma + 1].unsqueeze(2)
         ).squeeze(2)
         score_logprobs = chosen - torch.logsumexp(verify_scaled, dim=-1)
-        logprob_diff_out.copy_(alpha_col * score_logprobs - logprobs_out)
+        logprob_diff_out.copy_(self.alpha * score_logprobs - logprobs_out)
 
-        # Bonus from the same p_T^alpha(t) tempered-power target, Gumbel-max.
+        # Bonus from the same p_T^alpha tempered-power target, Gumbel-max.
         bonus_base = logits3[:, -1, :] / self.target_temperature
-        bonus_scaled = alpha_col * bonus_base
+        bonus_scaled = self.alpha * bonus_base
         bonus_gumbel = -torch.log(
             -torch.log(torch.rand_like(bonus_scaled).clamp_min_(tiny))
         )
@@ -529,7 +501,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         # alpha=1.  Accumulated in write_back_gpu, gated by the EOS/finish logic.
         bonus_logz_out.copy_(
             torch.logsumexp(bonus_scaled, dim=-1)
-            - alpha_row * torch.logsumexp(bonus_base, dim=-1)
+            - self.alpha * torch.logsumexp(bonus_base, dim=-1)
         )
 
         next_tokens_out[:, :gamma].copy_(tokens_out[:, 1 : gamma + 1])
@@ -570,31 +542,16 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
-    def _stage_alpha_ramp(self, raw_bs, alpha_vec, draft_temp_vec):
-        """Stage the per-row exponent-bridging buffers before graph replay.
-
-        No-op when the ramp is off (vectors are None): the buffers keep their
-        baked (alpha, draft temperature) constants from _init_extra_state, so
-        the captured graph reproduces the fixed-alpha path byte-for-byte.
-        """
-        if alpha_vec is not None:
-            self.alpha_buf[:raw_bs].copy_(alpha_vec)
-        if draft_temp_vec is not None:
-            self.draft_temp_buf[:raw_bs].copy_(draft_temp_vec)
-
     def replay(
         self,
         verified_id: torch.Tensor,
         cache_locs: torch.Tensor,
         ctx: SMCDecodeContext,
         req_pool_indices: torch.Tensor,
-        alpha_vec: torch.Tensor = None,
-        draft_temp_vec: torch.Tensor = None,
     ):
         raw_bs, bs = self._stage_replay_inputs(
             verified_id, cache_locs, ctx, req_pool_indices
         )
-        self._stage_alpha_ramp(raw_bs, alpha_vec, draft_temp_vec)
         # Verify-side staging: positions [S..S+gamma] and request-major
         # cache locations per row.
         n_raw_tokens = raw_bs * self.num_steps
@@ -769,11 +726,7 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         ).next_token_logits
         head_logits = logits2.view(bs, 2, -1)[:, 1, :]   # S / bonus column
 
-        # Per-row proposal temperature T_target/alpha(t) (exponent-bridging).
-        # draft_temp_buf is staged by the worker before replay; constant ==
-        # self.temperature when the ramp is off, so this is identical then.
-        draft_temp = self.draft_temp_buf[:bs].unsqueeze(1)  # (bs, 1)
-        scaled = head_logits / draft_temp
+        scaled = head_logits / self.temperature
         gumbel = -torch.log(
             -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
         )
@@ -789,7 +742,7 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
             logits = forward(input_ids, positions, fb).next_token_logits
-            scaled = logits / draft_temp
+            scaled = logits / self.temperature
             gumbel = -torch.log(
                 -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
             )
@@ -836,8 +789,6 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         ctx: SMCDecodeContext,
         req_pool_indices: torch.Tensor,
         prev_last_draft_id: torch.Tensor = None,
-        alpha_vec: torch.Tensor = None,
-        draft_temp_vec: torch.Tensor = None,
     ):
         assert prev_last_draft_id is not None, (
             "deferred cycle graph requires prev_last_draft_id "
@@ -846,7 +797,6 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         raw_bs, bs = self._stage_replay_inputs(
             verified_id, cache_locs, ctx, req_pool_indices
         )
-        self._stage_alpha_ramp(raw_bs, alpha_vec, draft_temp_vec)
         if bs != raw_bs:
             self.prev_input.zero_()
             self.head_out_cache_loc.zero_()  # pad rows scribble page 0

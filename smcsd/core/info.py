@@ -73,11 +73,6 @@ class SMCDecodeContext:
     # cache-locs table under the kv_allocated == seq invariant).  None only
     # for legacy callers of from_slot_gather, which re-read the block table.
     cache_locs: Optional[torch.Tensor] = None
-    # (bs,) per-row generated-token count BEFORE this block (= the ramp's t),
-    # snapshotted from slot_state.token_counts at prepare time. Used by the
-    # worker to compute the per-row exponent-bridging alpha(t); None when the
-    # alpha-ramp is off (fixed alpha throughout).
-    gen_lens: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_slot_gather(
