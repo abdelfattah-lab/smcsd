@@ -763,6 +763,7 @@ class ScheduleBatchSMC:
         bonus_ids: torch.Tensor,
         *,
         prev_last_draft_ids: Optional[torch.Tensor] = None,
+        bonus_logz: Optional[torch.Tensor] = None,
     ) -> None:
         """Write forward-pass results back to slot-indexed tensors.
 
@@ -810,6 +811,7 @@ class ScheduleBatchSMC:
                 log_weights=self.log_weights,
                 interval_weights=self.interval_weights,
                 gamma_plus_1=self.gamma_plus_1,
+                bonus_logz=bonus_logz,
             )
             return
 
@@ -929,6 +931,18 @@ class ScheduleBatchSMC:
         cols = torch.arange(n_weight_cols, device=self.device).unsqueeze(0)
         keep = cols <= weight_cutoff.unsqueeze(1)
         d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
+
+        # Bonus-token normalizer log Z (joint-power target; 0 at alpha=1).  The
+        # bonus is part of the sequence — and so weighted — unless the particle
+        # was already finished or terminated via EOS within the draft columns
+        # 0..gamma-1 (an EOS in the bonus column itself still emits the bonus, so
+        # first_eos == n_weight_cols does NOT drop it).  Mirrors logprob_diff's
+        # EOS-cutoff convention: length-only termination keeps the full block.
+        if bonus_logz is not None:
+            eos_in_draft = eos_cut & (first_eos < n_weight_cols)
+            add_bonus = (~prev_finished_active & ~eos_in_draft).to(torch.float64)
+            d = d + bonus_logz.to(torch.float64) * add_bonus
+
         self.log_weights[active] += d
         self.interval_weights[active] += d
 

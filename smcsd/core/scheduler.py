@@ -862,6 +862,9 @@ class SMCScheduler(Scheduler):
         prev_last_draft_ids = (
             next_draft.prev_last_draft_id if next_draft is not None else None
         )
+        # Per-particle bonus-token normalizer log Z, accumulated into the weight
+        # alongside logprob_diff (0 at power_alpha=1).
+        bonus_logz = next_draft.bonus_logz if next_draft is not None else None
 
         # GPU write-back: token scatter, finish flags, weight accumulation.
         # Sync-free — finish state lands in slot tensors, not Req objects.
@@ -870,6 +873,7 @@ class SMCScheduler(Scheduler):
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
             prev_last_draft_ids=prev_last_draft_ids,
+            bonus_logz=bonus_logz,
         )
 
         # Snapshot the per-row log Z_hat increment BEFORE the resample kernel

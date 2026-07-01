@@ -20,11 +20,15 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from smcsd.core.info import SMCDecodeContext, SMCDraftInput
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -515,20 +519,59 @@ class SMCWorker(BaseSpecWorker):
     def _forward_extend(self, batch: ModelWorkerBatch):
         bs = len(batch.seq_lens)
 
-        # Dense AR draft + target prefill.
-        # Score model prefill
+        # Score model prefill — authoritative prompt KV + score state.
         score_result = self._target_worker.forward_batch_generation(batch)
 
-        # Draft model prefill — samples the first token (x0)
+        # Draft model prefill — populate the draft's prompt KV; token discarded.
         draft_batch = self._make_clean_batch(batch)
-        draft_result = self._draft_worker.forward_batch_generation(draft_batch)
+        self._draft_worker.forward_batch_generation(draft_batch)
 
-        # Use draft model's sampled token as verified_id
-        score_result.next_token_ids = draft_result.next_token_ids
+        # x0 seed from the TARGET's real first-token distribution.
+        #
+        # The SMC target's score/extend forward does not compute
+        # next_token_logits (the logits processor gets no sample position and
+        # returns an unwritten warmup buffer), so we recover the real
+        # distribution from the prompt's hidden states: one target forward with
+        # FULL hidden capture, then the target's own LogitsProcessor on the last
+        # prompt token's (post-final-norm) hidden state. KV writes are idempotent
+        # (same prompt -> same out_cache_loc), so the score prefill above stays
+        # authoritative. x0 is shared conditioning across the group's particles
+        # and carries no per-particle weight; drawing it from the target power
+        # p_T^alpha makes the seed model-correct and draft-independent.
+        x0_batch = dataclasses.replace(
+            batch, spec_info=None, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        x0_result = self._target_worker.forward_batch_generation(x0_batch)
+        hidden = x0_result.logits_output.hidden_states
+        assert hidden is not None, (
+            "FULL hidden-state capture did not populate hidden_states for x0"
+        )
+        last_idx = torch.cumsum(batch.seq_lens.to(torch.int64), dim=0) - 1
+        last_hidden = hidden[last_idx]  # last prompt token per request (post-norm)
+        # Project to logits through the target's own LogitsProcessor rather than
+        # a raw lm_head matmul.  Under tensor parallelism the lm_head is
+        # vocab-sharded (ParallelLMHead), so matmul against a single rank's
+        # weight yields only that rank's vocab slice; the LogitsProcessor
+        # computes the local shard and all-gathers it across TP ranks, so x0 is
+        # drawn from the full vocabulary on every rank.  DECODE mode treats each
+        # row as a sample position (no pruning), so feeding the already
+        # last-token hidden states returns exactly one logit row per request.
+        logits_metadata = LogitsMetadata(
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        x0_logits = self.score_runner.model.logits_processor(
+            None,
+            last_hidden,
+            self.score_runner.model.lm_head,
+            logits_metadata,
+        ).next_token_logits
+        x0, _ = self._sample_target_power(x0_logits)
+        score_result.next_token_ids = x0
 
         # x0 KV is NOT written during prefill — first decode writes it.
         score_result.next_draft_input = SMCDraftInput(
-            verified_id=draft_result.next_token_ids,
+            verified_id=x0,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
         score_result.accept_lens = torch.zeros(
@@ -569,6 +612,33 @@ class SMCWorker(BaseSpecWorker):
         chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
         lp = chosen - torch.logsumexp(scaled, dim=-1)
         return idx, lp
+
+    def _sample_target_power(self, logits):
+        """Gumbel-max draw from the tempered-power target
+        ``p_T^alpha ∝ softmax(alpha * logits / T_target)``.
+
+        Returns ``(idx, logz)`` where ``idx`` is the sampled token and
+        ``logz = logsumexp(alpha*logits/T) - alpha*logsumexp(logits/T)`` is the
+        per-row log-normalizer of the power conditional (the bonus token's
+        incremental importance weight under the joint-power target; 0 at
+        alpha=1).  Shared by the per-block bonus draw and the prefill x0 draw so
+        both come from one consistent target.
+        """
+        t = self.smc_target_temperature
+        base = logits / t
+        scaled = self.smc_power_alpha * base
+        gumbel = -torch.log(
+            -torch.log(
+                torch.rand_like(scaled).clamp_min_(
+                    torch.finfo(scaled.dtype).tiny
+                )
+            )
+        )
+        idx = torch.argmax(scaled + gumbel, dim=-1)
+        logz = torch.logsumexp(scaled, dim=-1) - self.smc_power_alpha * (
+            torch.logsumexp(base, dim=-1)
+        )
+        return idx, logz
 
     def _draft_ar_deferred(
         self, ctx, draft_input, draft_fb, cache_locs,
@@ -722,6 +792,7 @@ class SMCWorker(BaseSpecWorker):
             _draft_logprobs,
             logprob_diff,
             bonus,
+            bonus_logz,
             next_tokens,
         ) = self.cycle_graph_runner.replay(
             draft_input.verified_id,
@@ -742,6 +813,7 @@ class SMCWorker(BaseSpecWorker):
             verified_id=bonus,
             prev_last_draft_id=prev_last_draft_id,
             logprob_diff=logprob_diff,
+            bonus_logz=bonus_logz,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
         return GenerationBatchResult(
@@ -940,23 +1012,13 @@ class SMCWorker(BaseSpecWorker):
 
         # ---- 6. Bonus token ----
         # Sample from the same p_{T_t}^alpha distribution targeted above so the
-        # bonus and per-step draws come from one consistent target.
-        # Gumbel-max draw from the same p_T^alpha tempered-power target the
-        # per-step weights use — exactly equivalent to the previous
-        # log_softmax → exp → multinomial chain.
-        bonus_scaled = (
-            self.smc_power_alpha
-            * score_logits_3d[:, -1, :]
-            / self.smc_target_temperature
-        )
-        bonus_gumbel = -torch.log(
-            -torch.log(
-                torch.rand_like(bonus_scaled).clamp_min_(
-                    torch.finfo(bonus_scaled.dtype).tiny
-                )
-            )
-        )
-        bonus = torch.argmax(bonus_scaled + bonus_gumbel, dim=-1)
+        # bonus and per-step draws come from one consistent target.  ``bonus_logz``
+        # is the bonus token's incremental importance weight log Z = logsumexp(
+        # alpha*ℓ/T) - alpha*logsumexp(ℓ/T): the bonus is drawn from the locally
+        # normalized power conditional p_T^alpha / Z, so under the joint-power
+        # target its weight is Z, not 1 (identically 0 at alpha=1).  Accumulated
+        # in write_back_gpu, gated by the same EOS/finish logic as logprob_diff.
+        bonus, bonus_logz = self._sample_target_power(score_logits_3d[:, -1, :])
 
         # ---- 7. Output ----
         output_token_ids = torch.stack(
@@ -982,11 +1044,13 @@ class SMCWorker(BaseSpecWorker):
         next_verified_id.record_stream(current_stream)
         prev_last_draft_id.record_stream(current_stream)
         logprob_diff.record_stream(current_stream)
+        bonus_logz.record_stream(current_stream)
 
         next_draft_input = SMCDraftInput(
             verified_id=next_verified_id,
             prev_last_draft_id=prev_last_draft_id,
             logprob_diff=logprob_diff,
+            bonus_logz=bonus_logz,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
 
