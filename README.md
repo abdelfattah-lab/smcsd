@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./logo.png" alt="SMCSD Logo" width="150">
+</p>
+
 # SMC Speculative Decoding
 
 > **Warning:** This repository is under active development. APIs, configuration flags, and internal interfaces may go through breaking changes.
