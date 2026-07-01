@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from pprint import pformat
@@ -1214,27 +1213,10 @@ class SMCGPUModelRunner(GPUModelRunner):
         smc_logprob_diffs: dict[str, torch.Tensor] = {}
         if all_batches:
             resample_threshold = self.vllm_config.smc_config.resample_threshold
-            if os.environ.get("SMC_VLLM_UNBATCH_DRAFT") == "1":
-                for batch in all_batches:
-                    smc_draft_results.update(
-                        self._run_batched_draft_decode([batch])
-                    )
-            else:
-                smc_draft_results = self._run_batched_draft_decode(all_batches)
-
-            if os.environ.get("SMC_VLLM_UNBATCH_TARGET") == "1":
-                bonus_tokens_per_group = {}
-                logprob_diff_per_group = {}
-                for batch in all_batches:
-                    bonus, logprob_diff = self._run_batched_target_verify(
-                        [batch], smc_draft_results
-                    )
-                    bonus_tokens_per_group.update(bonus)
-                    logprob_diff_per_group.update(logprob_diff)
-            else:
-                bonus_tokens_per_group, logprob_diff_per_group = self._run_batched_target_verify(
-                    all_batches, smc_draft_results
-                )
+            smc_draft_results = self._run_batched_draft_decode(all_batches)
+            bonus_tokens_per_group, logprob_diff_per_group = self._run_batched_target_verify(
+                all_batches, smc_draft_results
+            )
             for group_id, bonus in bonus_tokens_per_group.items():
                 draft_ids, log_probs, _ = smc_draft_results[group_id]
                 smc_draft_results[group_id] = (draft_ids, log_probs, bonus)
