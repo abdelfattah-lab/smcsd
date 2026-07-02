@@ -10,6 +10,10 @@ This repository implements **Sequential Monte Carlo Speculative Decoding (SMC-SD
 
 Paper: [*Faster LLM Inference via Sequential Monte Carlo*](https://arxiv.org/abs/2604.15672)
 
+Blog posts:
+- [SMC-SD Engine v0.1.0](https://abdelfattah-lab.github.io/blogs/smcsd-engine-v0-1-0/)
+- [SMC-SD Engine v0.2.0](https://abdelfattah-lab.github.io/blogs/smcsd-engine-v0-2-0/)
+
 <img width="772" height="424" alt="SMC speculative decoding overview" src="assets/teaser.png" />
 
 ## Installation
