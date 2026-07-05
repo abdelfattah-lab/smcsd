@@ -22,17 +22,6 @@ from typing import Any
 
 DEFAULT_MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_PATH = "meta-llama/Llama-3.2-1B-Instruct"
-# DEFAULT_PROMPTS = [
-#     "The capital of France is",
-#     "Write one sentence about why overlap scheduling matters for inference systems.",
-#     "List two prime numbers and one composite number.",
-#     "In one short paragraph, explain speculative decoding.",
-#     "Briefly explain why batching improves GPU utilization.",
-#     "Give two benefits and one risk of speculative decoding.",
-#     "What is 17 plus 28? Answer in one sentence.",
-#     "Describe effective sample size in plain language.",
-# ]
-
 DEFAULT_PROMPTS  = [
     "The capital of France is",
     "Write one sentence about why overlap scheduling matters for inference systems.",
@@ -47,8 +36,6 @@ DEFAULT_PROMPTS  = [
     "If a batch contains 4 requests and each generates 16 tokens, how many total tokens are generated?",
     "Write a short explanation of why memory bandwidth can bottleneck LLM serving.",
 ]
-
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
