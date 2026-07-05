@@ -60,6 +60,7 @@ class SMCVLLMEngine:
         n_particles: int = 4,
         gamma: int = 4,
         resample_threshold: float = 0.5,
+        draft_cudagraph: bool = True,
         tp_size: int = 1,
         max_model_len: int | None = None,
         **kwargs,
@@ -69,6 +70,7 @@ class SMCVLLMEngine:
             n_particles=n_particles,
             gamma=gamma,
             resample_threshold=resample_threshold,
+            draft_cudagraph=draft_cudagraph,
         )
 
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"

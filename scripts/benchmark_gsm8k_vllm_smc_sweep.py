@@ -490,7 +490,7 @@ def parse_args() -> argparse.Namespace:
         default="both",
         help="Which engine(s) to run.",
     )
-    parser.add_argument("--output-dir", default="/tmp/gsm8k-vllm-smc-bench")
+    parser.add_argument("--output-dir", default="/root/smcsd/tmp/gsm8k-vllm-smc-bench")
     parser.add_argument("--timeout-sec", type=float, default=None)
     parser.add_argument(
         "--enforce-eager",

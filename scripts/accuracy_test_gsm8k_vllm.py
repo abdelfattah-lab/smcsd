@@ -125,7 +125,7 @@ def run_eval(args, prompts, labels):
         tp_size=1,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_mem,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         enable_prefix_caching=False,
         **{
             k: v
@@ -221,7 +221,7 @@ def main():
     parser.add_argument("--particles", "-N", type=int, default=12)
     parser.add_argument("--gamma", "-g", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--num-questions", type=int, default=300)
+    parser.add_argument("--num-questions", type=int, default=1000)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-model-len", type=int, default=2048)
@@ -229,6 +229,13 @@ def main():
     parser.add_argument("--resample-threshold", type=float, default=0.5)
     parser.add_argument("--max-num-seqs", type=int, default=None)
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument(
+        "--enforce-eager",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Pass --no-enforce-eager to enable CUDA graphs "
+        "(target model piecewise graphs + SMC draft loop full graphs).",
+    )
     parser.add_argument(
         "--log-oracle-misses",
         type=int,

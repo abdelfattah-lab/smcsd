@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--draft-model-path", default=DEFAULT_DRAFT_MODEL_PATH)
-    parser.add_argument("--output-dir", default="/home/xq88/smcsd/tmp/vllm-smc-profile")
+    parser.add_argument("--output-dir", default="/root/smcsd/tmp/vllm-smc-profile")
     parser.add_argument(
         "--num-prompts",
         type=int,

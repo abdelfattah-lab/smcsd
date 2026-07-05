@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from pprint import pformat
@@ -11,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config.compilation import CUDAGraphMode, CompilationMode
+from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.model_loader import get_model
 from vllm.sampling_params import SamplingParams
@@ -23,12 +25,14 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.attn_utils import (
+    build_attn_metadata,
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, post_update
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from smcsd.vllm_backend.scheduler import (
@@ -42,6 +46,10 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from smcsd.vllm_backend.outputs import SMCModelRunnerOutput
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     pass
@@ -77,6 +85,9 @@ class SMCGPUModelRunner(GPUModelRunner):
         self.target_sampler: Sampler | None = None
         self.log_weights: torch.Tensor  # allocated in initialize_kv_cache
         self._draft_attn_metadata_debugged = False
+        self._smc_draft_use_cudagraph = False
+        self._smc_draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._smc_graph_sizes: list[int] = []
 
     @staticmethod
     def _copy_kv_blocks(kv_cache: torch.Tensor, block_ids: torch.Tensor) -> torch.Tensor:
@@ -169,6 +180,17 @@ class SMCGPUModelRunner(GPUModelRunner):
                     f"({draft_group.kv_cache_spec.block_size} != {target_group.kv_cache_spec.block_size})."
                 )
 
+        # Enable the FULL-cudagraph contract for the draft attention backend
+        smc = self.vllm_config.smc_config
+        self._smc_draft_use_cudagraph = bool(
+            getattr(smc, "draft_cudagraph", True)
+            and self.vllm_config.compilation_config.max_cudagraph_capture_size
+        )
+        if self._smc_draft_use_cudagraph:
+            self.draft_vllm_config.compilation_config.cudagraph_mode = (
+                CUDAGraphMode.FULL
+            )
+
         draft_attn_backends, draft_attn_groups, _ = init_attn_backend(
             draft_kv_cache_config,
             self.draft_vllm_config,
@@ -200,6 +222,42 @@ class SMCGPUModelRunner(GPUModelRunner):
         self.log_weights = torch.zeros(
             self.max_num_reqs, dtype=torch.float32, device=self.device
         )
+
+        # Static buffers for the draft decode loop. The captured CUDA graphs.
+        gamma = smc.gamma
+        n = self.max_num_reqs
+        dev = self.device
+        self.smc_rows = torch.zeros(n, dtype=torch.int32, device=dev)
+        self.smc_input_ids = torch.zeros(n, dtype=torch.int32, device=dev)
+        self.smc_positions = torch.zeros(n, dtype=torch.int64, device=dev)
+        self.smc_seq_lens = torch.zeros(n, dtype=torch.int32, device=dev)
+        self.smc_query_start_loc = torch.zeros(n + 1, dtype=torch.int32, device=dev)
+        self.smc_temps = torch.ones(n, 1, dtype=torch.float32, device=dev)
+        self.smc_draft_ids = torch.zeros(n, gamma + 1, dtype=torch.int32, device=dev)
+        self.smc_draft_log_probs = torch.zeros(n, gamma, dtype=torch.float32, device=dev)
+        self.smc_next_seeds = torch.zeros(n, dtype=torch.int32, device=dev)
+        # Stable copies of the sampler's per-row seed/temperature state. 
+        self.smc_sample_seeds = torch.zeros(n, dtype=torch.int64, device=dev)
+        self.smc_sample_temps = torch.ones(n, dtype=torch.float32, device=dev)
+        self._smc_arange = torch.arange(n + 1, dtype=torch.int32, device=dev)
+        # Committing all gamma draft tokens in one post_update call
+        self.smc_commit_query_start_loc = self._smc_arange * gamma
+        self.smc_commit_num_sampled = torch.full(
+            (n,), gamma, dtype=torch.int32, device=dev
+        )
+        self.smc_commit_num_rejected = torch.zeros(n, dtype=torch.int32, device=dev)
+
+        self._smc_draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        max_tokens_cap = min(
+            n, self.vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        sizes = []
+        size = 8
+        while size < max_tokens_cap:
+            sizes.append(size)
+            size *= 2
+        sizes.append(max_tokens_cap)
+        self._smc_graph_sizes = sorted(set(sizes))
 
     def register_particle_group(
         self,
@@ -235,12 +293,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             )
             self.block_tables.append_block_ids(req_index, combined_block_ids, overwrite=True)
             if self.is_last_pp_rank and self.sampler is not None:
-                # Draft must be pure temperature-sampling so that
-                # log_softmax(logits/T)[x_t] is the exact log q_draft.
-                # Copying target SamplingParams and propagating top-p/k/min-p/
-                # penalties would make the actual proposal a truncated/penalized
-                # distribution that does not match the log_softmax formula used
-                # in _run_batched_draft_decode, biasing importance weights.
+                # Draft must be pure temperature-sampling.
                 draft_sampling_params = SamplingParams(temperature=temperature)
                 self.sampler.add_request(
                     req_index, prompt_len, draft_sampling_params
@@ -302,9 +355,8 @@ class SMCGPUModelRunner(GPUModelRunner):
             positions = torch.tensor(
                 positions_list, dtype=torch.long, device=self.device
             )
-            seq_lens = torch.tensor(
-                seq_lens_list, dtype=torch.int32, device=self.device
-            )
+            seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int32)
+            seq_lens = seq_lens_cpu.to(self.device)
             query_start_loc = torch.tensor(
                 query_start_loc_list, dtype=torch.int32, device=self.device
             )
@@ -327,7 +379,7 @@ class SMCGPUModelRunner(GPUModelRunner):
                 query_start_loc_np=query_start_loc_np,
                 num_scheduled_tokens=np.array(num_scheduled_list, dtype=np.int32),
                 seq_lens=seq_lens,
-                seq_lens_cpu_upper_bound=seq_lens.cpu(),
+                seq_lens_cpu_upper_bound=seq_lens_cpu,
                 dcp_local_seq_lens=None,
                 positions=positions,
             )
@@ -464,7 +516,8 @@ class SMCGPUModelRunner(GPUModelRunner):
         particle_rows_t = torch.tensor(all_particle_rows, dtype=torch.int32, device=self.device)
         input_ids = torch.tensor(all_input_ids, dtype=torch.int32, device=self.device)
         positions = torch.tensor(all_positions, dtype=torch.long, device=self.device)
-        seq_lens = torch.tensor(all_seq_lens, dtype=torch.int32, device=self.device)
+        seq_lens_cpu = torch.tensor(all_seq_lens, dtype=torch.int32)
+        seq_lens = seq_lens_cpu.to(self.device)
         query_start_loc = torch.tensor(query_start_loc_list, dtype=torch.int32, device=self.device)
         query_start_loc_np = np.array(query_start_loc_list, dtype=np.int32)
 
@@ -485,7 +538,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             query_start_loc_np=query_start_loc_np,
             num_scheduled_tokens=np.array(all_num_scheduled, dtype=np.int32),
             seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens.cpu(),
+            seq_lens_cpu_upper_bound=seq_lens_cpu,
             dcp_local_seq_lens=None,
             positions=positions,
         )
@@ -625,8 +678,10 @@ class SMCGPUModelRunner(GPUModelRunner):
             return {}, {}
 
         rows = torch.tensor(all_rows, dtype=torch.int32, device=self.device)
+        rows_np = np.array(all_rows, dtype=np.int64)
         # L_i: seq_len at the start of this draft cycle for each particle
-        start_seq_lens = torch.tensor(all_start_seq_lens, dtype=torch.int32, device=self.device)
+        start_seq_lens_cpu = torch.tensor(all_start_seq_lens, dtype=torch.int32)
+        start_seq_lens = start_seq_lens_cpu.to(self.device)
 
         # Input ids: [seed, t1..t_gamma] per particle, flattened
         # draft_results[group_id][0] shape: [A_i, gamma+1], [:, 0] is seed
@@ -641,12 +696,15 @@ class SMCGPUModelRunner(GPUModelRunner):
 
         # After writing all gamma+1 new tokens the total KV length is L_i + gamma + 1.
         seq_lens_full = start_seq_lens + gamma + 1                # [A_total]
+        seq_lens_full_cpu = start_seq_lens_cpu + gamma + 1        # [A_total]
 
         total_tokens = A_total * (gamma + 1)
         query_start_loc = torch.arange(
             0, total_tokens + 1, gamma + 1, dtype=torch.int32, device=self.device
         )                                                          # [A_total + 1]
-        query_start_loc_np = query_start_loc.cpu().numpy()
+        query_start_loc_np = np.arange(
+            0, total_tokens + 1, gamma + 1, dtype=np.int32
+        )
 
         # Last token index (position L_i+gamma) in the flat token layout.
         last_token_indices = query_start_loc[1:].long() - 1       # [A_total]
@@ -668,7 +726,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             query_start_loc_np=query_start_loc_np,
             num_scheduled_tokens=np.full(A_total, gamma + 1, dtype=np.int32),
             seq_lens=seq_lens_full,
-            seq_lens_cpu_upper_bound=seq_lens_full.cpu(),
+            seq_lens_cpu_upper_bound=seq_lens_full_cpu,
             dcp_local_seq_lens=None,
             positions=positions,
         )
@@ -710,7 +768,7 @@ class SMCGPUModelRunner(GPUModelRunner):
         # Bonus logits from the last position (L_i+gamma) for sampling.
         bonus_logits = all_logits_2d[:, -1, :]                         # [A_total, V]
 
-        # ---- log-weight increment: keep per-position diffs. ----
+        # Log-weight increment: keep per-position diffs. 
         draft_ids = torch.cat(all_draft_ids, dim=0)                     # [A_total, gamma+1]
         draft_log_probs = torch.cat(all_draft_log_probs, dim=0)         # [A_total, gamma] scalars
         if gamma > 0:
@@ -740,6 +798,8 @@ class SMCGPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens_full,
             query_start_loc=torch.arange(A_total + 1, dtype=torch.int32, device=self.device),
             query_start_loc_np=np.arange(A_total + 1, dtype=np.int32),
+            seq_lens_cpu=seq_lens_full_cpu,
+            idx_mapping_np=rows_np.astype(np.int32),
         )
         sampler_output = self.target_sampler(bonus_logits, bonus_input_batch)
         bonus_tokens = sampler_output.sampled_token_ids.squeeze(-1).to(torch.int32)
@@ -796,7 +856,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
         )
-        self.req_states.num_computed_tokens_np[rows.cpu().numpy()] += 1
+        self.req_states.num_computed_tokens_np[rows_np] += 1
 
         active = {
             batch.group_id: (s, e)
@@ -817,9 +877,14 @@ class SMCGPUModelRunner(GPUModelRunner):
         seq_lens: torch.Tensor,
         query_start_loc: torch.Tensor,
         query_start_loc_np: np.ndarray,
+        seq_lens_cpu: torch.Tensor | None = None,
+        idx_mapping_np: np.ndarray | None = None,
     ) -> InputBatch:
         num_reqs = particle_rows.shape[0]
-        idx_mapping_np = particle_rows.detach().cpu().numpy().astype(np.int32, copy=False)
+        if idx_mapping_np is None:
+            idx_mapping_np = particle_rows.detach().cpu().numpy().astype(np.int32, copy=False)
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.detach().cpu()
         logits_indices = torch.arange(num_reqs, dtype=torch.int32, device=self.device)
         cu_num_logits = torch.arange(num_reqs + 1, dtype=torch.int32, device=self.device)
         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
@@ -839,7 +904,7 @@ class SMCGPUModelRunner(GPUModelRunner):
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens.detach().cpu(),
+            seq_lens_cpu_upper_bound=seq_lens_cpu,
             dcp_local_seq_lens=None,
             input_ids=input_ids,
             positions=positions,
@@ -857,27 +922,156 @@ class SMCGPUModelRunner(GPUModelRunner):
             particle_rows, num_reqs_padded=particle_rows.shape[0]
         )
 
-    def _build_draft_attn_metadata(
-        self,
-        input_batch: InputBatch,
-        slot_ids: torch.Tensor,                  # [num_kv_groups, n]
+    def _smc_build_draft_attn_metadata(
+        self, num_reqs: int, num_reqs_padded: int
     ) -> dict[str, Any]:
-        """Build attention metadata for one decode step over N particles.
-        seq_lens is already incremented to include the token being written.
+        """Build draft attention metadata over the smc_* static buffers.
+
+        Called before every graph replay as well: rebuilding refreshes the FA3
+        builder's persistent scheduler-metadata buffer, whose address is baked
+        into the captured graph (same contract as vLLM's EAGLE drafter).
         """
-        N = input_batch.num_reqs
-        block_tables = self._gather_block_tables(input_batch.idx_mapping)
-        assert self.draft_model_state is not None
-        attn_metadata = self.draft_model_state.prepare_attn(
-            input_batch,
-            CUDAGraphMode.NONE,
-            block_tables,
-            slot_ids,
-            self.draft_attn_groups,
-            self.draft_kv_cache_config,
+        query_start_loc_cpu = torch.arange(
+            num_reqs_padded + 1, dtype=torch.int32, device="cpu"
+        ).clamp_(max=num_reqs)
+        block_tables = [
+            bt[:num_reqs_padded] for bt in self.block_tables.input_block_tables
+        ]
+        slot_mappings = self.block_tables.slot_mappings[:, :num_reqs_padded]
+        return build_attn_metadata(
+            attn_groups=self.draft_attn_groups,
+            num_reqs=num_reqs_padded,
+            num_tokens=num_reqs_padded,
+            query_start_loc_gpu=self.smc_query_start_loc[: num_reqs_padded + 1],
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=1,
+            seq_lens=self.smc_seq_lens[:num_reqs_padded],
+            max_seq_len=self.draft_vllm_config.model_config.max_model_len,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            kv_cache_config=self.draft_kv_cache_config,
+            positions=self.smc_positions[:num_reqs_padded],
         )
 
-        return attn_metadata
+    def _smc_draft_decode_steps(
+        self, num_reqs: int, attn_metadata: dict[str, Any]
+    ) -> None:
+        """Run gamma+1 draft decode steps over the smc_* static buffers.
+
+        All state (input token, positions, seq_lens, sampled outputs) lives in
+        the static buffers, and every operation is a GPU kernel on them, so
+        this whole loop is capturable as one full CUDA graph. Padded rows
+        (beyond the real particle count) are neutralized by buffer contents:
+        query_start_loc goes flat at the real count, so the slot-mapping
+        kernel emits PAD_SLOT_ID for their tokens (no KV writes) and their
+        seq_lens are 0 (no KV reads); their sampled tokens are garbage but
+        never committed.
+        """
+        gamma = self.vllm_config.smc_config.gamma
+        rows = self.smc_rows[:num_reqs]
+        input_ids = self.smc_input_ids[:num_reqs]
+        positions = self.smc_positions[:num_reqs]
+        query_start_loc = self.smc_query_start_loc[: num_reqs + 1]
+        temps = self.smc_temps[:num_reqs]
+
+        for step in range(gamma + 1):
+            slot_ids = self.block_tables.compute_slot_mappings(
+                rows,
+                query_start_loc,
+                positions,
+                num_tokens_padded=num_reqs,
+            )
+            slot_mappings_by_layer = build_slot_mappings_by_layer(
+                slot_ids, self.draft_kv_cache_config
+            )
+            with set_forward_context(
+                attn_metadata,
+                self.draft_vllm_config,
+                num_tokens=num_reqs,
+                slot_mapping=slot_mappings_by_layer,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(num_tokens=num_reqs, has_lora=False),
+            ):
+                hidden_states = self.draft_model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=None,
+                    inputs_embeds=None,
+                )
+            logits = self.draft_model.compute_logits(hidden_states)
+
+            # Pure temperature sampling keyed on (per-row seed, position).
+            sampled = gumbel_sample(
+                logits,
+                rows,
+                self.smc_sample_temps,
+                self.smc_sample_seeds,
+                positions,
+                apply_temperature=True,
+            )
+            if step < gamma:
+                self.smc_draft_log_probs[:num_reqs, step] = (
+                    torch.log_softmax(logits / temps, dim=-1)
+                    .gather(1, sampled.unsqueeze(1))
+                    .squeeze(1)
+                )
+                self.smc_draft_ids[:num_reqs, step + 1] = sampled
+                input_ids.copy_(sampled)
+            else:
+                # Step gamma fills draft KV at L+gamma but its token is only
+                # used to seed the next cycle.
+                self.smc_next_seeds[:num_reqs] = sampled
+
+            positions.add_(1)
+            self.smc_seq_lens[:num_reqs].add_(1)
+
+    def _smc_reset_draft_buffers(self, num_reqs: int) -> None:
+        """Set the static buffers to a warmup/capture-safe state."""
+        self.smc_rows.zero_()
+        self.smc_input_ids.zero_()
+        self.smc_positions.zero_()
+        self.smc_seq_lens.fill_(1)
+        self.smc_temps.fill_(1.0)
+        torch.clamp(self._smc_arange, max=num_reqs, out=self.smc_query_start_loc)
+
+    @torch.inference_mode()
+    def _capture_smc_draft_graphs(self) -> None:
+        self._smc_graph_pool = torch.cuda.graph_pool_handle()
+        with graph_capture(device=self.device):
+            for size in sorted(self._smc_graph_sizes, reverse=True):
+                self._smc_reset_draft_buffers(size)
+                attn_metadata = self._smc_build_draft_attn_metadata(size, size)
+                # Warmup outside the graph
+                self._smc_draft_decode_steps(size, attn_metadata)
+                torch.cuda.synchronize()
+                self._smc_reset_draft_buffers(size)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, self._smc_graph_pool):
+                    self._smc_draft_decode_steps(size, attn_metadata)
+                self._smc_draft_graphs[size] = graph
+        torch.cuda.synchronize()
+
+    def capture_model(self) -> int:
+        ret = super().capture_model()
+        if self._smc_draft_use_cudagraph:
+            start = time.perf_counter()
+            try:
+                self._capture_smc_draft_graphs()
+            except Exception:
+                logger.exception(
+                    "SMC draft loop CUDA graph capture failed; "
+                    "falling back to eager draft decode."
+                )
+                self._smc_draft_graphs.clear()
+                torch.cuda.synchronize()
+            else:
+                logger.info(
+                    "SMC draft loop CUDA graph capture finished in %.1f secs "
+                    "(sizes: %s)",
+                    time.perf_counter() - start,
+                    self._smc_graph_sizes,
+                )
+        return ret
 
     def _run_batched_draft_decode(
         self,
@@ -919,88 +1113,76 @@ class SMCGPUModelRunner(GPUModelRunner):
             offset += A_i
 
         A_total = offset
+        if A_total == 0:
+            return {}
+        assert gamma == self.vllm_config.smc_config.gamma
 
-        # Run gamma+1 decode steps over all A_total particles
-        rows = torch.tensor(all_rows, dtype=torch.int32, device=self.device)
-        seq_lens_cur = torch.tensor(all_seq_lens, dtype=torch.int32, device=self.device)
-        draft_ids = torch.zeros(A_total, gamma + 1, dtype=torch.int32, device=self.device)
-        draft_log_probs = torch.zeros(A_total, gamma, dtype=torch.float32, device=self.device)
-        draft_ids[:, 0] = torch.tensor(all_seeds, dtype=torch.int32, device=self.device)
-        next_seeds = torch.zeros(A_total, dtype=torch.int32, device=self.device)
-        temps = torch.tensor(
-            all_temperatures, dtype=torch.float32, device=self.device,
-        ).unsqueeze(1)  # [A_total, 1]
+        rows_np = np.array(all_rows, dtype=np.int64)
+        rows_cpu = torch.from_numpy(rows_np.astype(np.int32))
+        seeds_cpu = torch.tensor(all_seeds, dtype=torch.int32)
+        seq_lens_start_cpu = torch.tensor(all_seq_lens, dtype=torch.int32)
+        temps_cpu = torch.tensor(all_temperatures, dtype=torch.float32)
 
-        for step in range(gamma + 1):
-            input_ids = draft_ids[:, step]
-            positions = seq_lens_cur.long()
-            query_start_loc = torch.arange(A_total + 1, dtype=torch.int32, device=self.device)
-            query_start_loc_np = np.arange(A_total + 1, dtype=np.int32)
-            input_batch = self._build_draft_input_batch(
-                particle_rows=rows,
-                input_ids=input_ids,
-                positions=positions,
-                seq_lens=seq_lens_cur + 1,
-                query_start_loc=query_start_loc,
-                query_start_loc_np=query_start_loc_np,
-            )
-            slot_ids = self.block_tables.compute_slot_mappings(
+        # Pick a captured graph bucket; fall back to eager at the exact size.
+        graph = None
+        num_reqs_padded = A_total
+        if self._smc_draft_graphs:
+            for size in self._smc_graph_sizes:
+                if size >= A_total:
+                    graph = self._smc_draft_graphs.get(size)
+                    if graph is not None:
+                        num_reqs_padded = size
+                    break
+
+        # Fill the static buffers the captured decode loop consumes.
+        self.smc_rows[:A_total].copy_(rows_cpu)
+        self.smc_input_ids[:A_total].copy_(seeds_cpu)
+        self.smc_draft_ids[:A_total, 0].copy_(seeds_cpu)
+        self.smc_positions[:A_total].copy_(seq_lens_start_cpu)
+        self.smc_seq_lens[:A_total].copy_(seq_lens_start_cpu)
+        self.smc_seq_lens[:A_total].add_(1)
+        self.smc_temps[:A_total, 0].copy_(temps_cpu)
+        if num_reqs_padded > A_total:
+            # Padded rows: positions bounded (rotary indexing) and zero seq_lens.
+            self.smc_positions[A_total:num_reqs_padded].zero_()
+            self.smc_seq_lens[A_total:num_reqs_padded].zero_()
+        torch.clamp(self._smc_arange, max=A_total, out=self.smc_query_start_loc)
+        # Refresh per-row sampling state from the sampler's UVA-backed tensors.
+        draft_sampling = self.sampler.sampling_states
+        self.smc_sample_seeds.copy_(draft_sampling.seeds.gpu)
+        self.smc_sample_temps.copy_(draft_sampling.temperature.gpu)
+
+        # Refresh gathered block tables and attention metadata.
+        self.block_tables.gather_block_tables(
+            self.smc_rows[:A_total], num_reqs_padded=num_reqs_padded
+        )
+        attn_metadata = self._smc_build_draft_attn_metadata(A_total, num_reqs_padded)
+
+        if graph is not None:
+            graph.replay()
+        else:
+            self._smc_draft_decode_steps(num_reqs_padded, attn_metadata)
+
+        # Commit all gamma draft tokens per particle in one call.
+        rows = self.smc_rows[:A_total]
+        if gamma > 0:
+            post_update(
                 rows,
-                query_start_loc,
-                positions,
-                num_tokens_padded=A_total,
+                self.req_states.num_computed_tokens.gpu,
+                self.req_states.last_sampled_tokens,
+                self.sampler.penalties_state.output_bin_counts,
+                self.smc_draft_ids[:A_total, 1:],
+                self.smc_commit_num_sampled[:A_total],
+                self.smc_commit_num_rejected[:A_total],
+                self.smc_commit_query_start_loc[: A_total + 1],
+                self.req_states.all_token_ids.gpu,
+                self.req_states.total_len.gpu,
             )
-            attn_metadata = self._build_draft_attn_metadata(input_batch, slot_ids)
-            slot_mappings_by_layer = build_slot_mappings_by_layer(
-                slot_ids, self.draft_kv_cache_config
-            )
+        self.req_states.num_computed_tokens_np[rows_np] += gamma
 
-            with set_forward_context(
-                attn_metadata,
-                self.draft_vllm_config,
-                num_tokens=A_total,
-                slot_mapping=slot_mappings_by_layer,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                batch_descriptor=BatchDescriptor(num_tokens=A_total, has_lora=False),
-            ):
-                hidden_states = self.draft_model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=None,
-                    inputs_embeds=None,
-                )
-
-            logits = self.draft_model.compute_logits(hidden_states)
-
-            assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
-            next_tokens = sampler_output.sampled_token_ids.squeeze(-1).to(torch.int32)
-
-            if step < gamma:
-                # Gather scalar log q_draft(t_{step+1}) at the sampled token.
-                draft_log_probs[:, step] = torch.log_softmax(logits / temps, dim=-1).gather(
-                    1, next_tokens.unsqueeze(1).long()
-                ).squeeze(1)
-                # Commit draft token t_{step+1}
-                post_update(
-                    rows,
-                    self.req_states.num_computed_tokens.gpu,
-                    self.req_states.last_sampled_tokens,
-                    self.sampler.penalties_state.output_bin_counts,
-                    sampler_output.sampled_token_ids,
-                    sampler_output.num_sampled,
-                    torch.zeros_like(sampler_output.num_sampled),
-                    query_start_loc,
-                    self.req_states.all_token_ids.gpu,
-                    self.req_states.total_len.gpu,
-                )
-                self.req_states.num_computed_tokens_np[rows.cpu().numpy()] += 1
-                draft_ids[:, step + 1] = next_tokens
-            else:
-                # Step gamma fills draft KV at L+gamma but its token is discarded
-                next_seeds = next_tokens
-
-            seq_lens_cur = seq_lens_cur + 1
+        draft_ids = self.smc_draft_ids[:A_total].clone()
+        draft_log_probs = self.smc_draft_log_probs[:A_total].clone()
+        next_seeds = self.smc_next_seeds[:A_total].clone()
 
         results: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         for batch in batches:
@@ -1072,9 +1254,8 @@ class SMCGPUModelRunner(GPUModelRunner):
 
             src_rows = all_rows[ancestor_indices]                       # [N]
 
-            # Used ancestor blocks, including a partial tail block, are
-            # remapped read-only. The next scheduler step repairs writable
-            # shared blocks with lazy COW before any particle writes again.
+            # Used ancestor blocks are remapped read-only. 
+            # The next scheduler step repairs writable shared blocks with lazy COW.
             all_rows_np = all_rows.cpu().numpy()
             all_seq_lens_np = self.req_states.num_computed_tokens_np[all_rows_np]
             bt_tuple = self._gather_block_tables(all_rows)
