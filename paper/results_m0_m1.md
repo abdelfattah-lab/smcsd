@@ -339,3 +339,43 @@ kernels untouched):
 - Init risk to de-risk first: constructing the draft ModelRunner with
   gpu_id=1 in-process (torch.distributed world-size-1 assumptions,
   set_device ordering vs the target's init).
+
+## E5c — M3 disagg-lite: 2-GPU pipelined rollback (draft on cuda:1)
+
+Built and working end-to-end (`SMC_DRAFT_GPU=1 SMC_PIPELINE=1`): draft
+worker constructed on its own device (isolated graph-capture buffer pool;
+mirror ReqToTokenPool row-synced from the canonical table before every
+draft forward; generic batch/ctx device movers; stacked P2P output copy;
+cross-device event fences both directions). Two init landmines found and
+patched: sglang's module-global graph-capture buffer pool asserts
+same-device reuse, and the draft's block-table alias crosses devices.
+
+100q benchmark (γ=8, self-bonus, thr=0.5 unless noted):
+
+| N | sync 1-GPU | pipe 1-GPU | pipe 2-GPU | 2-GPU vs sync |
+|---|---|---|---|---|
+| 4 | 560.2 | 481.3 | 536.6 | 0.96× |
+| 8 | 528.6 | 434.2 | 512.5 | 0.97× |
+| 12 | 495.8 | 393.5 | 490.5 | 0.99× |
+| 8, thr=0.25 | 515.3 | — | **556.2** | **1.08×** |
+
+Reading:
+1. The contention diagnosis is fully confirmed: moving the draft to its
+   own GPU recovers the single-GPU pipelining loss almost entirely
+   (434 → 512 at N=8).
+2. At thr=0.5 the design lands at parity: the 53-58% abort rate spends
+   the overlap dividend on redrafts, and the host (9 per-step drives +
+   per-cycle batch movers) has become the limiting stage again.
+3. First genuine crossover at thr=0.25: +8% over the matched sync config
+   at sync-exact sampling — the abort rate (0.32) is low enough for the
+   overlap to net out.
+4. Remaining path to the projected 1.15-1.3×: (a) draft-phase CUDA graph
+   on the draft GPU (collapses 9 host-driven step launches + moved-batch
+   prep into one replay; the SMCFullCycleGraphRunner draft-phase capture
+   is the starting point), (b) persistent device-resident input mirrors
+   instead of per-cycle dataclass moves, (c) resample-rate reduction
+   (threshold, or richer proposals) — every point of abort rate is
+   ~0.1ms of expected cycle time.
+
+Ops note: one benchmark run OOM'd due to an unrelated VLLM::EngineCore
+process holding 169GB on GPU 4 — not ours; rerouted to other GPUs.

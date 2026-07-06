@@ -13,6 +13,7 @@ has a different recurrent-state shape get an isolated draft Mamba pool via
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 import os
@@ -136,21 +137,59 @@ class SMCWorker(BaseSpecWorker):
 
         # Dense AR draft worker — no MTP-architecture rewrite, no shared
         # embed/lm_head with the target.
-        self._draft_worker = SMCDenseDraftTpModelWorker(
-            server_args=server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            pp_rank=0,
-            dp_rank=dp_rank,
-            moe_ep_rank=moe_ep_rank,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            memory_pool_config=target_worker.model_runner.memory_pool_config,
+        #
+        # SMC_DRAFT_GPU=<idx> (M3 disagg-lite): construct the draft worker
+        # on a different device than the target.  The draft then needs its
+        # own KV pool and a block-table mirror on that device — this env
+        # only covers worker construction + graph capture; the decode data
+        # path is wired separately.
+        draft_gpu_env = os.environ.get("SMC_DRAFT_GPU")
+        self.draft_gpu_id = (
+            int(draft_gpu_env) if draft_gpu_env is not None else gpu_id
         )
+        if self.draft_gpu_id != gpu_id:
+            logger.info(
+                "SMCWorker: constructing draft worker on cuda:%d "
+                "(target on cuda:%d)", self.draft_gpu_id, gpu_id,
+            )
+            # Cross-device draft cannot alias the canonical (target-device)
+            # block table — Triton rejects remote pointers.  Give it a
+            # same-shape mirror pool on its own device; rows are synced
+            # from the canonical table before every draft forward
+            # (sync_draft_block_rows).  Page numbering is shared with the
+            # canonical allocator, so the draft's own KV data pool on its
+            # device indexes identically and no KV bytes ever move.
+            from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+            self._draft_mirror_pool = ReqToTokenPool(
+                size=self.req_to_token_pool.size,
+                max_context_len=self.req_to_token_pool.max_context_len,
+                device=f"cuda:{self.draft_gpu_id}",
+                enable_memory_saver=server_args.enable_memory_saver,
+            )
+            draft_req_pool = self._draft_mirror_pool
+        else:
+            self._draft_mirror_pool = None
+            draft_req_pool = self.req_to_token_pool
+        self.draft_device = f"cuda:{self.draft_gpu_id}"
+        with torch.cuda.device(self.draft_gpu_id):
+            self._draft_worker = SMCDenseDraftTpModelWorker(
+                server_args=server_args,
+                gpu_id=self.draft_gpu_id,
+                tp_rank=tp_rank,
+                pp_rank=0,
+                dp_rank=dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+                req_to_token_pool=draft_req_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
+            )
+        # Draft-worker init may have moved the process-global device.
+        torch.cuda.set_device(gpu_id)
         self.draft_runner = self._draft_worker.model_runner
 
         # Hybrid Qwen3.5/3.6 drafts need an isolated MambaPool sized to the
@@ -191,7 +230,23 @@ class SMCWorker(BaseSpecWorker):
         server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         if not backup_disable_cuda_graph:
-            self.draft_runner.init_device_graphs()
+            if self.draft_gpu_id != gpu_id:
+                # sglang shares graph-capture input buffers across runners
+                # via a module-global pool (same-device memory
+                # optimization); a cross-device draft must capture into an
+                # isolated pool or the device assertion trips.
+                from sglang.srt.model_executor import input_buffers as _ib
+
+                saved_pool = _ib._forward_input_buffer_pool
+                _ib._forward_input_buffer_pool = {}
+                try:
+                    with torch.cuda.device(self.draft_gpu_id):
+                        self.draft_runner.init_device_graphs()
+                finally:
+                    _ib._forward_input_buffer_pool = saved_pool
+                torch.cuda.set_device(gpu_id)
+            else:
+                self.draft_runner.init_device_graphs()
 
         # Deferred-bonus: pin the DRAFT backend's verify-block-size global to
         # the head's 2 tokens.  The vendored verify-metadata paths read this
@@ -541,7 +596,20 @@ class SMCWorker(BaseSpecWorker):
 
         # Draft model prefill — samples the first token (x0)
         draft_batch = self._make_clean_batch(batch)
-        draft_result = self._draft_worker.forward_batch_generation(draft_batch)
+        if self._draft_mirror_pool is not None:
+            self.sync_draft_block_rows(draft_batch.req_pool_indices)
+            draft_batch = self._batch_to_draft_device(draft_batch)
+            with torch.cuda.device(self.draft_gpu_id):
+                draft_result = self._draft_worker.forward_batch_generation(
+                    draft_batch
+                )
+            draft_result.next_token_ids = draft_result.next_token_ids.to(
+                f"cuda:{self.gpu_id}"
+            )
+        else:
+            draft_result = self._draft_worker.forward_batch_generation(
+                draft_batch
+            )
 
         # Use draft model's sampled token as verified_id
         score_result.next_token_ids = draft_result.next_token_ids
@@ -776,6 +844,10 @@ class SMCWorker(BaseSpecWorker):
     def _forward_decode(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_idle():
             return self._forward_idle(batch)
+        assert self._draft_mirror_pool is None, (
+            "SMC_DRAFT_GPU != target gpu is only wired for the pipelined "
+            "decode path (SMC_PIPELINE=1)."
+        )
 
         current_stream = torch.get_device_module(self.device).current_stream()
         if batch.req_pool_indices is not None:
@@ -1041,7 +1113,93 @@ class SMCWorker(BaseSpecWorker):
     # gamma+1 AR draft schedule.  The synchronous _forward_decode above is
     # deliberately untouched.
 
+    def sync_draft_block_rows(self, pool_indices: torch.Tensor) -> None:
+        """Mirror the canonical block-table rows onto the draft device.
+
+        Called before every draft forward when the draft lives on another
+        GPU: covers prefill assignments, per-cycle fresh-page writes, and
+        resample copies — whatever mutated the canonical table since the
+        last draft forward.  bs rows × row-width int32 over NVLink;
+        microseconds."""
+        if self._draft_mirror_pool is None:
+            return
+        idx = pool_indices.to(torch.int64)
+        rows = self.req_to_token_pool.req_to_token.index_select(0, idx)
+        self._draft_mirror_pool.req_to_token.index_copy_(
+            0,
+            idx.to(self.draft_device, non_blocking=True),
+            rows.to(self.draft_device, non_blocking=True),
+        )
+
+    @staticmethod
+    def _move_dataclass_tensors(obj, device):
+        """Shallow-copy a dataclass, moving tensor fields to ``device``."""
+        kw = {}
+        for f in dataclasses.fields(obj):
+            v = getattr(obj, f.name)
+            kw[f.name] = (
+                v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+            )
+        return dataclasses.replace(obj, **kw)
+
+    def _batch_to_draft_device(self, batch: ModelWorkerBatch):
+        """Clone a ModelWorkerBatch with every tensor (including nested
+        spec_info / decode ctx / sampling info) on the draft device."""
+        dev = self.draft_device
+        moved = self._move_dataclass_tensors(batch, dev)
+        if batch.sampling_info is not None:
+            si = copy.copy(batch.sampling_info)
+            for name, v in vars(si).items():
+                if torch.is_tensor(v):
+                    setattr(si, name, v.to(dev, non_blocking=True))
+            moved.sampling_info = si
+        spec = batch.spec_info
+        if spec is not None:
+            moved_spec = self._move_dataclass_tensors(spec, dev)
+            if getattr(spec, "decode_ctx", None) is not None:
+                moved_spec.decode_ctx = self._move_dataclass_tensors(
+                    spec.decode_ctx, dev
+                )
+            moved.spec_info = moved_spec
+        return moved
+
     def draft_cycle(self, batch: ModelWorkerBatch, abort_check=None):
+        if self._draft_mirror_pool is not None:
+            # Cross-device: mirror the block rows, run the whole cycle on
+            # the draft device against device-local copies of the batch,
+            # then bring the outputs home.  ctx/cache_locs returned are the
+            # ORIGINAL (target-device) ones — verify consumes those.
+            self.sync_draft_block_rows(batch.req_pool_indices)
+            orig_ctx = batch.spec_info.decode_ctx
+            moved = self._batch_to_draft_device(batch)
+            # Fence: the input copies were enqueued from the target-device
+            # stream; the draft device's stream must not read them early.
+            ev_in = torch.cuda.Event()
+            ev_in.record()
+            with torch.cuda.device(self.draft_gpu_id):
+                torch.cuda.current_stream().wait_event(ev_in)
+                res = self._draft_cycle_local(moved, abort_check)
+            if res is None:
+                return None
+            all_tokens, draft_lps, _cache_locs, _ctx = res
+            dev = f"cuda:{self.gpu_id}"
+            # One stacked P2P copy per cycle instead of gamma+2 separate
+            # (host-syncing) .to() calls.
+            with torch.cuda.device(self.draft_gpu_id):
+                stacked = torch.stack(all_tokens, dim=0)
+                stacked_home = stacked.to(dev, non_blocking=True)
+                lps_home = draft_lps.to(dev, non_blocking=True)
+                ev_out = torch.cuda.Event()
+                ev_out.record()
+            # Fence: the commit/verify consumers on the target device's
+            # stream must wait for the P2P copies enqueued on the draft
+            # device's stream.
+            torch.cuda.current_stream().wait_event(ev_out)
+            all_tokens = list(stacked_home.unbind(0))
+            return all_tokens, lps_home, orig_ctx.cache_locs, orig_ctx
+        return self._draft_cycle_local(batch, abort_check)
+
+    def _draft_cycle_local(self, batch: ModelWorkerBatch, abort_check=None):
         """Run one draft cycle (gamma+1 AR forwards) on the current stream.
 
         ``abort_check`` is polled between AR steps (host-side, cheap); if it
@@ -1059,7 +1217,7 @@ class SMCWorker(BaseSpecWorker):
         draft_fb, can_cuda_graph, cache_locs, all_positions, all_seq_lens = (
             ctx.prepare_for_draft(
                 draft_input.verified_id,
-                self.req_to_token_pool,
+                self.draft_runner.req_to_token_pool,
                 batch,
                 self.draft_runner.graph_runner
                 if hasattr(self.draft_runner, "graph_runner")

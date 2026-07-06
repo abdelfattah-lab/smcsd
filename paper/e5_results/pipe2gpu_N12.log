@@ -1,0 +1,77 @@
+[transformers] use_kernel_func_from_hub is not available in the installed kernels version. Please upgrade kernels to use this feature.
+SMC speculative decoding uses the normal scheduler policy.
+Mode: SMCEngine (dedicated offline) | Model: meta-llama/Llama-3.1-8B-Instruct
+  particles=12, gamma=8, temperature=0.7, draft=meta-llama/Llama-3.2-1B-Instruct
+  num_questions=100, max_new_tokens=512, ignore_eos=False
+
+Loading GSM8K dataset...
+[transformers] use_kernel_func_from_hub is not available in the installed kernels version. Please upgrade kernels to use this feature.
+[2026-07-06 21:48:57] SMCScheduler hit an exception: Traceback (most recent call last):
+  File "/home/yahya/smcsd/smcsd/core/scheduler.py", line 1446, in run_smc_scheduler_process
+    scheduler = SMCScheduler(
+                ^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/smcsd/core/scheduler.py", line 247, in __init__
+    super().__init__(
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/managers/scheduler.py", line 433, in __init__
+    self.init_model_worker()
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/managers/scheduler.py", line 703, in init_model_worker
+    self.init_tp_model_worker()
+  File "/home/yahya/smcsd/smcsd/core/scheduler.py", line 457, in init_tp_model_worker
+    self.tp_worker = SMCTpModelWorker(
+                     ^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/managers/tp_worker.py", line 260, in __init__
+    self._init_model_runner()
+  File "/home/yahya/smcsd/smcsd/managers/smc_tp_worker.py", line 16, in _init_model_runner
+    self._model_runner = SMCModelRunner(
+                         ^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/model_executor/model_runner.py", line 508, in __init__
+    self.initialize(pre_model_load_memory)
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/model_executor/model_runner.py", line 625, in initialize
+    self.load_model()
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/model_executor/model_runner.py", line 1380, in load_model
+    self.model = self.loader.load_model(
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/model_loader/loader.py", line 698, in load_model
+    model = _initialize_model(
+            ^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/model_loader/loader.py", line 286, in _initialize_model
+    return model_class(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/models/llama.py", line 478, in __init__
+    self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/models/llama.py", line 510, in _init_model
+    return LlamaModel(config, quant_config=quant_config, prefix=prefix)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/models/llama.py", line 353, in __init__
+    self.layers, self.start_layer, self.end_layer = make_layers(
+                                                    ^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/utils/common.py", line 656, in make_layers
+    + get_offloader().wrap_modules(
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/utils/offloader.py", line 36, in wrap_modules
+    return list(all_modules_generator)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/utils/common.py", line 658, in <genexpr>
+    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/models/llama.py", line 355, in <lambda>
+    lambda idx, prefix: LlamaDecoderLayer(
+                        ^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/models/llama.py", line 294, in __init__
+    self.mlp = LlamaMLP(
+               ^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/models/llama.py", line 82, in __init__
+    self.gate_up_proj = MergedColumnParallelLinear(
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/layers/linear.py", line 529, in __init__
+    super().__init__(
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/layers/linear.py", line 353, in __init__
+    self.quant_method.create_weights(
+  File "/home/yahya/smcsd/3rdparty/sglang/python/sglang/srt/layers/quantization/unquant.py", line 121, in create_weights
+    torch.empty(
+  File "/home/yahya/miniconda3/envs/test/lib/python3.12/site-packages/torch/utils/_device.py", line 116, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 224.00 MiB. GPU 0 has a total capacity of 178.34 GiB of which 138.81 MiB is free. Process 3487316 has 165.73 GiB memory in use. Including non-PyTorch memory, this process has 12.45 GiB memory in use. Of the allocated memory 11.68 GiB is allocated by PyTorch, and 1.59 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+
+[2026-07-06 21:48:57] Received sigquit from a child process. It usually means the child failed.
