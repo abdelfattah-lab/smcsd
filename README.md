@@ -21,13 +21,10 @@ Blog posts:
 
 ```bash
 # 1. Clone with submodules — pick the branch you want
-git clone --recurse-submodules --branch main     https://github.com/abdelfattah-lab/smcsd.git
-# OR for the latest upstream-merged build (needs CUDA 13):
-# git clone --recurse-submodules --branch upstream https://github.com/abdelfattah-lab/smcsd.git
+git clone git@github.com:XinyiQiao/smcsd.git
 cd smcsd
-
-# If you already cloned without --recurse-submodules, initialise now:
-# git submodule update --init --recursive
+git checkout vllm-backends
+git submodule update --init --recursive
 
 # 2. Create a Python 3.12 environment
 uv venv --python 3.12

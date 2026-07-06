@@ -30,9 +30,7 @@ class SMCParticleGroupState:
     draft_temperature: float = 1.0
     # Cumulative log-weight per particle: sum_t log(p_target(x_t)/p_draft(x_t)).
     log_weights: list[float] = field(default_factory=list)  # [N]
-    # Per-particle sequence lengths: only active particles advance each cycle.
-    # After resampling, remapped from ancestors so the runner always gets the
-    # correct starting position for each particle's KV context.
+    # Per-particle sequence lengths.
     particle_num_computed_tokens: list[int] = field(default_factory=list)  # [N]
     target_temperature: float = 1.0
 
@@ -216,8 +214,6 @@ class SMCVLLMScheduler(Scheduler):
             seq_lens=seq_lens,
             gamma=gamma,
             temperature=temperature,
-            # The parent request has already emitted the seed token;
-            # accumulated_tokens stores only post-seed SMC tokens.
             token_counts=[1] * n_particles,
             stop_token_ids=stop_token_ids,
             max_tokens=visible_max_tokens,
@@ -405,7 +401,7 @@ class SMCVLLMScheduler(Scheduler):
 
             # draft_token_ids: [A, gamma+1]; [:, 0] is the carried seed input.
             # Commits gamma+1 tokens per particle: x_1..x_gamma from draft
-            # plus next_seed_ids (the target bonus token), which seeds the next cycle.
+            # plus next_seed_ids (the target bonus token).
             active_ps = [p for p, f in enumerate(state.particle_finished) if not f]
             new_tokens = torch.cat(
                 (draft_token_ids[:, 1:], next_seed_ids.unsqueeze(1)),
@@ -415,9 +411,10 @@ class SMCVLLMScheduler(Scheduler):
             sp = state.parent_req.sampling_params
             stop_ids: set[int] = sp._all_stop_token_ids if sp is not None else set()
             max_tokens = sp.max_tokens if sp is not None else None
+            new_tokens_rows = new_tokens.tolist()
 
             for i, p in enumerate(active_ps):
-                particle_tokens = new_tokens[i].tolist()
+                particle_tokens = list(new_tokens_rows[i])
                 if max_tokens is not None:
                     remaining = max_tokens - (1 + len(state.accumulated_tokens[p]))
                     if remaining <= 0:
@@ -441,8 +438,9 @@ class SMCVLLMScheduler(Scheduler):
             # Accumulate log-weight increments.
             logprob_diff = model_runner_output.smc_logprob_diffs.get(group_id)
             if logprob_diff is not None:
+                logprob_diff_list = logprob_diff.tolist()
                 for i, p in enumerate(active_ps):
-                    state.log_weights[p] += float(logprob_diff[i].item())
+                    state.log_weights[p] += logprob_diff_list[i]
 
             # Advance per-particle seq_lens for active particles only.
             for p in active_ps:
@@ -480,11 +478,11 @@ class SMCVLLMScheduler(Scheduler):
             if all(state.particle_finished):
                 self._finish_group(group_id, state, result)
             else:
-                # Build per-particle seeds for this cycle: active particles get the new
-                # bonus token; finished particles keep their previous seed.
+                # Build per-particle seeds for this cycle: active particles get the new bonus token.
                 full_seeds = list(state.seed_token_ids)
+                next_seed_list = next_seed_ids.tolist()
                 for i, p in enumerate(active_ps):
-                    full_seeds[p] = int(next_seed_ids[i].item())
+                    full_seeds[p] = next_seed_list[i]
                 # Apply ancestry so each particle uses its ancestor's seed.
                 if ancestor_indices_t is not None:
                     anc = ancestor_indices_t.tolist()
