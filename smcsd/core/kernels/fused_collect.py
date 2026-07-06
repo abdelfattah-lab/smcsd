@@ -307,3 +307,49 @@ def batched_collect_fused(
         counter=plan_counter,
         resample_mask=plan_mask.to(torch.bool),
     )
+
+
+@triton.jit
+def _transport_pending_kernel(
+    plan_dst_ptr,   # (cap,) int32
+    plan_src_ptr,   # (cap,) int32
+    counter_ptr,    # (1,) int32 — true job count, read on-device
+    ring_ptr,       # (R, max_slots) float64 (MUTATED)
+    ring_stride,
+    R: tl.constexpr,
+):
+    j = tl.program_id(0)
+    n = tl.load(counter_ptr)
+    if j < n:
+        dst = tl.load(plan_dst_ptr + j).to(tl.int64)
+        src = tl.load(plan_src_ptr + j).to(tl.int64)
+        for r in range(R):
+            v = tl.load(ring_ptr + r * ring_stride + src)
+            tl.store(ring_ptr + r * ring_stride + dst, v)
+
+
+def transport_pending(plan, pending_ring: torch.Tensor, max_jobs: int) -> None:
+    """Lineage-copy the staged-increment ring through a resample plan.
+
+    Delayed resampling holds the last D weight increments outside
+    ``log/interval_weights``.  A resample overwrites dst's trajectory
+    (tokens, KV, finish state) with src's — including the cycles whose
+    increments are still staged — so the staged values must be copied
+    dst <- src exactly like the other per-slot lineage tensors in
+    ``batched_resample_kv``.  Within one plan dst and src sets are
+    disjoint (dsts have count 0, srcs count >= 1), so a single-level copy
+    suffices.
+
+    Same counter-gated worst-case-grid idiom as the other plan consumers:
+    grid = host-known cap, true count read on-device, no host sync.
+    """
+    if max_jobs <= 0:
+        return
+    _transport_pending_kernel[(max_jobs,)](
+        plan.dst_flat,
+        plan.src_flat,
+        plan.counter,
+        pending_ring,
+        pending_ring.stride(0),
+        R=pending_ring.shape[0],
+    )

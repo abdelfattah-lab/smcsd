@@ -115,6 +115,18 @@ class SMCCoordinator:
         self.resample_threshold = resample_threshold
         self.resample_method = resample_method
         self._fast_step_counter = 0
+        # SMC_RESAMPLE_STATS=1: count resample events vs opportunities
+        # (in-use group rows per cycle).  Device-side accumulation; one
+        # .item() pair per 500 cycles.  The event rate is the async hit-rate
+        # determinant for optimistic resampling: a cycle with no resample
+        # needs no rollback.
+        self._stats_enabled = bool(
+            int(os.environ.get("SMC_RESAMPLE_STATS", "0"))
+        )
+        self._stats_resamples = torch.zeros(
+            1, dtype=torch.int64, device=device
+        )
+        self._stats_rows = torch.zeros(1, dtype=torch.int64, device=device)
         logger.info(
             "SMCCoordinator: resample_method=%s (fused systematic kernel)",
             resample_method,
@@ -131,7 +143,7 @@ class SMCCoordinator:
         from smcsd.core.kernels.fused_collect import batched_collect_fused
 
         self._fast_step_counter += 1
-        return batched_collect_fused(
+        plan = batched_collect_fused(
             slot_state.log_weights,
             slot_state.interval_weights,
             slot_state.group_to_slots,
@@ -139,6 +151,20 @@ class SMCCoordinator:
             self.resample_threshold,
             step_counter=self._fast_step_counter,
         )
+        if self._stats_enabled:
+            self._stats_resamples += plan.resample_mask.sum()
+            self._stats_rows += slot_state.row_in_use.sum()
+            if self._fast_step_counter % 500 == 0:
+                n_res = int(self._stats_resamples.item())
+                n_rows = int(self._stats_rows.item())
+                # print, not logger: the scheduler subprocess's logging does
+                # not reach the driving script's captured output.
+                print(
+                    f"[SMC_STATS] resamples={n_res} row_cycles={n_rows} "
+                    f"rate={n_res / max(1, n_rows):.4f}",
+                    flush=True,
+                )
+        return plan
 
     def dispatch_resample_batch(
         self,
@@ -273,6 +299,105 @@ class SMCScheduler(Scheduler):
         if self._use_overlap_loop:
             logger.info("SMCScheduler: overlapped scheduling enabled.")
 
+        # Delayed-by-D resampling: the resample decision at cycle t runs on
+        # weights through t-D (the last D increments are staged in
+        # slot_state.pending_ring during write-back, lineage-transported
+        # through each resample, and folded oldest-first after dispatch).
+        # Statistically this is auxiliary SMC with stale resampling weights
+        # λ = w_{t-D} and exact post-resample correction.  D=1 emulates a
+        # verify-stalls-draft schedule; D=2 emulates the fully-overlapped
+        # M2 schedule (verify(t-1) runs under draft(t)).  Requires the
+        # sequential loop for now: the fold must be enqueued before the
+        # next cycle's collect, which the overlap loop's deferred
+        # postprocessing cannot guarantee (M2's event-ordered dual-stream
+        # schedule lifts this).
+        self._delay_resample = bool(self.slot_state.delay_resample)
+        if self._delay_resample and self._use_overlap_loop:
+            logger.warning(
+                "SMC_DELAY_RESAMPLE=1 forces the sequential loop; "
+                "SMC_ENABLE_OVERLAP=1 ignored."
+            )
+            self._use_overlap_loop = False
+        if self._delay_resample:
+            logger.info("SMCScheduler: delayed-by-1 resampling enabled.")
+
+        # Lazy-apply resampling (fresh-decision, deferred copy): the
+        # resample DECISION at cycle t uses fresh weights through t (same
+        # as synchronous SMC — no staleness), but the KV/lineage copy is
+        # APPLIED at the t+1 boundary, after the speculative cycle-t+1
+        # draft has run.  Culled particles' speculative tokens are simply
+        # overwritten by the copy; survivors' stand.  Emulates the
+        # fully-overlapped M2 schedule where verify(t) lands mid-draft(t+1):
+        # no rollback, no stall, cycle time independent of resample rate.
+        # Statistical cost vs sync: resample offspring share one cycle of
+        # extension randomness (within-population correlation, one cycle
+        # deep) — measured, not assumed.  Mutually exclusive with
+        # SMC_DELAY_RESAMPLE (stale-decision emulation).
+        self._lazy_resample = bool(
+            int(os.environ.get("SMC_LAZY_RESAMPLE", "0"))
+        )
+        # Composable: SMC_DELAY_RESAMPLE=1 + SMC_LAZY_RESAMPLE=1 emulates the
+        # true single-GPU pipelined schedule (M2-lazy): the decision at
+        # boundary k sees weights through k-1 (verify(k) is still in flight
+        # when draft(k+1) must start) AND the copy lands one boundary late.
+        # In combined mode the pending ring is lineage-transported through
+        # the APPLIED (held) plan inside _apply_held_plan, and folded after
+        # collect (so collect stays one increment stale).
+        if self._lazy_resample and self._use_overlap_loop:
+            logger.warning(
+                "SMC_LAZY_RESAMPLE=1 forces the sequential loop; "
+                "SMC_ENABLE_OVERLAP=1 ignored."
+            )
+            self._use_overlap_loop = False
+        if self._lazy_resample:
+            logger.info(
+                "SMCScheduler: lazy-apply (fresh-decision) resampling "
+                "enabled."
+            )
+        self._held_plan = None
+
+        # Pipelined decode (M2, SMC_PIPELINE=1): verify runs on its own CUDA
+        # stream, overlapped with the NEXT cycle's draft.  Rollback
+        # ("guess no-resample") semantics: the next draft starts
+        # optimistically; when the verify-stream decision lands mid-draft,
+        # a no-resample outcome costs nothing, a resample aborts the
+        # in-flight cycle (nothing is committed mid-cycle), applies the
+        # plan, and redrafts.  Decisions are always fresh and always fully
+        # applied before any tokens commit — the sampler is
+        # distribution-identical to the synchronous engine.
+        # Requires self-continuation (the draft must free-run).
+        self._use_pipeline_loop = bool(
+            int(os.environ.get("SMC_PIPELINE", "0"))
+        )
+        if self._use_pipeline_loop:
+            if not bool(int(os.environ.get("SMC_SELF_BONUS", "0"))):
+                raise RuntimeError(
+                    "SMC_PIPELINE=1 requires SMC_SELF_BONUS=1 (the draft "
+                    "must free-run without the target bonus)."
+                )
+            if self._delay_resample or self._lazy_resample:
+                raise RuntimeError(
+                    "SMC_PIPELINE composes with neither SMC_DELAY_RESAMPLE "
+                    "nor SMC_LAZY_RESAMPLE (it has its own schedule)."
+                )
+            if self._use_overlap_loop:
+                logger.warning(
+                    "SMC_PIPELINE=1 supersedes SMC_ENABLE_OVERLAP=1."
+                )
+                self._use_overlap_loop = False
+            self._verify_stream = torch.cuda.Stream()
+            self._decision_flag_pin = torch.zeros(
+                1, dtype=torch.int32, pin_memory=True
+            )
+            self._verify_pending = None  # {plan, event, snapshot}
+            self._held_pipeline_plan = None
+            self._post_queue: List = []
+            self._pipe_cycles = 0
+            self._pipe_aborts = 0
+            logger.info(
+                "SMCScheduler: pipelined decode enabled (rollback mode)."
+            )
+
         # Debug instrumentation (scheduler process — the one that owns the
         # CUDA context, so torch.cuda.* must be queried here, not from the
         # engine/profiling script process):
@@ -368,7 +493,9 @@ class SMCScheduler(Scheduler):
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None
         with self.device_module.StreamContext(self.schedule_stream):
-            if self._use_overlap_loop:
+            if getattr(self, "_use_pipeline_loop", False):
+                self._event_loop_pipelined()
+            elif self._use_overlap_loop:
                 self._event_loop_overlap()
             else:
                 self._event_loop()
@@ -484,6 +611,240 @@ class SMCScheduler(Scheduler):
             self.last_batch = tracking_batch
             if hasattr(self, "waiting_queue"):
                 self.waiting_queue = []
+
+    # ── Pipelined event loop (M2) ──
+
+    @DynamicGradMode()
+    def _event_loop_pipelined(self) -> None:
+        """Rollback-mode pipelined decode: verify(k) on stream V overlaps
+        draft(k+1) on the schedule stream.  See __init__ for semantics."""
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                self._pipeline_flush()
+                self.cancel_bubble_timer()
+                continue
+
+            # Boundary work: land a plan whose decision arrived at the end
+            # of the previous cycle (nothing speculative is in flight here,
+            # so a plain dispatch applies it), then drain/finalize with the
+            # settled snapshots.
+            if self._held_pipeline_plan is not None:
+                self.coordinator.dispatch_resample_batch(
+                    self._held_pipeline_plan, self.slot_state
+                )
+                self._held_pipeline_plan = None
+            self._pipeline_process_posts()
+
+            batch, batch_kind = self._get_next_batch()
+            tracking_batch = self._make_runtime_tracking_batch(batch)
+            self.cur_batch = tracking_batch
+            self.running_batch = (
+                tracking_batch
+                if tracking_batch is not None
+                else ScheduleBatch(reqs=[])
+            )
+
+            if batch is None:
+                self._pipeline_flush()
+            elif batch_kind == "prefill":
+                self._pipeline_flush()
+                result = self.run_batch(batch)
+                self._process_prefill_result(
+                    batch, result, self._take_prefill_groups()
+                )
+            else:
+                self._pipeline_decode_cycle(batch)
+
+            self.last_batch = tracking_batch
+            if hasattr(self, "waiting_queue"):
+                self.waiting_queue = []
+
+    def _pipeline_decode_cycle(self, batch) -> None:
+        w = self.draft_worker
+        gamma = w.gamma
+        _timing = getattr(self, "_pipe_timing", None)
+        if _timing is None:
+            _timing = self._pipe_timing = (
+                {"draft": 0.0, "commit": 0.0, "verify_prep": 0.0,
+                 "cycle": 0.0, "gpu_wait": 0.0, "n": 0}
+                if bool(int(os.environ.get("SMC_PIPE_TIMING", "0")))
+                else False
+            )
+        import time as _time
+        _t0 = _time.perf_counter() if _timing else 0.0
+
+        # 1. Optimistic draft; the previous cycle's verify decision is
+        #    polled between AR steps.
+        res = w.draft_cycle(batch, abort_check=self._poll_decision)
+        if res is None:
+            # Decision fired mid-draft with a resample: abort + redraft.
+            self._pipeline_abort_and_apply(batch)
+            res = w.draft_cycle(batch, abort_check=None)
+        else:
+            # Verify slower than the whole draft cycle (or first cycle):
+            # settle before committing.
+            if self._verify_pending is not None:
+                if self._consume_decision(blocking=True):
+                    self._pipeline_abort_and_apply(batch)
+                    res = w.draft_cycle(batch, abort_check=None)
+        all_tokens, draft_lps, cache_locs, ctx = res
+        if _timing:
+            _t1 = _time.perf_counter()
+            _timing["draft"] += _t1 - _t0
+
+        # 2. Commit tokens / seeds / finish flags (schedule stream).
+        output_token_ids = torch.stack(all_tokens[1 : gamma + 2], dim=1)
+        self.slot_state.write_back_gpu(
+            next_token_ids=output_token_ids.reshape(-1),
+            logprob_diff=None,
+            bonus_ids=all_tokens[gamma + 1],
+            prev_last_draft_ids=all_tokens[gamma],
+            tokens_only=True,
+        )
+        snapshot = self.slot_state.snapshot_to_host()
+
+        # 3. Launch verify + weight fold + fresh decision on stream V.
+        if _timing:
+            _t2 = _time.perf_counter()
+            _timing["commit"] += _t2 - _t1
+        ev_draft = torch.cuda.Event()
+        ev_draft.record()
+        active_snapshot = self.slot_state.active_slots
+        vs = self._verify_stream
+        with torch.cuda.stream(vs):
+            vs.wait_event(ev_draft)
+            diff = w.verify_cycle(batch, ctx, all_tokens, draft_lps, cache_locs)
+            self.slot_state.fold_weights_from_diff(diff, active_snapshot)
+            logZ_inc = self.slot_state.resample_logZ_increment()
+            plan = self.coordinator.collect_resample_jobs_batch(
+                self.slot_state
+            )
+            self.slot_state.group_log_Z_hat += torch.where(
+                plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
+            )
+            self._decision_flag_pin.copy_(plan.counter, non_blocking=True)
+            ev_decision = torch.cuda.Event()
+            ev_decision.record(vs)
+        self._verify_pending = {
+            "plan": plan,
+            "event": ev_decision,
+            "snapshot": snapshot,
+            # Keepalive: D-allocated tensors consumed by the V stream must
+            # outlive this cycle's Python scope (the caching allocator may
+            # otherwise recycle them under V's in-flight kernels).  Dropped
+            # at _consume_decision, when the host has confirmed V is done.
+            "keepalive": (all_tokens, draft_lps, cache_locs, ctx, batch, diff),
+        }
+        self._pipe_cycles += 1
+        if _timing:
+            _t3 = _time.perf_counter()
+            _timing["verify_prep"] += _t3 - _t2
+            # GPU-side residue: how long the schedule stream still runs
+            # after the host finished enqueueing — the host-vs-GPU verdict.
+            torch.cuda.current_stream().synchronize()
+            _timing["gpu_wait"] += _time.perf_counter() - _t3
+            _timing["cycle"] += _time.perf_counter() - _t0
+            _timing["n"] += 1
+            if _timing["n"] % 300 == 0:
+                n = _timing["n"]
+                print(
+                    "[SMC_PIPE_TIMING] per-cycle ms: "
+                    + " ".join(
+                        f"{k}={1e3 * _timing[k] / n:.2f}"
+                        for k in ("draft", "commit", "verify_prep",
+                                  "gpu_wait", "cycle")
+                    ),
+                    flush=True,
+                )
+
+    def _poll_decision(self) -> bool:
+        """Between-draft-steps host poll.  True => a resample fired and the
+        in-flight cycle must abort."""
+        vp = self._verify_pending
+        if vp is None or not vp["event"].query():
+            return False
+        return self._consume_decision(blocking=False)
+
+    def _consume_decision(self, blocking: bool) -> bool:
+        vp = self._verify_pending
+        if blocking:
+            vp["event"].synchronize()
+        self._verify_pending = None
+        resampled = int(self._decision_flag_pin.item()) > 0
+        if resampled:
+            self._held_pipeline_plan = vp["plan"]
+            self._pipe_aborts += 1
+        # Postprocessing (drain/finalize + freed pages) is deferred to the
+        # next cycle boundary: mid-draft, a finalize would rebuild
+        # active_slots under the in-flight batch.
+        self._post_queue.append(vp["snapshot"])
+        if (
+            self.coordinator._stats_enabled
+            and self._pipe_cycles % 500 == 0
+            and self._pipe_cycles
+        ):
+            print(
+                f"[SMC_PIPE] cycles={self._pipe_cycles} "
+                f"aborts={self._pipe_aborts} "
+                f"abort_rate={self._pipe_aborts / self._pipe_cycles:.4f}",
+                flush=True,
+            )
+        return resampled
+
+    def _pipeline_abort_and_apply(self, batch) -> None:
+        """Mid-cycle resample: discard the in-flight draft, apply the plan
+        on the committed prefix, re-advance onto the SAME pre-allocated
+        pages, and refresh the seeds for the redraft.
+
+        The rewind matters: the resample copy's lengths must cover only the
+        committed prefix, so dst rows keep exclusive ownership of their own
+        fresh cycle pages (the copy never aliases them onto src's) and the
+        redraft can overwrite them in place — no realloc, no refcount
+        traffic beyond the prefix copy itself.
+        """
+        ctx = batch.spec_info.decode_ctx
+        active = self.slot_state.active_slots
+        plan = self._held_pipeline_plan
+        self._held_pipeline_plan = None
+
+        self.slot_state.seq_lens[active] = ctx.orig_seq_lens
+        self.slot_state.kv_allocated_lens[active] = ctx.orig_seq_lens
+        self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+        self.slot_state.seq_lens[active] = ctx.new_seq_lens
+        self.slot_state.kv_allocated_lens[active] = ctx.new_seq_lens
+        batch.spec_info.verified_id = self.slot_state.verified_ids[active]
+
+    def _pipeline_process_posts(self) -> None:
+        while self._post_queue:
+            snapshot = self._post_queue.pop(0)
+            snapshot.wait()
+            n_freed = int(
+                self.slot_state.kv_freed_count_host[snapshot.phase].item()
+            )
+            if n_freed > 0:
+                self.token_to_kv_pool_allocator.free(
+                    self.slot_state.kv_freed_buf[
+                        snapshot.phase, :n_freed
+                    ].to(torch.int64)
+                )
+                self.slot_state.kv_freed_counter[snapshot.phase].zero_()
+            self._drain_finished_groups(
+                self.slot_state.finished_mask_host[snapshot.phase]
+            )
+
+    def _pipeline_flush(self) -> None:
+        """Settle the pipeline: consume any in-flight decision, apply a
+        held plan at the (safe) boundary, run deferred postprocessing."""
+        if self._verify_pending is not None:
+            self._consume_decision(blocking=True)
+        if self._held_pipeline_plan is not None:
+            self.coordinator.dispatch_resample_batch(
+                self._held_pipeline_plan, self.slot_state
+            )
+            self._held_pipeline_plan = None
+        self._pipeline_process_posts()
 
     def _process_queued_result(self, result_queue: Deque) -> None:
         entry = result_queue.popleft()
@@ -870,7 +1231,15 @@ class SMCScheduler(Scheduler):
             logprob_diff=logprob_diff,
             bonus_ids=bonus_ids,
             prev_last_draft_ids=prev_last_draft_ids,
+            stage_weights=self._delay_resample,
         )
+
+        # Lazy-apply: land the PREVIOUS cycle's held plan first (its
+        # decision was fresh at cycle t-1; the copy sweeps up the
+        # speculative cycle-t extension, weights included).  Must precede
+        # this cycle's collect so the new decision sees post-apply state.
+        if self._lazy_resample and self._held_plan is not None:
+            self._apply_held_plan()
 
         # Snapshot the per-row log Z_hat increment BEFORE the resample kernel
         # zeroes weights, then fold it into group_log_Z_hat for the rows that
@@ -882,9 +1251,67 @@ class SMCScheduler(Scheduler):
         self.slot_state.group_log_Z_hat += torch.where(
             plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
         )
-        self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+        if self._lazy_resample:
+            # Hold: decision made (weights zeroed, logZ folded), copy
+            # deferred to the next boundary / finalize flush.
+            self._held_plan = plan
+        else:
+            self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+        if self._delay_resample:
+            # Lineage-copy the staged-increment ring through this cycle's
+            # plan (immediate-dispatch mode only — in lazy mode the ring is
+            # transported through the APPLIED plan in _apply_held_plan, and
+            # this cycle's held plan gets its turn next boundary), then land
+            # the ring's oldest increment.  Fold sits after collect, so the
+            # decision stays one increment stale by construction.
+            from smcsd.core.kernels.fused_collect import transport_pending
+
+            if not self._lazy_resample:
+                transport_pending(
+                    plan,
+                    self.slot_state.pending_ring,
+                    self.slot_state.max_groups
+                    * (self.slot_state.n_particles - 1),
+                )
+            self.slot_state.fold_pending_weights()
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
+
+    def _apply_held_plan(self) -> None:
+        """Land a lazily-held resample plan: weight transport + KV/lineage
+        copy.
+
+        The plan's decision was made on fresh weights one cycle ago; since
+        then every slot accumulated one speculative cycle of tokens and
+        weight increments.  The copy makes dst a byte-consistent clone of
+        src's trajectory *including* that speculative extension — tokens
+        and KV via ``batched_resample_kv``, the post-decision weight
+        increments via the same lineage-transport kernel (dst's own
+        speculative increment belongs to the trajectory being overwritten).
+
+        Called at the next cycle boundary, or from ``_finalize_group``
+        (a finalize must never read pre-apply state or free slots a held
+        plan still references).
+        """
+        from smcsd.core.kernels.fused_collect import transport_pending
+
+        plan = self._held_plan
+        self._held_plan = None
+        max_jobs = self.slot_state.max_groups * (
+            self.slot_state.n_particles - 1
+        )
+        transport_pending(
+            plan, self.slot_state.log_weights.unsqueeze(0), max_jobs
+        )
+        transport_pending(
+            plan, self.slot_state.interval_weights.unsqueeze(0), max_jobs
+        )
+        if self._delay_resample:
+            # Combined delay+lazy: staged increments belong to trajectories
+            # this copy overwrites — transport the ring through the applied
+            # plan (the fold after collect then lands slot-correct values).
+            transport_pending(plan, self.slot_state.pending_ring, max_jobs)
+        self.coordinator.dispatch_resample_batch(plan, self.slot_state)
 
     def _process_decode_result(
         self,
@@ -957,6 +1384,10 @@ class SMCScheduler(Scheduler):
         self.running_groups = remaining
 
     def _finalize_group(self, group: SequenceGroup) -> None:
+        # Lazy-apply: a held plan must land before finalize reads weights /
+        # finish state or frees slots it references.
+        if getattr(self, "_lazy_resample", False) and self._held_plan is not None:
+            self._apply_held_plan()
         if not group.has_materialized_particles():
             # Shouldn't happen — but handle gracefully
             parent_req = group.parent_req

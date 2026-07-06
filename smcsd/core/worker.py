@@ -100,6 +100,21 @@ class SMCWorker(BaseSpecWorker):
         self.smc_defer_bonus = bool(
             int(os.environ.get("SMC_DEFER_BONUS", "0"))
         )
+        # Self-continuation drafting (delayed-by-1 groundwork): keep the
+        # over-draft d_gamma as the cycle's (gamma+1)-th emitted token and the
+        # next cycle's seed, instead of sampling a bonus token from the
+        # target.  The verify pass then scores all gamma+1 emitted tokens
+        # (pure-q proposal; logprob_diff gains a (gamma+1)-th column).  This
+        # removes the token-level verify->draft dependency: nothing the next
+        # draft cycle consumes comes from the target.
+        self.smc_self_bonus = bool(int(os.environ.get("SMC_SELF_BONUS", "0")))
+        if self.smc_self_bonus and self.smc_defer_bonus:
+            logger.warning(
+                "SMC_SELF_BONUS=1 overrides SMC_DEFER_BONUS=1: the deferred "
+                "2-token head exists to consume the target bonus, which "
+                "self-continuation removes."
+            )
+            self.smc_defer_bonus = False
         # Only the dense-AR draft path is supported here.
         self._dense_draft_hybrid_req_to_token_pool = None
 
@@ -252,6 +267,11 @@ class SMCWorker(BaseSpecWorker):
             )
 
             reasons = []
+            if self.smc_self_bonus:
+                reasons.append(
+                    "self-continuation drafting (SMC_SELF_BONUS=1) is not "
+                    "captured yet; running the eager path"
+                )
             if backup_disable_cuda_graph:
                 reasons.append("cuda graph disabled")
             if not self.smc_draft_temperature > 0:
@@ -862,11 +882,14 @@ class SMCWorker(BaseSpecWorker):
 
                 # Shared Gumbel-max + fused-logprob sampler; the over-draft
                 # step (step == gamma) skips the logprob reduction since its
-                # token never contributes to the importance weight.
+                # token never contributes to the importance weight — except
+                # under self-continuation, where d_gamma is a kept sample and
+                # its q-logprob enters the (gamma+1)-th weight column.
+                keep_logprob = step < gamma or self.smc_self_bonus
                 draft_idx, token_logprob = self._sample_draft_token(
-                    logits, need_logprob=step < gamma
+                    logits, need_logprob=keep_logprob
                 )
-                if step < gamma:
+                if keep_logprob:
                     draft_logprobs.append(token_logprob)
 
                 all_tokens.append(draft_idx)
@@ -913,9 +936,13 @@ class SMCWorker(BaseSpecWorker):
         # — one gather + one reduction instead of materializing the full
         # (bs*(gamma+1), vocab) log_softmax tensor.
         score_logits_3d = score_logits.reshape(bs, gamma + 1, -1)
-        target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
+        # Under self-continuation all gamma+1 emitted tokens are draft
+        # samples and every one gets a weight column; row gamma of the
+        # verify logits scores d_gamma instead of feeding a bonus draw.
+        n_scored = gamma + 1 if self.smc_self_bonus else gamma
+        target_tokens = torch.stack(all_tokens[1 : n_scored + 1], dim=1)
         verify_scaled = (
-            score_logits_3d[:, :gamma, :] / self.smc_target_temperature
+            score_logits_3d[:, :n_scored, :] / self.smc_target_temperature
         )
         chosen_logits = verify_scaled.gather(
             2, target_tokens.unsqueeze(2)
@@ -938,31 +965,39 @@ class SMCWorker(BaseSpecWorker):
             self.smc_power_alpha * score_logprobs_stacked - draft_logprobs_stacked
         )
 
-        # ---- 6. Bonus token ----
-        # Sample from the same p_{T_t}^alpha distribution targeted above so the
-        # bonus and per-step draws come from one consistent target.
-        # Gumbel-max draw from the same p_T^alpha tempered-power target the
-        # per-step weights use — exactly equivalent to the previous
-        # log_softmax → exp → multinomial chain.
-        bonus_scaled = (
-            self.smc_power_alpha
-            * score_logits_3d[:, -1, :]
-            / self.smc_target_temperature
-        )
-        bonus_gumbel = -torch.log(
-            -torch.log(
-                torch.rand_like(bonus_scaled).clamp_min_(
-                    torch.finfo(bonus_scaled.dtype).tiny
+        if self.smc_self_bonus:
+            # ---- 6/7. Self-continuation ----
+            # The over-draft d_gamma is the (gamma+1)-th emitted token AND
+            # the next cycle's seed; no target bonus is drawn.  Row gamma of
+            # the verify logits was consumed above as d_gamma's score column.
+            output_token_ids = torch.stack(all_tokens[1 : gamma + 2], dim=1)
+            next_verified_id = all_tokens[gamma + 1]
+        else:
+            # ---- 6. Bonus token ----
+            # Sample from the same p_{T_t}^alpha distribution targeted above so the
+            # bonus and per-step draws come from one consistent target.
+            # Gumbel-max draw from the same p_T^alpha tempered-power target the
+            # per-step weights use — exactly equivalent to the previous
+            # log_softmax → exp → multinomial chain.
+            bonus_scaled = (
+                self.smc_power_alpha
+                * score_logits_3d[:, -1, :]
+                / self.smc_target_temperature
+            )
+            bonus_gumbel = -torch.log(
+                -torch.log(
+                    torch.rand_like(bonus_scaled).clamp_min_(
+                        torch.finfo(bonus_scaled.dtype).tiny
+                    )
                 )
             )
-        )
-        bonus = torch.argmax(bonus_scaled + bonus_gumbel, dim=-1)
+            bonus = torch.argmax(bonus_scaled + bonus_gumbel, dim=-1)
 
-        # ---- 7. Output ----
-        output_token_ids = torch.stack(
-            all_tokens[1 : gamma + 1] + [bonus], dim=1
-        )
-        next_verified_id = bonus
+            # ---- 7. Output ----
+            output_token_ids = torch.stack(
+                all_tokens[1 : gamma + 1] + [bonus], dim=1
+            )
+            next_verified_id = bonus
 
         next_token_ids = output_token_ids.reshape(-1)
         accept_lens = torch.full(
@@ -997,6 +1032,117 @@ class SMCWorker(BaseSpecWorker):
             next_draft_input=next_draft_input,
             logprob_diff=logprob_diff,
             can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    # ── Pipelined decode (M2): draft / verify split ──
+    #
+    # Used only by SMCScheduler._event_loop_pipelined (SMC_PIPELINE=1).
+    # Self-continuation only (the draft must free-run), eager verify, legacy
+    # gamma+1 AR draft schedule.  The synchronous _forward_decode above is
+    # deliberately untouched.
+
+    def draft_cycle(self, batch: ModelWorkerBatch, abort_check=None):
+        """Run one draft cycle (gamma+1 AR forwards) on the current stream.
+
+        ``abort_check`` is polled between AR steps (host-side, cheap); if it
+        returns True the cycle is abandoned and None is returned — the
+        caller rewinds, applies the resample, and calls again.  Partial
+        draft KV writes land in this cycle's pre-allocated pages and are
+        simply overwritten by the redraft.
+
+        Returns (all_tokens, draft_logprobs_stacked, cache_locs, ctx).
+        """
+        assert self.smc_self_bonus and not self.smc_defer_bonus
+        draft_input: SMCDraftInput = batch.spec_info
+        ctx: SMCDecodeContext = draft_input.decode_ctx
+
+        draft_fb, can_cuda_graph, cache_locs, all_positions, all_seq_lens = (
+            ctx.prepare_for_draft(
+                draft_input.verified_id,
+                self.req_to_token_pool,
+                batch,
+                self.draft_runner.graph_runner
+                if hasattr(self.draft_runner, "graph_runner")
+                else None,
+                self.draft_runner,
+            )
+        )
+        bs = len(ctx.orig_seq_lens)
+        gamma = self.gamma
+
+        use_multistep = (
+            self.draft_attn_backend is not None and not can_cuda_graph
+        )
+        if use_multistep and not draft_fb.forward_mode.is_idle():
+            draft_fb.spec_info = draft_input
+            draft_fb.seq_lens = ctx.orig_seq_lens
+            draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu
+            self.draft_attn_backend.init_forward_metadata(draft_fb)
+
+        x0 = draft_input.verified_id
+        all_tokens = [x0]
+        draft_logprobs = []
+        current_ids = x0
+
+        for step in range(gamma + 1):
+            if abort_check is not None and abort_check():
+                return None
+            draft_fb.input_ids = current_ids
+            draft_fb.positions = all_positions[:, step].contiguous()
+            draft_fb.out_cache_loc = cache_locs[:, step].contiguous()
+            if use_multistep:
+                draft_fb.attn_backend = self.draft_attn_backend.attn_backends[step]
+                draft_out = self.draft_runner.forward(
+                    draft_fb, skip_attn_backend_init=True
+                )
+            else:
+                draft_fb.seq_lens = all_seq_lens[:, step].contiguous()
+                draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
+                draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
+                draft_out = self.draft_runner.forward(draft_fb)
+            logits = draft_out.logits_output.next_token_logits
+            draft_idx, token_logprob = self._sample_draft_token(logits)
+            draft_logprobs.append(token_logprob)
+            all_tokens.append(draft_idx)
+            current_ids = draft_idx
+
+        draft_logprobs_stacked = torch.stack(draft_logprobs, dim=1)
+        return all_tokens, draft_logprobs_stacked, cache_locs, ctx
+
+    def verify_cycle(self, batch, ctx, all_tokens, draft_logprobs_stacked,
+                     cache_locs):
+        """Score one drafted cycle on the current stream (caller picks the
+        stream).  Self-continuation: all gamma+1 columns are scored, no
+        bonus is drawn.  Returns logprob_diff (bs, gamma+1) float32."""
+        gamma = self.gamma
+        bs = len(ctx.orig_seq_lens)
+        verify_forward_batch, _ = ctx.prepare_for_verify(
+            self.req_to_token_pool,
+            batch,
+            self._target_worker,
+            all_tokens,
+            cache_locs,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        score_result = self._target_worker.forward_batch_generation(
+            model_worker_batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+        )
+        score_logits = score_result.logits_output.next_token_logits
+        score_logits_3d = score_logits.reshape(bs, gamma + 1, -1)
+        target_tokens = torch.stack(all_tokens[1 : gamma + 2], dim=1)
+        verify_scaled = score_logits_3d / self.smc_target_temperature
+        chosen_logits = verify_scaled.gather(
+            2, target_tokens.unsqueeze(2)
+        ).squeeze(2)
+        score_logprobs_stacked = chosen_logits - torch.logsumexp(
+            verify_scaled, dim=-1
+        )
+        return (
+            self.smc_power_alpha * score_logprobs_stacked
+            - draft_logprobs_stacked
         )
 
     def _forward_idle(self, batch: ModelWorkerBatch):

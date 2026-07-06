@@ -207,6 +207,35 @@ class ScheduleBatchSMC:
             self.max_slots, dtype=torch.float64, device=device
         )
 
+        # ── Delayed resampling (SMC_DELAY_RESAMPLE=D) ──
+        # Ring of D staged increments: the resample decision at cycle t runs
+        # on weights through t-D (the last D increments live in the ring,
+        # not yet in log/interval_weights).  Statistically this is auxiliary
+        # SMC with stale resampling weights λ = w_{t-D} and exact
+        # post-resample correction — provided each staged increment is
+        # lineage-transported through every resample between its staging and
+        # its fold (``transport_pending``: ring[:, dst] = ring[:, src],
+        # exactly like the other per-slot lineage tensors).  Per cycle:
+        # stage d_t into ring[head] → collect/dispatch → transport ring →
+        # fold ring[tail] (the increment staged D-1 cycles ago).  D=1
+        # degenerates to stage → fold within one cycle.
+        self.delay_resample = max(
+            0, int(os.environ.get("SMC_DELAY_RESAMPLE", "0"))
+        )
+        ring_depth = max(1, self.delay_resample)
+        self.pending_ring = torch.zeros(
+            (ring_depth, self.max_slots), dtype=torch.float64, device=device
+        )
+        self._pending_head = 0  # host-side rotating cursor
+
+        # Pipelined decode (M2): per-slot weight-column cutoff, written by
+        # the tokens-only write-back on the schedule stream, consumed by the
+        # verify-stream weight fold (the diff isn't available at write-back
+        # time when verify runs on its own stream).
+        self.weight_cutoff_t = torch.full(
+            (self.max_slots,), -1, dtype=torch.int32, device=device
+        )
+
         # ── Token history [max_slots, max_output_len] ──
         self.all_token_ids = torch.zeros(
             (self.max_slots, max_output_len), dtype=torch.int32, device=device
@@ -430,6 +459,9 @@ class ScheduleBatchSMC:
         self.matched_eos_token.index_fill_(0, idx, 0)
         self.log_weights.index_fill_(0, idx, 0.0)
         self.interval_weights.index_fill_(0, idx, 0.0)
+        # Delayed-resample hygiene: a reused slot must not inherit a stale
+        # staged increment from a previous tenant.
+        self.pending_ring[:, idx] = 0.0
 
         # ── Category 2: per-particle scalars → pinned upload + scatter ──
         self.req_pool_indices[idx] = self._to_device_async(
@@ -543,6 +575,7 @@ class ScheduleBatchSMC:
             self.ignore_eos_t.index_fill_(0, idx, 0)
             self.log_weights.index_fill_(0, idx, 0.0)
             self.interval_weights.index_fill_(0, idx, 0.0)
+            self.pending_ring[:, idx] = 0.0
 
         self.rebuild_active_slots()
 
@@ -763,6 +796,8 @@ class ScheduleBatchSMC:
         bonus_ids: torch.Tensor,
         *,
         prev_last_draft_ids: Optional[torch.Tensor] = None,
+        stage_weights: bool = False,
+        tokens_only: bool = False,
     ) -> None:
         """Write forward-pass results back to slot-indexed tensors.
 
@@ -810,6 +845,11 @@ class ScheduleBatchSMC:
                 log_weights=self.log_weights,
                 interval_weights=self.interval_weights,
                 gamma_plus_1=self.gamma_plus_1,
+                pending_diff=self.pending_ring[self._pending_head],
+                stage_weights=stage_weights,
+                tokens_only=tokens_only,
+                cutoff_out=self.weight_cutoff_t,
+                n_weight_cols=self.gamma_plus_1,
             )
             return
 
@@ -899,7 +939,11 @@ class ScheduleBatchSMC:
         # absorbing state with incremental weight 1).  An EOS in the bonus
         # slot keeps the full block (the clamp).  Already-finished particles
         # keep nothing (cutoff -1).
-        n_weight_cols = logprob_diff.shape[1]
+        n_weight_cols = (
+            logprob_diff.shape[1]
+            if logprob_diff is not None
+            else self.gamma_plus_1
+        )
         weight_cutoff = torch.full(
             (bs,), n_weight_cols - 1, dtype=torch.int64, device=self.device
         )
@@ -926,11 +970,61 @@ class ScheduleBatchSMC:
         #    slot that terminates this step sums only up to its EOS column, so
         #    post-EOS draft tokens — which are not part of the sequence — do
         #    not corrupt its importance weight.
+        if tokens_only:
+            # Pipelined decode: persist the cutoff for the verify-stream
+            # fold; the diff doesn't exist yet.
+            self.weight_cutoff_t[active] = weight_cutoff.to(torch.int32)
+            return
+
         cols = torch.arange(n_weight_cols, device=self.device).unsqueeze(0)
         keep = cols <= weight_cutoff.unsqueeze(1)
         d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
+        if stage_weights:
+            # Delayed resampling: hold d_t aside so the resample decision
+            # this cycle runs on weights through t-D; fold_pending_weights()
+            # lands the ring's oldest increment after dispatch+transport.
+            self.pending_ring[self._pending_head, active] = d
+        else:
+            self.log_weights[active] += d
+            self.interval_weights[active] += d
+
+    def fold_weights_from_diff(
+        self, logprob_diff: torch.Tensor, active: torch.Tensor
+    ) -> None:
+        """Verify-stream weight fold (pipelined decode): mask the diff with
+        the cutoff persisted by the tokens-only write-back, sum, accumulate.
+        Enqueue-only on the caller's current stream."""
+        cut = self.weight_cutoff_t[active].to(torch.int64)
+        cols = torch.arange(
+            logprob_diff.shape[1], device=self.device
+        ).unsqueeze(0)
+        keep = cols <= cut.unsqueeze(1)
+        d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
         self.log_weights[active] += d
         self.interval_weights[active] += d
+
+    def fold_pending_weights(self) -> None:
+        """Land the ring's oldest staged increment into the cumulative
+        weights.
+
+        Called once per decode cycle (delayed mode), after
+        ``dispatch_resample_batch`` and after ``transport_pending`` has
+        lineage-copied the ring through this cycle's resample plan — a slot
+        overwritten by the resample (dst) inherited its src's trajectory
+        including the staged cycles' tokens, so it inherits src's staged
+        increments too.  This is the auxiliary-SMC correction: the resample
+        used stale weights λ = w_{t-D}; the missing increments multiply
+        back in as they fold.
+
+        Enqueue-only (two adds + one fill); the head then rotates onto the
+        just-zeroed buffer for the next cycle's stage.
+        """
+        fold_idx = (self._pending_head + 1) % self.pending_ring.shape[0]
+        w = self.pending_ring[fold_idx]
+        self.log_weights += w
+        self.interval_weights += w
+        self.pending_ring[fold_idx].zero_()
+        self._pending_head = fold_idx
 
     # ────────────────────────────────────────────────────────
     #  Host snapshot (postprocessing inputs, no stream-tail block)
@@ -1027,11 +1121,16 @@ class ScheduleBatchSMC:
         # slot reflects its surviving lineage.
         row = self.group_id_to_row.get(group_id)
         base = self.group_log_Z_hat[row] if row is not None else 0.0
+        # Under delayed resampling up to D-1 increments are still staged in
+        # the ring (lineage-transported, so slot-correct); a finalizing
+        # group's weights must include them.  Zeros when delay is off.
+        outstanding = self.pending_ring[:, slot_idx_t].sum(dim=0)
+        final_log_w = self.log_weights[slot_idx_t] + outstanding
         tail = torch.logsumexp(
-            self.interval_weights[slot_idx_t], dim=0
+            self.interval_weights[slot_idx_t] + outstanding, dim=0
         ) - math.log(self.n_particles)
         log_Z_hat = float((base + tail))
-        log_w_tilde = [float(x) for x in self.log_weights[slot_idx_t].tolist()]
+        log_w_tilde = [float(x) for x in final_log_w.tolist()]
 
         # Per-particle results read lazily from the slot tensors — the first
         # (and only) time decode-time finish state crosses to the host.
@@ -1045,7 +1144,7 @@ class ScheduleBatchSMC:
         # Posterior sample over particles for the primary output. softmax
         # handles the max-shift for numerical stability; multinomial respects
         # the global torch RNG (seeded via ServerArgs.random_seed).
-        probs = torch.softmax(self.log_weights[slot_idx_t], dim=0)
+        probs = torch.softmax(final_log_w, dim=0)
         pick = int(torch.multinomial(probs, num_samples=1).item())
         parent_req.output_ids = list(particle_output_ids[pick])
         parent_req.finished_reason = self._finish_reason_from_code(

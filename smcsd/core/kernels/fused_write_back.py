@@ -43,6 +43,10 @@ def _fused_write_back_kernel(
     eos_token_ids_ptr,     # (max_slots, MAX_EOS) int64
     log_weights_ptr,       # (max_slots,) float64
     interval_weights_ptr,  # (max_slots,) float64
+    pending_diff_ptr,      # (max_slots,) float64 (STAGE mode only)
+    cutoff_out_ptr,        # (max_slots,) int32 (TOKENS_ONLY mode only)
+    STAGE: tl.constexpr,   # 1 => stage d into pending_diff, don't accumulate
+    TOKENS_ONLY: tl.constexpr,  # 1 => write cutoff, skip weight math entirely
     HAS_PREV: tl.constexpr,
     STRIDE: tl.constexpr,   # gamma + 1
     GAMMA: tl.constexpr,    # weight columns
@@ -119,18 +123,29 @@ def _fused_write_back_kernel(
     )
     cutoff = tl.where(prev_fin != 0, -1, cutoff)
 
-    offs_g = tl.arange(0, BLOCK)
-    mg = offs_g < GAMMA
-    lpd = tl.load(
-        logprob_diff_ptr + i * GAMMA + offs_g, mask=mg, other=0.0
-    ).to(tl.float64)
-    keep = mg & (offs_g <= cutoff)
-    d = tl.sum(tl.where(keep, lpd, 0.0), axis=0)
+    if TOKENS_ONLY:
+        # Pipelined decode: the diff isn't computed yet (verify runs on a
+        # separate stream); persist the cutoff for the verify-side fold.
+        tl.store(cutoff_out_ptr + s, cutoff)
+    else:
+        offs_g = tl.arange(0, BLOCK)
+        mg = offs_g < GAMMA
+        lpd = tl.load(
+            logprob_diff_ptr + i * GAMMA + offs_g, mask=mg, other=0.0
+        ).to(tl.float64)
+        keep = mg & (offs_g <= cutoff)
+        d = tl.sum(tl.where(keep, lpd, 0.0), axis=0)
 
-    tl.store(log_weights_ptr + s, tl.load(log_weights_ptr + s) + d)
-    tl.store(
-        interval_weights_ptr + s, tl.load(interval_weights_ptr + s) + d
-    )
+        if STAGE:
+            # Delayed resampling: stage d_t; fold_pending_weights() lands it
+            # (lineage-corrected) after this cycle's resample dispatch.
+            tl.store(pending_diff_ptr + s, d)
+        else:
+            tl.store(log_weights_ptr + s, tl.load(log_weights_ptr + s) + d)
+            tl.store(
+                interval_weights_ptr + s,
+                tl.load(interval_weights_ptr + s) + d,
+            )
 
 
 def fused_write_back(
@@ -154,15 +169,22 @@ def fused_write_back(
     log_weights: torch.Tensor,
     interval_weights: torch.Tensor,
     gamma_plus_1: int,
+    pending_diff: torch.Tensor = None,
+    stage_weights: bool = False,
+    tokens_only: bool = False,
+    cutoff_out: torch.Tensor = None,
+    n_weight_cols: int = None,
 ) -> None:
     """Launch the fused write-back kernel (one program per active row)."""
     bs = active_slots.shape[0]
-    gamma = logprob_diff.shape[1]
+    gamma = n_weight_cols if logprob_diff is None else logprob_diff.shape[1]
     has_prev = prev_last_draft_ids is not None
+    assert not stage_weights or pending_diff is not None
+    assert not tokens_only or cutoff_out is not None
     _fused_write_back_kernel[(bs,)](
         active_slots,
         next_token_ids.contiguous(),
-        logprob_diff.contiguous(),
+        logprob_diff.contiguous() if logprob_diff is not None else log_weights,
         bonus_ids.contiguous(),
         prev_last_draft_ids.contiguous() if has_prev else bonus_ids,
         all_token_ids,
@@ -179,6 +201,10 @@ def fused_write_back(
         eos_token_ids,
         log_weights,
         interval_weights,
+        pending_diff if pending_diff is not None else log_weights,
+        cutoff_out if cutoff_out is not None else active_slots,
+        STAGE=stage_weights,
+        TOKENS_ONLY=tokens_only,
         HAS_PREV=has_prev,
         STRIDE=gamma_plus_1,
         GAMMA=gamma,
