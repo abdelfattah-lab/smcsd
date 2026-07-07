@@ -369,6 +369,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         logprobs_out      (bs, gamma)    draft logprobs (diagnostic)
         logprob_diff_out  (bs, gamma)    alpha * score_logp - draft_logp
         bonus_out         (bs,)          Gumbel draw from p_T^alpha
+        bonus_logz_out    (bs,)          bonus normalizer log Z (0 at alpha=1)
         next_tokens_out   (bs, gamma+1)  [d_0..d_{gamma-1}, bonus]
 
     The verify forward runs on the TARGET model inside the same graph —
@@ -400,6 +401,10 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
                 (self.max_bs, self.gamma), dtype=torch.float32
             )
             self.bonus_out = torch.zeros((self.max_bs,), dtype=torch.int64)
+            # Per-particle bonus normalizer log Z (see SMCDraftInput.bonus_logz).
+            self.bonus_logz_out = torch.zeros(
+                (self.max_bs,), dtype=torch.float32
+            )
             self.next_tokens_out = torch.zeros(
                 (self.max_bs, self.num_steps), dtype=torch.int64
             )
@@ -462,6 +467,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         logprobs_out = self.logprobs_out[:bs]
         logprob_diff_out = self.logprob_diff_out[:bs]
         bonus_out = self.bonus_out[:bs]
+        bonus_logz_out = self.bonus_logz_out[:bs]
         next_tokens_out = self.next_tokens_out[:bs]
         tiny = torch.finfo(torch.float32).tiny
 
@@ -483,13 +489,20 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         logprob_diff_out.copy_(self.alpha * score_logprobs - logprobs_out)
 
         # Bonus from the same p_T^alpha tempered-power target, Gumbel-max.
-        bonus_scaled = (
-            self.alpha * logits3[:, -1, :] / self.target_temperature
-        )
+        bonus_base = logits3[:, -1, :] / self.target_temperature
+        bonus_scaled = self.alpha * bonus_base
         bonus_gumbel = -torch.log(
             -torch.log(torch.rand_like(bonus_scaled).clamp_min_(tiny))
         )
         bonus_out.copy_(torch.argmax(bonus_scaled + bonus_gumbel, dim=-1))
+        # Bonus normalizer log Z = logsumexp(alpha*ℓ/T) - alpha*logsumexp(ℓ/T):
+        # the bonus's incremental importance weight under the joint-power target
+        # (the bonus is drawn from the locally normalized p_T^alpha/Z).  0 at
+        # alpha=1.  Accumulated in write_back_gpu, gated by the EOS/finish logic.
+        bonus_logz_out.copy_(
+            torch.logsumexp(bonus_scaled, dim=-1)
+            - self.alpha * torch.logsumexp(bonus_base, dim=-1)
+        )
 
         next_tokens_out[:, :gamma].copy_(tokens_out[:, 1 : gamma + 1])
         next_tokens_out[:, gamma].copy_(bonus_out)
@@ -498,6 +511,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             logprobs_out,
             logprob_diff_out,
             bonus_out,
+            bonus_logz_out,
             next_tokens_out,
         )
 
@@ -571,6 +585,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self.logprobs_out[:raw_bs],
             self.logprob_diff_out[:raw_bs],
             self.bonus_out[:raw_bs],
+            self.bonus_logz_out[:raw_bs],
             self.next_tokens_out[:raw_bs],
         )
 
@@ -846,5 +861,6 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             self.logprobs_out[:raw_bs],
             self.logprob_diff_out[:raw_bs],
             self.bonus_out[:raw_bs],
+            self.bonus_logz_out[:raw_bs],
             self.next_tokens_out[:raw_bs],
         )

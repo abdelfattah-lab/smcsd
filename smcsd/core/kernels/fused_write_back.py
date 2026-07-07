@@ -28,6 +28,7 @@ def _fused_write_back_kernel(
     logprob_diff_ptr,      # (bs, GAMMA) float32, contiguous
     bonus_ptr,             # (bs,) int
     prev_ptr,              # (bs,) int
+    bonus_logz_ptr,        # (bs,) float32 — bonus normalizer log Z
     # slot-indexed state (MUTATED)
     all_token_ids_ptr,     # (max_slots, max_out) int32
     all_token_ids_stride,
@@ -44,6 +45,7 @@ def _fused_write_back_kernel(
     log_weights_ptr,       # (max_slots,) float64
     interval_weights_ptr,  # (max_slots,) float64
     HAS_PREV: tl.constexpr,
+    HAS_BONUS_LOGZ: tl.constexpr,
     STRIDE: tl.constexpr,   # gamma + 1
     GAMMA: tl.constexpr,    # weight columns
     MAX_EOS: tl.constexpr,
@@ -127,6 +129,15 @@ def _fused_write_back_kernel(
     keep = mg & (offs_g <= cutoff)
     d = tl.sum(tl.where(keep, lpd, 0.0), axis=0)
 
+    # Bonus-token normalizer log Z (0 at alpha=1).  Weighted unless the row was
+    # already finished or terminated via EOS within the draft columns 0..GAMMA-1
+    # (EOS in the bonus column, first_eos == GAMMA, still emits the bonus).
+    if HAS_BONUS_LOGZ:
+        blz = tl.load(bonus_logz_ptr + i).to(tl.float64)
+        eos_in_draft = eos_cut & (first_eos < GAMMA)
+        add_bonus = (prev_fin == 0) & (eos_in_draft == 0)
+        d = d + tl.where(add_bonus, blz, 0.0)
+
     tl.store(log_weights_ptr + s, tl.load(log_weights_ptr + s) + d)
     tl.store(
         interval_weights_ptr + s, tl.load(interval_weights_ptr + s) + d
@@ -154,17 +165,20 @@ def fused_write_back(
     log_weights: torch.Tensor,
     interval_weights: torch.Tensor,
     gamma_plus_1: int,
+    bonus_logz: torch.Tensor = None,
 ) -> None:
     """Launch the fused write-back kernel (one program per active row)."""
     bs = active_slots.shape[0]
     gamma = logprob_diff.shape[1]
     has_prev = prev_last_draft_ids is not None
+    has_bonus_logz = bonus_logz is not None
     _fused_write_back_kernel[(bs,)](
         active_slots,
         next_token_ids.contiguous(),
         logprob_diff.contiguous(),
         bonus_ids.contiguous(),
         prev_last_draft_ids.contiguous() if has_prev else bonus_ids,
+        bonus_logz.contiguous() if has_bonus_logz else bonus_ids,
         all_token_ids,
         all_token_ids.stride(0),
         token_counts,
@@ -180,6 +194,7 @@ def fused_write_back(
         log_weights,
         interval_weights,
         HAS_PREV=has_prev,
+        HAS_BONUS_LOGZ=has_bonus_logz,
         STRIDE=gamma_plus_1,
         GAMMA=gamma,
         MAX_EOS=eos_token_ids.shape[1],
