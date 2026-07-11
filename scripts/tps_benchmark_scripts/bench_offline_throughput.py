@@ -162,6 +162,7 @@ class BenchArgs:
     apply_chat_template: bool = False
     prompt_suffix: str = ""
     skip_warmup: bool = False
+    measure_prefill: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -287,6 +288,12 @@ class BenchArgs:
             action="store_true",
             help="Skip the warmup batch.",
         )
+        parser.add_argument(
+            "--measure-prefill",
+            action="store_true",
+            help="After the main run, rerun all requests with max_new_tokens=1 "
+            "to measure prefill time and report decode-only throughput.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -305,6 +312,7 @@ def throughput_test_once(
     reqs: List[DatasetRow],
     ignore_eos: bool,
     extra_request_body: Dict,
+    max_new_tokens_override: int = None,
 ):
     measurement_results = {
         "backend": backend_name,
@@ -322,7 +330,11 @@ def throughput_test_once(
     sampling_params = [
         {
             "temperature": 0,
-            "max_new_tokens": r.output_len,
+            "max_new_tokens": (
+                max_new_tokens_override
+                if max_new_tokens_override is not None
+                else r.output_len
+            ),
             "ignore_eos": ignore_eos,
             **extra_request_body,
         }
@@ -415,6 +427,32 @@ def throughput_test(server_args: ServerArgs, bench_args: BenchArgs):
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
     )
+
+    if bench_args.measure_prefill:
+        # Prefill calibration: same requests, one generated token each. The
+        # first token is sampled from the prefill forward, so this pass
+        # measures per-request prefill + scheduling overhead only.
+        logging.info("\nPrefill calibration...")
+        calib = throughput_test_once(
+            backend_name=bench_args.backend,
+            backend=backend,
+            reqs=input_requests,
+            ignore_eos=not bench_args.disable_ignore_eos,
+            extra_request_body=extra_request_body,
+            max_new_tokens_override=1,
+        )
+        # Subtract the calibration pass's actual token count: engines with
+        # block-granular emission (e.g. SMC emits a full K-token cycle) return
+        # more than 1 token per request even at max_new_tokens=1.
+        decode_tokens = (
+            result["total_output_tokens"] - calib["total_output_tokens"]
+        )
+        decode_time = result["total_latency"] - calib["total_latency"]
+        result["prefill_latency"] = calib["total_latency"]
+        result["decode_only_throughput"] = (
+            decode_tokens / decode_time if decode_time > 0 else float("nan")
+        )
+
     backend.shutdown()
 
     if bench_args.result_filename:
@@ -437,6 +475,11 @@ def throughput_test(server_args: ServerArgs, bench_args: BenchArgs):
         "Output token throughput (tok/s):", result["output_throughput"]))
     print("{:<40} {:<10.2f}".format(
         "Total token throughput (tok/s):", result["total_throughput"]))
+    if "decode_only_throughput" in result:
+        print("{:<40} {:<10.2f}".format(
+            "Prefill calibration duration (s):", result["prefill_latency"]))
+        print("{:<40} {:<10.2f}".format(
+            "Decode-only output throughput (tok/s):", result["decode_only_throughput"]))
     print("=" * 50)
 
     return result

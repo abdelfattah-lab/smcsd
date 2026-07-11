@@ -824,6 +824,12 @@ class SMCScheduler(Scheduler):
         draft_input = self.slot_state.prepare_for_decode()
         if draft_input.decode_ctx is None:
             return None
+        if os.environ.get("SMC_LOG_KV_USAGE") == "1":
+            used = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+            )
+            logger.info(f"SMC KV usage: #token: {used}")
         return self.slot_state.build_model_worker_batch(draft_input)
 
     def _resample(self, result: GenerationBatchResult):
