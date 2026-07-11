@@ -1,0 +1,3 @@
+run,model,method,tps,accept_len
+smc_8b_n6g16,8B,smc_n6_g16,590.54,n/a
+smc_70b_n6g16,70B,smc_n6_g16,371.25,n/a

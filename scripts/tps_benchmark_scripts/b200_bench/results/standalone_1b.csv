@@ -1,0 +1,9 @@
+run,model,method,tps,accept_len
+sa1b_8b_tree_lossless,8B,sa1b_tree_s1.0_a1.0,322.95,4.37
+sa1b_8b_tree_lossy075,8B,sa1b_tree_s0.75_a0.75,380.37,5.17
+sa1b_8b_tree_lossy050,8B,sa1b_tree_s0.5_a0.5,397.23,5.40
+sa1b_8b_chain,8B,sa1b_chain_lossless,278.03,2.87
+sa1b_70b_tree_lossless,70B,sa1b_tree_s1.0_a1.0,195.49,4.68
+sa1b_70b_tree_lossy075,70B,sa1b_tree_s0.75_a0.75,195.21,4.70
+sa1b_70b_tree_lossy050,70B,sa1b_tree_s0.5_a0.5,207.86,5.02
+sa1b_70b_chain,70B,sa1b_chain_lossless,150.89,2.83

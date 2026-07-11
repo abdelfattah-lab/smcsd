@@ -1,0 +1,17 @@
+run,model,method,e2e_tps,decode_tps,prefill_s,accept_len
+d_sa1b_8b_chain,8B,sa1b_chain_lossless,277.77,285.32,1.27,2.86
+d_sa1b_8b_tree_lossless,8B,sa1b_tree_s1.0_a1.0,329.53,335.74,0.80,4.47
+d_sa1b_8b_tree_lossy075,8B,sa1b_tree_s0.75_a0.75,371.98,379.79,0.77,5.05
+d_sa1b_8b_tree_lossy050,8B,sa1b_tree_s0.5_a0.5,404.30,413.86,0.78,5.48
+d_eagle3_8b_lossy050,8B,eagle3_s0.5_a0.5,377.72,384.10,0.64,2.98
+d_smc_8b_n6g16,8B,smc_n6_g16,591.63,635.43,1.42,n/a
+d_sa1b_70b_chain,70B,sa1b_chain_lossless,153.53,158.85,2.83,2.88
+d_sa1b_70b_tree_lossless,70B,sa1b_tree_s1.0_a1.0,192.77,198.37,1.94,4.63
+d_sa1b_70b_tree_lossy075,70B,sa1b_tree_s0.75_a0.75,203.96,210.52,2.00,4.92
+d_sa1b_70b_tree_lossy050,70B,sa1b_tree_s0.5_a0.5,206.42,213.26,2.03,4.99
+d_eagle3_70b_lossy050,70B,eagle3_s0.5_a0.5,99.38,100.54,1.84,1.90
+d_smc_70b_n6g16,70B,smc_n6_g16,370.32,420.50,3.83,n/a
+d_rs_8B,8B,vllm_rs,209.27,210.97,0.69,3.9890
+d_cactus_8B,8B,vllm_cactus,360.09,366.29,0.69,7.7390
+d_rs_70B,70B,vllm_rs,103.96,105.09,1.68,3.0687
+d_cactus_70B,70B,vllm_cactus,160.65,163.69,1.66,5.4298

@@ -1,0 +1,9 @@
+run,model,method,tps,accept_len
+eagle3_8b_lossless,8B,eagle3_s1.0_a1.0,339.30,2.71
+eagle3_8b_lossy075,8B,eagle3_s0.75_a0.75,361.07,2.89
+eagle3_8b_lossy050,8B,eagle3_s0.5_a0.5,390.18,3.10
+smc_8b_n66g16,8B,smc_n66_g16,305.03,n/a
+eagle3_70b_lossless,70B,eagle3_s1.0_a1.0,95.06,1.82
+eagle3_70b_lossy075,70B,eagle3_s0.75_a0.75,98.98,1.89
+eagle3_70b_lossy050,70B,eagle3_s0.5_a0.5,101.15,1.93
+smc_70b_n66g16,70B,smc_n66_g16,184.56,n/a

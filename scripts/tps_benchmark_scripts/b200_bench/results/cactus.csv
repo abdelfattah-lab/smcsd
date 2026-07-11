@@ -1,0 +1,5 @@
+run,model,method,tps,tracker_accept
+vllm_rs_8b,8B,vllm_sps_lossless,198.94,3.7400
+cactus_8b,8B,cactus_d1.0,372.19,8.0144
+vllm_rs_70b,70B,vllm_sps_lossless,105.77,3.1454
+cactus_70b,70B,cactus_d1.0,167.26,5.8504
