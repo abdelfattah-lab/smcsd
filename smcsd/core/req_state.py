@@ -764,6 +764,7 @@ class ScheduleBatchSMC:
         *,
         prev_last_draft_ids: Optional[torch.Tensor] = None,
         bonus_logz: Optional[torch.Tensor] = None,
+        active: Optional[torch.Tensor] = None,
     ) -> None:
         """Write forward-pass results back to slot-indexed tensors.
 
@@ -788,11 +789,20 @@ class ScheduleBatchSMC:
         torch implementation below remains as the reference / CPU fallback
         (kill-switch: SMC_FUSED_WRITE_BACK=0).
         """
-        if self._use_fused_write_back:
+        if active is None:
+            full_active = True
+            active = self.active_slots
+            bs = self.num_active
+        else:
+            full_active = False
+            bs = int(active.numel())
+        stride = self.gamma_plus_1
+
+        if self._use_fused_write_back and full_active:
             from smcsd.core.kernels.fused_write_back import fused_write_back
 
             fused_write_back(
-                self.active_slots,
+                active,
                 next_token_ids,
                 logprob_diff,
                 bonus_ids,
@@ -814,10 +824,6 @@ class ScheduleBatchSMC:
                 bonus_logz=bonus_logz,
             )
             return
-
-        active = self.active_slots
-        bs = self.num_active
-        stride = self.gamma_plus_1
 
         # a. Scatter accepted tokens into (bs, stride) columns starting at
         #    offsets[i] = token_counts[slot_i].

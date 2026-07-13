@@ -72,7 +72,12 @@ def format_instruction(question: str) -> str:
 def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False):
     """Load GSM8K and build chat-template prompts + gold labels."""
     print("Loading GSM8K dataset...")
-    dataset = load_dataset("openai/gsm8k", "main", split="test")
+    from huggingface_hub import hf_hub_download
+
+    parquet_path = hf_hub_download(
+        "openai/gsm8k", "main/test-00000-of-00001.parquet", repo_type="dataset"
+    )
+    dataset = load_dataset("parquet", data_files=parquet_path, split="train")
 
     prompts = []
     labels = []
@@ -100,7 +105,12 @@ def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False)
 
 def run_smc_engine_eval(args, prompts, labels):
     """Evaluation using the dedicated SMCEngine (offline, no tokenizer manager)."""
-    from smcsd.engine import SMCEngine
+    if args.mode == "smc_decoupled":
+        from smcsd.decoupled.engine import DecoupledSMCEngine as SMCEngine
+    elif args.mode == "smc_async":
+        from smcsd.decoupled.engine import AsyncDecoupledSMCEngine as SMCEngine
+    else:
+        from smcsd.engine import SMCEngine
 
     draft_model = args.draft_model or DEFAULT_DRAFT_MODEL
     engine_kwargs = dict(
@@ -242,10 +252,12 @@ def run_baseline_eval(args, prompts, labels):
 def main(args):
     mode_label = {
         "smc_engine": "SMCEngine (dedicated offline)",
+        "smc_decoupled": "Decoupled serial SMC (draft engine on separate GPU)",
+        "smc_async": "AsyncDecoupledSMCEngine (lag-1 exact-bonus overlap)",
         "baseline": "Baseline (vanilla)",
     }
     print(f"Mode: {mode_label[args.mode]} | Model: {args.model}")
-    if args.mode == "smc_engine":
+    if args.mode in ("smc_engine", "smc_decoupled", "smc_async"):
         draft = args.draft_model or DEFAULT_DRAFT_MODEL
         print(
             f"  particles={args.particles}, gamma={args.gamma}, "
@@ -271,7 +283,7 @@ def main(args):
     )
 
     # Run evaluation
-    if args.mode == "smc_engine":
+    if args.mode in ("smc_engine", "smc_decoupled", "smc_async"):
         preds, total_tokens, latency = run_smc_engine_eval(args, prompts, labels)
     else:
         preds, total_tokens, latency = run_baseline_eval(args, prompts, labels)
@@ -283,7 +295,7 @@ def main(args):
 
     print(f"\n{'=' * 55}")
     print(f"  {mode_label[args.mode]}")
-    if args.mode == "smc_engine":
+    if args.mode in ("smc_engine", "smc_decoupled", "smc_async"):
         print(f"  N={args.particles}, γ={args.gamma}, temp={args.temperature}")
     print(f"{'=' * 55}")
     print(f"  Accuracy:          {correct}/{n} ({100 * correct / n:.1f}%)")
@@ -303,9 +315,13 @@ if __name__ == "__main__":
     # Core
     parser.add_argument(
         "--mode",
-        choices=["baseline", "smc_engine"],
+        choices=["baseline", "smc_engine", "smc_decoupled", "smc_async"],
         default="smc_engine",
-        help="baseline = vanilla, smc_engine = dedicated SMCEngine (default: smc_engine)",
+        help=(
+            "baseline = vanilla, smc_engine = dedicated SMCEngine, "
+            "smc_decoupled/smc_async = draft engine in a separate process/GPU "
+            "(default: smc_engine)"
+        ),
     )
     parser.add_argument(
         "--model",
