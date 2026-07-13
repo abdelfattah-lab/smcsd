@@ -110,13 +110,18 @@ def copy_smc_resampled_hybrid_state(
 ) -> None:
     """Copy hybrid recurrent state after SMC resampling clones particles.
 
-    No-op for pure-attention models, decided from CPU-only pool metadata —
-    no device sync.  Only when a Mamba pool exists does this sync: the
-    ``plan.dst_slots`` / ``plan.src_slots`` views slice the device plan to
-    its valid jobs via ``n_jobs_sync()``, because the mamba ``copy_from``
-    is a torch indexed copy that needs exact host-shaped index tensors and
-    the flat plan buffers' tails are uninitialised.  An empty plan yields
-    empty slices, which the pairwise copy treats as a no-op.
+    Device-driven and sync-free, so it can run inside the GPU resample step
+    (stream-ordered before the next forward is enqueued) and be CUDA-graph
+    captured.  Instead of the host-sliced ``plan.dst_slots``/``src_slots``
+    views (which force ``n_jobs_sync()``), it consumes the FULL-capacity flat
+    plan buffers plus the device-side ``plan.counter``.  Tail jobs
+    (``index >= counter``, uninitialised garbage in the flat buffers) are
+    trash-padded to Mamba slot 0 — the pool's reserved null slot (allocation
+    starts at 1, per ``free_slots = range(1, size+1)``), which is never a valid
+    destination — turning them into harmless ``state[:,0] = state[:,0]``
+    self-copies that can't collide with a real job's write.
+
+    No-op for pure-attention models (decided from CPU-only pool metadata).
     """
     has_mamba = any(
         pool is not None and hasattr(pool, "mamba_pool")
@@ -124,13 +129,50 @@ def copy_smc_resampled_hybrid_state(
     )
     if not has_mamba:
         return
-    dst_slots_t = plan.dst_slots.to(torch.long)
-    src_slots_t = plan.src_slots.to(torch.long)
+    flat_cap = plan.dst_flat.numel()  # host-known shape, no sync
+    if flat_cap == 0:
+        return
 
-    dst_req_pool = slot_state.req_pool_indices[dst_slots_t]
-    src_req_pool = slot_state.req_pool_indices[src_slots_t]
-    _copy_hybrid_mamba_state_pairwise(target_pool, src_req_pool, dst_req_pool)
-    _copy_hybrid_mamba_state_pairwise(draft_pool, src_req_pool, dst_req_pool)
+    # valid[i] == (i < counter): a device-side bool mask; comparing against the
+    # (1,) device counter tensor never triggers a host sync.
+    job_ids = torch.arange(flat_cap, device=device)
+    valid = job_ids < plan.counter
+
+    # Garbage tail slot indices are clamped in-range before the gather so the
+    # lookup can't fault; the values they produce are discarded by `valid`.
+    n_slots = slot_state.req_pool_indices.numel()
+    dst_slot = plan.dst_flat.to(torch.long).clamp_(0, n_slots - 1)
+    src_slot = plan.src_flat.to(torch.long).clamp_(0, n_slots - 1)
+    dst_req_pool = slot_state.req_pool_indices[dst_slot]
+    src_req_pool = slot_state.req_pool_indices[src_slot]
+    _copy_hybrid_mamba_state_padded(target_pool, src_req_pool, dst_req_pool, valid)
+    _copy_hybrid_mamba_state_padded(draft_pool, src_req_pool, dst_req_pool, valid)
+
+
+def _copy_hybrid_mamba_state_padded(
+    pool,
+    src_req_pool_indices: torch.Tensor,
+    dst_req_pool_indices: torch.Tensor,
+    valid: torch.Tensor,
+) -> None:
+    """Full-capacity, sync-free variant of _copy_hybrid_mamba_state_pairwise:
+    maps req_pool -> mamba indices for every job and forces invalid (tail) jobs
+    to the reserved null Mamba slot 0 (self-copy no-op).  Fixed-shape → CUDA-graph
+    capturable."""
+    if pool is None or not hasattr(pool, "mamba_pool"):
+        return
+    mapping = pool.req_index_to_mamba_index_mapping
+    m = mapping.numel()
+    src_mamba = mapping[src_req_pool_indices.clamp(0, m - 1).to(torch.long)].to(
+        torch.long
+    )
+    dst_mamba = mapping[dst_req_pool_indices.clamp(0, m - 1).to(torch.long)].to(
+        torch.long
+    )
+    null = torch.zeros_like(src_mamba)
+    src_mamba = torch.where(valid, src_mamba, null)
+    dst_mamba = torch.where(valid, dst_mamba, null)
+    pool.mamba_pool.copy_from(src_mamba, dst_mamba)
 
 
 def validate_smc_parent_req(req: Req) -> Optional[str]:

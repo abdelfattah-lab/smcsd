@@ -116,10 +116,12 @@ class SMCWorker(BaseSpecWorker):
         self._smc_dbg_calls = 0
         # Deferred-bonus draft schedule: drop the per-step over-draft and fold
         # the deferred d_{gamma-1} write into the next step's leading 2-token
-        # head (eager; CUDA-graph capture is a later step).  Off => legacy
-        # gamma+1 single-token AR loop, byte-identical.
+        # head.  ON BY DEFAULT; configured via server_args (SMCEngine's
+        # defer_bonus=False to opt out — dynamic attr, smc_power_alpha
+        # pattern).  Unsupported draft backends downgrade to the legacy
+        # gamma+1 schedule with a warning.
         self.smc_defer_bonus = bool(
-            int(os.environ.get("SMC_DEFER_BONUS", "0"))
+            getattr(server_args, "smc_defer_bonus", True)
         )
         # Only the dense-AR draft path is supported here.
         self._dense_draft_hybrid_req_to_token_pool = None
@@ -173,6 +175,7 @@ class SMCWorker(BaseSpecWorker):
         draft_is_hybrid = (
             getattr(self.draft_runner, "hybrid_gdn_config", None) is not None
         )
+        self._draft_is_hybrid = draft_is_hybrid
         if draft_is_hybrid:
             from smcsd.core.hybrid_multistep_backend import (
                 HybridLinearAttnMultiStepBackend,
@@ -227,13 +230,41 @@ class SMCWorker(BaseSpecWorker):
                 draft_ab.num_draft_tokens = 2
             elif isinstance(draft_ab, FlashAttentionBackend):
                 draft_ab.speculative_num_draft_tokens = 2
+            elif self.draft_runner.hybrid_gdn_config is not None:
+                # Hybrid (Mamba/GDN) draft: the 2-token head uses per-batch
+                # linear-verify metadata (head_spec.draft_token_num=2 +
+                # populate_linear_verify_metadata in prepare_for_draft_head).
+                # The draft pool carries a depth-2 intermediate recurrent buffer
+                # (see _maybe_isolate_dense_hybrid_draft_state), and the head's
+                # S-position state is committed after the forward via
+                # _commit_draft_mamba_state_after_head.
+                #
+                # The head is a 2-token verify on the FULL-ATTENTION
+                # sub-backend too: pin its verify-block-size global to 2,
+                # exactly like the non-hybrid branches above pin the primary.
+                # The captured verify path reads this global, not the batch's
+                # spec fields.  At gamma==1 the inherited default (gamma+1 == 2)
+                # masked this; at gamma>1 the stale global made the captured
+                # head verify kernels stride kv indices by gamma+1 per request
+                # over a 2-token window -> illegal memory access at capture.
+                full_ab = getattr(draft_ab, "full_attn_backend", None)
+                if isinstance(full_ab, TritonAttnBackend):
+                    full_ab.num_draft_tokens = 2
+                elif isinstance(full_ab, FlashAttentionBackend):
+                    full_ab.speculative_num_draft_tokens = 2
+                # CUDA-graph verify cache fix: pin the shared linear backend's
+                # verify query-start-loc cache to step-2 BEFORE the standalone
+                # head runner captures (see _pin_draft_head_verify_qsl).
+                self._pin_draft_head_verify_qsl()
             else:
-                raise RuntimeError(
-                    "SMC_DEFER_BONUS supports triton and fa3 draft attention "
-                    f"backends only; got {type(draft_ab).__name__} (hybrid "
-                    "and MLA drafts are not supported by the deferred-bonus "
-                    "head)."
+                logger.warning(
+                    "Deferred bonus supports triton, fa3, and hybrid-GDN draft "
+                    "attention backends only; got %s (MLA drafts are not "
+                    "supported by the deferred-bonus head).  Falling back to "
+                    "the legacy gamma+1 draft schedule.",
+                    type(draft_ab).__name__,
                 )
+                self.smc_defer_bonus = False
 
         # Deferred-bonus: a second, num_tokens_per_bs=2 TARGET_VERIFY graph
         # runner on the draft for the 2-token head (the primary draft runner is
@@ -255,16 +286,9 @@ class SMCWorker(BaseSpecWorker):
                 self.draft_runner
             )
 
-        # Whole-draft-phase CUDA graph (issue #14): capture all gamma+1 draft
-        # forwards + in-graph Gumbel sampling in one graph per bs bucket,
-        # replacing gamma+1 separate decode-graph replays + eager sampling
-        # (~25% GPU idle from host dispatch at bs=32).  SMC_CYCLE_GRAPH=1
-        # extends the capture through TARGET_VERIFY + weight diff + bonus —
-        # one launch for the whole worker cycle.  Opt-in; the per-step path
-        # stays as the fallback for oversized batches / long contexts.
         self.draft_phase_graph_runner = None
         self.cycle_graph_runner = None
-        want_cycle = bool(int(os.environ.get("SMC_CYCLE_GRAPH", "0")))
+        want_cycle = bool(getattr(server_args, "smc_cycle_graph", True))
         want_phase = bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0")))
         if want_cycle or want_phase:
             from sglang.srt.layers.attention.triton_backend import (
@@ -284,26 +308,37 @@ class SMCWorker(BaseSpecWorker):
                 )
             if not self.smc_draft_temperature > 0:
                 reasons.append("greedy draft (temperature 0)")
-            if not isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend):
-                reasons.append(
-                    f"unsupported multi-step backend "
-                    f"{type(self.draft_attn_backend).__name__} (triton only)"
-                )
-            if want_cycle and self.score_runner.hybrid_gdn_config is not None:
-                reasons.append(
-                    "hybrid target (cycle graph cannot capture the "
-                    "post-verify mamba state commit)"
-                )
-            if want_cycle and not isinstance(
-                self.score_runner.attn_backend, TritonAttnBackend
+            from smcsd.core.hybrid_multistep_backend import (
+                HybridLinearAttnMultiStepBackend,
+            )
+
+            if not isinstance(
+                self.draft_attn_backend,
+                (TritonMultiStepDraftBackend, HybridLinearAttnMultiStepBackend),
             ):
                 reasons.append(
+                    f"unsupported multi-step backend "
+                    f"{type(self.draft_attn_backend).__name__} "
+                    "(triton or hybrid-GDN multi-step)"
+                )
+
+            target_ab = self.score_runner.attn_backend
+            target_ok = isinstance(target_ab, TritonAttnBackend) or (
+                self.score_runner.hybrid_gdn_config is not None
+                and hasattr(target_ab, "update_mamba_state_after_mtp_verify")
+            )
+            if want_cycle and not target_ok:
+                reasons.append(
                     f"unsupported target backend "
-                    f"{type(self.score_runner.attn_backend).__name__} "
-                    "(triton only)"
+                    f"{type(target_ab).__name__} "
+                    "(triton, or hybrid-GDN with in-graph mamba commit)"
                 )
             if reasons:
-                logger.warning("%s=1 ignored: %s", flag, "; ".join(reasons))
+                logger.warning(
+                    "%s disabled (falling back to per-step path): %s",
+                    flag,
+                    "; ".join(reasons),
+                )
             elif want_cycle:
                 from smcsd.model_executor.smc_draft_phase_graph_runner import (
                     SMCDeferredCycleGraphRunner,
@@ -319,12 +354,49 @@ class SMCWorker(BaseSpecWorker):
                     else SMCFullCycleGraphRunner
                 )
                 self.cycle_graph_runner = runner_cls(self)
+                # The cycle runner's multi-step backend init re-binds the
+                # shared linear backend's verify query-start-loc cache back to
+                # step-1 (decode layout).  Re-pin step-2 so the STANDALONE head
+                # runner (used on the eager/cycle-fallback path) replays with
+                # correct 2-token windows.  The cycle runner itself is immune —
+                # its head uses a dedicated linear backend.
+                if self.smc_defer_bonus:
+                    self._pin_draft_head_verify_qsl()
             else:
                 from smcsd.model_executor.smc_draft_phase_graph_runner import (
                     SMCDraftPhaseGraphRunner,
                 )
 
                 self.draft_phase_graph_runner = SMCDraftPhaseGraphRunner(self)
+
+    def _pin_draft_head_verify_qsl(self) -> None:
+        """(Deferred-bonus, hybrid draft) Pin the shared linear backend's
+        cuda-graph VERIFY query-start-loc cache to a step-2 arange.
+
+        The draft's linear (GDN) backend gets its cuda-graph state from the
+        DECODE graph init (max_num_tokens == max_bs -> draft_token_num == 1),
+        so its verify cache is a step-1 arange.  The deferred 2-token head is a
+        verify forward: with step-1 windows the GDN kernels process only the
+        first bs of the head's 2*bs tokens and leave the remaining outputs
+        unwritten (stale graph-pool memory -> non-deterministic quality
+        collapse).  Called before the standalone head runner captures, and
+        again after the cycle runner's multi-step init (which re-binds the
+        cache back to step-1).  The decode cache is a separate buffer and is
+        untouched.  No-op for non-hybrid drafts or when cuda graphs are off.
+        """
+        if getattr(self.draft_runner, "hybrid_gdn_config", None) is None:
+            return
+        lin = getattr(self.draft_runner.attn_backend, "linear_attn_backend", None)
+        cached = getattr(lin, "cached_cuda_graph_verify_query_start_loc", None)
+        if cached is None:
+            return
+        # Cover the largest bs any runner may replay with (list length grows
+        # across repeated init_cuda_graph_state calls; over-length is harmless,
+        # under-length would slice out of range on fallback replays).
+        n = max(cached.numel() - 1, len(lin.state_indices_list))
+        lin.cached_cuda_graph_verify_query_start_loc = torch.arange(
+            0, 2 * n + 1, step=2, dtype=cached.dtype, device=cached.device
+        )
 
     def _dense_hybrid_state_shape(self) -> Optional[Tuple[Tuple, Tuple]]:
         target_cfg = getattr(self.score_runner, "hybrid_gdn_config", None)
@@ -401,7 +473,10 @@ class SMCWorker(BaseSpecWorker):
                 if self.draft_runner.start_layer <= i < self.draft_runner.end_layer
             ],
             enable_mamba_extra_buffer=False,
-            speculative_num_draft_tokens=None,
+            # Deferred-bonus runs a 2-token verify-style head on the draft, so
+            # it needs a depth-2 intermediate recurrent-state buffer (like the
+            # target's verify buffer); plain full-cycle drafts need none.
+            speculative_num_draft_tokens=(2 if self.smc_defer_bonus else None),
             enable_overlap_schedule=False,
             start_layer=self.draft_runner.start_layer,
         )
@@ -510,6 +585,36 @@ class SMCWorker(BaseSpecWorker):
             model=self._target_worker.model_runner.model,
         )
 
+    def _commit_draft_mamba_state_after_head(
+        self, head_forward_batch: ForwardBatch, bs: int
+    ) -> None:
+        """Commit the DRAFT's recurrent state after the deferred-bonus 2-token
+        head.
+
+        The head ``[prev @ S-1, verified @ S]`` runs on the draft as a
+        verify-style forward with deferred state updates, so the live Mamba
+        state is still at S-2 afterwards.  We scatter the index-1 (verified /
+        S) intermediate state back into the live cache so the subsequent single
+        decodes continue from S.  accepted_steps==1 selects the second (last)
+        of the head's two positions, mirroring the target's accepted_steps==gamma
+        for its gamma+1-token verify.
+        """
+        attn_backend = self.draft_runner.attn_backend
+        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            return
+        if head_forward_batch.forward_mode.is_idle():
+            return
+
+        accepted_steps = torch.ones(bs, dtype=torch.int64, device=self.device)
+        attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps,
+            mamba_track_indices=getattr(
+                head_forward_batch, "mamba_track_indices", None
+            ),
+            mamba_steps_to_track=None,
+            model=self.draft_runner.model,
+        )
+
     # ── Properties (required by BaseSpecWorker / scheduler) ──
 
     @property
@@ -552,29 +657,29 @@ class SMCWorker(BaseSpecWorker):
         bs = len(batch.seq_lens)
 
         # Score model prefill — authoritative prompt KV + score state.
-        score_result = self._target_worker.forward_batch_generation(batch)
+        #
+        # Capture FULL hidden states in this SAME pass so x0 can be seeded from
+        # the target's real first-token distribution without a second target
+        # forward. The SMC target's score/extend forward does not compute
+        # next_token_logits (the logits processor gets no sample position and
+        # returns an unwritten warmup buffer), so we recover the real
+        # distribution from the prompt's hidden states below: the target's own
+        # LogitsProcessor on the last prompt token's (post-final-norm) hidden
+        # state. spec_info is cleared for the same reason the draft prefill
+        # clears it (ForwardBatch/CUDA-graph compatibility); prefill KV writes
+        # are unaffected. x0 is shared conditioning across the group's particles
+        # and carries no per-particle weight; drawing it from the target power
+        # p_T^alpha makes the seed model-correct and draft-independent.
+        score_batch = dataclasses.replace(
+            batch, spec_info=None, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        score_result = self._target_worker.forward_batch_generation(score_batch)
 
         # Draft model prefill — populate the draft's prompt KV; token discarded.
         draft_batch = self._make_clean_batch(batch)
         self._draft_worker.forward_batch_generation(draft_batch)
 
-        # x0 seed from the TARGET's real first-token distribution.
-        #
-        # The SMC target's score/extend forward does not compute
-        # next_token_logits (the logits processor gets no sample position and
-        # returns an unwritten warmup buffer), so we recover the real
-        # distribution from the prompt's hidden states: one target forward with
-        # FULL hidden capture, then the target's own LogitsProcessor on the last
-        # prompt token's (post-final-norm) hidden state. KV writes are idempotent
-        # (same prompt -> same out_cache_loc), so the score prefill above stays
-        # authoritative. x0 is shared conditioning across the group's particles
-        # and carries no per-particle weight; drawing it from the target power
-        # p_T^alpha makes the seed model-correct and draft-independent.
-        x0_batch = dataclasses.replace(
-            batch, spec_info=None, capture_hidden_mode=CaptureHiddenMode.FULL
-        )
-        x0_result = self._target_worker.forward_batch_generation(x0_batch)
-        hidden = x0_result.logits_output.hidden_states
+        hidden = score_result.logits_output.hidden_states
         assert hidden is not None, (
             "FULL hidden-state capture did not populate hidden_states for x0"
         )
@@ -740,6 +845,14 @@ class SMCWorker(BaseSpecWorker):
                     ).logits_output.next_token_logits
             finally:
                 self.draft_runner.graph_runner = saved_gr
+        # Hybrid draft: the verify-style head defers its recurrent-state update
+        # (like the target verify), so the draft's live Mamba state is still at
+        # S-2 after the head forward.  Commit the S-position (index 1 = verified
+        # token) intermediate state so the gamma-1 single decodes below continue
+        # from S rather than the stale S-2 state.  No-op for attention drafts.
+        if self._draft_is_hybrid:
+            self._commit_draft_mamba_state_after_head(head_fb, bs)
+
         # d_0 from the second (S / bonus) column of each req pair.
         head_logits = head_logits_full.reshape(bs, 2, -1)[:, 1, :]  # (bs, V)
 

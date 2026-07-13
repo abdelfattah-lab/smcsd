@@ -252,24 +252,8 @@ class SMCScheduler(Scheduler):
             resample_method=server_args.smc_resample_method,
         )
 
-        # Overlapped scheduling: opt-in via SMC_ENABLE_OVERLAP=1, gated to
-        # pure-attention models.  Hybrid (Mamba) models copy recurrent
-        # state in postprocessing, which must complete before the next
-        # forward reads it — overlap would enqueue that forward first.
-        draft_hybrid_pool = getattr(
-            self.model_worker, "_dense_draft_hybrid_req_to_token_pool", None
-        )
-        is_hybrid = any(
-            pool is not None and hasattr(pool, "mamba_pool")
-            for pool in (self.req_to_token_pool, draft_hybrid_pool)
-        )
-        want_overlap = bool(int(os.environ.get("SMC_ENABLE_OVERLAP", "0")))
-        self._use_overlap_loop = want_overlap and not is_hybrid
-        if want_overlap and is_hybrid:
-            logger.warning(
-                "SMC_ENABLE_OVERLAP=1 ignored: hybrid (Mamba) models "
-                "require sequential postprocessing."
-            )
+        want_overlap = bool(getattr(server_args, "smc_enable_overlap", True))
+        self._use_overlap_loop = want_overlap
         if self._use_overlap_loop:
             logger.info("SMCScheduler: overlapped scheduling enabled.")
 
@@ -887,6 +871,19 @@ class SMCScheduler(Scheduler):
             plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
         )
         self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+
+        copy_smc_resampled_hybrid_state(
+            target_pool=self.req_to_token_pool,
+            draft_pool=getattr(
+                self.model_worker,
+                "_dense_draft_hybrid_req_to_token_pool",
+                None,
+            ),
+            slot_state=self.slot_state,
+            plan=plan,
+            device=self.device,
+        )
+
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
 
@@ -923,21 +920,6 @@ class SMCScheduler(Scheduler):
                 )
             )
             self.slot_state.kv_freed_counter[snapshot.phase].zero_()
-
-        # Hybrid (Mamba) recurrent-state copy.  Internally a CPU-metadata
-        # no-op for pure-attention models; only hybrid models pay the
-        # plan-slicing sync.
-        copy_smc_resampled_hybrid_state(
-            target_pool=self.req_to_token_pool,
-            draft_pool=getattr(
-                self.model_worker,
-                "_dense_draft_hybrid_req_to_token_pool",
-                None,
-            ),
-            slot_state=self.slot_state,
-            plan=plan,
-            device=self.device,
-        )
 
         # No rebuild here: neither finishing (absorbing-state semantics) nor
         # resampling changes slot membership — only allocate_slots /

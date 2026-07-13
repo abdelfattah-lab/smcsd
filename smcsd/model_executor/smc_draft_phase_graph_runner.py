@@ -53,6 +53,7 @@ from __future__ import annotations
 import bisect
 import logging
 import os
+import copy
 from typing import TYPE_CHECKING
 
 import torch
@@ -122,32 +123,51 @@ class SMCDraftPhaseGraphRunner:
         )
 
         # ── Multi-step attention graph state (our sizing, see docstring) ──
-        # The kernel grid in common_template covers speculative_num_steps
-        # (= gamma+2) rows even though only gamma+1 step backends exist.
         backend = self.draft_attn_backend
-        n_rows = backend.speculative_num_steps
         device = model_runner.device
-        backend.cuda_graph_kv_indices = torch.zeros(
-            (n_rows, self.max_bs * self.max_context),
-            dtype=torch.int64,
-            device=device,
+        from smcsd.core.hybrid_multistep_backend import (
+            HybridLinearAttnMultiStepBackend,
         )
-        backend.cuda_graph_num_kv_splits = torch.full(
-            (self.max_bs,),
-            backend.attn_backends[0].max_kv_splits,
-            dtype=torch.int32,
-            device=device,
-        )
-        for i, step_backend in enumerate(backend.attn_backends):
-            step_backend.init_cuda_graph_state(
-                self.max_bs,
-                self.max_bs,
-                kv_indices_buf=backend.cuda_graph_kv_indices[i],
-                cuda_graph_num_kv_splits_buf=backend.cuda_graph_num_kv_splits,
+
+        if isinstance(backend, HybridLinearAttnMultiStepBackend):
+            # Hybrid (Mamba/GDN) draft: the multi-step backend manages its own
+            # per-step full-attention + shared linear-attention (recurrent) graph
+            # state internally — no manual triton kv-indices buffers.  It serves
+            # DECODE steps only (one token per sequence per step), so
+            # max_num_tokens == max_bs.  The deferred runner's 2-token verify
+            # HEAD does NOT run on this backend: it gets a dedicated
+            # linear-backend instance with verify-layout (step-2) graph state —
+            # see SMCDeferredCycleGraphRunner._init_extra_state.
+            backend.init_cuda_graph_state(self.max_bs, self.max_bs)
+            self.seq_len_fill_value = backend.attn_backends[
+                0
+            ].get_cuda_graph_seq_len_fill_value()
+        else:
+            # Triton multi-step draft.  The kernel grid in common_template covers
+            # speculative_num_steps (= gamma+2) rows even though only gamma+1 step
+            # backends exist.
+            n_rows = backend.speculative_num_steps
+            backend.cuda_graph_kv_indices = torch.zeros(
+                (n_rows, self.max_bs * self.max_context),
+                dtype=torch.int64,
+                device=device,
             )
-        self.seq_len_fill_value = backend.attn_backends[
-            0
-        ].get_cuda_graph_seq_len_fill_value()
+            backend.cuda_graph_num_kv_splits = torch.full(
+                (self.max_bs,),
+                backend.attn_backends[0].max_kv_splits,
+                dtype=torch.int32,
+                device=device,
+            )
+            for i, step_backend in enumerate(backend.attn_backends):
+                step_backend.init_cuda_graph_state(
+                    self.max_bs,
+                    self.max_bs,
+                    kv_indices_buf=backend.cuda_graph_kv_indices[i],
+                    cuda_graph_num_kv_splits_buf=backend.cuda_graph_num_kv_splits,
+                )
+            self.seq_len_fill_value = backend.attn_backends[
+                0
+            ].get_cuda_graph_seq_len_fill_value()
 
         # ── Graph input/output buffers ──
         with torch.device(device):
@@ -168,8 +188,18 @@ class SMCDraftPhaseGraphRunner:
             self.logprobs_out = torch.zeros(
                 (self.max_bs, self.gamma), dtype=torch.float32
             )
+            # MRoPE draft (Qwen3.5/VL): the model overrides the passed
+            # `positions` with forward_batch.mrope_positions, so the captured
+            # draft forward needs a persistent (3, bs) mrope buffer kept in sync
+            # with `positions` each step (text tokens -> all 3 rows equal).
+            self.mrope_positions = torch.zeros(
+                (3, self.max_bs), dtype=torch.int64
+            )
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
+        )
+        self._draft_is_mrope = bool(
+            getattr(self.model_runner.model, "is_mrope_enabled", False)
         )
 
         # ForwardBatch per bucket, kept so replay-time metadata regeneration
@@ -247,6 +277,11 @@ class SMCDraftPhaseGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        if self._draft_is_mrope:
+            # MRoPE model reads forward_batch.mrope_positions (not `positions`).
+            # Point it at the persistent buffer; _draft_steps_in_graph keeps it
+            # in sync with `positions` each step.
+            fb.mrope_positions = self.mrope_positions[:, :bs]
         self.fbs[bs] = fb
         self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(fb)
         return fb, input_ids, positions, out_cache_loc_steps
@@ -261,6 +296,11 @@ class SMCDraftPhaseGraphRunner:
         for s in range(self.num_steps):
             fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
+            if self._draft_is_mrope:
+                # Keep mrope_positions in sync with the current `positions`
+                # (text tokens: all 3 rows share the linear position).  copy_
+                # broadcasts (1, bs) -> (3, bs); in-graph and fixed-shape.
+                self.mrope_positions[:, :bs].copy_(positions.unsqueeze(0))
             # `forward` is the (patched) model.forward — returns a
             # LogitsProcessorOutput directly.
             logits = forward(input_ids, positions, fb).next_token_logits
@@ -408,7 +448,37 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self.next_tokens_out = torch.zeros(
                 (self.max_bs, self.num_steps), dtype=torch.int64
             )
+            # MRoPE target (Qwen3.5/VL): the verify forward reads
+            # forward_batch.mrope_positions; keep a persistent (3, n_verify_tokens)
+            # buffer synced with verify_positions.
+            self.verify_mrope_positions = torch.zeros(
+                (3, n_verify_tokens), dtype=torch.int64
+            )
         self.verify_fbs = {}
+        self._target_is_mrope = bool(
+            getattr(self.target_runner.model, "is_mrope_enabled", False)
+        )
+
+        # Hybrid (Mamba/GDN) target: the post-verify recurrent-state commit must
+        # run INSIDE the captured cycle (it was the sole SMC-side reason hybrid
+        # targets were excluded from the cycle graph).  For SMC every drafted
+        # token is accepted, so accepted_steps is the constant gamma — a
+        # persistent buffer whose stable address the graph captures once and the
+        # scatter reads on every replay.  mamba_track_indices is None for SMC
+        # (no prefix-cache tracking), so the commit is just the fused
+        # gather-scatter kernel: fixed-shape and capturable.  replay() refreshes
+        # the target verify metadata (mamba_cache_indices) via
+        # init_forward_metadata_replay_cuda_graph before graph.replay(), so the
+        # captured scatter targets the current step's mamba slots.
+        self._hybrid_commit = (
+            worker.score_runner.hybrid_gdn_config is not None
+            and hasattr(self.target_backend, "update_mamba_state_after_mtp_verify")
+        )
+        if self._hybrid_commit:
+            with torch.device(self.model_runner.device):
+                self._accepted_steps = torch.full(
+                    (self.max_bs,), self.gamma, dtype=torch.int64
+                )
 
     def _setup_verify_capture(self, bs: int):
         n_tokens = bs * self.num_steps
@@ -445,6 +515,8 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             spec_info=verify_spec,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        if self._target_is_mrope:
+            fb.mrope_positions = self.verify_mrope_positions[:, :n_tokens]
         verify_spec.populate_linear_verify_metadata(fb)
         self.verify_fbs[bs] = (fb, verify_spec)
         # NOTE: reuses the target backend's existing cuda-graph metadata
@@ -475,9 +547,25 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         verify_input_ids.view(bs, self.num_steps).copy_(
             tokens_out[:, : self.num_steps]
         )
+        if self._target_is_mrope:
+            n_tokens = bs * self.num_steps
+            self.verify_mrope_positions[:, :n_tokens].copy_(
+                verify_positions.unsqueeze(0)
+            )
         logits = self.target_runner.model.forward(
             verify_input_ids, verify_positions, fb
         ).next_token_logits
+
+        # Hybrid target: commit the accepted recurrent state IN-GRAPH, right
+        # after the verify forward that produced the intermediate states.
+        # Reuses the eager commit (same guards / track-index handling) with the
+        # persistent constant accepted_steps buffer; captured once, replayed
+        # every step against the metadata replay() refreshes.
+        if self._hybrid_commit:
+            self.smc_worker._commit_target_mamba_state_after_verify(
+                fb, self._accepted_steps[:bs]
+            )
+
         logits3 = logits.view(bs, self.num_steps, -1)
 
         # Fused score logprobs under the tempered target p_T.
@@ -632,8 +720,67 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
                 (n_head_tokens,), dtype=torch.int64
             )
             self.head_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+            # MRoPE draft: the 2-token head window needs its own (3, 2*bs)
+            # mrope buffer (the singles reuse the base (3, bs) self.mrope_positions).
+            self.head_mrope_positions = torch.zeros(
+                (3, n_head_tokens), dtype=torch.int64
+            )
         self.head_seq_lens_cpu = torch.zeros((self.max_bs,), dtype=torch.int64)
         self.head_fbs = {}
+        # Hybrid (Mamba/GDN) draft: after the verify-style head, commit the
+        # index-1 (verified / S) recurrent state IN-GRAPH so the gamma-1 singles
+        # continue from S.  Constant accepted_steps=1 (persistent buffer).
+        self._draft_head_commit = hasattr(
+            self.draft_primary_backend, "update_mamba_state_after_mtp_verify"
+        ) and (
+            getattr(self.model_runner, "hybrid_gdn_config", None) is not None
+        )
+        if self._draft_head_commit:
+            with torch.device(self.model_runner.device):
+                self._head_accepted_steps = torch.ones(
+                    self.max_bs, dtype=torch.int64
+                )
+
+        # Head attention backend.  For a hybrid (Mamba/GDN) draft the head gets
+        # a DEDICATED linear-backend instance: the shared GDN backend has one
+        # set of per-bs cuda-graph metadata buffers (query_start_loc_list /
+        # state_indices_list), and inside ONE captured cycle the head needs
+        # them in verify layout (2-token windows) while the gamma-1 singles
+        # need decode layout (1-token windows) — one buffer can't hold both,
+        # which is what previously limited deferred+cycle to gamma==1.
+        # Recurrent STATE lives in the req_to_token_pool, not on the backend,
+        # so a second backend instance over the same pool is safe (the
+        # multi-step wrapper shares its linear backend for the same reason).
+        # copy.copy carries over the isolation-time pool re-pointing
+        # (req_to_token_pool / conv_states_shape /
+        # verify_intermediate_state_indices); only the graph-state lists and
+        # forward_metadata are given fresh instances, then graph state is
+        # built with max_num_tokens=2*max_bs so draft_token_num == 2 and the
+        # verify query-start-loc cache is a step-2 arange.  The FA3
+        # full-attention side keeps per-mode metadata dicts, so it is shared.
+        if self._draft_head_commit:
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+            )
+
+            shared_lin = self.draft_primary_backend.linear_attn_backend
+            head_lin = copy.copy(shared_lin)
+            head_lin.forward_metadata = None
+            head_lin.state_indices_list = []
+            head_lin.query_start_loc_list = []
+            head_lin.retrieve_next_token_list = []
+            head_lin.retrieve_next_sibling_list = []
+            head_lin.retrieve_parent_token_list = []
+            head_lin.init_cuda_graph_state(self.max_bs, 2 * self.max_bs)
+            self.head_backend = HybridLinearAttnBackend(
+                self.draft_primary_backend.full_attn_backend,
+                head_lin,
+                self.draft_primary_backend.full_attn_layers,
+            )
+        else:
+            # Triton/FA3 drafts: the primary backend serves the head directly
+            # (its verify-block-size global is pinned to 2 by the worker).
+            self.head_backend = self.draft_primary_backend
 
     def _setup_head_capture(self, bs: int):
         """Build the head's ForwardBatch (TARGET_VERIFY on the draft model,
@@ -668,7 +815,7 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             seq_lens_sum=int(head_seq_lens.sum().item()),
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.draft_primary_backend,
+            attn_backend=self.head_backend,
             out_cache_loc=head_ocl,
             return_logprob=False,
             positions=head_positions,
@@ -676,13 +823,17 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             spec_info=head_spec,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        if self._draft_is_mrope:
+            fb.mrope_positions = self.head_mrope_positions[:, :n_tokens]
         head_spec.populate_linear_verify_metadata(fb)
         self.head_fbs[bs] = (fb, head_spec)
-        # Reuses the draft primary backend's existing cuda-graph metadata
-        # buffers (allocated by the draft's own decode graph runner) — do
-        # NOT call init_cuda_graph_state here (rebinding hazard, see module
-        # docstring).
-        self.draft_primary_backend.init_forward_metadata_capture_cuda_graph(
+        # head_backend: for hybrid drafts a DEDICATED backend whose linear
+        # graph-state was built in _init_extra_state (verify layout, step-2
+        # windows), so it never conflicts with the singles' decode metadata;
+        # for triton/FA3 drafts it aliases the primary backend, reusing its
+        # existing buffers (do NOT call init_cuda_graph_state — rebinding
+        # hazard, see module docstring).
+        self.head_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             n_tokens,
             req_pool_indices,
@@ -719,11 +870,31 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         head_pos2[:, 1] = seq_lens
         head_ocl2[:, 1] = out_cache_loc_steps[0]     # fresh slot @ S
 
+        if self._draft_is_mrope:
+            self.head_mrope_positions[:, :n_head].copy_(
+                self.head_positions[:n_head].unsqueeze(0)
+            )
+
         logits2 = forward(
             self.head_input_ids[:n_head],
             self.head_positions[:n_head],
             head_fb,
         ).next_token_logits
+
+        # Hybrid draft: commit the S-position (index 1) recurrent state
+        # IN-GRAPH, right after the head forward, so the gamma-1 singles (and
+        # the next cycle) continue from S.  Runs on the DEDICATED head backend,
+        # whose linear metadata is verify-layout and never clobbered by the
+        # singles' decode metadata; the captured scatter reads the persistent
+        # index buffers that replay() refreshes.  Constant accepted_steps=1.
+        if self._draft_head_commit:
+            self.head_backend.update_mamba_state_after_mtp_verify(
+                accepted_steps=self._head_accepted_steps[:bs],
+                mamba_track_indices=getattr(head_fb, "mamba_track_indices", None),
+                mamba_steps_to_track=None,
+                model=self.model_runner.model,
+            )
+
         head_logits = logits2.view(bs, 2, -1)[:, 1, :]   # S / bonus column
 
         scaled = head_logits / self.temperature
@@ -741,6 +912,8 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         for s in range(1, self.gamma):
             fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
+            if self._draft_is_mrope:
+                self.mrope_positions[:, :bs].copy_(positions.unsqueeze(0))
             logits = forward(input_ids, positions, fb).next_token_logits
             scaled = logits / self.temperature
             gumbel = -torch.log(
@@ -813,21 +986,7 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             slot_sm1
         )
 
-        # Head metadata: prefix S-1 on the draft primary backend.
-        torch.sub(self.seq_lens[:bs], 1, out=self.head_seq_lens[:bs])
-        self.head_seq_lens_cpu[:bs].copy_(self.seq_lens_cpu[:bs] - 1)
-        head_sum = int(self.head_seq_lens_cpu[:bs].sum().item())
-        _, head_spec = self.head_fbs[bs]
-        self.draft_primary_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            self.req_pool_indices[:bs],
-            self.head_seq_lens[:bs],
-            head_sum,
-            None,
-            ForwardMode.TARGET_VERIFY,
-            head_spec,
-            self.head_seq_lens_cpu[:bs],
-        )
+        # (Head metadata is refreshed LAST — see below.)
 
         # Verify-side staging + metadata — same as the parent runner.
         n_raw_tokens = raw_bs * self.num_steps
@@ -855,7 +1014,30 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             self.seq_lens_cpu[:bs],
         )
 
+        # Head metadata refresh.  For hybrid drafts this writes into the
+        # DEDICATED head backend's own persistent buffers (verify layout), so
+        # it cannot clobber — nor be clobbered by — the singles' decode
+        # metadata refresh above; ordering is no longer load-bearing.  For
+        # triton/FA3 drafts head_backend aliases the primary backend, whose
+        # per-mode isolation makes this equally safe.  The in-graph draft
+        # commit (see _draft_steps_in_graph) reads the buffers refreshed here.
+        torch.sub(self.seq_lens[:bs], 1, out=self.head_seq_lens[:bs])
+        self.head_seq_lens_cpu[:bs].copy_(self.seq_lens_cpu[:bs] - 1)
+        head_sum = int(self.head_seq_lens_cpu[:bs].sum().item())
+        _, head_spec = self.head_fbs[bs]
+        self.head_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            self.req_pool_indices[:bs],
+            self.head_seq_lens[:bs],
+            head_sum,
+            None,
+            ForwardMode.TARGET_VERIFY,
+            head_spec,
+            self.head_seq_lens_cpu[:bs],
+        )
+
         self.graphs[_default_make_graph_key(bs)].replay()
+
         return (
             self.tokens_out[:raw_bs],
             self.logprobs_out[:raw_bs],

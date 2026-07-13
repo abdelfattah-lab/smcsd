@@ -70,6 +70,10 @@ class SMCEngine:
         power_alpha: float = 1.0,
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
+        # Decode hot-path optimizations (all default ON; set False to disable)
+        defer_bonus: bool = True,
+        cycle_graph: bool = True,
+        enable_overlap: bool = True,
         # Hardware
         tp_size: int = 1,
         base_gpu_id: int = 0,
@@ -118,19 +122,12 @@ class SMCEngine:
         server_args = ServerArgs(**merged)
         self.server_args = server_args
 
-        # power_alpha rides the ServerArgs *instance* as a dynamic attribute
-        # (plain dataclass, no __slots__ — extra attrs live in __dict__ and
-        # survive pickling into the scheduler subprocess).  This keeps the
-        # vendored ServerArgs class unmodified; SMCWorker reads it via getattr
-        # with a 1.0 default so non-SMCEngine launches are unaffected.
         if power_alpha <= 0:
             raise ValueError("power_alpha must be > 0.")
         server_args.smc_power_alpha = float(power_alpha)
-        # SMCEngine consumes SMCParticleOutput itself (both scheduler sockets
-        # point back at this process), so opt in to the scheduler's particle
-        # collection emission.  HTTP launches never set this: there the same
-        # socket feeds a real DetokenizerManager, whose TypeBasedDispatcher
-        # raises ValueError on unknown message types.
+        server_args.smc_defer_bonus = bool(defer_bonus)
+        server_args.smc_cycle_graph = bool(cycle_graph)
+        server_args.smc_enable_overlap = bool(enable_overlap)
         server_args.smc_emit_particle_output = True
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
