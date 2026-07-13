@@ -81,19 +81,24 @@ python scripts/accuracy_test_gsm8k.py \
 > [!NOTE] 
 > When using non-Hopper GPU (such as A100, A6000), specify `--attention-backend` to be `triton`
 
-### Performance flags (fastest known config)
+### Performance optimizations (on by default)
 
-The decode hot path has three opt-in, env-gated optimizations (all require `--attention-backend triton`):
+The decode hot path has three optimizations that are **enabled by default** —
+supported for triton and hybrid-GDN (e.g. Qwen3.5) attention backends, dense
+and hybrid drafts alike.  On unsupported configs (greedy draft, fa3/MLA
+backends, `--disable-cuda-graph`) they log a warning and fall back to the
+legacy per-step path automatically.  Each can be disabled individually via
+`SMCEngine` constructor kwargs (threaded through `server_args`):
 
-| Flag | What it does |
-| --- | --- |
-| `SMC_CYCLE_GRAPH=1` | One CUDA graph per decode cycle: draft AR + target verify + weight diff + bonus |
-| `SMC_ENABLE_OVERLAP=1` | Overlapped scheduler loop: CPU postprocessing of step *t* runs while the GPU executes *t+1* |
-| `SMC_DEFER_BONUS=1` | Deferred-bonus draft schedule — γ draft forwards per cycle instead of γ+1 (captured in the cycle graph when both flags are set) |
+| Optimization | Opt-out | What it does |
+| --- | --- | --- |
+| Cycle CUDA graph | `SMCEngine(..., cycle_graph=False)` | One CUDA graph per decode cycle: draft AR + target verify + weight diff + bonus |
+| Overlapped scheduling | `SMCEngine(..., enable_overlap=False)` | CPU postprocessing of step *t* runs while the GPU executes *t+1* |
+| Deferred bonus | `SMCEngine(..., defer_bonus=False)` | γ draft forwards per cycle instead of γ+1 (captured in the cycle graph) |
 
 ```bash
-# Fastest N=12, gamma=8 GSM8K config (single B300, Llama-3.1-8B + 3.2-1B)
-SMC_CYCLE_GRAPH=1 SMC_ENABLE_OVERLAP=1 SMC_DEFER_BONUS=1 \
+# Fastest N=12, gamma=8 GSM8K config (single B300, Llama-3.1-8B + 3.2-1B).
+# No env flags needed — cycle graph + overlap + deferred bonus are the default.
 python scripts/accuracy_test_gsm8k.py \
   --mode smc_engine \
   --model meta-llama/Llama-3.1-8B-Instruct \

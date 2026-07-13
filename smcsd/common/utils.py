@@ -110,16 +110,17 @@ def copy_smc_resampled_hybrid_state(
 ) -> None:
     """Copy hybrid recurrent state after SMC resampling clones particles.
 
-    Device-driven and sync-free, so it can run inside the GPU resample step
-    (stream-ordered before the next forward is enqueued) and be CUDA-graph
-    captured.  Instead of the host-sliced ``plan.dst_slots``/``src_slots``
-    views (which force ``n_jobs_sync()``), it consumes the FULL-capacity flat
-    plan buffers plus the device-side ``plan.counter``.  Tail jobs
-    (``index >= counter``, uninitialised garbage in the flat buffers) are
-    trash-padded to Mamba slot 0 — the pool's reserved null slot (allocation
-    starts at 1, per ``free_slots = range(1, size+1)``), which is never a valid
-    destination — turning them into harmless ``state[:,0] = state[:,0]``
-    self-copies that can't collide with a real job's write.
+    Device-driven and sync-free, so it runs inside the GPU resample step
+    (stream-ordered before the next forward is enqueued) and is CUDA-graph
+    capturable.  One fused Triton launch per state tensor (see
+    ``fused_resample_mamba``): the grid is the host-known worst case and each
+    program early-exits on the device-side ``plan.counter``, so work is
+    O(n_jobs) — an empty plan (no resample this step, the common case) costs a
+    few no-op launches instead of a full-capacity copy, and valid jobs move
+    contiguous state rows at near-peak bandwidth instead of through torch
+    advanced indexing.  Index resolution (slot -> req_pool row -> mamba row)
+    happens in-kernel with bounds guards, so no host-side staging tensors are
+    built at all.
 
     No-op for pure-attention models (decided from CPU-only pool metadata).
     """
@@ -129,50 +130,21 @@ def copy_smc_resampled_hybrid_state(
     )
     if not has_mamba:
         return
-    flat_cap = plan.dst_flat.numel()  # host-known shape, no sync
-    if flat_cap == 0:
+    max_jobs = plan.dst_flat.numel()  # host-known worst case, no sync
+    if max_jobs == 0:
         return
 
-    # valid[i] == (i < counter): a device-side bool mask; comparing against the
-    # (1,) device counter tensor never triggers a host sync.
-    job_ids = torch.arange(flat_cap, device=device)
-    valid = job_ids < plan.counter
+    from smcsd.core.kernels.fused_resample_mamba import fused_mamba_resample_copy
 
-    # Garbage tail slot indices are clamped in-range before the gather so the
-    # lookup can't fault; the values they produce are discarded by `valid`.
-    n_slots = slot_state.req_pool_indices.numel()
-    dst_slot = plan.dst_flat.to(torch.long).clamp_(0, n_slots - 1)
-    src_slot = plan.src_flat.to(torch.long).clamp_(0, n_slots - 1)
-    dst_req_pool = slot_state.req_pool_indices[dst_slot]
-    src_req_pool = slot_state.req_pool_indices[src_slot]
-    _copy_hybrid_mamba_state_padded(target_pool, src_req_pool, dst_req_pool, valid)
-    _copy_hybrid_mamba_state_padded(draft_pool, src_req_pool, dst_req_pool, valid)
-
-
-def _copy_hybrid_mamba_state_padded(
-    pool,
-    src_req_pool_indices: torch.Tensor,
-    dst_req_pool_indices: torch.Tensor,
-    valid: torch.Tensor,
-) -> None:
-    """Full-capacity, sync-free variant of _copy_hybrid_mamba_state_pairwise:
-    maps req_pool -> mamba indices for every job and forces invalid (tail) jobs
-    to the reserved null Mamba slot 0 (self-copy no-op).  Fixed-shape → CUDA-graph
-    capturable."""
-    if pool is None or not hasattr(pool, "mamba_pool"):
-        return
-    mapping = pool.req_index_to_mamba_index_mapping
-    m = mapping.numel()
-    src_mamba = mapping[src_req_pool_indices.clamp(0, m - 1).to(torch.long)].to(
-        torch.long
-    )
-    dst_mamba = mapping[dst_req_pool_indices.clamp(0, m - 1).to(torch.long)].to(
-        torch.long
-    )
-    null = torch.zeros_like(src_mamba)
-    src_mamba = torch.where(valid, src_mamba, null)
-    dst_mamba = torch.where(valid, dst_mamba, null)
-    pool.mamba_pool.copy_from(src_mamba, dst_mamba)
+    for pool in (target_pool, draft_pool):
+        fused_mamba_resample_copy(
+            pool,
+            slot_state.req_pool_indices,
+            plan.dst_flat,
+            plan.src_flat,
+            plan.counter,
+            max_jobs,
+        )
 
 
 def validate_smc_parent_req(req: Req) -> Optional[str]:
