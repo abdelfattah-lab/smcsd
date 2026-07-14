@@ -142,23 +142,18 @@ M=8, not weight-bandwidth-bound) and in-register K-transpose loads
 
 ## Part 2 — Reference
 
-### Flags (opt out via `SMCEngine` kwargs or env)
+### Flags (all default ON; opt out via `SMCEngine` kwargs or env)
 
 Resolution order per optimization: `SMC_*` env var if set (kill switch for
 CLI harnesses) > `SMCEngine(...)` kwarg (`defer_bonus` / `cycle_graph` /
-`enable_overlap`, threaded through server_args) > default.  Defaults are ON
-except `SMC_ENABLE_OVERLAP` on **hybrid (Mamba/GDN) models**, where the
-overlap loop is correct but measured slower on B200/triton with
-Qwen3.5-2B->9B (-26% decode tok/s at bs=1, -14% at bs=8), so it defaults
-OFF there; force it with `SMC_ENABLE_OVERLAP=1` or
-`SMCEngine(enable_overlap=True)` (the kwarg is tri-state, `None` = auto).
-Unsupported configs downgrade with a warning instead of failing.
+`enable_overlap`, threaded through server_args) > default ON.  Unsupported
+configs downgrade with a warning instead of failing.
 
 | flag | what it gates | off-switch use case |
 |---|---|---|
 | `SMC_CYCLE_GRAPH` | full-cycle CUDA graph (draft AR + verify + weights + bonus in one launch) | capture failures on new configs |
 | `SMC_DEFER_BONUS` | deferred-bonus draft schedule (γ instead of γ+1 draft forwards) | hybrid/MLA drafts (auto-skipped by the launch default) |
-| `SMC_ENABLE_OVERLAP` | overlapped scheduler loop (postprocess step t during step t+1); default OFF for hybrid models (perf, see above) | one-step-late semantics debugging |
+| `SMC_ENABLE_OVERLAP` | overlapped scheduler loop (postprocess step t during step t+1) | one-step-late semantics debugging |
 | `SMC_FAST_VERIFY` | split-KV GQA-packed verify kernel dispatch | widest input surface; first switch to try in triage |
 | `SMC_FUSED_SAMPLING` | fused Gumbel sampling in the cycle graph | reproducing pre-change RNG streams |
 
