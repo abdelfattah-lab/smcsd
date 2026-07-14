@@ -261,6 +261,10 @@ def _verify_attn_stage2(
     tl.store(o_ptrs, out.to(O_Extend.dtype.element_ty))
 
 
+# Shape-keyed persistent partial buffers, shared module-level state.  Safe
+# under the current execution model (one scheduler subprocess, one stream,
+# graph capture serializes use); not safe for concurrent multi-stream
+# launches sharing a shape key.
 _PARTIAL_CACHE: dict = {}
 
 

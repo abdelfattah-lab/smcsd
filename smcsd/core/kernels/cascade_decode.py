@@ -300,6 +300,9 @@ def _cascade_stage2(
     )
 
 
+# Shape-keyed persistent partial buffers, shared module-level state.  Safe
+# under the current execution model (one scheduler subprocess, one stream);
+# not safe for concurrent multi-stream launches sharing a shape key.
 _PART_CACHE: dict = {}
 
 

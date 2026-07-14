@@ -214,6 +214,10 @@ def _chosen_logprob_stage2(
     tl.store(Out_logp + row, chosen - lse)
 
 
+# Shape-keyed persistent partial buffers, shared module-level state.  Safe
+# under the current execution model — one scheduler subprocess, one CUDA
+# stream, and cycle-graph capture serializes buffer use — but NOT safe for
+# concurrent launches on multiple streams sharing a shape key.
 _BUF_CACHE: dict = {}
 
 
@@ -251,6 +255,17 @@ def fused_gumbel_sample(
     logp = scaled[idx] - lse(scaled); logz = lse(scaled) - alpha*lse(base).
     """
     r, v = logits.shape
+    # Philox counters are computed in int32 inside the kernel:
+    # (row_offset + row) * V + col.  Overflow does NOT crash — it silently
+    # wraps and reuses another launch's noise stream, which would correlate
+    # SMC particle proposals.  Unreachable at the bs<=max_bs operating
+    # points this was built for; fail loudly rather than silently if a
+    # future large-batch caller crosses the line.
+    assert (row_offset + r) * v < 2**31, (
+        f"fused_gumbel_sample Philox counter overflow: "
+        f"(row_offset={row_offset} + rows={r}) * V={v} exceeds int32; "
+        "reduce row_offset stride or widen the kernel's counter math."
+    )
     need_base = need_logz and alpha != 1.0
     zmax, zidx, m, l, mb, lb = _bufs(r, logits.device, need_base)
     out_idx = torch.empty((r,), dtype=torch.int64, device=logits.device)

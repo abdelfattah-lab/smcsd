@@ -540,16 +540,23 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         self.verify_out_cache_loc[:n_tokens].view(bs, self.num_steps).copy_(
             self.out_cache_loc[:, :bs].t()
         )
+        # CROSS-REPO SEAM: seq_lens_sum=0 / seq_lens_cpu=None are
+        # placeholders — the vendored triton backend's linear-verify replay
+        # branch reads neither (verified byte-identical vs the eager path).
+        # If a future submodule bump makes that branch read either host
+        # value, this capture records garbage: None fails loudly, but the
+        # 0 would be silent.  Re-verify on submodule bumps (an assert in
+        # the vendored branch is queued for the next bump).
         _, verify_spec = self.verify_fbs[bs]
         self.target_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             self.req_pool_indices[:bs],
             self.seq_lens[:bs],
-            0,      # seq_lens_sum: unused by the linear-verify branch
+            0,      # seq_lens_sum: placeholder, see seam note above
             None,
             ForwardMode.TARGET_VERIFY,
             verify_spec,
-            None,   # seq_lens_cpu: unused by the linear-verify branch
+            None,   # seq_lens_cpu: placeholder, see seam note above
         )
 
     def _verify_in_graph(self, bs, fb, verify_input_ids, verify_positions):
