@@ -35,6 +35,18 @@ import torch
 import triton
 import triton.language as tl
 
+# CUDA-only for now: the tile/warp/stage constants are B200-swept and the
+# kernel is unvalidated on ROCm (the stock extend kernel carries
+# HIP-specific launch tuning this one lacks).  Raising ImportError here is
+# deliberate — the vendored triton backend imports this module lazily and
+# treats ImportError as "fast path unavailable", so ROCm deployments fall
+# back to the stock extend kernel and keep their previous behavior.
+if torch.version.hip is not None:
+    raise ImportError(
+        "smcsd fast verify attention is CUDA-only (untuned/unvalidated on "
+        "ROCm); the triton backend falls back to the stock extend kernel."
+    )
+
 # Fixed split count keeps the launch grid static under CUDA graph capture.
 # 7 prefix chunks + 1 extend-triangle = 8 partials, so the stage-2 merge's
 # tl.arange over partials is a power of 2.
