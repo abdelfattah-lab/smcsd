@@ -115,6 +115,34 @@ class SMCEngine:
         if "log_level" not in merged:
             merged["log_level"] = "error"
 
+        # SMC requires the triton (or fa3) attention backend; without an
+        # explicit choice sglang's sm100 default would pick trtllm_mha,
+        # which is incompatible with SMC's page_size=1 state machinery.
+        if merged.get("attention_backend") is None:
+            merged["attention_backend"] = "triton"
+        if merged["attention_backend"] == "triton":
+            # B200-swept decode default: neutral at short context, +7% at
+            # 4k (the draft decode attention is split-starved at 8).
+            merged.setdefault("triton_attention_num_kv_splits", 16)
+
+        # Best-known decode configuration by default (cycle graph, overlap
+        # loop, deferred bonus where supported).  Explicit env settings —
+        # including "0" kill switches — always win.  Must run before the
+        # scheduler subprocess launch below so the env is inherited.
+        from smcsd.common.utils import apply_smc_perf_env_defaults
+
+        applied_defaults = apply_smc_perf_env_defaults(
+            attention_backend=merged["attention_backend"],
+            draft_model_path=draft_model_path,
+            trust_remote_code=merged.get("trust_remote_code", False),
+        )
+        if applied_defaults:
+            logger.info(
+                "SMCEngine: enabled decode perf defaults %s "
+                "(set the env var to 0 to disable one).",
+                applied_defaults,
+            )
+
         server_args = ServerArgs(**merged)
         self.server_args = server_args
 
