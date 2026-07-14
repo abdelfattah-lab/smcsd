@@ -122,7 +122,7 @@ all N×G query rows) was built and measured during this campaign: a
 **wash at 4k** — at that size the kernel is bound by scattered-read
 latency, not traffic, so reading less doesn't help — but 1.9×/3×/4.2×
 over stock at 8k/16k/32k prefixes.  It ships in its own follow-up PR
-(`perf/cascade-decode`) rather than here: it is not wired into the hot
+(#31, `perf/cascade-decode`) rather than here: it is not wired into the hot
 path — dispatch cannot branch inside a captured graph, so enabling it
 needs dual-graph capture keyed on prompt-length regime — and it deserves
 its own review alongside that integration.
@@ -161,7 +161,7 @@ short context, +7% at 4k).
 |---|---|---|
 | `verify_attention.py` | triton extend `_fwd_kernel` on the linear TARGET_VERIFY path | 5× at 4k ctx (319→64 µs/8B layer) |
 | `fused_sampling.py` | ~10-op torch Gumbel chain + verify score extraction | ~6× on the sampling chain |
-| `cascade_decode.py` (follow-up PR, `perf/cascade-decode`) | grouped decode with shared-prefix reads | 1.9–4.2× at 8k–32k prefixes; wash at ≤4k |
+| `cascade_decode.py` (follow-up PR #31) | grouped decode with shared-prefix reads | 1.9–4.2× at 8k–32k prefixes; wash at ≤4k |
 
 ### Why not FA4 / trtllm?
 
