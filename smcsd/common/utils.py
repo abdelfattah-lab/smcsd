@@ -110,13 +110,19 @@ def copy_smc_resampled_hybrid_state(
 ) -> None:
     """Copy hybrid recurrent state after SMC resampling clones particles.
 
-    No-op for pure-attention models, decided from CPU-only pool metadata —
-    no device sync.  Only when a Mamba pool exists does this sync: the
-    ``plan.dst_slots`` / ``plan.src_slots`` views slice the device plan to
-    its valid jobs via ``n_jobs_sync()``, because the mamba ``copy_from``
-    is a torch indexed copy that needs exact host-shaped index tensors and
-    the flat plan buffers' tails are uninitialised.  An empty plan yields
-    empty slices, which the pairwise copy treats as a no-op.
+    Device-driven and sync-free, so it runs inside the GPU resample step
+    (stream-ordered before the next forward is enqueued) and is CUDA-graph
+    capturable.  One fused Triton launch per state tensor (see
+    ``fused_resample_mamba``): the grid is the host-known worst case and each
+    program early-exits on the device-side ``plan.counter``, so work is
+    O(n_jobs) — an empty plan (no resample this step, the common case) costs a
+    few no-op launches instead of a full-capacity copy, and valid jobs move
+    contiguous state rows at near-peak bandwidth instead of through torch
+    advanced indexing.  Index resolution (slot -> req_pool row -> mamba row)
+    happens in-kernel with bounds guards, so no host-side staging tensors are
+    built at all.
+
+    No-op for pure-attention models (decided from CPU-only pool metadata).
     """
     has_mamba = any(
         pool is not None and hasattr(pool, "mamba_pool")
@@ -124,13 +130,21 @@ def copy_smc_resampled_hybrid_state(
     )
     if not has_mamba:
         return
-    dst_slots_t = plan.dst_slots.to(torch.long)
-    src_slots_t = plan.src_slots.to(torch.long)
+    max_jobs = plan.dst_flat.numel()  # host-known worst case, no sync
+    if max_jobs == 0:
+        return
 
-    dst_req_pool = slot_state.req_pool_indices[dst_slots_t]
-    src_req_pool = slot_state.req_pool_indices[src_slots_t]
-    _copy_hybrid_mamba_state_pairwise(target_pool, src_req_pool, dst_req_pool)
-    _copy_hybrid_mamba_state_pairwise(draft_pool, src_req_pool, dst_req_pool)
+    from smcsd.core.kernels.fused_resample_mamba import fused_mamba_resample_copy
+
+    for pool in (target_pool, draft_pool):
+        fused_mamba_resample_copy(
+            pool,
+            slot_state.req_pool_indices,
+            plan.dst_flat,
+            plan.src_flat,
+            plan.counter,
+            max_jobs,
+        )
 
 
 def validate_smc_parent_req(req: Req) -> Optional[str]:
@@ -362,62 +376,3 @@ def systematic_resample(
         device=weights_t.device,
     )
     return torch.searchsorted(cdf, positions, right=False)
-
-
-def _draft_is_hybrid(draft_model_path: str, trust_remote_code: bool) -> bool:
-    """Config-level sniff for hybrid (Mamba/GDN) drafts.
-
-    Mirrors the attributes SMCWorker reads off ``hybrid_gdn_config`` — the
-    deferred-bonus head does not support hybrid draft attention backends and
-    the worker raises if asked, so launch-path defaulting must skip it.
-    Unknown/unloadable configs are conservatively treated as hybrid.
-    """
-    try:
-        from transformers import AutoConfig
-
-        cfg = AutoConfig.from_pretrained(
-            draft_model_path, trust_remote_code=trust_remote_code
-        )
-    except Exception:
-        return True
-    markers = (
-        "linear_num_value_heads",
-        "linear_key_head_dim",
-        "mamba_d_state",
-        "ssm_state_size",
-    )
-    return any(getattr(cfg, m, None) is not None for m in markers)
-
-
-def apply_smc_perf_env_defaults(
-    *,
-    attention_backend: Optional[str],
-    draft_model_path: str,
-    trust_remote_code: bool = False,
-) -> dict:
-    """Default the SMC decode-path performance toggles ON for supported configs.
-
-    Called by the launch paths (SMCEngine / http server) BEFORE the scheduler
-    subprocess spawns, so the env is inherited.  ``os.environ.setdefault``
-    keeps explicit user settings (including "0" kill switches) authoritative.
-
-    Only applies on the triton backend (the fully supported SMC backend):
-    SMC_CYCLE_GRAPH and SMC_ENABLE_OVERLAP degrade gracefully on unsupported
-    configs (warn + fall back), and SMC_DEFER_BONUS — which hard-raises on
-    hybrid draft backends — is only defaulted for non-hybrid drafts.
-    SMC_FAST_VERIFY / SMC_FUSED_SAMPLING already default on at their read
-    sites.  Returns the dict of defaults actually applied (for logging).
-    """
-    import os
-
-    if attention_backend != "triton":
-        return {}
-    defaults = {"SMC_CYCLE_GRAPH": "1", "SMC_ENABLE_OVERLAP": "1"}
-    if not _draft_is_hybrid(draft_model_path, trust_remote_code):
-        defaults["SMC_DEFER_BONUS"] = "1"
-    applied = {}
-    for key, val in defaults.items():
-        if key not in os.environ:
-            os.environ[key] = val
-            applied[key] = val
-    return applied

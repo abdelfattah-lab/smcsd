@@ -93,21 +93,9 @@ def build_smc_server_args(
         # B200-swept decode default (neutral short-ctx, +7% at 4k).
         kwargs.setdefault("triton_attention_num_kv_splits", 16)
 
-    # Best-known decode configuration by default (cycle graph, overlap loop,
-    # deferred bonus where supported); explicit env settings always win.
-    from smcsd.common.utils import apply_smc_perf_env_defaults
-
-    applied_defaults = apply_smc_perf_env_defaults(
-        attention_backend=kwargs["attention_backend"],
-        draft_model_path=draft_model_path,
-        trust_remote_code=bool(kwargs.get("trust_remote_code", False)),
-    )
-    if applied_defaults:
-        logger.info(
-            "SMC server: enabled decode perf defaults %s "
-            "(set the env var to 0 to disable one).",
-            applied_defaults,
-        )
+    # Decode perf optimizations default ON via the worker/scheduler-side
+    # smc_* attr defaults (getattr(..., True)); SMC_* env vars remain as
+    # kill switches.
 
     # SMC loads two independent model runners (target + draft) and each sizes
     # its own KV-cache pool from mem_fraction_static, so the fraction is counted

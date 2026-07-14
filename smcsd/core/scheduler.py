@@ -233,6 +233,14 @@ class SMCScheduler(Scheduler):
         self.waiting_groups: Deque[SequenceGroup] = deque()
         self.prefill_groups: List[SequenceGroup] = []
         self.running_groups: List[SequenceGroup] = []
+        # Slots reserved by admission but not yet claimed by allocate_slots.
+        # allocate_slots runs in prefill POSTPROCESSING, which the overlap
+        # loop defers by one iteration — without this reservation the next
+        # _admit_prefill_groups reads stale free_slots and over-admits,
+        # violating max_running_requests (observed: rr=1 running every
+        # queued group concurrently, blowing decode past the captured
+        # cuda-graph buckets).
+        self._pending_admitted_slots = 0
         self.slot_state = ScheduleBatchSMC(
             max_num_reqs=self.max_user_groups * n_particles,
             device=self.device,
@@ -252,24 +260,18 @@ class SMCScheduler(Scheduler):
             resample_method=server_args.smc_resample_method,
         )
 
-        # Overlapped scheduling: opt-in via SMC_ENABLE_OVERLAP=1, gated to
-        # pure-attention models.  Hybrid (Mamba) models copy recurrent
-        # state in postprocessing, which must complete before the next
-        # forward reads it — overlap would enqueue that forward first.
-        draft_hybrid_pool = getattr(
-            self.model_worker, "_dense_draft_hybrid_req_to_token_pool", None
+        # Resolution order: SMC_ENABLE_OVERLAP env (kill switch) >
+        # SMCEngine kwarg (server_args attr) > default ON.  The hybrid
+        # (Mamba) gate is gone: the recurrent-state resample copy is now a
+        # device-driven fused kernel enqueued inside _resample (before the
+        # snapshot), so it is stream-ordered ahead of the next forward.
+        _ov_env = os.environ.get("SMC_ENABLE_OVERLAP")
+        want_overlap = (
+            bool(int(_ov_env))
+            if _ov_env is not None
+            else bool(getattr(server_args, "smc_enable_overlap", True))
         )
-        is_hybrid = any(
-            pool is not None and hasattr(pool, "mamba_pool")
-            for pool in (self.req_to_token_pool, draft_hybrid_pool)
-        )
-        want_overlap = bool(int(os.environ.get("SMC_ENABLE_OVERLAP", "0")))
-        self._use_overlap_loop = want_overlap and not is_hybrid
-        if want_overlap and is_hybrid:
-            logger.warning(
-                "SMC_ENABLE_OVERLAP=1 ignored: hybrid (Mamba) models "
-                "require sequential postprocessing."
-            )
+        self._use_overlap_loop = want_overlap
         if self._use_overlap_loop:
             logger.info("SMCScheduler: overlapped scheduling enabled.")
 
@@ -631,7 +633,9 @@ class SMCScheduler(Scheduler):
 
     def _admit_prefill_groups(self) -> List[SequenceGroup]:
         admitted: List[SequenceGroup] = []
-        remaining_capacity = self.slot_state.available_slot_count()
+        remaining_capacity = (
+            self.slot_state.available_slot_count() - self._pending_admitted_slots
+        )
 
         while self.waiting_groups:
             group = self.waiting_groups[0]
@@ -639,6 +643,7 @@ class SMCScheduler(Scheduler):
             if group_size > remaining_capacity:
                 break
             admitted.append(self.waiting_groups.popleft())
+            self._pending_admitted_slots += group_size
             remaining_capacity -= group_size
             if remaining_capacity <= 0:
                 break
@@ -704,6 +709,11 @@ class SMCScheduler(Scheduler):
             zip(groups, batch.reqs, next_token_ids)
         ):
             assert req is group.parent_req
+            # Admission resolves here: whether the group materializes,
+            # finishes at prefill, or aborts, true slot accounting
+            # (allocate_slots / never-claimed) takes over from the
+            # reservation made in _admit_prefill_groups.
+            self._pending_admitted_slots -= group.n_particles
 
             req.output_ids.append(next_token_id)
             req.check_finished()
@@ -887,6 +897,19 @@ class SMCScheduler(Scheduler):
             plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
         )
         self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+
+        copy_smc_resampled_hybrid_state(
+            target_pool=self.req_to_token_pool,
+            draft_pool=getattr(
+                self.model_worker,
+                "_dense_draft_hybrid_req_to_token_pool",
+                None,
+            ),
+            slot_state=self.slot_state,
+            plan=plan,
+            device=self.device,
+        )
+
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
 
@@ -923,21 +946,6 @@ class SMCScheduler(Scheduler):
                 )
             )
             self.slot_state.kv_freed_counter[snapshot.phase].zero_()
-
-        # Hybrid (Mamba) recurrent-state copy.  Internally a CPU-metadata
-        # no-op for pure-attention models; only hybrid models pay the
-        # plan-slicing sync.
-        copy_smc_resampled_hybrid_state(
-            target_pool=self.req_to_token_pool,
-            draft_pool=getattr(
-                self.model_worker,
-                "_dense_draft_hybrid_req_to_token_pool",
-                None,
-            ),
-            slot_state=self.slot_state,
-            plan=plan,
-            device=self.device,
-        )
 
         # No rebuild here: neither finishing (absorbing-state semantics) nor
         # resampling changes slot membership — only allocate_slots /

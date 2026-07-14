@@ -142,7 +142,12 @@ M=8, not weight-bandwidth-bound) and in-register K-transpose loads
 
 ## Part 2 — Reference
 
-### Flags (all default ON via the launch paths; set to 0 to disable)
+### Flags (all default ON; opt out via `SMCEngine` kwargs or env)
+
+Resolution order per optimization: `SMC_*` env var if set (kill switch for
+CLI harnesses) > `SMCEngine(...)` kwarg (`defer_bonus` / `cycle_graph` /
+`enable_overlap`, threaded through server_args) > default ON.  Unsupported
+configs downgrade with a warning instead of failing.
 
 | flag | what it gates | off-switch use case |
 |---|---|---|
@@ -153,7 +158,11 @@ M=8, not weight-bandwidth-bound) and in-register K-transpose loads
 | `SMC_FUSED_SAMPLING` | fused Gumbel sampling in the cycle graph | reproducing pre-change RNG streams |
 
 Plus `--triton-attention-num-kv-splits 16` (kwarg-defaulted; neutral at
-short context, +7% at 4k).
+short context, +7% at 4k), and `SMC_DRAFT_GRAPH_MAX_BS` (default 32): the
+cycle-graph capture cap on decode batch = groups x N; batches above it
+fall back to the per-step path.  Raising it to 64 measured +10% at
+8 groups x 8 particles on B200 hybrid (1158 -> 1274 tok/s) with bs=1
+unchanged, at the cost of more capture buckets and graph memory.
 
 ### Kernel inventory (all in `smcsd/core/kernels/`, tests in `tests/`)
 
