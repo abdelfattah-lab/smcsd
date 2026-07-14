@@ -50,6 +50,7 @@ def _gumbel_sample_stage1(
     V,
     inv_t,           # 1 / temperature
     alpha,
+    row_offset,      # disjoint counter ranges across launches sharing a seed
     S: tl.constexpr,
     BLOCK: tl.constexpr,
     NEED_BASE: tl.constexpr,
@@ -77,9 +78,10 @@ def _gumbel_sample_stage1(
         base = x.to(tl.float32) * inv_t
         scaled = base * alpha
 
-        # Gumbel noise: one Philox seed per launch, disjoint counter range
-        # per row (row * V + col), so no (row, launch) stream collisions.
-        u = tl.rand(seed, row * V + offs)
+        # Gumbel noise: one Philox seed per cycle, disjoint counter range per
+        # (launch, row): callers sharing a seed across several launches (the
+        # in-graph draft steps + bonus) pass a distinct row_offset per launch.
+        u = tl.rand(seed, (row_offset + row) * V + offs)
         tiny = 1.1754944e-38
         g = -tl.log(-tl.log(tl.maximum(u, tiny)))
         z = tl.where(mask, scaled + g, float("-inf"))
@@ -241,6 +243,7 @@ def fused_gumbel_sample(
     alpha: float = 1.0,
     need_logp: bool = True,
     need_logz: bool = False,
+    row_offset: int = 0,
 ):
     """Returns (idx (R,) int64, logp (R,) fp32 | None, logz (R,) fp32 | None).
 
@@ -264,7 +267,7 @@ def fused_gumbel_sample(
     _gumbel_sample_stage1[(r, SPLITS)](
         logits, seed_buf,
         zmax, zidx, m, l, mb, lb,
-        logits.stride(0), v, inv_t, alpha,
+        logits.stride(0), v, inv_t, alpha, row_offset,
         S=SPLITS, BLOCK=BLOCK_V, NEED_BASE=need_base,
         num_warps=8, num_stages=2,
     )

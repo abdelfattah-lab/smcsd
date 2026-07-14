@@ -172,6 +172,20 @@ class SMCDraftPhaseGraphRunner:
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
         )
 
+        # Fused-sampler RNG state: one Philox seed per cycle, bumped by a
+        # captured add_ at the start of the in-graph draft phase, so every
+        # replay draws fresh noise (deterministic from random_seed).  Each
+        # in-graph sampling launch gets a disjoint counter range via
+        # row_offset = step * max_bs.  Kill switch: SMC_FUSED_SAMPLING=0
+        # falls back to the torch Gumbel chain.
+        self.use_fused_sampling = bool(
+            int(os.environ.get("SMC_FUSED_SAMPLING", "1"))
+        )
+        with torch.device(model_runner.device):
+            self.sample_seed = torch.randint(
+                0, 2**31 - 1, (1,), dtype=torch.int64
+            )
+
         # ForwardBatch per bucket, kept so replay-time metadata regeneration
         # reads the very buffers the graph was captured against.
         self.fbs = {}
@@ -251,28 +265,54 @@ class SMCDraftPhaseGraphRunner:
         self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(fb)
         return fb, input_ids, positions, out_cache_loc_steps
 
+    def _sample_step_in_graph(self, logits, step: int, need_logp: bool):
+        """One in-graph draft draw: fused kernel or the torch Gumbel chain.
+
+        Returns (idx, logp-or-None).  ``step`` selects the fused sampler's
+        Philox counter range (disjoint per launch within a cycle).
+        """
+        if self.use_fused_sampling:
+            from smcsd.core.kernels.fused_sampling import fused_gumbel_sample
+
+            idx, logp, _ = fused_gumbel_sample(
+                logits,
+                self.temperature,
+                self.sample_seed,
+                need_logp=need_logp,
+                row_offset=step * self.max_bs,
+            )
+            return idx, logp
+        tiny = torch.finfo(torch.float32).tiny
+        scaled = logits / self.temperature
+        gumbel = -torch.log(
+            -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
+        )
+        idx = torch.argmax(scaled + gumbel, dim=-1)
+        if not need_logp:
+            return idx, None
+        chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
+        return idx, chosen - torch.logsumexp(scaled, dim=-1)
+
     def _draft_steps_in_graph(self, bs, forward, fb, input_ids, positions,
                               out_cache_loc_steps):
         """The captured draft loop: gamma+1 forwards + Gumbel sampling."""
         backends = self.draft_attn_backend.attn_backends
         tokens_out = self.tokens_out[:bs]
         logprobs_out = self.logprobs_out[:bs]
-        tiny = torch.finfo(torch.float32).tiny
+        if self.use_fused_sampling:
+            self.sample_seed.add_(1)  # captured: fresh noise every replay
         for s in range(self.num_steps):
             fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
             # `forward` is the (patched) model.forward — returns a
             # LogitsProcessorOutput directly.
             logits = forward(input_ids, positions, fb).next_token_logits
-            scaled = logits / self.temperature
-            gumbel = -torch.log(
-                -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
+            idx, logp = self._sample_step_in_graph(
+                logits, s, need_logp=s < self.gamma
             )
-            idx = torch.argmax(scaled + gumbel, dim=-1)
             tokens_out[:, s + 1] = idx
             if s < self.gamma:
-                chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
-                logprobs_out[:, s] = chosen - torch.logsumexp(scaled, dim=-1)
+                logprobs_out[:, s] = logp
             input_ids.copy_(idx)
             positions.add_(1)
         return tokens_out, logprobs_out
@@ -408,6 +448,11 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self.next_tokens_out = torch.zeros(
                 (self.max_bs, self.num_steps), dtype=torch.int64
             )
+            # Padded token buffer for the fused score-logprob pass (the
+            # bonus row scores a dummy 0 token and is sliced off).
+            self.score_tok_buf = torch.zeros(
+                (self.max_bs, self.num_steps), dtype=torch.int64
+            )
         self.verify_fbs = {}
 
     def _setup_verify_capture(self, bs: int):
@@ -480,29 +525,61 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         ).next_token_logits
         logits3 = logits.view(bs, self.num_steps, -1)
 
-        # Fused score logprobs under the tempered target p_T.
-        verify_scaled = logits3[:, :gamma, :] / self.target_temperature
-        chosen = verify_scaled.gather(
-            2, tokens_out[:, 1 : gamma + 1].unsqueeze(2)
-        ).squeeze(2)
-        score_logprobs = chosen - torch.logsumexp(verify_scaled, dim=-1)
-        logprob_diff_out.copy_(self.alpha * score_logprobs - logprobs_out)
+        if self.use_fused_sampling:
+            from smcsd.core.kernels.fused_sampling import (
+                fused_chosen_logprob,
+                fused_gumbel_sample,
+            )
 
-        # Bonus from the same p_T^alpha tempered-power target, Gumbel-max.
-        bonus_base = logits3[:, -1, :] / self.target_temperature
-        bonus_scaled = self.alpha * bonus_base
-        bonus_gumbel = -torch.log(
-            -torch.log(torch.rand_like(bonus_scaled).clamp_min_(tiny))
-        )
-        bonus_out.copy_(torch.argmax(bonus_scaled + bonus_gumbel, dim=-1))
-        # Bonus normalizer log Z = logsumexp(alpha*ℓ/T) - alpha*logsumexp(ℓ/T):
-        # the bonus's incremental importance weight under the joint-power target
-        # (the bonus is drawn from the locally normalized p_T^alpha/Z).  0 at
-        # alpha=1.  Accumulated in write_back_gpu, gated by the EOS/finish logic.
-        bonus_logz_out.copy_(
-            torch.logsumexp(bonus_scaled, dim=-1)
-            - self.alpha * torch.logsumexp(bonus_base, dim=-1)
-        )
+            # Score logprobs: one pass over ALL gamma+1 rows (contiguous),
+            # the bonus row scored against a dummy token and sliced off —
+            # cheaper than materializing a non-contiguous (bs*gamma, V) view.
+            score_toks = self.score_tok_buf[:bs]
+            score_toks[:, :gamma].copy_(tokens_out[:, 1 : gamma + 1])
+            score_lp = fused_chosen_logprob(
+                logits, score_toks.reshape(-1), self.target_temperature
+            ).view(bs, self.num_steps)[:, :gamma]
+            logprob_diff_out.copy_(self.alpha * score_lp - logprobs_out)
+
+            # Bonus from p_T^alpha (strided row view: fixed offset + row
+            # stride, inner-contiguous — supported by the kernel).  logz is
+            # the bonus's incremental importance weight; exact 0 at alpha=1.
+            b_idx, _, b_logz = fused_gumbel_sample(
+                logits3[:, -1, :],
+                self.target_temperature,
+                self.sample_seed,
+                alpha=self.alpha,
+                need_logp=False,
+                need_logz=True,
+                row_offset=(self.num_steps + 1) * self.max_bs,
+            )
+            bonus_out.copy_(b_idx)
+            bonus_logz_out.copy_(b_logz)
+        else:
+            # Torch reference chain.
+            verify_scaled = logits3[:, :gamma, :] / self.target_temperature
+            chosen = verify_scaled.gather(
+                2, tokens_out[:, 1 : gamma + 1].unsqueeze(2)
+            ).squeeze(2)
+            score_logprobs = chosen - torch.logsumexp(verify_scaled, dim=-1)
+            logprob_diff_out.copy_(self.alpha * score_logprobs - logprobs_out)
+
+            # Bonus from the same p_T^alpha tempered-power target, Gumbel-max.
+            bonus_base = logits3[:, -1, :] / self.target_temperature
+            bonus_scaled = self.alpha * bonus_base
+            bonus_gumbel = -torch.log(
+                -torch.log(torch.rand_like(bonus_scaled).clamp_min_(tiny))
+            )
+            bonus_out.copy_(torch.argmax(bonus_scaled + bonus_gumbel, dim=-1))
+            # Bonus normalizer log Z = logsumexp(alpha*ℓ/T) -
+            # alpha*logsumexp(ℓ/T): the bonus's incremental importance weight
+            # under the joint-power target (drawn from the locally normalized
+            # p_T^alpha/Z).  0 at alpha=1.  Accumulated in write_back_gpu,
+            # gated by the EOS/finish logic.
+            bonus_logz_out.copy_(
+                torch.logsumexp(bonus_scaled, dim=-1)
+                - self.alpha * torch.logsumexp(bonus_base, dim=-1)
+            )
 
         next_tokens_out[:, :gamma].copy_(tokens_out[:, 1 : gamma + 1])
         next_tokens_out[:, gamma].copy_(bonus_out)
@@ -699,7 +776,8 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         backends = self.draft_attn_backend.attn_backends
         tokens_out = self.tokens_out[:bs]
         logprobs_out = self.logprobs_out[:bs]
-        tiny = torch.finfo(torch.float32).tiny
+        if self.use_fused_sampling:
+            self.sample_seed.add_(1)  # captured: fresh noise every replay
 
         head_fb, _ = self.head_fbs[bs]
         n_head = 2 * bs
@@ -726,14 +804,9 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         ).next_token_logits
         head_logits = logits2.view(bs, 2, -1)[:, 1, :]   # S / bonus column
 
-        scaled = head_logits / self.temperature
-        gumbel = -torch.log(
-            -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
-        )
-        idx = torch.argmax(scaled + gumbel, dim=-1)
+        idx, logp = self._sample_step_in_graph(head_logits, 0, need_logp=True)
         tokens_out[:, 1] = idx
-        chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
-        logprobs_out[:, 0] = chosen - torch.logsumexp(scaled, dim=-1)
+        logprobs_out[:, 0] = logp
         input_ids.copy_(idx)
         positions.add_(1)
 
@@ -742,14 +815,9 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
             logits = forward(input_ids, positions, fb).next_token_logits
-            scaled = logits / self.temperature
-            gumbel = -torch.log(
-                -torch.log(torch.rand_like(scaled).clamp_min_(tiny))
-            )
-            idx = torch.argmax(scaled + gumbel, dim=-1)
+            idx, logp = self._sample_step_in_graph(logits, s, need_logp=True)
             tokens_out[:, s + 1] = idx
-            chosen = scaled.gather(1, idx.unsqueeze(1)).squeeze(1)
-            logprobs_out[:, s] = chosen - torch.logsumexp(scaled, dim=-1)
+            logprobs_out[:, s] = logp
             input_ids.copy_(idx)
             positions.add_(1)
         return tokens_out, logprobs_out
