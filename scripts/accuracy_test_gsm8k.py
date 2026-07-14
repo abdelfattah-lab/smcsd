@@ -72,12 +72,7 @@ def format_instruction(question: str) -> str:
 def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False):
     """Load GSM8K and build chat-template prompts + gold labels."""
     print("Loading GSM8K dataset...")
-    from huggingface_hub import hf_hub_download
-
-    parquet_path = hf_hub_download(
-        "openai/gsm8k", "main/test-00000-of-00001.parquet", repo_type="dataset"
-    )
-    dataset = load_dataset("parquet", data_files=parquet_path, split="train")
+    dataset = load_dataset("openai/gsm8k", "main", split="test")
 
     prompts = []
     labels = []
