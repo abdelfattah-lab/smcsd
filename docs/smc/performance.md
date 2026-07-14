@@ -142,23 +142,32 @@ M=8, not weight-bandwidth-bound) and in-register K-transpose loads
 
 ## Part 2 — Reference
 
-### Flags (all default ON; opt out via `SMCEngine` kwargs or env)
+### Flags (opt out via `SMCEngine` kwargs or env)
 
 Resolution order per optimization: `SMC_*` env var if set (kill switch for
 CLI harnesses) > `SMCEngine(...)` kwarg (`defer_bonus` / `cycle_graph` /
-`enable_overlap`, threaded through server_args) > default ON.  Unsupported
-configs downgrade with a warning instead of failing.
+`enable_overlap`, threaded through server_args) > default.  Defaults are ON
+except `SMC_ENABLE_OVERLAP` on **hybrid (Mamba/GDN) models**, where the
+overlap loop is correct but measured slower on B200/triton with
+Qwen3.5-2B->9B (-26% decode tok/s at bs=1, -14% at bs=8), so it defaults
+OFF there; force it with `SMC_ENABLE_OVERLAP=1` or
+`SMCEngine(enable_overlap=True)` (the kwarg is tri-state, `None` = auto).
+Unsupported configs downgrade with a warning instead of failing.
 
 | flag | what it gates | off-switch use case |
 |---|---|---|
 | `SMC_CYCLE_GRAPH` | full-cycle CUDA graph (draft AR + verify + weights + bonus in one launch) | capture failures on new configs |
 | `SMC_DEFER_BONUS` | deferred-bonus draft schedule (γ instead of γ+1 draft forwards) | hybrid/MLA drafts (auto-skipped by the launch default) |
-| `SMC_ENABLE_OVERLAP` | overlapped scheduler loop (postprocess step t during step t+1) | one-step-late semantics debugging |
+| `SMC_ENABLE_OVERLAP` | overlapped scheduler loop (postprocess step t during step t+1); default OFF for hybrid models (perf, see above) | one-step-late semantics debugging |
 | `SMC_FAST_VERIFY` | split-KV GQA-packed verify kernel dispatch | widest input surface; first switch to try in triage |
 | `SMC_FUSED_SAMPLING` | fused Gumbel sampling in the cycle graph | reproducing pre-change RNG streams |
 
 Plus `--triton-attention-num-kv-splits 16` (kwarg-defaulted; neutral at
-short context, +7% at 4k).
+short context, +7% at 4k), and `SMC_DRAFT_GRAPH_MAX_BS` (default 32): the
+cycle-graph capture cap on decode batch = groups x N; batches above it
+fall back to the per-step path.  Raising it to 64 measured +10% at
+8 groups x 8 particles on B200 hybrid (1158 -> 1274 tok/s) with bs=1
+unchanged, at the cost of more capture buckets and graph memory.
 
 ### Kernel inventory (all in `smcsd/core/kernels/`, tests in `tests/`)
 
