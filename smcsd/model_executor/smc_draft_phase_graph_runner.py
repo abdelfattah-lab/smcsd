@@ -185,6 +185,7 @@ class SMCDraftPhaseGraphRunner:
             self.sample_seed = torch.randint(
                 0, 2**31 - 1, (1,), dtype=torch.int64
             )
+            self._steps_arange = torch.arange(self.num_steps)
 
         # ForwardBatch per bucket, kept so replay-time metadata regeneration
         # reads the very buffers the graph was captured against.
@@ -265,6 +266,22 @@ class SMCDraftPhaseGraphRunner:
         self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(fb)
         return fb, input_ids, positions, out_cache_loc_steps
 
+    def _metadata_in_graph(self, bs: int):
+        """Attention-metadata refresh, captured INSIDE the cycle graph.
+
+        Every op here is a device op over staged input buffers (seq_lens /
+        positions / req_pool_indices) or persistent pool tensors
+        (req_to_token, the backends' cuda-graph indptr/indices buffers), so
+        recording it in the graph reproduces today's eager pre-launch
+        metadata calls exactly — while removing ~15-30 host-dispatched ops
+        from the replay critical path.  Must run before the model forwards
+        that consume the metadata; the draft loop's in-graph positions
+        increments happen after, exactly like the eager ordering.
+        """
+        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+            self.fbs[bs], bs
+        )
+
     def _sample_step_in_graph(self, logits, step: int, need_logp: bool):
         """One in-graph draft draw: fused kernel or the torch Gumbel chain.
 
@@ -326,6 +343,7 @@ class SMCDraftPhaseGraphRunner:
 
         def run_once():
             set_is_extend_in_batch(False)
+            self._metadata_in_graph(bs)
             return self._draft_steps_in_graph(
                 bs, forward, fb, input_ids, positions, ocl_steps
             )
@@ -390,9 +408,7 @@ class SMCDraftPhaseGraphRunner:
         raw_bs, bs = self._stage_replay_inputs(
             verified_id, cache_locs, ctx, req_pool_indices
         )
-        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            self.fbs[bs], bs
-        )
+        # Attention metadata is captured in-graph (_metadata_in_graph).
         # capture() stores keys via _default_make_graph_key(bs, None, None),
         # which is the plain bs int.
         self.graphs[_default_make_graph_key(bs)].replay()
@@ -506,6 +522,36 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         )
         return fb, verify_input_ids, verify_positions
 
+    def _metadata_in_graph(self, bs: int):
+        """Draft multistep metadata + verify staging/metadata, in-graph.
+
+        The verify positions / out-cache-locs are pure functions of the
+        staged seq_lens and step-major out_cache_loc buffers, so they are
+        derived here instead of being staged eagerly per replay.
+        """
+        super()._metadata_in_graph(bs)
+
+        n_tokens = bs * self.num_steps
+        # positions[r, e] = S_r + e
+        self.verify_positions[:n_tokens].view(bs, self.num_steps).copy_(
+            self.seq_lens[:bs].unsqueeze(1) + self._steps_arange
+        )
+        # step-major staged buffer -> request-major verify layout
+        self.verify_out_cache_loc[:n_tokens].view(bs, self.num_steps).copy_(
+            self.out_cache_loc[:, :bs].t()
+        )
+        _, verify_spec = self.verify_fbs[bs]
+        self.target_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            self.req_pool_indices[:bs],
+            self.seq_lens[:bs],
+            0,      # seq_lens_sum: unused by the linear-verify branch
+            None,
+            ForwardMode.TARGET_VERIFY,
+            verify_spec,
+            None,   # seq_lens_cpu: unused by the linear-verify branch
+        )
+
     def _verify_in_graph(self, bs, fb, verify_input_ids, verify_positions):
         gamma = self.gamma
         tokens_out = self.tokens_out[:bs]
@@ -604,6 +650,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
 
         def run_once():
             set_is_extend_in_batch(False)
+            self._metadata_in_graph(bs)
             self._draft_steps_in_graph(
                 bs, forward, fb, input_ids, positions, ocl_steps
             )
@@ -629,33 +676,8 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         raw_bs, bs = self._stage_replay_inputs(
             verified_id, cache_locs, ctx, req_pool_indices
         )
-        # Verify-side staging: positions [S..S+gamma] and request-major
-        # cache locations per row.
-        n_raw_tokens = raw_bs * self.num_steps
-        self.verify_positions[:n_raw_tokens].view(raw_bs, self.num_steps).copy_(
-            ctx.orig_seq_lens.unsqueeze(1)
-            + torch.arange(self.num_steps, device=cache_locs.device)
-        )
-        self.verify_out_cache_loc[:n_raw_tokens].view(
-            raw_bs, self.num_steps
-        ).copy_(cache_locs)
-
-        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            self.fbs[bs], bs
-        )
-        verify_fb, verify_spec = self.verify_fbs[bs]
-        seq_lens_sum = int(self.seq_lens_cpu[:bs].sum().item())
-        self.target_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            self.req_pool_indices[:bs],
-            self.seq_lens[:bs],
-            seq_lens_sum,
-            None,
-            ForwardMode.TARGET_VERIFY,
-            verify_spec,
-            self.seq_lens_cpu[:bs],
-        )
-
+        # Verify staging + all attention metadata are captured in-graph
+        # (_metadata_in_graph); replay is staging copies + one launch.
         self.graphs[_default_make_graph_key(bs)].replay()
         return (
             self.tokens_out[:raw_bs],
@@ -770,6 +792,26 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         )
         return fb
 
+    def _metadata_in_graph(self, bs: int):
+        """Head-prefix lengths + head metadata, then the parent's verify/
+        draft metadata — all captured in-graph.  The deferred S-1 cache
+        slot (head_out_cache_loc column 0) is the one input still staged
+        eagerly in replay(): it needs pad-row-safe zeros, and raw_bs is a
+        host-side value."""
+        torch.sub(self.seq_lens[:bs], 1, out=self.head_seq_lens[:bs])
+        _, head_spec = self.head_fbs[bs]
+        self.draft_primary_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            self.req_pool_indices[:bs],
+            self.head_seq_lens[:bs],
+            0,      # seq_lens_sum: unused by the linear-verify branch
+            None,
+            ForwardMode.TARGET_VERIFY,
+            head_spec,
+            None,   # seq_lens_cpu: unused by the linear-verify branch
+        )
+        super()._metadata_in_graph(bs)
+
     def _draft_steps_in_graph(self, bs, forward, fb, input_ids, positions,
                               out_cache_loc_steps):
         """Deferred captured draft phase: head + gamma-1 singles."""
@@ -835,6 +877,7 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
 
         def run_once():
             set_is_extend_in_batch(False)
+            self._metadata_in_graph(bs)
             self._draft_steps_in_graph(
                 bs, forward, fb, input_ids, positions, ocl_steps
             )
@@ -871,7 +914,9 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         self.prev_input[:raw_bs].copy_(prev_last_draft_id)
 
         # Deferred S-1 slot: live block-table lookup (post-resample
-        # correct), enqueued eagerly so pad rows keep page 0.
+        # correct), enqueued eagerly so pad rows keep page 0.  Everything
+        # else — head prefix lens, head/draft/target metadata, verify
+        # staging — is captured in-graph (_metadata_in_graph).
         r2t = self.model_runner.req_to_token_pool.req_to_token
         slot_sm1 = r2t[
             req_pool_indices.to(torch.int64),
@@ -879,48 +924,6 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         ]
         self.head_out_cache_loc[: 2 * raw_bs].view(raw_bs, 2)[:, 0].copy_(
             slot_sm1
-        )
-
-        # Head metadata: prefix S-1 on the draft primary backend.
-        torch.sub(self.seq_lens[:bs], 1, out=self.head_seq_lens[:bs])
-        self.head_seq_lens_cpu[:bs].copy_(self.seq_lens_cpu[:bs] - 1)
-        head_sum = int(self.head_seq_lens_cpu[:bs].sum().item())
-        _, head_spec = self.head_fbs[bs]
-        self.draft_primary_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            self.req_pool_indices[:bs],
-            self.head_seq_lens[:bs],
-            head_sum,
-            None,
-            ForwardMode.TARGET_VERIFY,
-            head_spec,
-            self.head_seq_lens_cpu[:bs],
-        )
-
-        # Verify-side staging + metadata — same as the parent runner.
-        n_raw_tokens = raw_bs * self.num_steps
-        self.verify_positions[:n_raw_tokens].view(raw_bs, self.num_steps).copy_(
-            ctx.orig_seq_lens.unsqueeze(1)
-            + torch.arange(self.num_steps, device=cache_locs.device)
-        )
-        self.verify_out_cache_loc[:n_raw_tokens].view(
-            raw_bs, self.num_steps
-        ).copy_(cache_locs)
-
-        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            self.fbs[bs], bs
-        )
-        verify_fb, verify_spec = self.verify_fbs[bs]
-        seq_lens_sum = int(self.seq_lens_cpu[:bs].sum().item())
-        self.target_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            self.req_pool_indices[:bs],
-            self.seq_lens[:bs],
-            seq_lens_sum,
-            None,
-            ForwardMode.TARGET_VERIFY,
-            verify_spec,
-            self.seq_lens_cpu[:bs],
         )
 
         self.graphs[_default_make_graph_key(bs)].replay()
