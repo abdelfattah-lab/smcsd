@@ -233,6 +233,14 @@ class SMCScheduler(Scheduler):
         self.waiting_groups: Deque[SequenceGroup] = deque()
         self.prefill_groups: List[SequenceGroup] = []
         self.running_groups: List[SequenceGroup] = []
+        # Slots reserved by admission but not yet claimed by allocate_slots.
+        # allocate_slots runs in prefill POSTPROCESSING, which the overlap
+        # loop defers by one iteration — without this reservation the next
+        # _admit_prefill_groups reads stale free_slots and over-admits,
+        # violating max_running_requests (observed: rr=1 running every
+        # queued group concurrently, blowing decode past the captured
+        # cuda-graph buckets).
+        self._pending_admitted_slots = 0
         self.slot_state = ScheduleBatchSMC(
             max_num_reqs=self.max_user_groups * n_particles,
             device=self.device,
@@ -625,7 +633,9 @@ class SMCScheduler(Scheduler):
 
     def _admit_prefill_groups(self) -> List[SequenceGroup]:
         admitted: List[SequenceGroup] = []
-        remaining_capacity = self.slot_state.available_slot_count()
+        remaining_capacity = (
+            self.slot_state.available_slot_count() - self._pending_admitted_slots
+        )
 
         while self.waiting_groups:
             group = self.waiting_groups[0]
@@ -633,6 +643,7 @@ class SMCScheduler(Scheduler):
             if group_size > remaining_capacity:
                 break
             admitted.append(self.waiting_groups.popleft())
+            self._pending_admitted_slots += group_size
             remaining_capacity -= group_size
             if remaining_capacity <= 0:
                 break
@@ -698,6 +709,11 @@ class SMCScheduler(Scheduler):
             zip(groups, batch.reqs, next_token_ids)
         ):
             assert req is group.parent_req
+            # Admission resolves here: whether the group materializes,
+            # finishes at prefill, or aborts, true slot accounting
+            # (allocate_slots / never-claimed) takes over from the
+            # reservation made in _admit_prefill_groups.
+            self._pending_admitted_slots -= group.n_particles
 
             req.output_ids.append(next_token_id)
             req.check_finished()
