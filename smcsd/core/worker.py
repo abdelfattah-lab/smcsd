@@ -519,8 +519,13 @@ class SMCWorker(BaseSpecWorker):
     def _forward_extend(self, batch: ModelWorkerBatch):
         bs = len(batch.seq_lens)
 
-        # Score model prefill — authoritative prompt KV + score state.
-        score_result = self._target_worker.forward_batch_generation(batch)
+        # Score model prefill — authoritative prompt KV + score state.  FULL
+        # hidden capture: x0's logits are projected from this same forward's
+        # hidden states (below), so no second target pass over the prompt.
+        score_batch = dataclasses.replace(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        score_result = self._target_worker.forward_batch_generation(score_batch)
 
         # Draft model prefill — populate the draft's prompt KV; token discarded.
         draft_batch = self._make_clean_batch(batch)
@@ -531,23 +536,32 @@ class SMCWorker(BaseSpecWorker):
         # The SMC target's score/extend forward does not compute
         # next_token_logits (the logits processor gets no sample position and
         # returns an unwritten warmup buffer), so we recover the real
-        # distribution from the prompt's hidden states: one target forward with
-        # FULL hidden capture, then the target's own LogitsProcessor on the last
-        # prompt token's (post-final-norm) hidden state. KV writes are idempotent
-        # (same prompt -> same out_cache_loc), so the score prefill above stays
-        # authoritative. x0 is shared conditioning across the group's particles
-        # and carries no per-particle weight; drawing it from the target power
-        # p_T^alpha makes the seed model-correct and draft-independent.
-        x0_batch = dataclasses.replace(
-            batch, spec_info=None, capture_hidden_mode=CaptureHiddenMode.FULL
-        )
-        x0_result = self._target_worker.forward_batch_generation(x0_batch)
-        hidden = x0_result.logits_output.hidden_states
+        # distribution from the score prefill's own hidden states (FULL capture
+        # above), then the target's own LogitsProcessor on the last prompt
+        # token's (post-final-norm) hidden state. x0 is shared conditioning
+        # across the group's particles and carries no per-particle weight;
+        # drawing it from the target power p_T^alpha makes the seed
+        # model-correct and draft-independent.
+        hidden = score_result.logits_output.hidden_states
         assert hidden is not None, (
             "FULL hidden-state capture did not populate hidden_states for x0"
         )
+        # The row layout below assumes the score forward processed EVERY prompt
+        # token (no prefix-cache hit, no chunked prefill).  Both provided launch
+        # paths force disable_radix_cache=True, but that is not auto-forced for
+        # raw-server-args SMC launches — fail loudly rather than index the
+        # wrong rows.
+        total_prompt_tokens = int(batch.seq_lens.sum().item())
+        assert hidden.shape[0] == total_prompt_tokens, (
+            f"x0 hidden capture covers {hidden.shape[0]} tokens but the batch "
+            f"has {total_prompt_tokens} prompt tokens; SMC requires full-prompt "
+            "prefill (disable radix/prefix caching and chunked prefill)."
+        )
         last_idx = torch.cumsum(batch.seq_lens.to(torch.int64), dim=0) - 1
         last_hidden = hidden[last_idx]  # last prompt token per request (post-norm)
+        # Drop the (sum_prompt_tokens, hidden) capture buffer once the per-row
+        # seeds are extracted; nothing downstream reads it.
+        score_result.logits_output.hidden_states = None
         # Project to logits through the target's own LogitsProcessor rather than
         # a raw lm_head matmul.  Under tensor parallelism the lm_head is
         # vocab-sharded (ParallelLMHead), so matmul against a single rank's
