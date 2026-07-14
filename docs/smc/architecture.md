@@ -1,13 +1,17 @@
 # SMC Speculative Decoding — Architecture Overview
 
 Entry point for the Sequential-Monte-Carlo speculative-decoding implementation.
-This doc is the map; two companions go deeper:
+This doc is the map; three companions go deeper:
 
 - [`state.md`](./state.md) — data structures: `SequenceGroup`,
   `ScheduleBatchSMC` (slot-major weights + group lookup), the
   refcounted KV allocator.
 - [`pipeline.md`](./pipeline.md) — the end-to-end flow: admit → prefill →
   materialize → decode cycle → resample → finalize.
+- [`performance.md`](./performance.md) — the decode-throughput
+  optimizations (custom verify-attention and sampling kernels, in-graph
+  metadata, launch defaults): a plain-language explainer of why each
+  works, plus the flag and kernel reference.
 
 All code lives under the `smcsd/` package. There is no legacy variant; this
 is the implementation.
