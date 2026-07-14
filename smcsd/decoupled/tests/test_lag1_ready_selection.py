@@ -236,7 +236,9 @@ class TestLag1PreDraftPrep(unittest.TestCase):
             n_jobs_sync=lambda: 1,
             dst_slots=torch.tensor([1], dtype=torch.int32),
             src_slots=torch.tensor([0], dtype=torch.int32),
+            resample_mask=torch.tensor([True]),
         )
+        snapshot = SimpleNamespace(phase=0, wait=lambda: calls.append(("wait", 0)))
         scheduler = SimpleNamespace(
             _lag_profile=False,
             _lag_resample_row_mask=lambda verify_slots: "row-mask",
@@ -250,6 +252,15 @@ class TestLag1PreDraftPrep(unittest.TestCase):
             slot_state=SimpleNamespace(
                 active_slots=torch.tensor([0, 1], dtype=torch.int64),
                 reset_interval_weights=lambda active: calls.append(("reset", active)),
+                resample_logZ_increment=lambda: torch.tensor([2.0]),
+                group_log_Z_hat=torch.tensor([3.0]),
+                snapshot_to_host=lambda: snapshot,
+                kv_freed_count_host=torch.tensor([[2]], dtype=torch.int32),
+                kv_freed_buf=torch.tensor([[10, 11, 0]], dtype=torch.int32),
+                kv_freed_counter=torch.ones((1, 1), dtype=torch.int32),
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free=lambda pages: calls.append(("free", pages.tolist()))
             ),
             coordinator=SimpleNamespace(
                 dispatch_resample_batch=lambda p, slot_state: calls.append(
@@ -270,9 +281,13 @@ class TestLag1PreDraftPrep(unittest.TestCase):
         self.assertTrue(did_resample)
         self.assertIn(("collect", "row-mask"), calls)
         self.assertIn(("dispatch", plan), calls)
+        self.assertIn(("wait", 0), calls)
+        self.assertIn(("free", [10, 11]), calls)
         self.assertIn(("commit", [1], [0]), calls)
         self.assertIn(("apply", [1], [0]), calls)
         self.assertFalse(any(call[0] == "reset" for call in calls))
+        self.assertEqual(float(scheduler.slot_state.group_log_Z_hat.item()), 5.0)
+        self.assertEqual(int(scheduler.slot_state.kv_freed_counter[0, 0].item()), 0)
 
 
 if __name__ == "__main__":

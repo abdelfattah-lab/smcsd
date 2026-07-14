@@ -1486,13 +1486,25 @@ class AsyncDecoupledSMCScheduler(DecoupledSMCScheduler):
         row_mask = self._lag_resample_row_mask(verify_slots)
         if self._lag_profile:
             self._lp["eligible_rows"] += int(row_mask.sum().item())
+        logZ_inc = self.slot_state.resample_logZ_increment()
         plan = self._lag_collect_resample_jobs(row_mask)
         n_jobs = plan.n_jobs_sync()
         if self._lag_profile:
             self._lp["resample_jobs"] += int(n_jobs)
+        self.slot_state.group_log_Z_hat += torch.where(
+            plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
+        )
         if n_jobs == 0:
             return False
         self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+        snapshot = self.slot_state.snapshot_to_host()
+        snapshot.wait()
+        n_freed = int(self.slot_state.kv_freed_count_host[snapshot.phase].item())
+        if n_freed > 0:
+            self.token_to_kv_pool_allocator.free(
+                self.slot_state.kv_freed_buf[snapshot.phase, :n_freed].to(torch.int64)
+            )
+            self.slot_state.kv_freed_counter[snapshot.phase].zero_()
         dsts = [int(x) for x in plan.dst_slots.detach().cpu().tolist()]
         srcs = [int(x) for x in plan.src_slots.detach().cpu().tolist()]
         self._draft_client.send_commit(dst_slots=dsts, src_slots=srcs)
