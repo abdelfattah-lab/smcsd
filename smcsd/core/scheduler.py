@@ -253,15 +253,28 @@ class SMCScheduler(Scheduler):
         )
 
         # Resolution order: SMC_ENABLE_OVERLAP env (kill switch) >
-        # SMCEngine kwarg (server_args attr) > default ON.  The hybrid
-        # (Mamba) gate is gone: the recurrent-state resample copy is now a
-        # device-driven fused kernel enqueued inside _resample (before the
-        # snapshot), so it is stream-ordered ahead of the next forward.
+        # SMCEngine kwarg (server_args attr) > default ON for non-hybrid,
+        # OFF for hybrid.  The hybrid (Mamba) CORRECTNESS gate is gone: the
+        # recurrent-state resample copy is now a device-driven fused kernel
+        # enqueued inside _resample (before the snapshot), so it is
+        # stream-ordered ahead of the next forward.  Overlap stays
+        # default-OFF for hybrid on PERF grounds: measured on B200/triton
+        # with Qwen3.5-2B->9B (gamma8 n8, in256/out512), the overlap loop
+        # costs ~26% decode tok/s at bs=1 (359 -> 264) and ~14% at bs=8
+        # (1165 -> 997).  SMC_ENABLE_OVERLAP=1 (or the engine kwarg) forces
+        # it on for hybrid; it is correct there now, just slower today.
+        draft_hybrid_pool = getattr(
+            self.model_worker, "_dense_draft_hybrid_req_to_token_pool", None
+        )
+        is_hybrid = any(
+            pool is not None and hasattr(pool, "mamba_pool")
+            for pool in (self.req_to_token_pool, draft_hybrid_pool)
+        )
         _ov_env = os.environ.get("SMC_ENABLE_OVERLAP")
         want_overlap = (
             bool(int(_ov_env))
             if _ov_env is not None
-            else bool(getattr(server_args, "smc_enable_overlap", True))
+            else bool(getattr(server_args, "smc_enable_overlap", not is_hybrid))
         )
         self._use_overlap_loop = want_overlap
         if self._use_overlap_loop:

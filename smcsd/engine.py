@@ -70,10 +70,11 @@ class SMCEngine:
         power_alpha: float = 1.0,
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
-        # Decode hot-path optimizations (all default ON; set False to disable)
+        # Decode hot-path optimizations (defer/cycle default ON; overlap
+        # defaults ON for non-hybrid, OFF for hybrid - pass a bool to force)
         defer_bonus: bool = True,
         cycle_graph: bool = True,
-        enable_overlap: bool = True,
+        enable_overlap: Optional[bool] = None,
         # Hardware
         tp_size: int = 1,
         base_gpu_id: int = 0,
@@ -141,7 +142,11 @@ class SMCEngine:
         server_args.smc_power_alpha = float(power_alpha)
         server_args.smc_defer_bonus = bool(defer_bonus)
         server_args.smc_cycle_graph = bool(cycle_graph)
-        server_args.smc_enable_overlap = bool(enable_overlap)
+        # None = auto: the scheduler defaults overlap ON for non-hybrid
+        # and OFF for hybrid (see SMCScheduler); pass an explicit bool
+        # (or SMC_ENABLE_OVERLAP) to override.
+        if enable_overlap is not None:
+            server_args.smc_enable_overlap = bool(enable_overlap)
         server_args.smc_emit_particle_output = True
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
