@@ -13,7 +13,6 @@ has a different recurrent-state shape get an isolated draft Mamba pool via
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import logging
 import os
@@ -50,22 +49,6 @@ class SMCDenseDraftTpModelWorker(TpModelWorker):
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
-
-        # Draft-only quantization (e.g. SMC_DRAFT_QUANTIZATION=fp8): the
-        # draft phase is weight-read-bound at decode, so quantized draft
-        # weights cut its HBM traffic.  The sampler stays exact —
-        # importance weights are computed under the same (quantized)
-        # proposal q the tokens are drawn from, so this changes proposal
-        # quality only, never introduces bias.  The target model is
-        # untouched.  Swap self.server_args to the modified copy so the
-        # draft ModelRunner sees a consistent view.
-        draft_quant = os.environ.get("SMC_DRAFT_QUANTIZATION")
-        if draft_quant:
-            # Shallow copy (NOT dataclasses.replace, which would re-run
-            # ServerArgs.__post_init__ on an already-derived instance).
-            draft_args = copy.copy(self.server_args)
-            draft_args.quantization = draft_quant
-            self.server_args = draft_args
 
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
@@ -296,26 +279,22 @@ class SMCWorker(BaseSpecWorker):
                 TritonMultiStepDraftBackend,
             )
 
-            flag = "SMC_CYCLE_GRAPH" if want_cycle else "SMC_DRAFT_PHASE_GRAPH"
             reasons = []
             if backup_disable_cuda_graph:
                 reasons.append("cuda graph disabled")
-            if self.smc_defer_bonus and not want_cycle:
-                reasons.append(
-                    "SMC_DEFER_BONUS=1 (phase graph captures the legacy "
-                    "gamma+1 schedule; the deferred head is only captured "
-                    "by the full-cycle runner, SMC_CYCLE_GRAPH=1)"
-                )
             if not self.smc_draft_temperature > 0:
                 reasons.append("greedy draft (temperature 0)")
-            from smcsd.core.hybrid_multistep_backend import (
-                HybridLinearAttnMultiStepBackend,
-            )
-
-            if not isinstance(
-                self.draft_attn_backend,
-                (TritonMultiStepDraftBackend, HybridLinearAttnMultiStepBackend),
-            ):
+            if not isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend):
+                reasons.append(
+                    f"unsupported multi-step backend "
+                    f"{type(self.draft_attn_backend).__name__} (triton only)"
+                )
+            if self.score_runner.hybrid_gdn_config is not None:
+                reasons.append(
+                    "hybrid target (cycle graph cannot capture the "
+                    "post-verify mamba state commit)"
+                )
+            if not isinstance(self.score_runner.attn_backend, TritonAttnBackend):
                 reasons.append(
                     f"unsupported multi-step backend "
                     f"{type(self.draft_attn_backend).__name__} "
@@ -336,7 +315,6 @@ class SMCWorker(BaseSpecWorker):
             if reasons:
                 logger.warning(
                     "%s disabled (falling back to per-step path): %s",
-                    flag,
                     "; ".join(reasons),
                 )
             elif want_cycle:
@@ -354,6 +332,7 @@ class SMCWorker(BaseSpecWorker):
                     else SMCFullCycleGraphRunner
                 )
                 self.cycle_graph_runner = runner_cls(self)
+<<<<<<< HEAD
                 # The cycle runner's multi-step backend init re-binds the
                 # shared linear backend's verify query-start-loc cache back to
                 # step-1 (decode layout).  Re-pin step-2 so the STANDALONE head
@@ -368,6 +347,8 @@ class SMCWorker(BaseSpecWorker):
                 )
 
                 self.draft_phase_graph_runner = SMCDraftPhaseGraphRunner(self)
+=======
+>>>>>>> b2500e9a246ac5530033f6799d1dc45464766886
 
     def _pin_draft_head_verify_qsl(self) -> None:
         """(Deferred-bonus, hybrid draft) Pin the shared linear backend's
@@ -1042,23 +1023,6 @@ class SMCWorker(BaseSpecWorker):
                 ctx, draft_input, draft_fb, cache_locs,
                 all_positions, all_seq_lens, batch, bs, gamma,
             )
-        elif (
-            self.draft_phase_graph_runner is not None
-            and not draft_fb.forward_mode.is_idle()
-            and self.draft_phase_graph_runner.can_run(bs, ctx)
-        ):
-            # Whole-phase graph: one launch for all gamma+1 draft forwards +
-            # in-graph Gumbel sampling (issue #14).  Returns the same
-            # [x0, d_0..d_gamma] layout the verify/bonus code consumes.
-            tokens_out, draft_logprobs_stacked = (
-                self.draft_phase_graph_runner.replay(
-                    draft_input.verified_id,
-                    cache_locs,
-                    ctx,
-                    batch.req_pool_indices,
-                )
-            )
-            all_tokens = [tokens_out[:, j] for j in range(gamma + 2)]
         else:
             # Legacy gamma+1 single-token AR loop (over-draft included).
             use_multistep = (

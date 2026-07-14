@@ -13,10 +13,8 @@ pools are co-budgeted inside ``mem_fraction_static`` instead of the draft riding
 along on leftover headroom (see below).
 """
 
-import copy
 import gc
 import logging
-import os
 
 import torch
 
@@ -242,16 +240,11 @@ class SMCModelRunner(ModelRunner):
 
     def _build_draft_model_config(self):
         """Build the draft ModelConfig exactly as SMCDenseDraftTpModelWorker
-        will (dense AR load, no MTP rewrite; SMC_DRAFT_QUANTIZATION applied) so
-        the KV cell size and the weight measurement match the model that
-        actually loads."""
+        will (dense AR load, no MTP rewrite) so the KV cell size and the weight
+        measurement match the model that actually loads."""
         from sglang.srt.configs.model_config import ModelConfig
 
         sa = self.server_args
-        draft_quant = os.environ.get("SMC_DRAFT_QUANTIZATION")
-        if draft_quant:
-            sa = copy.copy(sa)
-            sa.quantization = draft_quant
         return ModelConfig.from_server_args(
             sa, model_path=sa.speculative_draft_model_path, is_draft_model=False
         )
@@ -291,10 +284,10 @@ class SMCModelRunner(ModelRunner):
         """Exactly measure this rank's draft weight footprint by loading the
         draft weights, reading the free-GPU-memory delta, then freeing them.
 
-        Weights are measured (not counted) because quantization
-        (SMC_DRAFT_QUANTIZATION), MoE experts, and tied/untied embeddings make an
-        analytical byte count fragile — unlike the KV / Mamba caches, which are
-        clean geometric tensors and ARE counted.  This is a throwaway load (the
+        Weights are measured (not counted) because quantization, MoE experts,
+        and tied/untied embeddings make an analytical byte count fragile —
+        unlike the KV / Mamba caches, which are clean geometric tensors and ARE
+        counted.  This is a throwaway load (the
         real draft is loaded later by SMCDenseDraftTpModelWorker), so the draft
         loads twice (~seconds for small drafts); in exchange W_d is exact,
         including quantization and TP sharding.  All TP ranks reach this method
