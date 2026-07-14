@@ -252,7 +252,17 @@ class SMCScheduler(Scheduler):
             resample_method=server_args.smc_resample_method,
         )
 
-        want_overlap = bool(getattr(server_args, "smc_enable_overlap", True))
+        # Resolution order: SMC_ENABLE_OVERLAP env (kill switch) >
+        # SMCEngine kwarg (server_args attr) > default ON.  The hybrid
+        # (Mamba) gate is gone: the recurrent-state resample copy is now a
+        # device-driven fused kernel enqueued inside _resample (before the
+        # snapshot), so it is stream-ordered ahead of the next forward.
+        _ov_env = os.environ.get("SMC_ENABLE_OVERLAP")
+        want_overlap = (
+            bool(int(_ov_env))
+            if _ov_env is not None
+            else bool(getattr(server_args, "smc_enable_overlap", True))
+        )
         self._use_overlap_loop = want_overlap
         if self._use_overlap_loop:
             logger.info("SMCScheduler: overlapped scheduling enabled.")

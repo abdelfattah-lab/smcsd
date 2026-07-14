@@ -119,6 +119,20 @@ class SMCEngine:
         if "log_level" not in merged:
             merged["log_level"] = "error"
 
+        # SMC requires the triton (or fa3) attention backend; without an
+        # explicit choice sglang's sm100 default would pick trtllm_mha,
+        # which is incompatible with SMC's page_size=1 state machinery.
+        if merged.get("attention_backend") is None:
+            merged["attention_backend"] = "triton"
+        if merged["attention_backend"] == "triton":
+            # B200-swept decode default: neutral at short context, +7% at
+            # 4k (the draft decode attention is split-starved at 8).
+            merged.setdefault("triton_attention_num_kv_splits", 16)
+
+        # Decode perf optimizations (cycle graph / overlap / deferred bonus)
+        # default ON via the smc_* server_args attrs set below; the worker
+        # and scheduler downgrade gracefully on unsupported configs.  The
+        # SMC_* env vars remain as kill switches that override the kwargs.
         server_args = ServerArgs(**merged)
         self.server_args = server_args
 

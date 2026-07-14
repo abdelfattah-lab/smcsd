@@ -89,6 +89,13 @@ def build_smc_server_args(
 
     # SMC requires the triton or fa3 attention backend; default to triton.
     kwargs.setdefault("attention_backend", "triton")
+    if kwargs["attention_backend"] == "triton":
+        # B200-swept decode default (neutral short-ctx, +7% at 4k).
+        kwargs.setdefault("triton_attention_num_kv_splits", 16)
+
+    # Decode perf optimizations default ON via the worker/scheduler-side
+    # smc_* attr defaults (getattr(..., True)); SMC_* env vars remain as
+    # kill switches.
 
     # SMC loads two independent model runners (target + draft) and each sizes
     # its own KV-cache pool from mem_fraction_static, so the fraction is counted

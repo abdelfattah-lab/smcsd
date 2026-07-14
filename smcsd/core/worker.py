@@ -103,8 +103,13 @@ class SMCWorker(BaseSpecWorker):
         # defer_bonus=False to opt out — dynamic attr, smc_power_alpha
         # pattern).  Unsupported draft backends downgrade to the legacy
         # gamma+1 schedule with a warning.
-        self.smc_defer_bonus = bool(
-            getattr(server_args, "smc_defer_bonus", True)
+        # Resolution order: SMC_DEFER_BONUS env (kill switch for CLI
+        # harnesses) > SMCEngine kwarg (server_args attr) > default ON.
+        _defer_env = os.environ.get("SMC_DEFER_BONUS")
+        self.smc_defer_bonus = (
+            bool(int(_defer_env))
+            if _defer_env is not None
+            else bool(getattr(server_args, "smc_defer_bonus", True))
         )
         # Only the dense-AR draft path is supported here.
         self._dense_draft_hybrid_req_to_token_pool = None
@@ -271,7 +276,12 @@ class SMCWorker(BaseSpecWorker):
 
         self.draft_phase_graph_runner = None
         self.cycle_graph_runner = None
-        want_cycle = bool(getattr(server_args, "smc_cycle_graph", True))
+        _cycle_env = os.environ.get("SMC_CYCLE_GRAPH")
+        want_cycle = (
+            bool(int(_cycle_env))
+            if _cycle_env is not None
+            else bool(getattr(server_args, "smc_cycle_graph", True))
+        )
         want_phase = bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0")))
         if want_cycle or want_phase:
             from sglang.srt.layers.attention.triton_backend import (
@@ -279,22 +289,19 @@ class SMCWorker(BaseSpecWorker):
                 TritonMultiStepDraftBackend,
             )
 
+            from smcsd.core.hybrid_multistep_backend import (
+                HybridLinearAttnMultiStepBackend,
+            )
+
             reasons = []
             if backup_disable_cuda_graph:
                 reasons.append("cuda graph disabled")
             if not self.smc_draft_temperature > 0:
                 reasons.append("greedy draft (temperature 0)")
-            if not isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend):
-                reasons.append(
-                    f"unsupported multi-step backend "
-                    f"{type(self.draft_attn_backend).__name__} (triton only)"
-                )
-            if self.score_runner.hybrid_gdn_config is not None:
-                reasons.append(
-                    "hybrid target (cycle graph cannot capture the "
-                    "post-verify mamba state commit)"
-                )
-            if not isinstance(self.score_runner.attn_backend, TritonAttnBackend):
+            if not isinstance(
+                self.draft_attn_backend,
+                (TritonMultiStepDraftBackend, HybridLinearAttnMultiStepBackend),
+            ):
                 reasons.append(
                     f"unsupported multi-step backend "
                     f"{type(self.draft_attn_backend).__name__} "
@@ -314,7 +321,8 @@ class SMCWorker(BaseSpecWorker):
                 )
             if reasons:
                 logger.warning(
-                    "%s disabled (falling back to per-step path): %s",
+                    "cycle/draft-phase graph disabled (falling back to the "
+                    "per-step path): %s",
                     "; ".join(reasons),
                 )
             elif want_cycle:
@@ -332,7 +340,6 @@ class SMCWorker(BaseSpecWorker):
                     else SMCFullCycleGraphRunner
                 )
                 self.cycle_graph_runner = runner_cls(self)
-<<<<<<< HEAD
                 # The cycle runner's multi-step backend init re-binds the
                 # shared linear backend's verify query-start-loc cache back to
                 # step-1 (decode layout).  Re-pin step-2 so the STANDALONE head
@@ -347,8 +354,6 @@ class SMCWorker(BaseSpecWorker):
                 )
 
                 self.draft_phase_graph_runner = SMCDraftPhaseGraphRunner(self)
-=======
->>>>>>> b2500e9a246ac5530033f6799d1dc45464766886
 
     def _pin_draft_head_verify_qsl(self) -> None:
         """(Deferred-bonus, hybrid draft) Pin the shared linear backend's
@@ -637,22 +642,11 @@ class SMCWorker(BaseSpecWorker):
     def _forward_extend(self, batch: ModelWorkerBatch):
         bs = len(batch.seq_lens)
 
-        # Score model prefill — authoritative prompt KV + score state.
-        #
-        # Capture FULL hidden states in this SAME pass so x0 can be seeded from
-        # the target's real first-token distribution without a second target
-        # forward. The SMC target's score/extend forward does not compute
-        # next_token_logits (the logits processor gets no sample position and
-        # returns an unwritten warmup buffer), so we recover the real
-        # distribution from the prompt's hidden states below: the target's own
-        # LogitsProcessor on the last prompt token's (post-final-norm) hidden
-        # state. spec_info is cleared for the same reason the draft prefill
-        # clears it (ForwardBatch/CUDA-graph compatibility); prefill KV writes
-        # are unaffected. x0 is shared conditioning across the group's particles
-        # and carries no per-particle weight; drawing it from the target power
-        # p_T^alpha makes the seed model-correct and draft-independent.
+        # Score model prefill — authoritative prompt KV + score state.  FULL
+        # hidden capture: x0's logits are projected from this same forward's
+        # hidden states (below), so no second target pass over the prompt.
         score_batch = dataclasses.replace(
-            batch, spec_info=None, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
         score_result = self._target_worker.forward_batch_generation(score_batch)
 
@@ -660,12 +654,37 @@ class SMCWorker(BaseSpecWorker):
         draft_batch = self._make_clean_batch(batch)
         self._draft_worker.forward_batch_generation(draft_batch)
 
+        # x0 seed from the TARGET's real first-token distribution.
+        #
+        # The SMC target's score/extend forward does not compute
+        # next_token_logits (the logits processor gets no sample position and
+        # returns an unwritten warmup buffer), so we recover the real
+        # distribution from the score prefill's own hidden states (FULL capture
+        # above), then the target's own LogitsProcessor on the last prompt
+        # token's (post-final-norm) hidden state. x0 is shared conditioning
+        # across the group's particles and carries no per-particle weight;
+        # drawing it from the target power p_T^alpha makes the seed
+        # model-correct and draft-independent.
         hidden = score_result.logits_output.hidden_states
         assert hidden is not None, (
             "FULL hidden-state capture did not populate hidden_states for x0"
         )
+        # The row layout below assumes the score forward processed EVERY prompt
+        # token (no prefix-cache hit, no chunked prefill).  Both provided launch
+        # paths force disable_radix_cache=True, but that is not auto-forced for
+        # raw-server-args SMC launches — fail loudly rather than index the
+        # wrong rows.
+        total_prompt_tokens = int(batch.seq_lens.sum().item())
+        assert hidden.shape[0] == total_prompt_tokens, (
+            f"x0 hidden capture covers {hidden.shape[0]} tokens but the batch "
+            f"has {total_prompt_tokens} prompt tokens; SMC requires full-prompt "
+            "prefill (disable radix/prefix caching and chunked prefill)."
+        )
         last_idx = torch.cumsum(batch.seq_lens.to(torch.int64), dim=0) - 1
         last_hidden = hidden[last_idx]  # last prompt token per request (post-norm)
+        # Drop the (sum_prompt_tokens, hidden) capture buffer once the per-row
+        # seeds are extracted; nothing downstream reads it.
+        score_result.logits_output.hidden_states = None
         # Project to logits through the target's own LogitsProcessor rather than
         # a raw lm_head matmul.  Under tensor parallelism the lm_head is
         # vocab-sharded (ParallelLMHead), so matmul against a single rank's
