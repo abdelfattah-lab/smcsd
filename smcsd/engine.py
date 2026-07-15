@@ -57,6 +57,8 @@ class SMCEngine:
         engine.shutdown()
     """
 
+    scheduler_process_func = staticmethod(run_smc_scheduler_process)
+
     def __init__(
         self,
         model_path: str,
@@ -183,7 +185,7 @@ class SMCEngine:
         # Upstream Engine._launch_scheduler_processes now returns
         # (SchedulerInitResult, scheduler_procs); the procs list is unused here.
         self._scheduler_init_result, _ = Engine._launch_scheduler_processes(
-            server_args, port_args, run_smc_scheduler_process
+            server_args, port_args, type(self).scheduler_process_func
         )
         self._scheduler_init_result.wait_for_ready()
         logger.info("SMCEngine: Scheduler is ready.")
