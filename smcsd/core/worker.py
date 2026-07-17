@@ -102,6 +102,12 @@ class SMCWorker(BaseSpecWorker):
                 "power_alpha must be 1.0 (alpha has no exact-sampling "
                 f"interpretation), got {self.smc_power_alpha}."
             )
+        # Fused accept kernel (one Triton launch per cycle) vs the torch
+        # operator (~N*gamma small launches).  Kill switch for A/B.
+        self._use_fused_accept = (
+            torch.device(self.device).type == "cuda"
+            and bool(int(os.environ.get("SMC_FUSED_ACCEPT", "1")))
+        )
         # Debug-only: dump draft KV positions / cache-loc mapping for the first
         # few decode calls to confirm the prefill→step-0 position convention
         # before the deferred-bonus rework.  No behavior change when unset.
@@ -317,14 +323,18 @@ class SMCWorker(BaseSpecWorker):
             else bool(getattr(server_args, "smc_cycle_graph", True))
         )
         want_phase = bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0")))
-        if self.smc_mode in ("exact", "mixed") and (want_cycle or want_phase):
-            # Phase-1 exact mode runs the eager per-step path (the accept
+        if self.smc_mode == "exact" and (want_cycle or want_phase):
+            # All-exact engines run the eager per-step path (the accept
             # operator + variable-length collapse are not yet captured).
             logger.info(
                 "smc_mode='exact': cycle/draft-phase CUDA graphs disabled "
                 "(eager exact path)."
             )
             want_cycle = want_phase = False
+        # smc_mode='mixed' keeps the cycle graph: pure-SMC cycles replay it
+        # (deferred bonus stays off, so the non-deferred runner is captured);
+        # cycles carrying exact groups fall back to the eager path via the
+        # per-batch gate in _forward_decode.
         if want_cycle or want_phase:
             from sglang.srt.layers.attention.triton_backend import (
                 TritonAttnBackend,
@@ -1030,9 +1040,17 @@ class SMCWorker(BaseSpecWorker):
         # One launch covers draft AR + TARGET_VERIFY + weight diff + bonus,
         # skipping both ForwardBatch.init_new constructions and all per-phase
         # dispatch.  Falls through to the regular path when the batch exceeds
-        # the captured bs/context caps.
-        if self.cycle_graph_runner is not None and self.cycle_graph_runner.can_run(
-            len(ctx.orig_seq_lens), ctx
+        # the captured bs/context caps, or (mixed mode) when this cycle
+        # carries exact-mode groups — those need the eager path's proposal
+        # dists + accept operator.
+        cycle_has_exact = (
+            draft_input.exact_group_idx is not None
+            and draft_input.exact_group_idx.numel() > 0
+        )
+        if (
+            self.cycle_graph_runner is not None
+            and not cycle_has_exact
+            and self.cycle_graph_runner.can_run(len(ctx.orig_seq_lens), ctx)
         ):
             return self._forward_decode_cycle_graph(batch, draft_input, ctx)
 
@@ -1371,6 +1389,14 @@ class SMCWorker(BaseSpecWorker):
         p_probs = torch.softmax(
             score_logits_3d / self.smc_target_temperature, dim=-1
         )
+        if self._use_fused_accept:
+            from smcsd.core.kernels.fused_mdsd_accept import fused_mdsd_accept
+
+            return fused_mdsd_accept(
+                target_tokens.view(G, N, gamma),
+                q_probs.view(G, N, gamma, V),
+                p_probs.view(G, N, gamma + 1, V),
+            )
         return mdsd_accept_batched(
             target_tokens.view(G, N, gamma),
             q_probs.view(G, N, gamma, V),

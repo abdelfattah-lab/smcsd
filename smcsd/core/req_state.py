@@ -505,12 +505,14 @@ class ScheduleBatchSMC:
     def exact_partition(self):
         """Batch partition by mode, cached until membership or a mode flips.
 
-        Returns ``(exact_gpos, exact_rows, smc_rows)``:
+        Returns ``(exact_gpos, exact_rows, smc_rows, exact_rows_cpu)``:
 
         * ``exact_gpos`` — CPU int64 tensor of exact groups' positions in the
           batch's group order (``_sorted_group_ids``);
         * ``exact_rows`` / ``smc_rows`` — device int64 tensors of the
-          corresponding contiguous batch-row indices (N rows per group).
+          corresponding contiguous batch-row indices (N rows per group);
+        * ``exact_rows_cpu`` — CPU twin of ``exact_rows`` (host-shadow
+          indexing without a device round trip).
 
         Built purely from CPU state (the mode dict + sorted group ids), so
         attaching it to the cycle is sync-free.
@@ -534,17 +536,17 @@ class ScheduleBatchSMC:
             if self.group_mode.get(gid) != "exact"
         ]
         exact_gpos = torch.tensor(exact_pos, dtype=torch.int64)
-        exact_rows = torch.tensor(
+        exact_rows_cpu = torch.tensor(
             [g * n + i for g in exact_pos for i in range(n)],
             dtype=torch.int64,
-            device=self.device,
         )
+        exact_rows = exact_rows_cpu.to(self.device)
         smc_rows = torch.tensor(
             [g * n + i for g in smc_pos for i in range(n)],
             dtype=torch.int64,
             device=self.device,
         )
-        payload = (exact_gpos, exact_rows, smc_rows)
+        payload = (exact_gpos, exact_rows, smc_rows, exact_rows_cpu)
         self._exact_partition_cache = (key, payload)
         return payload
 
@@ -764,7 +766,7 @@ class ScheduleBatchSMC:
             gamma=self.gamma_plus_1 - 1,
             cache_locs=pages.view(bs, self.gamma_plus_1),
         )
-        exact_gpos, exact_rows, smc_rows = self.exact_partition()
+        exact_gpos, exact_rows, smc_rows, _ = self.exact_partition()
         return SMCDraftInput(
             verified_id=verified_g,
             prev_last_draft_id=prev_last_draft_g,
@@ -1115,12 +1117,16 @@ class ScheduleBatchSMC:
         cols = torch.arange(stride, dtype=torch.int64, device=device)
         col_valid = cols.unsqueeze(0) < commit_len.unsqueeze(1)      # (bs, stride)
 
-        # a. Masked token scatter + variable count advance.
+        # a. Masked token scatter + variable count advance.  Read-modify-
+        # write with torch.where instead of boolean indexing — boolean
+        # advanced indexing has a data-dependent output shape and forces a
+        # host sync on the hot path.
         offsets = self.token_counts[active].to(torch.int64)
         row_idx = active.unsqueeze(1).expand(-1, stride)
         col_idx = offsets.unsqueeze(1) + cols
-        self.all_token_ids[row_idx[col_valid], col_idx[col_valid]] = (
-            committed_2d[col_valid].to(self.all_token_ids.dtype)
+        cur = self.all_token_ids[row_idx, col_idx]
+        self.all_token_ids[row_idx, col_idx] = torch.where(
+            col_valid, committed_2d.to(self.all_token_ids.dtype), cur
         )
         self.token_counts[active] += commit_len.to(torch.int32)
 
@@ -1211,19 +1217,23 @@ class ScheduleBatchSMC:
         new_seq = cur_seq - stride + exact_accept_len + 1             # L + a + 1
 
         # 1. Winner tail pages [new_seq, cur_seq): rejected drafts' KV.
-        tail_len = cur_seq - new_seq                                  # gamma - a
+        # Freed through the same dec_ref + freed-buffer mechanism as the
+        # resample kernel (sync-free; postprocessing returns them to the
+        # allocator pool), instead of dec_ref_and_free's boolean indexing.
         if stride > 1:
-            tcols = torch.arange(
-                stride - 1, dtype=torch.int64, device=device
+            from smcsd.core.kernels.fused_resample_kv import (
+                dec_ref_tail_pages,
             )
-            tail_valid = tcols.unsqueeze(0) < tail_len.unsqueeze(1)   # (G, s-1)
-            pool = self.req_pool_indices[winner_slot]
-            tail_pos = new_seq.unsqueeze(1) + tcols
-            pages = self.req_to_token_pool.req_to_token[
-                pool.unsqueeze(1), tail_pos
-            ]
-            self.token_to_kv_pool_allocator.dec_ref_and_free(
-                pages[tail_valid].to(torch.int64)
+
+            dec_ref_tail_pages(
+                self.req_to_token_pool.req_to_token,
+                self.token_to_kv_pool_allocator.slot_ref_count,
+                slots=winner_slot,
+                req_pool_indices=self.req_pool_indices,
+                tail_start=new_seq,
+                tail_end=cur_seq,
+                freed_buf=self.kv_freed_buf[self._snap_phase],
+                freed_counter=self.kv_freed_counter[self._snap_phase],
             )
 
         # 2. Roll back the winner (losers get these via the kernel's Phase 3).
@@ -1231,11 +1241,20 @@ class ScheduleBatchSMC:
         self.kv_allocated_lens[winner_slot] = new_seq
 
         # 3. One-hot plan: every non-winner slot copies from the winner.
+        # (Stable argsort on the loser mask instead of boolean indexing —
+        # same no-sync rationale as the token scatter above.)
         if n > 1:
             keep = torch.arange(n, device=device).unsqueeze(
                 0
             ) != exact_winner.unsqueeze(1)                             # (G, N)
-            dst = slots_2d[keep].view(g, n - 1).reshape(-1).to(torch.int32)
+            order = torch.argsort(
+                keep.to(torch.int8), dim=1, descending=True, stable=True
+            )
+            dst = (
+                slots_2d.gather(1, order[:, : n - 1])
+                .reshape(-1)
+                .to(torch.int32)
+            )
             src = winner_slot.repeat_interleave(n - 1).to(torch.int32)
         else:
             dst = torch.empty(0, dtype=torch.int32, device=device)

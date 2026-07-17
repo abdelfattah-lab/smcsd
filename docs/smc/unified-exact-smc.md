@@ -298,9 +298,56 @@ next cycle, one-step-late is fine).
   - Tests: mixed-partition isolation + ESS gating + forced-collapse CUDA
     tests; mixed e2e smoke (one engine: SMC request, exact request, and a
     plan-switching request in one batch).
-- **Phase 2 remainder (perf/coverage)** — `fused_mdsd_accept` Triton kernel
-  + cycle-graph capture for exact/mixed cycles, hybrid (Mamba) rollback
-  commit (`update_mamba_state_after_mtp_verify` already takes per-row
+- **Cycle schedules + first perf pass — IMPLEMENTED** (this branch):
+  - **Cycle schedule** (the pre-"auto" control knob): a cyclic
+    per-cycle mode schedule, e.g. *4 cycles exact, 2 cycles SMC,
+    repeat* — engine-wide via `SMCEngine(mode_cycles=[("exact", 4),
+    ("smc", 2)])` (implies `mode="mixed"`), or per request via
+    `custom_params={"smc_mode_cycles": [["exact", 4], ["smc", 2]]}`.
+    Evaluated in decode postprocessing next to the token-threshold
+    `smc_mode_plan`; each boundary goes through the standard switch
+    (posterior collapse on SMC→exact, gate flip on exact→SMC).
+  - **`fused_mdsd_accept` Triton kernel** (`core/kernels/`): the whole
+    multi-draft rejection walk — viability bitmask, per-candidate accept
+    draws (Philox), residual updates and CDF-scan residual/bonus sampling
+    over V — in ONE launch per cycle, replacing the torch operator's
+    ~N·γ·6 small launches.  Statistically verified against the same
+    exactness harness (GPU, 60k trials).  `SMC_FUSED_ACCEPT=0` falls back
+    to the torch operator for A/B.
+  - **Cycle CUDA graph in mixed mode**: the full-cycle graph is captured
+    at init (deferred bonus stays off) and replayed for cycles whose
+    batch carries no exact groups; exact-carrying cycles fall back to the
+    eager path via a sync-free per-batch gate.  SMC cycles inside a
+    schedule now run at graph speed.
+  - **Sync-slimming in the exact commit**: token scatter and collapse-plan
+    construction rewritten without boolean advanced indexing (data-
+    dependent shapes force host syncs); the winner-tail page release goes
+    through a new `dec_ref_tail_pages` kernel into the standard freed-page
+    buffer (was `dec_ref_and_free` with two syncs).  One deliberate sync
+    remains per exact cycle: the `accept_len` host read that feeds the
+    seq-len shadow, telemetry, and schedules.
+
+  Measured (single stream, Qwen2.5-1.5B target + 0.5B draft, N=8 γ=8,
+  512 tokens, B200):
+
+  | config | tok/s | tok/cycle | ms/cycle |
+  |---|---|---|---|
+  | SMC (full perf path) | ~884 | 9.0 | 10.2 |
+  | exact, torch operator | ~234 | ~4.9 | 21.1 |
+  | exact, fused kernel | ~334 | ~4.9 | 13.8 |
+  | schedule exact4/smc2 | ~470–580 | ~6–7 | ~13 |
+
+  Exact mode's remaining gap vs SMC is (a) inherent: ~4.9 committed
+  tokens/cycle at ≈0.48 acceptance vs SMC's fixed 9 — a draft-quality
+  property, addressed by better drafts (phase 4), and (b) ~3.6 ms/cycle of
+  eager-path overhead — addressed by capturing the exact cycle
+  (draft AR + verify + fused accept + collapse are all fixed-shape now).
+
+- **Phase 2 remainder (perf/coverage)** — cycle-graph capture of the
+  EXACT cycle (all pieces are single fixed-shape launches now; the
+  accept kernel + collapse plan + dec_ref_tail are capture-friendly),
+  hybrid (Mamba) rollback commit
+  (`update_mamba_state_after_mtp_verify` already takes per-row
   `accepted_steps`), overlap-loop compatibility (accept_len via the pinned
   snapshot instead of a sync).
 - **Phase 3** — `"auto"` policy signals + API for span markers; benchmarks:

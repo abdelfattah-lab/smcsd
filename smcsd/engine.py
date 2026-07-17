@@ -69,10 +69,16 @@ class SMCEngine:
         #             particles; output is exactly target-distributed;
         #   "mixed" — per-request modes and mid-sequence switching.  Pick
         #             per request via sampling_params custom_params:
-        #             {"smc_mode": "exact"} or
+        #             {"smc_mode": "exact"},
         #             {"smc_mode_plan": [[0, "smc"], [200, "exact"]]}
-        #             (switch at generated-token thresholds).
+        #             (switch at generated-token thresholds), or
+        #             {"smc_mode_cycles": [["exact", 4], ["smc", 2]]}
+        #             (cyclic per-cycle schedule).
         mode: str = "smc",
+        # Engine-wide default cyclic schedule, e.g. [("exact", 4), ("smc", 2)]
+        # = every request runs 4 exact cycles then 2 SMC cycles, repeating.
+        # Implies mode="mixed"; per-request smc_mode_cycles overrides it.
+        mode_cycles: Optional[list] = None,
         # SMC hyper-parameters
         n_particles: int = 4,
         gamma: int = 4,
@@ -92,6 +98,17 @@ class SMCEngine:
         **kwargs,
     ):
         # -- 0. Mode validation --
+        if mode_cycles:
+            mode_cycles = [(str(m), int(n)) for m, n in mode_cycles]
+            if any(
+                m not in ("smc", "exact") or n <= 0 for m, n in mode_cycles
+            ):
+                raise ValueError(
+                    "mode_cycles entries must be (smc|exact, n>0), got "
+                    f"{mode_cycles!r}"
+                )
+            if mode == "smc":
+                mode = "mixed"
         if mode not in ("smc", "exact", "mixed"):
             raise ValueError(
                 f"mode must be 'smc', 'exact' or 'mixed', got {mode!r}"
@@ -103,17 +120,27 @@ class SMCEngine:
                 "mode='exact' targets the plain model distribution; "
                 "power_alpha must be 1.0."
             )
-        if mode in ("exact", "mixed"):
-            # Exact/mixed run the eager sequential path; the worker and
-            # scheduler enforce the same downgrades defensively.
+        if mode == "exact":
+            # All-exact engines run the eager sequential path; the worker
+            # and scheduler enforce the same downgrades defensively.
             if defer_bonus or cycle_graph or enable_overlap:
                 logger.info(
-                    "SMCEngine(mode=%r): disabling deferred bonus, cycle "
-                    "graph, and overlapped scheduling (variable-length "
-                    "commits).",
-                    mode,
+                    "SMCEngine(mode='exact'): disabling deferred bonus, "
+                    "cycle graph, and overlapped scheduling (eager exact "
+                    "path)."
                 )
             defer_bonus = cycle_graph = enable_overlap = False
+        elif mode == "mixed":
+            # Mixed keeps the cycle graph — pure-SMC cycles replay it, and
+            # cycles carrying exact groups fall back to eager per batch.
+            # Deferred bonus and overlap stay off (variable-length commits).
+            if defer_bonus or enable_overlap:
+                logger.info(
+                    "SMCEngine(mode='mixed'): disabling deferred bonus and "
+                    "overlapped scheduling (variable-length commits); cycle "
+                    "graph stays on for pure-SMC cycles."
+                )
+            defer_bonus = enable_overlap = False
 
         # -- 1. Build ServerArgs --
         # Each SMC group needs N+1 Req slots (1 parent + N particles co-exist
@@ -175,6 +202,7 @@ class SMCEngine:
             raise ValueError("power_alpha must be > 0.")
         server_args.smc_power_alpha = float(power_alpha)
         server_args.smc_mode = mode
+        server_args.smc_mode_cycles = mode_cycles or None
         server_args.smc_defer_bonus = bool(defer_bonus)
         server_args.smc_cycle_graph = bool(cycle_graph)
         server_args.smc_enable_overlap = bool(enable_overlap)

@@ -148,6 +148,75 @@ def _fused_resample_kernel(
         tl.store(dst_tok + offset, tok, mask=mask)
 
 
+@triton.jit
+def _dec_ref_tail_kernel(
+    slots_ptr,            # (G,) int64 — slot ids whose tail to release
+    req_pool_indices_ptr, # (max_slots,) int64
+    tail_start_ptr,       # (G,) int64 — first page position to release
+    tail_end_ptr,         # (G,) int64 — one past the last position
+    req_to_token_ptr,     # (pool_size, max_ctx_len) int32
+    req_to_token_stride,
+    refcount_ptr,         # (kv_pool_size,) int32
+    freed_buf_ptr,        # (kv_pool_size+,) int32
+    freed_counter_ptr,    # (1,) int32 atomic cursor
+    BLOCK_SIZE: tl.constexpr,
+):
+    g = tl.program_id(0)
+    slot = tl.load(slots_ptr + g)
+    pool = tl.load(req_pool_indices_ptr + slot)
+    start = tl.load(tail_start_ptr + g)
+    end = tl.load(tail_end_ptr + g)
+    row = req_to_token_ptr + pool * req_to_token_stride
+
+    length = end - start
+    num_iters = tl.cdiv(length, BLOCK_SIZE)
+    for i in range(num_iters):
+        offset = start + i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offset < end
+        kv_idx = tl.load(row + offset, mask=mask)
+        prev = tl.atomic_add(refcount_ptr + kv_idx.to(tl.int64), -1, mask=mask)
+        is_freed = mask & (prev == 1)
+        n_freed = tl.sum(is_freed.to(tl.int32), axis=0)
+        base = tl.atomic_add(freed_counter_ptr, n_freed)
+        excl = tl.cumsum(is_freed.to(tl.int32), axis=0) - is_freed.to(tl.int32)
+        tl.store(freed_buf_ptr + base + excl, kv_idx, mask=is_freed)
+
+
+def dec_ref_tail_pages(
+    req_to_token: torch.Tensor,
+    refcount: torch.Tensor,
+    *,
+    slots: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    tail_start: torch.Tensor,
+    tail_end: torch.Tensor,
+    freed_buf: torch.Tensor,
+    freed_counter: torch.Tensor,
+) -> None:
+    """dec_ref a per-slot block-table span ``[tail_start, tail_end)``,
+    capturing refcount-0 pages into ``freed_buf`` — one launch, no host
+    sync.  Used by the exact-mode collapse to release the winner chain's
+    rejected-tail pages (the losers' pages go through the resample
+    kernel's Phase 1); the scheduler frees the captured pages in
+    postprocessing like any resample-freed page.
+    """
+    g = slots.numel()
+    if g == 0:
+        return
+    _dec_ref_tail_kernel[(g,)](
+        slots,
+        req_pool_indices,
+        tail_start,
+        tail_end,
+        req_to_token,
+        req_to_token.stride(0),
+        refcount,
+        freed_buf,
+        freed_counter,
+        BLOCK_SIZE=64,
+    )
+
+
 def batched_resample_kv(
     req_to_token: torch.Tensor,
     refcount: torch.Tensor,

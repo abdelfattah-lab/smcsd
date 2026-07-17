@@ -59,6 +59,11 @@ class SequenceGroup:
     # per-request mode stats reported at finalize.
     mode: str = "smc"
     mode_plan: List = field(default_factory=list)
+    # Cyclic schedule: [(mode, n_cycles), ...] repeated for the request's
+    # lifetime (e.g. [("exact", 4), ("smc", 2)]).  Overrides mode_plan.
+    cycle_schedule: List = field(default_factory=list)
+    schedule_pos: int = 0
+    cycles_in_mode: int = 0
     tokens_generated: int = 0
     smc_cycles: int = 0
     exact_cycles: int = 0
@@ -613,7 +618,9 @@ class SMCScheduler(Scheduler):
         if error_msg is not None:
             self._emit_abort(req, error_msg)
             return
-        mode, mode_plan, mode_err = self._resolve_request_mode(req)
+        mode, mode_plan, cycle_schedule, mode_err = (
+            self._resolve_request_mode(req)
+        )
         if mode_err is not None:
             self._emit_abort(req, mode_err)
             return
@@ -623,6 +630,7 @@ class SMCScheduler(Scheduler):
             particle_temperature=self.server_args.smc_draft_temperature,
             mode=mode,
             mode_plan=mode_plan,
+            cycle_schedule=cycle_schedule,
         )
         self.waiting_groups.append(group)
         req.time_stats.set_wait_queue_entry_time()
@@ -638,39 +646,72 @@ class SMCScheduler(Scheduler):
           mode (default "smc"); ``custom_params["smc_mode_plan"]`` is an
           ascending list of ``[token_threshold, mode]`` switch points
           applied mid-sequence (SMC→exact enters through the posterior
-          collapse; exact→SMC is free).
+          collapse; exact→SMC is free); ``custom_params["smc_mode_cycles"]``
+          is a CYCLIC schedule ``[[mode, n_cycles], ...]`` (e.g.
+          ``[["exact", 4], ["smc", 2]]``) repeated for the request's
+          lifetime — it takes precedence over plan/mode and defaults to the
+          engine-wide ``mode_cycles`` when one was configured.
 
-        Returns ``(mode, mode_plan, error_msg)``.
+        Returns ``(mode, mode_plan, cycle_schedule, error_msg)``.
         """
         custom = getattr(req.sampling_params, "custom_params", None) or {}
         req_mode = custom.get("smc_mode")
         req_plan = custom.get("smc_mode_plan")
+        req_cycles = custom.get("smc_mode_cycles")
 
         if self.smc_mode in ("smc", "exact"):
-            if (req_mode is not None and req_mode != self.smc_mode) or req_plan:
-                return None, None, (
+            if (
+                (req_mode is not None and req_mode != self.smc_mode)
+                or req_plan
+                or req_cycles
+            ):
+                return None, None, None, (
                     f"Per-request smc_mode requires the engine to be "
                     f"launched with mode='mixed' (engine mode is "
                     f"'{self.smc_mode}')."
                 )
-            return self.smc_mode, [], None
+            return self.smc_mode, [], [], None
+
+        if req_cycles is None:
+            req_cycles = getattr(self.server_args, "smc_mode_cycles", None)
+        schedule: List = []
+        if req_cycles:
+            try:
+                schedule = [(str(m), int(n)) for m, n in req_cycles]
+            except (TypeError, ValueError):
+                return None, None, None, (
+                    "smc_mode_cycles must be a list of [mode, n_cycles] "
+                    "pairs."
+                )
+            if any(
+                m not in ("smc", "exact") or n <= 0 for m, n in schedule
+            ):
+                return None, None, None, (
+                    "smc_mode_cycles entries must be (smc|exact, n>0)."
+                )
+            # The schedule dictates the mode from the first cycle on.
+            return schedule[0][0], [], schedule, None
 
         mode = req_mode or "smc"
         if mode not in ("smc", "exact"):
-            return None, None, f"Invalid smc_mode {mode!r} (smc | exact)."
+            return None, None, None, (
+                f"Invalid smc_mode {mode!r} (smc | exact)."
+            )
         plan: List = []
         if req_plan:
             try:
                 plan = [(int(t), str(m)) for t, m in req_plan]
             except (TypeError, ValueError):
-                return None, None, (
+                return None, None, None, (
                     "smc_mode_plan must be a list of [token_threshold, mode] "
                     "pairs."
                 )
             if any(m not in ("smc", "exact") for _, m in plan):
-                return None, None, "smc_mode_plan modes must be smc | exact."
+                return None, None, None, (
+                    "smc_mode_plan modes must be smc | exact."
+                )
             plan.sort(key=lambda e: e[0])
-        return mode, plan, None
+        return mode, plan, [], None
 
     def _abort_on_queue_limit(self, req: Req) -> bool:
         if (
@@ -936,14 +977,15 @@ class SMCScheduler(Scheduler):
         ``slot_state.kv_freed_buf`` (freed there, not here).
         """
         if self.smc_mode != "smc":
-            exact_gpos, exact_rows, smc_rows = (
+            exact_gpos, exact_rows, smc_rows, exact_rows_cpu = (
                 self.slot_state.exact_partition()
             )
             if exact_gpos.numel() > 0:
                 if smc_rows.numel() == 0:
                     return self._exact_commit(result)
                 return self._mixed_commit(
-                    result, exact_gpos, exact_rows, smc_rows
+                    result, exact_gpos, exact_rows, smc_rows,
+                    exact_rows_cpu,
                 )
             # mixed engine, no exact groups this cycle: plain SMC body.
 
@@ -1055,6 +1097,7 @@ class SMCScheduler(Scheduler):
         exact_gpos: torch.Tensor,
         exact_rows: torch.Tensor,
         smc_rows: torch.Tensor,
+        exact_rows_cpu: torch.Tensor,
     ):
         """Mixed-cycle post-decode step: SMC weight/resample machinery on the
         SMC groups' rows, the exact commit on the exact groups' rows.
@@ -1111,7 +1154,7 @@ class SMCScheduler(Scheduler):
         self.coordinator.dispatch_resample_batch(plan2, self.slot_state)
         accept_cpu = next_draft.exact_accept_len.cpu()
         self.slot_state.rollback_seq_lens_host(
-            accept_cpu, rows_cpu=exact_rows.cpu()
+            accept_cpu, rows_cpu=exact_rows_cpu
         )
         self._stash_exact_accept(exact_gpos, accept_cpu)
 
@@ -1187,38 +1230,62 @@ class SMCScheduler(Scheduler):
             else:
                 group.tokens_generated += stride
                 group.smc_cycles += 1
+            group.cycles_in_mode += 1
         self._cycle_exact_accept = {}
 
-    def _apply_mode_plans(self) -> None:
-        """Apply due mode-plan switch points (engine mode "mixed").
+    def _switch_group_mode(self, group: SequenceGroup, new_mode: str) -> None:
+        """Switch a live group's verification mode for the next cycle.
 
-        Runs in postprocessing, after drain and before the next cycle's
-        prepare, so a switch cleanly changes the *next* cycle's operator.
         SMC→exact goes through the posterior collapse (finalize-style
         ancestor pick, forced one-hot resample, weights zeroed); exact→SMC
         just flips the gates — diversity re-emerges from the next cycle's
         i.i.d. drafts.
         """
+        if new_mode == group.mode:
+            return
+        if new_mode == "exact":
+            plan = self.slot_state.force_collapse_group(group.group_id)
+            self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+        self.slot_state.set_group_mode(group.group_id, new_mode)
+        group.mode = new_mode
+        group.cycles_in_mode = 0
+        logger.debug(
+            "SMC group %s switched to mode=%s at %d tokens.",
+            group.group_id, new_mode, group.tokens_generated,
+        )
+
+    def _apply_mode_plans(self) -> None:
+        """Apply due mode switches (engine mode "mixed").
+
+        Runs in postprocessing, after drain and before the next cycle's
+        prepare, so a switch cleanly changes the *next* cycle's operator.
+        Two mechanisms:
+
+        * ``cycle_schedule`` — cyclic ``[(mode, n_cycles), ...]``: when the
+          group has spent its quota of cycles in the current entry, advance
+          to the next (wrapping around).
+        * ``mode_plan`` — one-shot ``[(token_threshold, mode), ...]``
+          switch points on the generated-token count.
+        """
         for group in self.running_groups:
+            if group.cycle_schedule:
+                _, quota = group.cycle_schedule[group.schedule_pos]
+                if group.cycles_in_mode >= quota:
+                    group.schedule_pos = (
+                        group.schedule_pos + 1
+                    ) % len(group.cycle_schedule)
+                    self._switch_group_mode(
+                        group, group.cycle_schedule[group.schedule_pos][0]
+                    )
+                    # A single-entry schedule "switches" to itself; reset
+                    # the counter either way so the quota re-arms.
+                    group.cycles_in_mode = 0
+                continue
             while group.mode_plan and (
                 group.tokens_generated >= group.mode_plan[0][0]
             ):
                 _, new_mode = group.mode_plan.pop(0)
-                if new_mode == group.mode:
-                    continue
-                if new_mode == "exact":
-                    plan = self.slot_state.force_collapse_group(
-                        group.group_id
-                    )
-                    self.coordinator.dispatch_resample_batch(
-                        plan, self.slot_state
-                    )
-                self.slot_state.set_group_mode(group.group_id, new_mode)
-                group.mode = new_mode
-                logger.info(
-                    "SMC group %s switched to mode=%s at %d tokens.",
-                    group.group_id, new_mode, group.tokens_generated,
-                )
+                self._switch_group_mode(group, new_mode)
 
     def _drain_finished_groups(self, finished_mask_host) -> None:
         remaining: List[SequenceGroup] = []

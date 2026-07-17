@@ -226,32 +226,29 @@ class TestExactCommitPath(unittest.TestCase):
                     continue
                 self.assertTrue((rc[self.fresh_pages[s]] == 0).all())
 
-        # freed-buffer capture: losers' fresh pages, (N-1)*gp1 per group.
-        # (No snapshot_to_host in this test, so the phase never flipped;
-        # dispatch wrote into the current phase's buffer.)
-        phase = st._snap_phase
-        n_freed = int(st.kv_freed_counter[phase].item())
-        self.assertEqual(n_freed, G * (N - 1) * gp1)
-        freed = set(st.kv_freed_buf[phase, :n_freed].tolist())
+        # freed-buffer capture: losers' fresh pages ((N-1)*gp1 per group)
+        # PLUS the winner tails (gamma - a per group) — both flow through
+        # the same phase buffer now.  (No snapshot_to_host in this test, so
+        # the phase never flipped.)
         expect = set()
+        n_expected = 0
         for g in range(G):
             w = g * N + int(winner[g])
+            a = int(accept_len[g])
+            expect.update(self.fresh_pages[w][a + 1 :].tolist())
+            n_expected += gp1 - (a + 1)
             for i in range(N):
                 s = g * N + i
                 if s != w:
                     expect.update(self.fresh_pages[s].tolist())
+                    n_expected += gp1
+        phase = st._snap_phase
+        n_freed = int(st.kv_freed_counter[phase].item())
+        self.assertEqual(n_freed, n_expected)
+        freed = set(st.kv_freed_buf[phase, :n_freed].tolist())
         self.assertEqual(freed, expect)
-
-        # winner tails were freed directly through the allocator
-        direct_freed = set()
-        for t in alloc.freed:
-            direct_freed.update(t.tolist())
-        expect_tails = set()
-        for g in range(G):
-            w = g * N + int(winner[g])
-            a = int(accept_len[g])
-            expect_tails.update(self.fresh_pages[w][a + 1 :].tolist())
-        self.assertEqual(direct_freed, expect_tails)
+        # Nothing goes through the allocator's immediate-free path anymore.
+        self.assertEqual(alloc.freed, [])
 
     def test_mixed_partition_isolation(self):
         """Mixed cycle: SMC write-back on group 0's rows and exact commit
@@ -266,7 +263,9 @@ class TestExactCommitPath(unittest.TestCase):
         st.row_exact[1] = True
         st._mode_version += 1
 
-        exact_gpos, exact_rows, smc_rows = st.exact_partition()
+        exact_gpos, exact_rows, smc_rows, exact_rows_cpu = (
+            st.exact_partition()
+        )
         self.assertEqual(exact_gpos.tolist(), [1])
         self.assertEqual(exact_rows.tolist(), list(range(N, 2 * N)))
         self.assertEqual(smc_rows.tolist(), list(range(N)))
