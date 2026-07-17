@@ -399,6 +399,13 @@ class SMCDraftInput(SpecInput):
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
 
+    # ── Exact mode (multi-draft rejection sampling; unified-exact-smc.md) ──
+    # Populated by the worker's exact-mode verify branch, consumed by the
+    # scheduler's exact commit path.  G = bs / N groups.
+    exact_accept_len: Optional[torch.Tensor] = None  # (G,) int64 in [0, gamma]
+    exact_tokens: Optional[torch.Tensor] = None      # (G, gamma+1) int64
+    exact_winner: Optional[torch.Tensor] = None      # (G,) int64 chain idx
+
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1
 

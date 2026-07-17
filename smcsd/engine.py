@@ -62,6 +62,11 @@ class SMCEngine:
         model_path: str,
         draft_model_path: str,
         *,
+        # Verification mode: "smc" (importance weights + ESS resampling,
+        # fast approximate) or "exact" (multi-draft rejection sampling over
+        # the same N particles — output is exactly target-distributed;
+        # see docs/smc/unified-exact-smc.md).
+        mode: str = "smc",
         # SMC hyper-parameters
         n_particles: int = 4,
         gamma: int = 4,
@@ -80,6 +85,25 @@ class SMCEngine:
         # Extra ServerArgs overrides
         **kwargs,
     ):
+        # -- 0. Mode validation --
+        if mode not in ("smc", "exact"):
+            raise ValueError(f"mode must be 'smc' or 'exact', got {mode!r}")
+        if mode == "exact":
+            if power_alpha != 1.0:
+                raise ValueError(
+                    "mode='exact' targets the plain model distribution; "
+                    "power_alpha must be 1.0."
+                )
+            # Phase-1 exact mode runs the eager sequential path; the worker
+            # and scheduler enforce the same downgrades defensively.
+            if defer_bonus or cycle_graph or enable_overlap:
+                logger.info(
+                    "SMCEngine(mode='exact'): disabling deferred bonus, "
+                    "cycle graph, and overlapped scheduling (eager exact "
+                    "path)."
+                )
+            defer_bonus = cycle_graph = enable_overlap = False
+
         # -- 1. Build ServerArgs --
         # Each SMC group needs N+1 Req slots (1 parent + N particles co-exist
         # briefly during materialize).  Expand max_running_requests upfront so
@@ -139,6 +163,7 @@ class SMCEngine:
         if power_alpha <= 0:
             raise ValueError("power_alpha must be > 0.")
         server_args.smc_power_alpha = float(power_alpha)
+        server_args.smc_mode = mode
         server_args.smc_defer_bonus = bool(defer_bonus)
         server_args.smc_cycle_graph = bool(cycle_graph)
         server_args.smc_enable_overlap = bool(enable_overlap)

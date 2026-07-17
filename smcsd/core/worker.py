@@ -90,6 +90,18 @@ class SMCWorker(BaseSpecWorker):
         # ServerArgs instance (keeps the vendored class unmodified); defaults
         # to 1.0 (plain p) for launches that don't go through SMCEngine.
         self.smc_power_alpha = float(getattr(server_args, "smc_power_alpha", 1.0))
+        # Verification mode: "smc" (importance weights, all tokens accepted)
+        # or "exact" (multi-draft rejection sampling — the committed stream is
+        # exactly target-distributed; see docs/smc/unified-exact-smc.md).
+        # SMCEngine dynamic-attr pattern, like smc_power_alpha.
+        self.smc_mode = str(getattr(server_args, "smc_mode", "smc"))
+        self.smc_n_particles = int(getattr(server_args, "smc_n_particles", 1))
+        if self.smc_mode == "exact" and self.smc_power_alpha != 1.0:
+            raise ValueError(
+                "smc_mode='exact' targets the plain model distribution; "
+                "power_alpha must be 1.0 (alpha has no exact-sampling "
+                f"interpretation), got {self.smc_power_alpha}."
+            )
         # Debug-only: dump draft KV positions / cache-loc mapping for the first
         # few decode calls to confirm the prefill→step-0 position convention
         # before the deferred-bonus rework.  No behavior change when unset.
@@ -111,6 +123,15 @@ class SMCWorker(BaseSpecWorker):
             if _defer_env is not None
             else bool(getattr(server_args, "smc_defer_bonus", True))
         )
+        if self.smc_mode == "exact" and self.smc_defer_bonus:
+            # Exact mode commits a variable-length prefix; the deferred-bonus
+            # seed (prev_last_draft_id at S-1) is only correct for fixed
+            # gamma+1 commits.  Phase-1 exact runs the legacy draft schedule.
+            logger.info(
+                "smc_mode='exact': disabling deferred-bonus draft schedule "
+                "(variable-length commits)."
+            )
+            self.smc_defer_bonus = False
         # Only the dense-AR draft path is supported here.
         self._dense_draft_hybrid_req_to_token_pool = None
 
@@ -164,6 +185,19 @@ class SMCWorker(BaseSpecWorker):
             getattr(self.draft_runner, "hybrid_gdn_config", None) is not None
         )
         self._draft_is_hybrid = draft_is_hybrid
+        if self.smc_mode == "exact" and (
+            draft_is_hybrid
+            or getattr(self.score_runner, "hybrid_gdn_config", None) is not None
+        ):
+            # Hybrid recurrent-state commit is depth-indexed at gamma today;
+            # exact mode needs a per-row accepted_steps commit (the
+            # update_mamba_state_after_mtp_verify API already supports it) —
+            # wired in a later phase.
+            raise NotImplementedError(
+                "smc_mode='exact' currently supports dense (attention-only) "
+                "target/draft pairs; hybrid (Mamba/GDN) models need the "
+                "variable-depth recurrent-state commit."
+            )
         if draft_is_hybrid:
             from smcsd.core.hybrid_multistep_backend import (
                 HybridLinearAttnMultiStepBackend,
@@ -283,6 +317,14 @@ class SMCWorker(BaseSpecWorker):
             else bool(getattr(server_args, "smc_cycle_graph", True))
         )
         want_phase = bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0")))
+        if self.smc_mode == "exact" and (want_cycle or want_phase):
+            # Phase-1 exact mode runs the eager per-step path (the accept
+            # operator + variable-length collapse are not yet captured).
+            logger.info(
+                "smc_mode='exact': cycle/draft-phase CUDA graphs disabled "
+                "(eager exact path)."
+            )
+            want_cycle = want_phase = False
         if want_cycle or want_phase:
             from sglang.srt.layers.attention.triton_backend import (
                 TritonAttnBackend,
@@ -1057,6 +1099,7 @@ class SMCWorker(BaseSpecWorker):
             x0 = draft_input.verified_id
             all_tokens = [x0]
             draft_logprobs = []
+            draft_q_probs = []  # exact mode: full proposal dists (bs, V) per step
             current_ids = x0
 
             for step in range(gamma + 1):
@@ -1085,6 +1128,11 @@ class SMCWorker(BaseSpecWorker):
                 )
                 if step < gamma:
                     draft_logprobs.append(token_logprob)
+                    if self.smc_mode == "exact":
+                        # Full proposal distribution q_t for the accept
+                        # operator's ratio/residual math (the gumbel draw
+                        # above samples exactly from this distribution).
+                        draft_q_probs.append(self._draft_probs(logits, draft_idx))
 
                 all_tokens.append(draft_idx)
                 current_ids = draft_idx
@@ -1131,6 +1179,21 @@ class SMCWorker(BaseSpecWorker):
         # (bs*(gamma+1), vocab) log_softmax tensor.
         score_logits_3d = score_logits.reshape(bs, gamma + 1, -1)
         target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
+
+        # ---- 4b. Exact mode: multi-draft rejection sampling ----
+        # Replaces steps 5-7 (weight diff + bonus): the same verify logits
+        # feed the exact accept operator instead of the importance weight.
+        if self.smc_mode == "exact":
+            return self._exact_verify_outputs(
+                score_logits_3d,
+                target_tokens,
+                draft_q_probs,
+                score_result,
+                bs,
+                gamma,
+                can_run_cuda_graph,
+            )
+
         verify_scaled = (
             score_logits_3d[:, :gamma, :] / self.smc_target_temperature
         )
@@ -1199,6 +1262,104 @@ class SMCWorker(BaseSpecWorker):
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
 
+        return GenerationBatchResult(
+            logits_output=score_result.logits_output,
+            next_token_ids=next_token_ids,
+            accept_lens=accept_lens,
+            next_draft_input=next_draft_input,
+            logprob_diff=logprob_diff,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def _draft_probs(self, logits: torch.Tensor, idx: torch.Tensor):
+        """Full proposal distribution the draft token was sampled from.
+
+        ``softmax(logits / T_draft)`` for stochastic drafts; a one-hot at the
+        argmax for greedy drafts (T=0), which is the distribution the greedy
+        selection realizes — the accept ratio then degenerates to
+        ``min(1, p(c))`` as in greedy speculative sampling.
+        """
+        if self.smc_draft_temperature > 0:
+            return torch.softmax(logits / self.smc_draft_temperature, dim=-1)
+        one_hot = torch.zeros_like(logits)
+        return one_hot.scatter(1, idx.unsqueeze(1), 1.0)
+
+    def _exact_verify_outputs(
+        self,
+        score_logits_3d: torch.Tensor,   # (bs, gamma+1, V)
+        target_tokens: torch.Tensor,     # (bs, gamma) drafted tokens
+        draft_q_probs: list,             # gamma x (bs, V)
+        score_result,
+        bs: int,
+        gamma: int,
+        can_run_cuda_graph: bool,
+    ) -> GenerationBatchResult:
+        """Exact-mode verify: multi-draft sequential rejection sampling.
+
+        The batch's rows are the group-contiguous particle layout
+        (``rebuild_active_slots`` orders slots by group, global-N), so a
+        ``(G, N, ...)`` view recovers the group structure.  Viable chains
+        share their conditioning prefix exactly (post-collapse invariant +
+        the viability filter inside the operator), which is the i.i.d.
+        setting the multi-draft correctness proof requires.
+
+        Returns per-group ``exact_*`` fields on ``next_draft_input``; the
+        scheduler's exact commit path (write-back, collapse, rollback)
+        consumes them.  ``next_token_ids`` / ``accept_lens`` carry the
+        committed block broadcast per-particle for interface compatibility.
+        """
+        from smcsd.core.exact_accept import mdsd_accept_batched
+
+        N = self.smc_n_particles
+        assert bs % N == 0, f"exact mode: batch {bs} not divisible by N={N}"
+        assert len(draft_q_probs) == gamma, (
+            "exact mode requires the legacy draft schedule "
+            f"(got {len(draft_q_probs)} proposal dists for gamma={gamma})"
+        )
+        G = bs // N
+        V = score_logits_3d.shape[-1]
+
+        # Target rows at the USER's sampling temperature (power_alpha == 1
+        # is enforced at init — exact mode targets plain p).
+        p_probs = torch.softmax(
+            score_logits_3d / self.smc_target_temperature, dim=-1
+        )
+        q_probs = torch.stack(draft_q_probs, dim=1)  # (bs, gamma, V)
+
+        res = mdsd_accept_batched(
+            target_tokens.view(G, N, gamma),
+            q_probs.view(G, N, gamma, V),
+            p_probs.view(G, N, gamma + 1, V),
+        )
+
+        # Last committed token (residual or bonus draw) seeds the next
+        # cycle's draft for every particle of the group.
+        last_committed = res.tokens.gather(
+            1, res.accept_len.unsqueeze(1)
+        ).squeeze(1)                                            # (G,)
+        verified_next = last_committed.repeat_interleave(N)     # (bs,)
+
+        next_token_ids = res.tokens.repeat_interleave(N, dim=0).reshape(-1)
+        accept_lens = (
+            (res.accept_len + 1).repeat_interleave(N).to(torch.int32)
+        )
+        # Interface stub: exact mode accrues no importance weight.
+        logprob_diff = torch.zeros(
+            bs, gamma, dtype=torch.float32, device=self.device
+        )
+
+        next_draft_input = SMCDraftInput(
+            verified_id=verified_next,
+            # Deferred bonus is disabled in exact mode; keep the lineage
+            # tensor coherent for later mode switches.
+            prev_last_draft_id=verified_next,
+            logprob_diff=logprob_diff,
+            bonus_logz=None,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+            exact_accept_len=res.accept_len,
+            exact_tokens=res.tokens,
+            exact_winner=res.winner,
+        )
         return GenerationBatchResult(
             logits_output=score_result.logits_output,
             next_token_ids=next_token_ids,

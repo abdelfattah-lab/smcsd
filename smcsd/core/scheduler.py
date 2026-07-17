@@ -265,12 +265,25 @@ class SMCScheduler(Scheduler):
         # (Mamba) gate is gone: the recurrent-state resample copy is now a
         # device-driven fused kernel enqueued inside _resample (before the
         # snapshot), so it is stream-ordered ahead of the next forward.
+        # Verification mode ("smc" | "exact"); SMCEngine dynamic-attr pattern.
+        self.smc_mode = str(getattr(server_args, "smc_mode", "smc"))
+
         _ov_env = os.environ.get("SMC_ENABLE_OVERLAP")
         want_overlap = (
             bool(int(_ov_env))
             if _ov_env is not None
             else bool(getattr(server_args, "smc_enable_overlap", True))
         )
+        if self.smc_mode == "exact" and want_overlap:
+            # Exact-mode commits are variable-length: the host seq-len shadow
+            # is rolled back from a synced accept_len each cycle, which the
+            # one-step-late overlap loop would read stale.  Phase-1 exact
+            # runs the sequential loop.
+            logger.info(
+                "SMCScheduler: smc_mode='exact' — overlapped scheduling "
+                "disabled (variable-length commits)."
+            )
+            want_overlap = False
         self._use_overlap_loop = want_overlap
         if self._use_overlap_loop:
             logger.info("SMCScheduler: overlapped scheduling enabled.")
@@ -851,6 +864,9 @@ class SMCScheduler(Scheduler):
         cursor, finished mask).  Freed KV pages accumulate in
         ``slot_state.kv_freed_buf`` (freed there, not here).
         """
+        if self.smc_mode == "exact":
+            return self._exact_commit(result)
+
         if result.logprob_diff is None:
             raise RuntimeError("SMCScheduler requires batched logprob_diff.")
 
@@ -909,6 +925,36 @@ class SMCScheduler(Scheduler):
             plan=plan,
             device=self.device,
         )
+
+        snapshot = self.slot_state.snapshot_to_host()
+        return plan, snapshot
+
+    def _exact_commit(self, result: GenerationBatchResult):
+        """Exact-mode post-decode step (replaces ``_resample``'s body).
+
+        The worker already ran the multi-draft accept operator; this applies
+        its outcome: variable-length write-back, one-hot collapse onto the
+        winner chain through the *existing* resample-dispatch kernel, and
+        the seq-len rollback (device + host shadow).  ESS/systematic
+        resampling and weight bookkeeping are skipped — weights are
+        identically zero in exact mode.
+        """
+        next_draft = result.next_draft_input
+        if next_draft is None or next_draft.exact_accept_len is None:
+            raise RuntimeError(
+                "SMCScheduler(exact): result missing exact accept outputs."
+            )
+
+        self.slot_state.write_back_exact(
+            exact_tokens=next_draft.exact_tokens,
+            exact_accept_len=next_draft.exact_accept_len,
+            verified_next=next_draft.verified_id,
+        )
+        plan = self.slot_state.collapse_exact(
+            next_draft.exact_accept_len, next_draft.exact_winner
+        )
+        self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+        self.slot_state.rollback_seq_lens_host(next_draft.exact_accept_len)
 
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot

@@ -947,6 +947,184 @@ class ScheduleBatchSMC:
         self.interval_weights[active] += d
 
     # ────────────────────────────────────────────────────────
+    #  Exact mode (multi-draft rejection sampling) commit path
+    # ────────────────────────────────────────────────────────
+
+    def write_back_exact(
+        self,
+        exact_tokens: torch.Tensor,      # (G, gamma+1) int64 committed block
+        exact_accept_len: torch.Tensor,  # (G,) int64 in [0, gamma]
+        verified_next: torch.Tensor,     # (bs,) next-cycle seed per particle
+    ) -> None:
+        """Exact-mode write-back: commit ``accept_len+1`` tokens per group.
+
+        The committed block is identical for every particle of a group (the
+        group collapses onto it), so per-group tensors are broadcast to the
+        group's N contiguous batch rows.  Mirrors ``write_back_gpu``'s torch
+        path with the token scatter and EOS scan masked to the committed
+        columns; weights are untouched (identically zero in exact mode).
+        """
+        active = self.active_slots
+        bs = self.num_active
+        n = self.n_particles
+        stride = self.gamma_plus_1
+        device = self.device
+
+        committed_2d = exact_tokens.repeat_interleave(n, dim=0)      # (bs, stride)
+        commit_len = (exact_accept_len + 1).repeat_interleave(n)     # (bs,)
+        cols = torch.arange(stride, dtype=torch.int64, device=device)
+        col_valid = cols.unsqueeze(0) < commit_len.unsqueeze(1)      # (bs, stride)
+
+        # a. Masked token scatter + variable count advance.
+        offsets = self.token_counts[active].to(torch.int64)
+        row_idx = active.unsqueeze(1).expand(-1, stride)
+        col_idx = offsets.unsqueeze(1) + cols
+        self.all_token_ids[row_idx[col_valid], col_idx[col_valid]] = (
+            committed_2d[col_valid].to(self.all_token_ids.dtype)
+        )
+        self.token_counts[active] += commit_len.to(torch.int32)
+
+        # b. Next-cycle seeds.
+        self.verified_ids[active] = verified_next.to(torch.int32)
+        self.prev_last_draft_ids[active] = verified_next.to(torch.int32)
+
+        # c. Finish checks over the committed columns only.
+        updated = self.token_counts[active]
+        max_tokens = self.max_new_tokens_t[active]
+        length_hit = updated >= max_tokens
+
+        eos_ids = self.eos_token_ids_t[active]
+        eos_match = (
+            committed_2d.unsqueeze(2).to(torch.int64) == eos_ids.unsqueeze(1)
+        ).any(dim=2) & col_valid
+        eos_hit = eos_match.any(dim=1) & ~self.ignore_eos_t[active]
+
+        prev_fin = self.finished_mask[active]
+        newly = (length_hit | eos_hit) & ~prev_fin
+        self.finished_mask[active] = prev_fin | newly
+
+        first_eos = torch.where(eos_match, cols, stride).min(dim=1).values
+        matched_tok = committed_2d.gather(
+            1, first_eos.clamp(max=stride - 1).unsqueeze(1)
+        ).squeeze(1)
+        eos_branch = newly & ~length_hit
+        fin_len = torch.where(
+            length_hit,
+            max_tokens,
+            (
+                updated.to(torch.int64) - commit_len + first_eos + 1
+            ).to(max_tokens.dtype),
+        )
+        fin_code = torch.where(length_hit, 1, 2).to(self.finish_reason_code.dtype)
+        self.finished_len[active] = torch.where(
+            newly, fin_len, self.finished_len[active]
+        )
+        self.finish_reason_code[active] = torch.where(
+            newly, fin_code, self.finish_reason_code[active]
+        )
+        self.matched_eos_token[active] = torch.where(
+            eos_branch,
+            matched_tok.to(torch.int32),
+            self.matched_eos_token[active],
+        )
+        # d. No weight accumulation: in exact mode every particle is a copy
+        # of the single exact stream; log-weights stay 0 and finalize's
+        # posterior sample degenerates to a uniform pick among identical
+        # particles.
+
+    def collapse_exact(self, exact_accept_len, exact_winner):
+        """Collapse each group onto its winner chain and roll back lengths.
+
+        Emits a ``BatchedResampleResult``-format plan (dst = the group's
+        other N-1 slots, src = winner) for the *existing*
+        ``batched_resample_kv`` dispatch.  Correctness of the unchanged
+        kernel relies on the ordering here:
+
+        1. Free the winner's stale tail pages ``[L+a+1, L+gamma+1)`` (the
+           rejected drafts' KV — exclusively owned, refcount 1).
+        2. Roll the winner's ``seq_lens`` / ``kv_allocated_lens`` back to
+           ``L+a+1`` BEFORE dispatch, so the kernel's Phase-2 copy spans
+           exactly the committed table and Phase-3 propagates the
+           rolled-back lengths; the losers' Phase-1 dec_ref still reads
+           their un-rolled ``kv_allocated_lens`` (full span, no leak).
+
+        This keeps the ``kv_allocated_lens == seq_lens`` invariant that
+        ``fused_prepare_decode`` relies on — the next cycle allocates a
+        fresh ``gamma+1`` pages per row as usual.
+        """
+        from smcsd.core.kernels.fused_collect import BatchedResampleResult
+
+        active = self.active_slots
+        bs = self.num_active
+        n = self.n_particles
+        stride = self.gamma_plus_1
+        device = self.device
+        g = bs // n
+
+        slots_2d = active.view(g, n)                                  # (G, N)
+        winner_slot = slots_2d.gather(1, exact_winner.view(g, 1)).squeeze(1)
+
+        # seq_lens are at L + stride here (advanced by prepare_for_decode).
+        cur_seq = self.seq_lens[winner_slot]                          # (G,)
+        new_seq = cur_seq - stride + exact_accept_len + 1             # L + a + 1
+
+        # 1. Winner tail pages [new_seq, cur_seq): rejected drafts' KV.
+        tail_len = cur_seq - new_seq                                  # gamma - a
+        if stride > 1:
+            tcols = torch.arange(
+                stride - 1, dtype=torch.int64, device=device
+            )
+            tail_valid = tcols.unsqueeze(0) < tail_len.unsqueeze(1)   # (G, s-1)
+            pool = self.req_pool_indices[winner_slot]
+            tail_pos = new_seq.unsqueeze(1) + tcols
+            pages = self.req_to_token_pool.req_to_token[
+                pool.unsqueeze(1), tail_pos
+            ]
+            self.token_to_kv_pool_allocator.dec_ref_and_free(
+                pages[tail_valid].to(torch.int64)
+            )
+
+        # 2. Roll back the winner (losers get these via the kernel's Phase 3).
+        self.seq_lens[winner_slot] = new_seq
+        self.kv_allocated_lens[winner_slot] = new_seq
+
+        # 3. One-hot plan: every non-winner slot copies from the winner.
+        if n > 1:
+            keep = torch.arange(n, device=device).unsqueeze(
+                0
+            ) != exact_winner.unsqueeze(1)                             # (G, N)
+            dst = slots_2d[keep].view(g, n - 1).reshape(-1).to(torch.int32)
+            src = winner_slot.repeat_interleave(n - 1).to(torch.int32)
+        else:
+            dst = torch.empty(0, dtype=torch.int32, device=device)
+            src = torch.empty(0, dtype=torch.int32, device=device)
+        counter = torch.tensor(
+            [dst.numel()], dtype=torch.int32, device=device
+        )
+        return BatchedResampleResult(
+            dst_flat=dst,
+            src_flat=src,
+            rows_flat=torch.zeros_like(dst),
+            counter=counter,
+            resample_mask=torch.zeros(
+                self.max_groups, dtype=torch.bool, device=device
+            ),
+            _n_jobs=int(dst.numel()),
+        )
+
+    def rollback_seq_lens_host(self, exact_accept_len: torch.Tensor) -> None:
+        """Mirror the exact-mode rollback into the CPU seq-len shadow.
+
+        One device->host sync per cycle (``.cpu()`` on a (G,) tensor) — the
+        exact path runs the sequential loop, where this is the accepted
+        boundary read (like finalize's).
+        """
+        delta = (
+            self.gamma_plus_1 - 1 - exact_accept_len.cpu()
+        ).repeat_interleave(self.n_particles)
+        self.seq_lens_host[self.active_slots_cpu] -= delta
+
+    # ────────────────────────────────────────────────────────
     #  Host snapshot (postprocessing inputs, no stream-tail block)
     # ────────────────────────────────────────────────────────
 
