@@ -163,6 +163,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
         scheduler = SimpleNamespace(
             waiting_groups=deque([queued_group]),
             max_running_requests=4,
+            _pending_admitted_slots=0,
             slot_state=SimpleNamespace(available_slot_count=lambda: 0),
         )
         scheduler._emit_abort = lambda req, error_msg: self.fail(
@@ -183,6 +184,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
         scheduler = SimpleNamespace(
             waiting_groups=deque([g0, g1]),
             max_running_requests=4,
+            _pending_admitted_slots=0,
             slot_state=SimpleNamespace(available_slot_count=lambda: 4),
         )
         scheduler._emit_abort = lambda req, error_msg: self.fail(
@@ -203,6 +205,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
         scheduler = SimpleNamespace(
             waiting_groups=deque([oversized]),
             max_running_requests=4,
+            _pending_admitted_slots=0,
             slot_state=SimpleNamespace(available_slot_count=lambda: 4),
         )
         scheduler._emit_abort = lambda req, error_msg: self.fail(
