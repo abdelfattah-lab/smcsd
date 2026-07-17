@@ -62,10 +62,16 @@ class SMCEngine:
         model_path: str,
         draft_model_path: str,
         *,
-        # Verification mode: "smc" (importance weights + ESS resampling,
-        # fast approximate) or "exact" (multi-draft rejection sampling over
-        # the same N particles — output is exactly target-distributed;
-        # see docs/smc/unified-exact-smc.md).
+        # Verification mode (docs/smc/unified-exact-smc.md):
+        #   "smc"   — importance weights + ESS resampling, fast approximate
+        #             (full perf path: cycle graph, deferred bonus, overlap);
+        #   "exact" — multi-draft rejection sampling over the same N
+        #             particles; output is exactly target-distributed;
+        #   "mixed" — per-request modes and mid-sequence switching.  Pick
+        #             per request via sampling_params custom_params:
+        #             {"smc_mode": "exact"} or
+        #             {"smc_mode_plan": [[0, "smc"], [200, "exact"]]}
+        #             (switch at generated-token thresholds).
         mode: str = "smc",
         # SMC hyper-parameters
         n_particles: int = 4,
@@ -86,21 +92,26 @@ class SMCEngine:
         **kwargs,
     ):
         # -- 0. Mode validation --
-        if mode not in ("smc", "exact"):
-            raise ValueError(f"mode must be 'smc' or 'exact', got {mode!r}")
-        if mode == "exact":
-            if power_alpha != 1.0:
-                raise ValueError(
-                    "mode='exact' targets the plain model distribution; "
-                    "power_alpha must be 1.0."
-                )
-            # Phase-1 exact mode runs the eager sequential path; the worker
-            # and scheduler enforce the same downgrades defensively.
+        if mode not in ("smc", "exact", "mixed"):
+            raise ValueError(
+                f"mode must be 'smc', 'exact' or 'mixed', got {mode!r}"
+            )
+        if mode == "exact" and power_alpha != 1.0:
+            # (mode="mixed" may keep alpha != 1: it applies to SMC segments
+            # only; exact segments always target plain p.)
+            raise ValueError(
+                "mode='exact' targets the plain model distribution; "
+                "power_alpha must be 1.0."
+            )
+        if mode in ("exact", "mixed"):
+            # Exact/mixed run the eager sequential path; the worker and
+            # scheduler enforce the same downgrades defensively.
             if defer_bonus or cycle_graph or enable_overlap:
                 logger.info(
-                    "SMCEngine(mode='exact'): disabling deferred bonus, "
-                    "cycle graph, and overlapped scheduling (eager exact "
-                    "path)."
+                    "SMCEngine(mode=%r): disabling deferred bonus, cycle "
+                    "graph, and overlapped scheduling (variable-length "
+                    "commits).",
+                    mode,
                 )
             defer_bonus = cycle_graph = enable_overlap = False
 
@@ -335,6 +346,8 @@ class SMCEngine:
                     entry["smc_log_Z_hat"] = msg.log_Z_hat
                     entry["smc_log_w_tilde"] = msg.log_w_tilde
                     entry["smc_particle_output_ids"] = msg.particle_output_ids
+                    if msg.mode_stats is not None:
+                        entry["smc_mode_stats"] = msg.mode_stats
                 continue
 
             if not isinstance(msg, BatchTokenIDOutput):
@@ -385,6 +398,8 @@ class SMCEngine:
                 "completion_tokens": entry["completion_tokens"],
             }
             # SMC particle collection (present when the group reported one).
+            if entry.get("smc_mode_stats") is not None:
+                out["smc_mode_stats"] = entry["smc_mode_stats"]
             particle_ids = entry.get("smc_particle_output_ids")
             if particle_ids is not None:
                 out["smc_log_Z_hat"] = entry.get("smc_log_Z_hat")

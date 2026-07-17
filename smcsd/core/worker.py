@@ -123,7 +123,7 @@ class SMCWorker(BaseSpecWorker):
             if _defer_env is not None
             else bool(getattr(server_args, "smc_defer_bonus", True))
         )
-        if self.smc_mode == "exact" and self.smc_defer_bonus:
+        if self.smc_mode in ("exact", "mixed") and self.smc_defer_bonus:
             # Exact mode commits a variable-length prefix; the deferred-bonus
             # seed (prev_last_draft_id at S-1) is only correct for fixed
             # gamma+1 commits.  Phase-1 exact runs the legacy draft schedule.
@@ -185,7 +185,7 @@ class SMCWorker(BaseSpecWorker):
             getattr(self.draft_runner, "hybrid_gdn_config", None) is not None
         )
         self._draft_is_hybrid = draft_is_hybrid
-        if self.smc_mode == "exact" and (
+        if self.smc_mode in ("exact", "mixed") and (
             draft_is_hybrid
             or getattr(self.score_runner, "hybrid_gdn_config", None) is not None
         ):
@@ -317,7 +317,7 @@ class SMCWorker(BaseSpecWorker):
             else bool(getattr(server_args, "smc_cycle_graph", True))
         )
         want_phase = bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0")))
-        if self.smc_mode == "exact" and (want_cycle or want_phase):
+        if self.smc_mode in ("exact", "mixed") and (want_cycle or want_phase):
             # Phase-1 exact mode runs the eager per-step path (the accept
             # operator + variable-length collapse are not yet captured).
             logger.info(
@@ -1078,6 +1078,9 @@ class SMCWorker(BaseSpecWorker):
             )
 
         # ---- 2. Dense draft AR ----
+        # (Defined here so the post-verify exact checks are safe on the
+        # deferred path too — deferred never coexists with exact groups.)
+        draft_q_probs = []
         if self.smc_defer_bonus and not draft_fb.forward_mode.is_idle():
             # Deferred-bonus schedule: head + gamma-1 singles, no over-draft.
             all_tokens, draft_logprobs_stacked = self._draft_ar_deferred(
@@ -1100,6 +1103,12 @@ class SMCWorker(BaseSpecWorker):
             all_tokens = [x0]
             draft_logprobs = []
             draft_q_probs = []  # exact mode: full proposal dists (bs, V) per step
+            # Retain full proposal dists whenever this cycle carries exact
+            # groups (partition attached by prepare_for_decode).
+            capture_q = (
+                draft_input.exact_group_idx is not None
+                and draft_input.exact_group_idx.numel() > 0
+            )
             current_ids = x0
 
             for step in range(gamma + 1):
@@ -1128,7 +1137,7 @@ class SMCWorker(BaseSpecWorker):
                 )
                 if step < gamma:
                     draft_logprobs.append(token_logprob)
-                    if self.smc_mode == "exact":
+                    if capture_q:
                         # Full proposal distribution q_t for the accept
                         # operator's ratio/residual math (the gumbel draw
                         # above samples exactly from this distribution).
@@ -1180,10 +1189,15 @@ class SMCWorker(BaseSpecWorker):
         score_logits_3d = score_logits.reshape(bs, gamma + 1, -1)
         target_tokens = torch.stack(all_tokens[1 : gamma + 1], dim=1)
 
-        # ---- 4b. Exact mode: multi-draft rejection sampling ----
-        # Replaces steps 5-7 (weight diff + bonus): the same verify logits
-        # feed the exact accept operator instead of the importance weight.
-        if self.smc_mode == "exact":
+        # ---- 4b. Exact groups: multi-draft rejection sampling ----
+        # For groups in exact mode, the same verify logits feed the accept
+        # operator instead of the importance weight.  A cycle whose groups
+        # are ALL exact skips the SMC tail entirely; a mixed cycle computes
+        # the SMC tail below and overwrites the exact rows' outputs.
+        gidx = draft_input.exact_group_idx
+        has_exact = gidx is not None and gidx.numel() > 0
+        all_exact = has_exact and gidx.numel() * self.smc_n_particles == bs
+        if all_exact:
             return self._exact_verify_outputs(
                 score_logits_3d,
                 target_tokens,
@@ -1247,6 +1261,37 @@ class SMCWorker(BaseSpecWorker):
         # wires the consumer and drops the over-draft.
         prev_last_draft_id = all_tokens[gamma]
 
+        # ---- 7b. Mixed cycle: exact groups override their rows ----
+        exact_fields = {}
+        if has_exact:
+            rows = draft_input.exact_rows
+            n = self.smc_n_particles
+            res = self._run_exact_accept(
+                score_logits_3d, target_tokens, draft_q_probs, gamma, rows
+            )
+            last_committed = res.tokens.gather(
+                1, res.accept_len.unsqueeze(1)
+            ).squeeze(1)
+            ver_rows = last_committed.repeat_interleave(n)
+            output_token_ids[rows] = res.tokens.repeat_interleave(n, dim=0)
+            next_token_ids = output_token_ids.reshape(-1)
+            next_verified_id = next_verified_id.clone()
+            next_verified_id[rows] = ver_rows
+            prev_last_draft_id = prev_last_draft_id.clone()
+            prev_last_draft_id[rows] = ver_rows
+            accept_lens[rows] = (
+                (res.accept_len + 1).repeat_interleave(n).to(torch.int32)
+            )
+            # Exact rows accrue no importance weight; the scheduler slices
+            # SMC rows for weight accumulation, this keeps the tensor sane
+            # for any full-batch consumer.
+            logprob_diff[rows] = 0.0
+            exact_fields = dict(
+                exact_accept_len=res.accept_len,
+                exact_tokens=res.tokens,
+                exact_winner=res.winner,
+            )
+
         next_token_ids.record_stream(current_stream)
         accept_lens.record_stream(current_stream)
         next_verified_id.record_stream(current_stream)
@@ -1260,6 +1305,7 @@ class SMCWorker(BaseSpecWorker):
             logprob_diff=logprob_diff,
             bonus_logz=bonus_logz,
             num_tokens_per_req=self.speculative_num_draft_tokens,
+            **exact_fields,
         )
 
         return GenerationBatchResult(
@@ -1284,6 +1330,53 @@ class SMCWorker(BaseSpecWorker):
         one_hot = torch.zeros_like(logits)
         return one_hot.scatter(1, idx.unsqueeze(1), 1.0)
 
+    def _run_exact_accept(
+        self,
+        score_logits_3d: torch.Tensor,   # (bs, gamma+1, V)
+        target_tokens: torch.Tensor,     # (bs, gamma) drafted tokens
+        draft_q_probs: list,             # gamma x (bs, V)
+        gamma: int,
+        rows: Optional[torch.Tensor] = None,   # exact groups' batch rows
+    ):
+        """Run the multi-draft accept operator on (a subset of) the batch.
+
+        The batch's rows are the group-contiguous particle layout
+        (``rebuild_active_slots`` orders slots by group, global-N), so a
+        ``(G, N, ...)`` view recovers the group structure.  Viable chains
+        share their conditioning prefix exactly (post-collapse invariant +
+        the viability filter inside the operator), which is the i.i.d.
+        setting the multi-draft correctness proof requires.
+
+        Targets plain p at the target temperature (power_alpha does not
+        apply to exact segments).  ``rows`` restricts to the exact groups'
+        rows in mixed cycles; None = the whole batch.
+        """
+        from smcsd.core.exact_accept import mdsd_accept_batched
+
+        N = self.smc_n_particles
+        assert len(draft_q_probs) == gamma, (
+            "exact mode requires the legacy draft schedule "
+            f"(got {len(draft_q_probs)} proposal dists for gamma={gamma})"
+        )
+        q_probs = torch.stack(draft_q_probs, dim=1)  # (bs, gamma, V)
+        if rows is not None:
+            score_logits_3d = score_logits_3d[rows]
+            target_tokens = target_tokens[rows]
+            q_probs = q_probs[rows]
+        nrows = target_tokens.shape[0]
+        assert nrows % N == 0, f"exact rows {nrows} not divisible by N={N}"
+        G = nrows // N
+        V = score_logits_3d.shape[-1]
+
+        p_probs = torch.softmax(
+            score_logits_3d / self.smc_target_temperature, dim=-1
+        )
+        return mdsd_accept_batched(
+            target_tokens.view(G, N, gamma),
+            q_probs.view(G, N, gamma, V),
+            p_probs.view(G, N, gamma + 1, V),
+        )
+
     def _exact_verify_outputs(
         self,
         score_logits_3d: torch.Tensor,   # (bs, gamma+1, V)
@@ -1294,42 +1387,16 @@ class SMCWorker(BaseSpecWorker):
         gamma: int,
         can_run_cuda_graph: bool,
     ) -> GenerationBatchResult:
-        """Exact-mode verify: multi-draft sequential rejection sampling.
-
-        The batch's rows are the group-contiguous particle layout
-        (``rebuild_active_slots`` orders slots by group, global-N), so a
-        ``(G, N, ...)`` view recovers the group structure.  Viable chains
-        share their conditioning prefix exactly (post-collapse invariant +
-        the viability filter inside the operator), which is the i.i.d.
-        setting the multi-draft correctness proof requires.
+        """All-exact cycle: the accept operator replaces the whole SMC tail.
 
         Returns per-group ``exact_*`` fields on ``next_draft_input``; the
         scheduler's exact commit path (write-back, collapse, rollback)
         consumes them.  ``next_token_ids`` / ``accept_lens`` carry the
         committed block broadcast per-particle for interface compatibility.
         """
-        from smcsd.core.exact_accept import mdsd_accept_batched
-
         N = self.smc_n_particles
-        assert bs % N == 0, f"exact mode: batch {bs} not divisible by N={N}"
-        assert len(draft_q_probs) == gamma, (
-            "exact mode requires the legacy draft schedule "
-            f"(got {len(draft_q_probs)} proposal dists for gamma={gamma})"
-        )
-        G = bs // N
-        V = score_logits_3d.shape[-1]
-
-        # Target rows at the USER's sampling temperature (power_alpha == 1
-        # is enforced at init — exact mode targets plain p).
-        p_probs = torch.softmax(
-            score_logits_3d / self.smc_target_temperature, dim=-1
-        )
-        q_probs = torch.stack(draft_q_probs, dim=1)  # (bs, gamma, V)
-
-        res = mdsd_accept_batched(
-            target_tokens.view(G, N, gamma),
-            q_probs.view(G, N, gamma, V),
-            p_probs.view(G, N, gamma + 1, V),
+        res = self._run_exact_accept(
+            score_logits_3d, target_tokens, draft_q_probs, gamma
         )
 
         # Last committed token (residual or bonus draw) seeds the next

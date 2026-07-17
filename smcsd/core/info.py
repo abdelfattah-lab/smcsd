@@ -50,6 +50,9 @@ class SMCParticleOutput:
     log_Z_hat: float
     log_w_tilde: List[float]
     particle_output_ids: List[List[int]]
+    # Unified exact/SMC mode telemetry: final_mode, smc_cycles,
+    # exact_cycles, exact_accepted_tokens, exact_accept_rate.
+    mode_stats: Optional[dict] = None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -400,11 +403,17 @@ class SMCDraftInput(SpecInput):
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
 
     # ── Exact mode (multi-draft rejection sampling; unified-exact-smc.md) ──
-    # Populated by the worker's exact-mode verify branch, consumed by the
-    # scheduler's exact commit path.  G = bs / N groups.
-    exact_accept_len: Optional[torch.Tensor] = None  # (G,) int64 in [0, gamma]
-    exact_tokens: Optional[torch.Tensor] = None      # (G, gamma+1) int64
-    exact_winner: Optional[torch.Tensor] = None      # (G,) int64 chain idx
+    # Inputs (attached by prepare_for_decode, from the cached batch
+    # partition): which of the batch's groups run the exact operator this
+    # cycle.  Empty exact_group_idx = pure-SMC cycle (zero-overhead path).
+    exact_group_idx: Optional[torch.Tensor] = None   # (Ge,) int64, CPU
+    exact_rows: Optional[torch.Tensor] = None        # (Ge*N,) int64, device
+    smc_rows: Optional[torch.Tensor] = None          # (Gs*N,) int64, device
+    # Outputs (populated by the worker's exact verify branch, consumed by
+    # the scheduler's exact commit path), sized to the exact subset Ge.
+    exact_accept_len: Optional[torch.Tensor] = None  # (Ge,) int64 in [0, gamma]
+    exact_tokens: Optional[torch.Tensor] = None      # (Ge, gamma+1) int64
+    exact_winner: Optional[torch.Tensor] = None      # (Ge,) int64 chain idx
 
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1

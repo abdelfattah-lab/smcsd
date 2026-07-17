@@ -52,6 +52,17 @@ class SequenceGroup:
     n_particles: int
     particle_temperature: float
     particle_reqs: Dict[int, Req] = field(default_factory=dict)
+    # ── Unified exact/SMC mode state (engine mode "mixed") ──
+    # mode: this group's current verification mode.  mode_plan: remaining
+    # [token_threshold, mode] entries (sorted ascending), applied when
+    # tokens_generated crosses the threshold.  The counters feed the
+    # per-request mode stats reported at finalize.
+    mode: str = "smc"
+    mode_plan: List = field(default_factory=list)
+    tokens_generated: int = 0
+    smc_cycles: int = 0
+    exact_cycles: int = 0
+    exact_accepted_tokens: int = 0
 
     @property
     def group_id(self) -> str:
@@ -131,11 +142,15 @@ class SMCCoordinator:
         from smcsd.core.kernels.fused_collect import batched_collect_fused
 
         self._fast_step_counter += 1
+        # Exact-mode groups are gated out of ESS/systematic resampling
+        # (their weights are identically zero; the exact commit collapses
+        # them explicitly).  All-False row_exact reduces to row_in_use.
+        gate = slot_state.row_in_use & ~slot_state.row_exact
         return batched_collect_fused(
             slot_state.log_weights,
             slot_state.interval_weights,
             slot_state.group_to_slots,
-            slot_state.row_in_use,
+            gate,
             self.resample_threshold,
             step_counter=self._fast_step_counter,
         )
@@ -274,17 +289,21 @@ class SMCScheduler(Scheduler):
             if _ov_env is not None
             else bool(getattr(server_args, "smc_enable_overlap", True))
         )
-        if self.smc_mode == "exact" and want_overlap:
+        if self.smc_mode in ("exact", "mixed") and want_overlap:
             # Exact-mode commits are variable-length: the host seq-len shadow
             # is rolled back from a synced accept_len each cycle, which the
-            # one-step-late overlap loop would read stale.  Phase-1 exact
-            # runs the sequential loop.
+            # one-step-late overlap loop would read stale.  Exact/mixed run
+            # the sequential loop.
             logger.info(
-                "SMCScheduler: smc_mode='exact' — overlapped scheduling "
-                "disabled (variable-length commits)."
+                "SMCScheduler: smc_mode=%r — overlapped scheduling "
+                "disabled (variable-length commits).",
+                self.smc_mode,
             )
             want_overlap = False
         self._use_overlap_loop = want_overlap
+        # Per-cycle host stash: gid -> accepted draft tokens (exact groups
+        # only), consumed by postprocessing telemetry / mode plans.
+        self._cycle_exact_accept: Dict[str, int] = {}
         if self._use_overlap_loop:
             logger.info("SMCScheduler: overlapped scheduling enabled.")
 
@@ -594,13 +613,64 @@ class SMCScheduler(Scheduler):
         if error_msg is not None:
             self._emit_abort(req, error_msg)
             return
+        mode, mode_plan, mode_err = self._resolve_request_mode(req)
+        if mode_err is not None:
+            self._emit_abort(req, mode_err)
+            return
         group = SequenceGroup(
             parent_req=req,
             n_particles=self.server_args.smc_n_particles,
             particle_temperature=self.server_args.smc_draft_temperature,
+            mode=mode,
+            mode_plan=mode_plan,
         )
         self.waiting_groups.append(group)
         req.time_stats.set_wait_queue_entry_time()
+
+    def _resolve_request_mode(self, req: Req):
+        """Resolve a request's verification mode + mode plan from
+        ``sampling_params.custom_params`` against the engine mode.
+
+        * engine "smc" / "exact": every request runs the engine mode;
+          per-request overrides are rejected (the perf-path decisions —
+          cycle graph, deferred bonus, overlap — are made at init).
+        * engine "mixed": ``custom_params["smc_mode"]`` picks the initial
+          mode (default "smc"); ``custom_params["smc_mode_plan"]`` is an
+          ascending list of ``[token_threshold, mode]`` switch points
+          applied mid-sequence (SMC→exact enters through the posterior
+          collapse; exact→SMC is free).
+
+        Returns ``(mode, mode_plan, error_msg)``.
+        """
+        custom = getattr(req.sampling_params, "custom_params", None) or {}
+        req_mode = custom.get("smc_mode")
+        req_plan = custom.get("smc_mode_plan")
+
+        if self.smc_mode in ("smc", "exact"):
+            if (req_mode is not None and req_mode != self.smc_mode) or req_plan:
+                return None, None, (
+                    f"Per-request smc_mode requires the engine to be "
+                    f"launched with mode='mixed' (engine mode is "
+                    f"'{self.smc_mode}')."
+                )
+            return self.smc_mode, [], None
+
+        mode = req_mode or "smc"
+        if mode not in ("smc", "exact"):
+            return None, None, f"Invalid smc_mode {mode!r} (smc | exact)."
+        plan: List = []
+        if req_plan:
+            try:
+                plan = [(int(t), str(m)) for t, m in req_plan]
+            except (TypeError, ValueError):
+                return None, None, (
+                    "smc_mode_plan must be a list of [token_threshold, mode] "
+                    "pairs."
+                )
+            if any(m not in ("smc", "exact") for _, m in plan):
+                return None, None, "smc_mode_plan modes must be smc | exact."
+            plan.sort(key=lambda e: e[0])
+        return mode, plan, None
 
     def _abort_on_queue_limit(self, req: Req) -> bool:
         if (
@@ -811,6 +881,7 @@ class SMCScheduler(Scheduler):
                 group_id=group.group_id,
                 particle_reqs=particle_reqs,
                 shared_seq_len=shared_seq_len,
+                mode=group.mode,
             )
         except Exception as exc:
             for particle_req in particle_reqs:
@@ -864,8 +935,17 @@ class SMCScheduler(Scheduler):
         cursor, finished mask).  Freed KV pages accumulate in
         ``slot_state.kv_freed_buf`` (freed there, not here).
         """
-        if self.smc_mode == "exact":
-            return self._exact_commit(result)
+        if self.smc_mode != "smc":
+            exact_gpos, exact_rows, smc_rows = (
+                self.slot_state.exact_partition()
+            )
+            if exact_gpos.numel() > 0:
+                if smc_rows.numel() == 0:
+                    return self._exact_commit(result)
+                return self._mixed_commit(
+                    result, exact_gpos, exact_rows, smc_rows
+                )
+            # mixed engine, no exact groups this cycle: plain SMC body.
 
         if result.logprob_diff is None:
             raise RuntimeError("SMCScheduler requires batched logprob_diff.")
@@ -929,8 +1009,15 @@ class SMCScheduler(Scheduler):
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
 
+    def _stash_exact_accept(self, exact_gpos, accept_len_cpu) -> None:
+        """Record this cycle's per-group accepted counts (host) for
+        postprocessing telemetry and mode plans."""
+        ids = self.slot_state._sorted_group_ids
+        for pos, a in zip(exact_gpos.tolist(), accept_len_cpu.tolist()):
+            self._cycle_exact_accept[ids[pos]] = int(a)
+
     def _exact_commit(self, result: GenerationBatchResult):
-        """Exact-mode post-decode step (replaces ``_resample``'s body).
+        """All-exact post-decode step (replaces ``_resample``'s body).
 
         The worker already ran the multi-draft accept operator; this applies
         its outcome: variable-length write-back, one-hot collapse onto the
@@ -954,7 +1041,79 @@ class SMCScheduler(Scheduler):
             next_draft.exact_accept_len, next_draft.exact_winner
         )
         self.coordinator.dispatch_resample_batch(plan, self.slot_state)
-        self.slot_state.rollback_seq_lens_host(next_draft.exact_accept_len)
+        accept_cpu = next_draft.exact_accept_len.cpu()
+        self.slot_state.rollback_seq_lens_host(accept_cpu)
+        n_groups = accept_cpu.numel()
+        self._stash_exact_accept(torch.arange(n_groups), accept_cpu)
+
+        snapshot = self.slot_state.snapshot_to_host()
+        return plan, snapshot
+
+    def _mixed_commit(
+        self,
+        result: GenerationBatchResult,
+        exact_gpos: torch.Tensor,
+        exact_rows: torch.Tensor,
+        smc_rows: torch.Tensor,
+    ):
+        """Mixed-cycle post-decode step: SMC weight/resample machinery on the
+        SMC groups' rows, the exact commit on the exact groups' rows.
+
+        The two partitions touch disjoint slot sets, so the two dispatch
+        launches compose (both append freed pages to the same phase buffer
+        through the atomic cursor).  The fused ESS collect is already gated
+        off exact rows via ``row_exact``.
+        """
+        next_draft = result.next_draft_input
+        if next_draft is None or next_draft.exact_accept_len is None:
+            raise RuntimeError(
+                "SMCScheduler(mixed): result missing exact accept outputs."
+            )
+        stride = self.slot_state.gamma_plus_1
+
+        # ── SMC partition ──
+        ntk_2d = result.next_token_ids.view(-1, stride)
+        self.slot_state.write_back_gpu(
+            next_token_ids=ntk_2d[smc_rows].reshape(-1),
+            logprob_diff=result.logprob_diff[smc_rows],
+            bonus_ids=next_draft.verified_id[smc_rows],
+            prev_last_draft_ids=(
+                next_draft.prev_last_draft_id[smc_rows]
+                if next_draft.prev_last_draft_id is not None
+                else None
+            ),
+            bonus_logz=(
+                next_draft.bonus_logz[smc_rows]
+                if next_draft.bonus_logz is not None
+                else None
+            ),
+            rows=smc_rows,
+        )
+        logZ_inc = self.slot_state.resample_logZ_increment()
+        plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
+        self.slot_state.group_log_Z_hat += torch.where(
+            plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
+        )
+        self.coordinator.dispatch_resample_batch(plan, self.slot_state)
+
+        # ── Exact partition ──
+        self.slot_state.write_back_exact(
+            exact_tokens=next_draft.exact_tokens,
+            exact_accept_len=next_draft.exact_accept_len,
+            verified_next=next_draft.verified_id[exact_rows],
+            rows=exact_rows,
+        )
+        plan2 = self.slot_state.collapse_exact(
+            next_draft.exact_accept_len,
+            next_draft.exact_winner,
+            rows=exact_rows,
+        )
+        self.coordinator.dispatch_resample_batch(plan2, self.slot_state)
+        accept_cpu = next_draft.exact_accept_len.cpu()
+        self.slot_state.rollback_seq_lens_host(
+            accept_cpu, rows_cpu=exact_rows.cpu()
+        )
+        self._stash_exact_accept(exact_gpos, accept_cpu)
 
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
@@ -997,11 +1156,69 @@ class SMCScheduler(Scheduler):
         # resampling changes slot membership — only allocate_slots /
         # free_group_slots do, and both rebuild themselves.
 
+        # Per-group cycle telemetry (before drain, so finalize sees the
+        # final counters), then drain, then mode-plan switches for the
+        # groups that remain.  All gated off on the pure-SMC engine.
+        if self.smc_mode != "smc":
+            self._update_group_cycle_stats()
+
         # Drain finished groups, reading finish state from the pinned
         # snapshot (post-resample lineage of this step).
         self._drain_finished_groups(
             self.slot_state.finished_mask_host[snapshot.phase]
         )
+
+        if self.smc_mode == "mixed":
+            self._apply_mode_plans()
+
+    def _update_group_cycle_stats(self) -> None:
+        """Advance per-group host token/cycle counters for the cycle that
+        just committed.  Exact groups' accepted counts come from the commit
+        path's host stash; SMC groups advance by the fixed gamma+1."""
+        stride = self.slot_state.gamma_plus_1
+        accepted = self._cycle_exact_accept
+        for group in self.running_groups:
+            gid = group.group_id
+            if gid in accepted:
+                a = accepted[gid]
+                group.tokens_generated += a + 1
+                group.exact_cycles += 1
+                group.exact_accepted_tokens += a
+            else:
+                group.tokens_generated += stride
+                group.smc_cycles += 1
+        self._cycle_exact_accept = {}
+
+    def _apply_mode_plans(self) -> None:
+        """Apply due mode-plan switch points (engine mode "mixed").
+
+        Runs in postprocessing, after drain and before the next cycle's
+        prepare, so a switch cleanly changes the *next* cycle's operator.
+        SMC→exact goes through the posterior collapse (finalize-style
+        ancestor pick, forced one-hot resample, weights zeroed); exact→SMC
+        just flips the gates — diversity re-emerges from the next cycle's
+        i.i.d. drafts.
+        """
+        for group in self.running_groups:
+            while group.mode_plan and (
+                group.tokens_generated >= group.mode_plan[0][0]
+            ):
+                _, new_mode = group.mode_plan.pop(0)
+                if new_mode == group.mode:
+                    continue
+                if new_mode == "exact":
+                    plan = self.slot_state.force_collapse_group(
+                        group.group_id
+                    )
+                    self.coordinator.dispatch_resample_batch(
+                        plan, self.slot_state
+                    )
+                self.slot_state.set_group_mode(group.group_id, new_mode)
+                group.mode = new_mode
+                logger.info(
+                    "SMC group %s switched to mode=%s at %d tokens.",
+                    group.group_id, new_mode, group.tokens_generated,
+                )
 
     def _drain_finished_groups(self, finished_mask_host) -> None:
         remaining: List[SequenceGroup] = []
@@ -1024,6 +1241,21 @@ class SMCScheduler(Scheduler):
             return
 
         parent_req = self.slot_state.finalize_group(group.group_id, group.parent_req)
+        # Per-request mode stats (meaningful when the engine allows exact
+        # segments; harmless zeros otherwise).  exact_accept_rate is
+        # accepted-draft-tokens / offered-draft-tokens over exact cycles.
+        gamma = self.slot_state.gamma_plus_1 - 1
+        parent_req.smc_mode_stats = {
+            "final_mode": group.mode,
+            "smc_cycles": group.smc_cycles,
+            "exact_cycles": group.exact_cycles,
+            "exact_accepted_tokens": group.exact_accepted_tokens,
+            "exact_accept_rate": (
+                group.exact_accepted_tokens / (group.exact_cycles * gamma)
+                if group.exact_cycles > 0 and gamma > 0
+                else None
+            ),
+        }
         parent_req.time_stats.set_completion_time()
         # Emit the full particle collection + unbiased log Z_hat on the same
         # scheduler->engine socket, BEFORE the token output.  FIFO delivery
@@ -1043,6 +1275,7 @@ class SMCScheduler(Scheduler):
                     log_Z_hat=parent_req.smc_log_Z_hat,
                     log_w_tilde=parent_req.smc_log_w_tilde,
                     particle_output_ids=parent_req.smc_particle_output_ids,
+                    mode_stats=parent_req.smc_mode_stats,
                 )
             )
         self.stream_output([parent_req], False)

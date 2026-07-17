@@ -272,12 +272,37 @@ next cycle, one-step-late is fine).
     `tests/test_exact_commit_path.py` (CUDA: write-back/collapse/rollback
     through the real dispatch kernel — refcounts, freed-page capture,
     block-table mirroring, finish state).
-- **Phase 2** — per-group mode + mid-sequence switching (SMC→exact via the
-  finalize-style posterior collapse of §4), mixed-mode batches,
-  `fused_mdsd_accept` Triton kernel + cycle-graph capture, hybrid (Mamba)
-  rollback commit (`update_mamba_state_after_mtp_verify` already takes
-  per-row `accepted_steps`), overlap-loop compatibility (accept_len via the
-  pinned snapshot instead of a sync).
+- **Phase 2 (switching + mixed batches) — IMPLEMENTED** (this branch):
+  - `SMCEngine(mode="mixed")`: per-request initial mode via
+    `sampling_params.custom_params["smc_mode"]`, and mid-sequence switch
+    points via `custom_params["smc_mode_plan"] = [[token_threshold, mode],
+    …]` (applied in decode postprocessing, so a switch cleanly changes the
+    next cycle's operator).
+  - Per-group mode state: `ScheduleBatchSMC.group_mode` /
+    `row_exact` (gates the fused ESS collect OFF for exact rows) /
+    `set_group_mode` / cached `exact_partition()` (CPU-built, sync-free).
+  - Mixed-mode batches: the worker computes the SMC tail for all rows and
+    overwrites the exact groups' rows from the accept operator
+    (`_run_exact_accept` on the row subset); the scheduler's
+    `_mixed_commit` runs `write_back_gpu(rows=smc_rows)` + ESS resample on
+    the SMC partition and the exact commit (subset write-back, collapse,
+    rollback) on the exact partition — two dispatches over disjoint slot
+    sets.
+  - SMC→exact switching: `force_collapse_group` — finalize-style posterior
+    ancestor sample, one-hot plan through the existing dispatch kernel,
+    weights zeroed.  exact→SMC is a gate flip (diversity re-emerges from
+    the next cycle's i.i.d. drafts).
+  - Telemetry: per-request `smc_mode_stats` (smc/exact cycle counts,
+    exact accepted tokens, accept rate) on the result dict — the raw
+    signal for a future "auto" policy.
+  - Tests: mixed-partition isolation + ESS gating + forced-collapse CUDA
+    tests; mixed e2e smoke (one engine: SMC request, exact request, and a
+    plan-switching request in one batch).
+- **Phase 2 remainder (perf/coverage)** — `fused_mdsd_accept` Triton kernel
+  + cycle-graph capture for exact/mixed cycles, hybrid (Mamba) rollback
+  commit (`update_mamba_state_after_mtp_verify` already takes per-row
+  `accepted_steps`), overlap-loop compatibility (accept_len via the pinned
+  snapshot instead of a sync).
 - **Phase 3** — `"auto"` policy signals + API for span markers; benchmarks:
   GSM8K accuracy/exactness vs tok/s across mode schedules.
 - **Phase 4** — JetSpec-side: tree-dedup drafting (distinct-candidate MDSD

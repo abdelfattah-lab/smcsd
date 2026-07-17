@@ -277,6 +277,19 @@ class ScheduleBatchSMC:
         self.row_to_group_id: Dict[int, str] = {}
         self._free_rows: List[int] = list(range(self.max_groups))
 
+        # ── Per-group verification mode (unified exact/SMC) ──
+        # row_exact gates the fused ESS/resample collect kernel OFF for
+        # exact-mode groups (their weights are identically zero; the exact
+        # commit path collapses them explicitly).  group_mode is the CPU
+        # authority, keyed by group id; row_exact is its row-aligned device
+        # mirror.  _mode_version invalidates the cached batch partition.
+        self.row_exact = torch.zeros(
+            self.max_groups, dtype=torch.bool, device=device,
+        )
+        self.group_mode: Dict[str, str] = {}
+        self._mode_version: int = 0
+        self._exact_partition_cache = None  # (mem_ver, mode_ver, payload)
+
         # Fused-collect kernel output buffers are allocated per call
         # inside `batched_collect_fused` — they are transient to one
         # kernel launch, not persistent batch state.
@@ -335,6 +348,7 @@ class ScheduleBatchSMC:
         group_id: str,
         particle_reqs: List[Req],
         shared_seq_len: int,
+        mode: str = "smc",
     ) -> List[int]:
         """Claim N slots + one group row for a freshly materialised group.
 
@@ -466,9 +480,112 @@ class ScheduleBatchSMC:
         row_idx = self._to_device_async([row], torch.int64)
         self.row_in_use.index_fill_(0, row_idx, 1)
         self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
+        self.group_mode[group_id] = mode
+        self.row_exact.index_fill_(0, row_idx, 1 if mode == "exact" else 0)
+        self._mode_version += 1
 
         self.rebuild_active_slots()
         return slots
+
+    def set_group_mode(self, group_id: str, mode: str) -> None:
+        """Flip a live group's verification mode ("smc" | "exact").
+
+        Only updates the gates; the *semantic* part of an SMC→exact switch
+        (posterior collapse + weight zeroing) is ``force_collapse_group`` —
+        callers do that first.  exact→SMC needs nothing else (particles are
+        identical, weights already zero; diversity re-emerges from the next
+        cycle's i.i.d. drafts).
+        """
+        row = self.group_id_to_row[group_id]
+        self.group_mode[group_id] = mode
+        row_idx = self._to_device_async([row], torch.int64)
+        self.row_exact.index_fill_(0, row_idx, 1 if mode == "exact" else 0)
+        self._mode_version += 1
+
+    def exact_partition(self):
+        """Batch partition by mode, cached until membership or a mode flips.
+
+        Returns ``(exact_gpos, exact_rows, smc_rows)``:
+
+        * ``exact_gpos`` — CPU int64 tensor of exact groups' positions in the
+          batch's group order (``_sorted_group_ids``);
+        * ``exact_rows`` / ``smc_rows`` — device int64 tensors of the
+          corresponding contiguous batch-row indices (N rows per group).
+
+        Built purely from CPU state (the mode dict + sorted group ids), so
+        attaching it to the cycle is sync-free.
+        """
+        key = (self._membership_version, self._mode_version)
+        if (
+            self._exact_partition_cache is not None
+            and self._exact_partition_cache[0] == key
+        ):
+            return self._exact_partition_cache[1]
+
+        n = self.n_particles
+        exact_pos = [
+            g
+            for g, gid in enumerate(self._sorted_group_ids)
+            if self.group_mode.get(gid) == "exact"
+        ]
+        smc_pos = [
+            g
+            for g, gid in enumerate(self._sorted_group_ids)
+            if self.group_mode.get(gid) != "exact"
+        ]
+        exact_gpos = torch.tensor(exact_pos, dtype=torch.int64)
+        exact_rows = torch.tensor(
+            [g * n + i for g in exact_pos for i in range(n)],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        smc_rows = torch.tensor(
+            [g * n + i for g in smc_pos for i in range(n)],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        payload = (exact_gpos, exact_rows, smc_rows)
+        self._exact_partition_cache = (key, payload)
+        return payload
+
+    def force_collapse_group(self, group_id: str):
+        """SMC→exact mode entry: collapse the group onto one posterior-sampled
+        ancestor and zero its weights.
+
+        The ancestor is drawn from ``P(slot) ∝ exp(log_weights[slot])`` —
+        exactly finalize's selection, run mid-flight.  Returns a one-hot
+        plan in ``BatchedResampleResult`` format for the caller to dispatch;
+        no length rollback is involved (particles are step-aligned).  One
+        host sync (the multinomial pick) — mode switches happen at cycle
+        boundaries on the sequential loop.
+        """
+        from smcsd.core.kernels.fused_collect import BatchedResampleResult
+
+        slots = self.group_slot_lists[group_id]
+        t = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        probs = torch.softmax(self.log_weights[t], dim=0)
+        pick = int(torch.multinomial(probs, num_samples=1).item())
+
+        src_slot = slots[pick]
+        dst = [s for s in slots if s != src_slot]
+        dst_t = torch.tensor(dst, dtype=torch.int32, device=self.device)
+        src_t = torch.full_like(dst_t, src_slot)
+
+        self.log_weights.index_fill_(0, t, 0.0)
+        self.interval_weights.index_fill_(0, t, 0.0)
+
+        return BatchedResampleResult(
+            dst_flat=dst_t,
+            src_flat=src_t,
+            rows_flat=torch.zeros_like(dst_t),
+            counter=torch.tensor(
+                [dst_t.numel()], dtype=torch.int32, device=self.device
+            ),
+            resample_mask=torch.zeros(
+                self.max_groups, dtype=torch.bool, device=self.device
+            ),
+            _n_jobs=int(dst_t.numel()),
+        )
 
     def free_group_slots(self, group_id: str) -> None:
         """Release every slot and the group row for a finalised group.
@@ -488,6 +605,9 @@ class ScheduleBatchSMC:
             row_idx = self._to_device_async([row], torch.int64)
             self.row_in_use.index_fill_(0, row_idx, 0)
             self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
+            self.row_exact.index_fill_(0, row_idx, 0)
+            self.group_mode.pop(group_id, None)
+            self._mode_version += 1
             self._free_rows.append(row)
 
         for slot in slots:
@@ -644,11 +764,15 @@ class ScheduleBatchSMC:
             gamma=self.gamma_plus_1 - 1,
             cache_locs=pages.view(bs, self.gamma_plus_1),
         )
+        exact_gpos, exact_rows, smc_rows = self.exact_partition()
         return SMCDraftInput(
             verified_id=verified_g,
             prev_last_draft_id=prev_last_draft_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
+            exact_group_idx=exact_gpos,
+            exact_rows=exact_rows,
+            smc_rows=smc_rows,
         )
 
     def prepare_for_extend(self):
@@ -764,6 +888,7 @@ class ScheduleBatchSMC:
         *,
         prev_last_draft_ids: Optional[torch.Tensor] = None,
         bonus_logz: Optional[torch.Tensor] = None,
+        rows: Optional[torch.Tensor] = None,
     ) -> None:
         """Write forward-pass results back to slot-indexed tensors.
 
@@ -787,12 +912,20 @@ class ScheduleBatchSMC:
         On CUDA this is ONE fused triton launch (one program per row); the
         torch implementation below remains as the reference / CPU fallback
         (kill-switch: SMC_FUSED_WRITE_BACK=0).
+
+        ``rows`` (mixed-mode batches): device int64 batch-row subset to
+        write back — the SMC-mode rows of a batch that also carries
+        exact-mode groups.  The per-row inputs must be PRE-SLICED to the
+        same subset by the caller.  Default (None) covers all active rows.
         """
+        wb_active = (
+            self.active_slots if rows is None else self.active_slots[rows]
+        )
         if self._use_fused_write_back:
             from smcsd.core.kernels.fused_write_back import fused_write_back
 
             fused_write_back(
-                self.active_slots,
+                wb_active,
                 next_token_ids,
                 logprob_diff,
                 bonus_ids,
@@ -815,8 +948,8 @@ class ScheduleBatchSMC:
             )
             return
 
-        active = self.active_slots
-        bs = self.num_active
+        active = wb_active
+        bs = active.numel()
         stride = self.gamma_plus_1
 
         # a. Scatter accepted tokens into (bs, stride) columns starting at
@@ -954,7 +1087,8 @@ class ScheduleBatchSMC:
         self,
         exact_tokens: torch.Tensor,      # (G, gamma+1) int64 committed block
         exact_accept_len: torch.Tensor,  # (G,) int64 in [0, gamma]
-        verified_next: torch.Tensor,     # (bs,) next-cycle seed per particle
+        verified_next: torch.Tensor,     # (G*N,) next-cycle seed per particle
+        rows: Optional[torch.Tensor] = None,
     ) -> None:
         """Exact-mode write-back: commit ``accept_len+1`` tokens per group.
 
@@ -963,9 +1097,15 @@ class ScheduleBatchSMC:
         group's N contiguous batch rows.  Mirrors ``write_back_gpu``'s torch
         path with the token scatter and EOS scan masked to the committed
         columns; weights are untouched (identically zero in exact mode).
+
+        ``rows`` (mixed-mode batches): the exact groups' contiguous
+        batch-row indices; the per-group inputs are sized to that subset.
+        Default covers the whole batch (pure exact mode).
         """
-        active = self.active_slots
-        bs = self.num_active
+        active = (
+            self.active_slots if rows is None else self.active_slots[rows]
+        )
+        bs = active.numel()
         n = self.n_particles
         stride = self.gamma_plus_1
         device = self.device
@@ -1032,7 +1172,7 @@ class ScheduleBatchSMC:
         # posterior sample degenerates to a uniform pick among identical
         # particles.
 
-    def collapse_exact(self, exact_accept_len, exact_winner):
+    def collapse_exact(self, exact_accept_len, exact_winner, rows=None):
         """Collapse each group onto its winner chain and roll back lengths.
 
         Emits a ``BatchedResampleResult``-format plan (dst = the group's
@@ -1054,8 +1194,10 @@ class ScheduleBatchSMC:
         """
         from smcsd.core.kernels.fused_collect import BatchedResampleResult
 
-        active = self.active_slots
-        bs = self.num_active
+        active = (
+            self.active_slots if rows is None else self.active_slots[rows]
+        )
+        bs = active.numel()
         n = self.n_particles
         stride = self.gamma_plus_1
         device = self.device
@@ -1112,17 +1254,27 @@ class ScheduleBatchSMC:
             _n_jobs=int(dst.numel()),
         )
 
-    def rollback_seq_lens_host(self, exact_accept_len: torch.Tensor) -> None:
+    def rollback_seq_lens_host(
+        self,
+        exact_accept_len_cpu: torch.Tensor,
+        rows_cpu: Optional[torch.Tensor] = None,
+    ) -> None:
         """Mirror the exact-mode rollback into the CPU seq-len shadow.
 
-        One device->host sync per cycle (``.cpu()`` on a (G,) tensor) — the
-        exact path runs the sequential loop, where this is the accepted
-        boundary read (like finalize's).
+        ``exact_accept_len_cpu`` must already be on the host (the exact
+        commit syncs it once per cycle and shares it with telemetry / mode
+        plans).  ``rows_cpu`` restricts to the exact groups' batch rows in
+        mixed batches.
         """
         delta = (
-            self.gamma_plus_1 - 1 - exact_accept_len.cpu()
+            self.gamma_plus_1 - 1 - exact_accept_len_cpu
         ).repeat_interleave(self.n_particles)
-        self.seq_lens_host[self.active_slots_cpu] -= delta
+        idx = (
+            self.active_slots_cpu
+            if rows_cpu is None
+            else self.active_slots_cpu[rows_cpu]
+        )
+        self.seq_lens_host[idx] -= delta
 
     # ────────────────────────────────────────────────────────
     #  Host snapshot (postprocessing inputs, no stream-tail block)
