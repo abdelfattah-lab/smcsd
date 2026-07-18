@@ -108,7 +108,11 @@ def run_smc_engine_eval(args, prompts, labels):
         draft_model_path=draft_model,
         n_particles=args.particles,
         gamma=args.gamma,
-        draft_temperature=args.temperature,
+        draft_temperature=(
+            args.draft_temperature
+            if args.draft_temperature is not None
+            else args.temperature
+        ),
         target_temperature=args.temperature,
         trust_remote_code=True,
         page_size=1,
@@ -120,6 +124,10 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["mode_cycles"] = [
             (m, int(n))
             for m, n in (e.split(":") for e in args.mode_cycles.split(","))
+        ]
+    if args.tree_fanout:
+        engine_kwargs["tree_fanout"] = [
+            int(f) for f in args.tree_fanout.split(",")
         ]
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
@@ -345,6 +353,10 @@ if __name__ == "__main__":
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
     )
     smc_grp.add_argument(
+        "--draft-temperature", type=float, default=None,
+        help="override draft temperature (default: --temperature)",
+    )
+    smc_grp.add_argument(
         "--smc-mode", type=str, default="smc",
         choices=["smc", "exact", "mixed"],
         help="verification mode (docs/smc/unified-exact-smc.md)",
@@ -352,6 +364,10 @@ if __name__ == "__main__":
     smc_grp.add_argument(
         "--mode-cycles", type=str, default=None,
         help="cyclic schedule, e.g. 'exact:4,smc:2' (implies --smc-mode mixed)",
+    )
+    smc_grp.add_argument(
+        "--tree-fanout", type=str, default=None,
+        help="exact-cycle tree drafting, e.g. '2,2' (product divides N)",
     )
     # Benchmark
     bench = parser.add_argument_group("benchmark")

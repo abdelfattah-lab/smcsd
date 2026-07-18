@@ -79,6 +79,11 @@ class SMCEngine:
         # = every request runs 4 exact cycles then 2 SMC cycles, repeating.
         # Implies mode="mixed"; per-request smc_mode_cycles overrides it.
         mode_cycles: Optional[list] = None,
+        # Tree drafting for exact cycles: distinct-candidate branching at
+        # shallow depths, e.g. [2, 2] = 2 distinct first tokens x 2 distinct
+        # second tokens (product must divide n_particles).  Lossless — the
+        # accept kernel applies the without-replacement correction.
+        tree_fanout: Optional[list] = None,
         # SMC hyper-parameters
         n_particles: int = 4,
         gamma: int = 4,
@@ -196,6 +201,14 @@ class SMCEngine:
         server_args.smc_power_alpha = float(power_alpha)
         server_args.smc_mode = mode
         server_args.smc_mode_cycles = mode_cycles or None
+        if tree_fanout and mode == "smc":
+            raise ValueError(
+                "tree_fanout applies to exact cycles; use mode='exact' or "
+                "'mixed'."
+            )
+        server_args.smc_tree_fanout = (
+            [int(f) for f in tree_fanout] if tree_fanout else None
+        )
         server_args.smc_defer_bonus = bool(defer_bonus)
         server_args.smc_cycle_graph = bool(cycle_graph)
         server_args.smc_enable_overlap = bool(enable_overlap)

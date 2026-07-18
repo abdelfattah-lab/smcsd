@@ -369,6 +369,9 @@ class SMCDraftPhaseGraphRunner:
         logprobs_out = self.logprobs_out[:bs]
         if self.use_fused_sampling:
             self.sample_seed.add_(1)  # captured: fresh noise every replay
+        tree_fans = (
+            self._tree_fans if getattr(self, "_tree_on", False) else ()
+        )
         for s in range(self.num_steps):
             fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
@@ -380,15 +383,49 @@ class SMCDraftPhaseGraphRunner:
             # `forward` is the (patched) model.forward — returns a
             # LogitsProcessorOutput directly.
             logits = forward(input_ids, positions, fb).next_token_logits
-            idx, logp = self._sample_step_in_graph(
-                logits, s, need_logp=s < self.gamma
-            )
+            if s < len(tree_fans) and tree_fans[s] > 1:
+                # Exact-variant tree drafting: q capture + coordinated
+                # distinct sampling per parent block (graph-safe RNG).
+                if self._q_capture_on:
+                    self.q_probs_buf[:bs, s].copy_(
+                        torch.softmax(logits / self.temperature, dim=-1)
+                    )
+                idx = self._tree_step_in_graph(logits, tree_fans, s)
+                logp = None
+            else:
+                idx, logp = self._sample_step_in_graph(
+                    logits, s, need_logp=s < self.gamma
+                )
             tokens_out[:, s + 1] = idx
-            if s < self.gamma:
+            if s < self.gamma and logp is not None:
                 logprobs_out[:, s] = logp
             input_ids.copy_(idx)
             positions.add_(1)
         return tokens_out, logprobs_out
+
+    def _tree_step_in_graph(self, logits, fans, step: int):
+        """Coordinated distinct sampling at a tree branch depth (see
+        SMCWorker._tree_step_sample; same math, graph-safe torch RNG)."""
+        n = self.smc_worker.smc_n_particles
+        cp = 1
+        for s_ in range(step):
+            cp *= fans[s_] if s_ < len(fans) else 1
+        parent = n // cp
+        child = parent // fans[step]
+        scaled = logits / self.temperature
+        leaders = scaled[::parent]
+        tiny = torch.finfo(scaled.dtype).tiny
+        gumbel = -torch.log(
+            -torch.log(torch.rand_like(leaders).clamp_min_(tiny))
+        )
+        top = (leaders + gumbel).topk(fans[step], dim=-1).indices
+        # Padded graph buckets need not be a multiple of the block size;
+        # the trailing partial parent block reuses its leader's draws.
+        return (
+            top.unsqueeze(-1)
+            .expand(-1, fans[step], child)
+            .reshape(-1)[: logits.shape[0]]
+        )
 
     def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
         graph = self._create_graph()
@@ -632,6 +669,8 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
                 )
             self.exact_graphs = {}
             self._q_capture_on = False
+            self._tree_on = False
+            self._tree_fans = tuple(worker.smc_tree_fanout or ())
 
     def _setup_verify_capture(self, bs: int):
         n_tokens = bs * self.num_steps
@@ -876,6 +915,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self.d_i32_buf, self.q_probs_buf, self.p_probs_buf,
             self.accept_beta_buf, self.acc_len_buf, self.acc_tok_buf,
             self.acc_win_buf, self.accept_seed,
+            fanout=self._tree_fans or None,
         )
 
         # Per-particle broadcasts: last committed token seeds every particle
@@ -937,12 +977,14 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
                 set_is_extend_in_batch(False)
                 self._metadata_in_graph(bs)
                 self._q_capture_on = True
+                self._tree_on = True
                 try:
                     self._draft_steps_in_graph(
                         bs, forward, fb, input_ids, positions, ocl_steps
                     )
                 finally:
                     self._q_capture_on = False
+                    self._tree_on = False
                 return self._exact_tail_in_graph(
                     bs, verify_fb, verify_input_ids, verify_positions
                 )

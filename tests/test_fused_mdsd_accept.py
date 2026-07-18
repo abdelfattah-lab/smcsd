@@ -133,5 +133,115 @@ class TestFusedStatisticalExactness(unittest.TestCase):
         self._run(n_chains=8, seed=23)
 
 
+def draft_tree_group(model, n_chains, gamma, fanout, generator):
+    """Draft a coordinated tree: at branch depth t, each parent block draws
+    fanout[t] DISTINCT tokens (sequential residual draws — the order the
+    kernel's without-replacement correction assumes) and each child block
+    adopts one; other depths draft i.i.d. per row."""
+    V = model.vocab
+    tokens = torch.zeros(n_chains, gamma, dtype=torch.int64)
+    q_probs = torch.zeros(n_chains, gamma, V)
+    p_probs = torch.zeros(n_chains, gamma + 1, V)
+    ctxs = [[] for _ in range(n_chains)]
+    cp = 1
+    for t in range(gamma):
+        f = fanout[t] if t < len(fanout) else 1
+        for i in range(n_chains):
+            q_probs[i, t] = model.q(ctxs[i])
+            p_probs[i, t] = model.p(ctxs[i])
+        if f > 1:
+            parent = n_chains // cp
+            child = parent // f
+            for p0 in range(0, n_chains, parent):
+                avail = model.q(ctxs[p0]).clone()
+                for j in range(f):
+                    tok = int(
+                        torch.multinomial(
+                            avail / avail.sum(), 1, generator=generator
+                        )
+                    )
+                    for r in range(p0 + j * child, p0 + (j + 1) * child):
+                        tokens[r, t] = tok
+                    avail[tok] = 0.0
+            cp *= f
+        else:
+            for i in range(n_chains):
+                tokens[i, t] = int(
+                    torch.multinomial(
+                        q_probs[i, t], 1, generator=generator
+                    )
+                )
+        for i in range(n_chains):
+            ctxs[i].append(int(tokens[i, t]))
+    for i in range(n_chains):
+        p_probs[i, gamma] = model.p(ctxs[i])
+    return tokens, q_probs, p_probs
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA (Triton kernel)")
+class TestTreeStatisticalExactness(unittest.TestCase):
+    """Tree drafting (distinct-candidate branch depths) stays lossless."""
+
+    TRIALS = 20000
+    VOCAB = 5
+    GAMMA = 3
+    TV_TOL = 0.04
+
+    def _run(self, n_chains, fanout, seed):
+        model = SyntheticModel(self.VOCAB, seed=seed)
+        gen = torch.Generator().manual_seed(seed + 1)
+        pos0 = torch.zeros(self.VOCAB)
+        pos1 = torch.zeros(self.VOCAB, self.VOCAB)
+        B = 200
+        for _ in range(self.TRIALS // B):
+            toks, qs, ps = [], [], []
+            for _ in range(B):
+                t_, q_, p_ = draft_tree_group(
+                    model, n_chains, self.GAMMA, fanout, gen
+                )
+                toks.append(t_); qs.append(q_); ps.append(p_)
+            res = fused_mdsd_accept(
+                torch.stack(toks).cuda(),
+                torch.stack(qs).cuda(),
+                torch.stack(ps).cuda(),
+                fanout=fanout,
+            )
+            al = res.accept_len.cpu()
+            tk = res.tokens.cpu()
+            for g in range(B):
+                c0 = int(tk[g, 0])
+                pos0[c0] += 1
+                if int(al[g]) >= 1:
+                    pos1[c0, int(tk[g, 1])] += 1
+
+        emp0 = pos0 / pos0.sum()
+        tv0 = 0.5 * (emp0 - model.p([])).abs().sum()
+        self.assertLess(
+            float(tv0), self.TV_TOL,
+            f"pos-0 marginal off: TV={float(tv0):.4f} "
+            f"(N={n_chains}, fanout={fanout})",
+        )
+        for c in range(self.VOCAB):
+            n_c = pos1[c].sum()
+            if n_c < 1500:
+                continue
+            emp1 = pos1[c] / n_c
+            tv1 = 0.5 * (emp1 - model.p([c])).abs().sum()
+            self.assertLess(
+                float(tv1), 2.5 * self.TV_TOL,
+                f"pos-1 conditional off at c={c}: TV={float(tv1):.4f} "
+                f"(N={n_chains}, fanout={fanout}, n={int(n_c)})",
+            )
+
+    def test_tree_fan2(self):
+        self._run(n_chains=4, fanout=[2], seed=31)
+
+    def test_tree_fan22(self):
+        self._run(n_chains=8, fanout=[2, 2], seed=32)
+
+    def test_tree_fan4(self):
+        self._run(n_chains=8, fanout=[4], seed=33)
+
+
 if __name__ == "__main__":
     unittest.main()

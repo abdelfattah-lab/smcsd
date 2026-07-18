@@ -428,6 +428,19 @@ next cycle, one-step-late is fine).
   423 → 449 tok/s at 75/100 (n=100; eager n=200 reference 81% — within
   binomial noise).
 
+- **Tree drafting (phase-4 tree-dedup) — IMPLEMENTED, off by default**:
+  `SMCEngine(tree_fanout=[2, 2])` — distinct-candidate branching at shallow
+  depths for exact cycles (coordinated Gumbel top-f sampling per parent
+  block; the accept kernel applies the without-replacement correction
+  `q/(1-R)` at branch depths).  Statistically verified lossless (harness
+  drafts coordinated trees; fanouts [2], [2,2], [4]).  Measured on
+  Llama-8B/1B GSM8K: **no throughput gain** over i.i.d. chains (438 vs
+  ~450 tok/s; accuracy 80-81%, lossless preserved) — at these accept
+  rates the i.i.d. duplicates' depth redundancy on the likely branch
+  matches distinct shallow coverage.  Kept as a lossless config knob for
+  peakier draft distributions; the real acceptance lever remains a
+  trained draft head (JetSpec phase 4 proper).
+
 - **Phase 2 remainder (perf/coverage)** — hybrid (Mamba) rollback commit
   (`update_mamba_state_after_mtp_verify` already takes per-row
   `accepted_steps`), overlap-loop compatibility (accept_len via the

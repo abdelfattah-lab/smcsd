@@ -56,6 +56,15 @@ def _mdsd_accept_kernel(
     N: tl.constexpr,
     GAMMA: tl.constexpr,
     BLOCK: tl.constexpr,
+    # Tree fan-out per shallow depth (1 = no branch).  At a branch depth
+    # the chains were drafted with COORDINATED DISTINCT tokens per child
+    # block (sampling without replacement, block-leader order), so the
+    # candidates are the viable child leaders and their proposal densities
+    # carry the without-replacement correction q/(1-R).
+    FAN0: tl.constexpr = 1,
+    FAN1: tl.constexpr = 1,
+    FAN2: tl.constexpr = 1,
+    FAN3: tl.constexpr = 1,
 ):
     g = tl.program_id(0)
     seed = tl.load(seed_ptr)
@@ -69,8 +78,24 @@ def _mdsd_accept_kernel(
     stopped = 0
     accept_len = GAMMA
     winner = 0
+    cp = 1  # cumulative fan product (rows per subtree = N // cp)
 
     for t in range(GAMMA):
+        fan_t = 1
+        if t == 0:
+            fan_t = FAN0
+        elif t == 1:
+            fan_t = FAN1
+        elif t == 2:
+            fan_t = FAN2
+        elif t == 3:
+            fan_t = FAN3
+        # Child-block size: candidates at a branch depth are the viable
+        # child leaders (row % blk == 0); at i.i.d. depths every viable
+        # row is a candidate (blk = 1).
+        blk = 1
+        if fan_t > 1:
+            blk = N // (cp * fan_t)
         if stopped == 0:
             # rep = first viable chain (lowest set bit index).
             rep = 0
@@ -89,8 +114,12 @@ def _mdsd_accept_kernel(
 
             accepted = 0
             tok = 0
+            r_mass = 0.0  # earlier-sibling proposal mass (branch depths)
             for i in range(N):
-                do_i = ((viable >> i) & 1) & (accepted == 0)
+                is_cand = (viable >> i) & 1
+                if blk > 1:
+                    is_cand = is_cand & ((i % blk) == 0)
+                do_i = is_cand & (accepted == 0)
                 if do_i != 0:
                     c = tl.load(d_g + i * GAMMA + t)
                     q_row = q_g + i.to(tl.int64) * GAMMA * V + t * V
@@ -100,14 +129,23 @@ def _mdsd_accept_kernel(
                     else:
                         beta_c = tl.load(beta_g + c)
                     u = tl.rand(seed, (g * GAMMA + t) * (N + 1) + i)
-                    ratio = (beta_c / s_mass) / tl.maximum(q_c, 1e-30)
+                    # Without-replacement correction: candidate i was drawn
+                    # from q / (1 - R_i) restricted off earlier siblings
+                    # (R_i = their q-mass, in draft order = scan order).
+                    # R stays 0 at i.i.d. depths.
+                    inv = tl.maximum(1.0 - r_mass, 1e-30)
+                    ratio = (beta_c * inv) / (
+                        s_mass * tl.maximum(q_c, 1e-30)
+                    )
                     if u <= tl.minimum(ratio, 1.0):
                         accepted = 1
                         tok = c
                     else:
-                        # Residual update: beta <- max(beta - S*q, 0) over V
-                        # (dividing by S is deferred into the ratio; keeping
-                        # beta at the original scale means subtracting S*q).
+                        # Residual update: beta <- max(beta - S*q_i, 0)
+                        # with q_i = q/(1-R_i) off earlier siblings (their
+                        # beta is already 0, so the clamp absorbs the
+                        # unrestricted subtraction there).
+                        scale = s_mass / inv
                         new_s = 0.0
                         for vb in range(0, tl.cdiv(V, BLOCK)):
                             offs = vb * BLOCK + tl.arange(0, BLOCK)
@@ -117,11 +155,13 @@ def _mdsd_accept_kernel(
                             else:
                                 b = tl.load(beta_g + offs, mask=m, other=0.0)
                             qv = tl.load(q_row + offs, mask=m, other=0.0)
-                            b = tl.maximum(b - s_mass * qv, 0.0)
+                            b = tl.maximum(b - scale * qv, 0.0)
                             tl.store(beta_g + offs, b, mask=m)
                             new_s += tl.sum(b, axis=0)
                         beta_valid = 1
                         s_mass = tl.maximum(new_s, 1e-30)
+                        if fan_t > 1:
+                            r_mass = r_mass + q_c
 
             if accepted != 0:
                 # Shrink viability to chains matching the committed token.
@@ -158,6 +198,7 @@ def _mdsd_accept_kernel(
                 accept_len = t
                 winner = rep
                 stopped = 1
+        cp = cp * fan_t
 
     if stopped == 0:
         # Full acceptance: bonus ~ p[rep, GAMMA, :] (normalized, S=1).
@@ -203,15 +244,36 @@ def fused_mdsd_accept_into(
     out_tok: torch.Tensor,    # (>=G, gamma+1) int32
     out_win: torch.Tensor,    # (>=G,) int32
     seed_buf: torch.Tensor,   # (1,) int32 device seed (caller bumps it)
+    fanout=None,              # tree fan-out per shallow depth, e.g. (2, 2)
 ) -> None:
     """Launch into caller-owned buffers — no allocations, no dtype
     conversion, seed from device memory: CUDA-graph-capturable."""
     assert n_particles <= 32, "viability bitmask supports N <= 32"
+    fans = _norm_fanout(fanout, n_particles, gamma)
     _mdsd_accept_kernel[(n_groups,)](
         d_i32, q_f32, p_f32, beta, out_len, out_tok, out_win,
         seed_buf, vocab,
         N=n_particles, GAMMA=gamma, BLOCK=1024,
+        FAN0=fans[0], FAN1=fans[1], FAN2=fans[2], FAN3=fans[3],
     )
+
+
+def _norm_fanout(fanout, n_particles: int, gamma: int):
+    """Validate + pad a tree fan-out schedule to the kernel's 4 slots."""
+    if not fanout:
+        return (1, 1, 1, 1)
+    fans = [int(f) for f in fanout]
+    assert 0 < len(fans) <= min(4, gamma), (
+        f"tree fan-out supports 1..min(4, gamma) depths, got {fans}"
+    )
+    prod = 1
+    for f in fans:
+        assert f >= 1, f"fan-out entries must be >= 1, got {fans}"
+        prod *= f
+    assert n_particles % prod == 0, (
+        f"fan-out product {prod} must divide n_particles {n_particles}"
+    )
+    return tuple(fans + [1] * (4 - len(fans)))
 
 
 _seed_bufs = {}
@@ -232,6 +294,8 @@ def fused_mdsd_accept(
     draft_tokens: torch.Tensor,   # (G, N, gamma) int
     draft_probs: torch.Tensor,    # (G, N, gamma, V) float
     target_probs: torch.Tensor,   # (G, N, gamma+1, V) float
+    *,
+    fanout=None,
 ) -> ExactAcceptResult:
     """One-launch exact accept over G groups (see module docstring).
 
@@ -253,7 +317,8 @@ def fused_mdsd_accept(
     seed_buf.add_(1)  # device-side: no H2D on the hot path
 
     fused_mdsd_accept_into(
-        G, N, gamma, V, d, q, p, beta, out_len, out_tok, out_win, seed_buf
+        G, N, gamma, V, d, q, p, beta, out_len, out_tok, out_win, seed_buf,
+        fanout=fanout,
     )
     return ExactAcceptResult(
         accept_len=out_len.to(torch.int64),

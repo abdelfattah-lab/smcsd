@@ -108,6 +108,29 @@ class SMCWorker(BaseSpecWorker):
             torch.device(self.device).type == "cuda"
             and bool(int(os.environ.get("SMC_FUSED_ACCEPT", "1")))
         )
+        # Tree drafting (exact cycles only): distinct-candidate branching
+        # at shallow depths, e.g. (2, 2).  Validated against N/gamma here;
+        # the accept kernel applies the without-replacement correction.
+        _fanout = getattr(server_args, "smc_tree_fanout", None)
+        self.smc_tree_fanout = (
+            tuple(int(f) for f in _fanout) if _fanout else ()
+        )
+        if self.smc_tree_fanout:
+            from smcsd.core.kernels.fused_mdsd_accept import _norm_fanout
+
+            if not self._use_fused_accept:
+                raise ValueError(
+                    "tree_fanout requires the fused accept kernel "
+                    "(SMC_FUSED_ACCEPT=1)."
+                )
+            _norm_fanout(
+                self.smc_tree_fanout, self.smc_n_particles, self.gamma
+            )
+            if self.smc_mode == "smc":
+                raise ValueError(
+                    "tree_fanout applies to exact cycles; engine mode must "
+                    "be 'exact' or 'mixed'."
+                )
         # Debug-only: dump draft KV positions / cache-loc mapping for the first
         # few decode calls to confirm the prefill→step-0 position convention
         # before the deferred-bonus rework.  No behavior change when unset.
@@ -1195,6 +1218,14 @@ class SMCWorker(BaseSpecWorker):
                 draft_input.exact_group_idx is not None
                 and draft_input.exact_group_idx.numel() > 0
             )
+            # Tree drafting only when the whole batch is exact (mixed
+            # partial cycles keep i.i.d. chains and the i.i.d. accept).
+            tree_fans = self.smc_tree_fanout if (
+                self.smc_tree_fanout
+                and capture_q
+                and draft_input.smc_rows is not None
+                and draft_input.smc_rows.numel() == 0
+            ) else ()
             current_ids = x0
 
             for step in range(gamma + 1):
@@ -1215,12 +1246,22 @@ class SMCWorker(BaseSpecWorker):
 
                 logits = draft_out.logits_output.next_token_logits
 
-                # Shared Gumbel-max + fused-logprob sampler; the over-draft
-                # step (step == gamma) skips the logprob reduction since its
-                # token never contributes to the importance weight.
-                draft_idx, token_logprob = self._sample_draft_token(
-                    logits, need_logprob=step < gamma
-                )
+                if step < len(tree_fans) and tree_fans[step] > 1:
+                    # Coordinated distinct sampling at a branch depth.
+                    draft_idx = self._tree_step_sample(
+                        logits, tree_fans, step
+                    )
+                    token_logprob = torch.zeros(
+                        bs, dtype=torch.float32, device=self.device
+                    )  # exact cycles never read draft logprobs
+                else:
+                    # Shared Gumbel-max + fused-logprob sampler; the
+                    # over-draft step (step == gamma) skips the logprob
+                    # reduction since its token never contributes to the
+                    # importance weight.
+                    draft_idx, token_logprob = self._sample_draft_token(
+                        logits, need_logprob=step < gamma
+                    )
                 if step < gamma:
                     draft_logprobs.append(token_logprob)
                     if capture_q:
@@ -1353,7 +1394,8 @@ class SMCWorker(BaseSpecWorker):
             rows = draft_input.exact_rows
             n = self.smc_n_particles
             res = self._run_exact_accept(
-                score_logits_3d, target_tokens, draft_q_probs, gamma, rows
+                score_logits_3d, target_tokens, draft_q_probs, gamma, rows,
+                fanout=None,  # mixed-partial cycles draft i.i.d. chains
             )
             last_committed = res.tokens.gather(
                 1, res.accept_len.unsqueeze(1)
@@ -1403,6 +1445,41 @@ class SMCWorker(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def _tree_step_sample(
+        self, logits: torch.Tensor, fans, step: int
+    ) -> torch.Tensor:
+        """Coordinated distinct sampling at a tree branch depth.
+
+        Rows are group-contiguous with global N and every fan product
+        divides N, so parent blocks never straddle groups.  Each parent
+        block shares its context; Gumbel top-f on the block leader
+        draws f DISTINCT tokens in without-replacement order (the order
+        the accept kernel corrects for) and each child block adopts one.
+        """
+        n = self.smc_n_particles
+        cp = 1
+        for s_ in range(step):
+            cp *= fans[s_] if s_ < len(fans) else 1
+        parent = n // cp
+        child = parent // fans[step]
+        scaled = logits / max(self.smc_draft_temperature, 1e-5)
+        leaders = scaled[::parent]
+        gumbel = -torch.log(
+            -torch.log(
+                torch.rand_like(leaders).clamp_min_(
+                    torch.finfo(leaders.dtype).tiny
+                )
+            )
+        )
+        top = (leaders + gumbel).topk(fans[step], dim=-1).indices
+        # Padded graph buckets need not be a multiple of the block size;
+        # the trailing partial parent block reuses its leader's draws.
+        return (
+            top.unsqueeze(-1)
+            .expand(-1, fans[step], child)
+            .reshape(-1)[: logits.shape[0]]
+        )
+
     def _draft_probs(self, logits: torch.Tensor, idx: torch.Tensor):
         """Full proposal distribution the draft token was sampled from.
 
@@ -1423,6 +1500,7 @@ class SMCWorker(BaseSpecWorker):
         draft_q_probs: list,             # gamma x (bs, V)
         gamma: int,
         rows: Optional[torch.Tensor] = None,   # exact groups' batch rows
+        fanout=None,                           # tree schedule the DRAFT used
     ):
         """Run the multi-draft accept operator on (a subset of) the batch.
 
@@ -1464,7 +1542,11 @@ class SMCWorker(BaseSpecWorker):
                 target_tokens.view(G, N, gamma),
                 q_probs.view(G, N, gamma, V),
                 p_probs.view(G, N, gamma + 1, V),
+                fanout=fanout,
             )
+        assert not fanout, (
+            "tree fan-out requires the fused accept kernel"
+        )
         return mdsd_accept_batched(
             target_tokens.view(G, N, gamma),
             q_probs.view(G, N, gamma, V),
@@ -1490,7 +1572,8 @@ class SMCWorker(BaseSpecWorker):
         """
         N = self.smc_n_particles
         res = self._run_exact_accept(
-            score_logits_3d, target_tokens, draft_q_probs, gamma
+            score_logits_3d, target_tokens, draft_q_probs, gamma,
+            fanout=self.smc_tree_fanout or None,
         )
 
         # Last committed token (residual or bonus draw) seeds the next
