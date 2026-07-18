@@ -121,19 +121,19 @@ class SMCEngine:
                 "power_alpha must be 1.0."
             )
         if mode in ("exact", "mixed"):
-            # Exact/mixed keep the cycle graph: the runner captures an
-            # EXACT variant per bucket (draft + verify + fused accept
-            # in-graph) alongside the SMC variant, and the worker replays
-            # whichever matches the cycle.  Deferred bonus and overlap stay
-            # off (variable-length commits).
-            if defer_bonus or enable_overlap:
+            # Exact/mixed keep the cycle graph (the runner captures an
+            # EXACT variant per bucket alongside the SMC variant) and the
+            # overlapped loop (accept lengths ride the pinned snapshot; the
+            # scheduler flushes before any cycle the graph can't cover).
+            # Only the deferred-bonus draft schedule stays off — its S-1
+            # seed semantics assume fixed gamma+1 commits.
+            if defer_bonus:
                 logger.info(
-                    "SMCEngine(mode=%r): disabling deferred bonus and "
-                    "overlapped scheduling (variable-length commits); the "
-                    "cycle graph stays on (SMC + exact variants).",
+                    "SMCEngine(mode=%r): disabling deferred bonus "
+                    "(variable-length commits).",
                     mode,
                 )
-            defer_bonus = enable_overlap = False
+            defer_bonus = False
 
         # -- 1. Build ServerArgs --
         # Each SMC group needs N+1 Req slots (1 parent + N particles co-exist

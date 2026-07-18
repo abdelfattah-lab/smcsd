@@ -321,6 +321,11 @@ class ScheduleBatchSMC:
         self.finished_mask_host = torch.zeros(
             (2, self.max_slots), dtype=torch.bool, pin_memory=is_cuda
         )
+        # Exact-mode accept lengths, one row per snapshot phase (int64 to
+        # match the accept output; see stage_exact_accept).
+        self.exact_accept_host = torch.zeros(
+            (2, self.max_groups), dtype=torch.int64, pin_memory=is_cuda
+        )
         self._snap_events = [
             torch.cuda.Event() if is_cuda else None for _ in range(2)
         ]
@@ -1259,8 +1264,10 @@ class ScheduleBatchSMC:
         else:
             dst = torch.empty(0, dtype=torch.int32, device=device)
             src = torch.empty(0, dtype=torch.int32, device=device)
-        counter = torch.tensor(
-            [dst.numel()], dtype=torch.int32, device=device
+        # torch.full bakes the scalar into the fill launch — torch.tensor
+        # would issue a BLOCKING H2D (a mid-commit stream sync).
+        counter = torch.full(
+            (1,), dst.numel(), dtype=torch.int32, device=device
         )
         return BatchedResampleResult(
             dst_flat=dst,
@@ -1273,27 +1280,37 @@ class ScheduleBatchSMC:
             _n_jobs=int(dst.numel()),
         )
 
+    def stage_exact_accept(self, exact_accept_len: torch.Tensor) -> None:
+        """Async-copy this cycle's per-group accept lengths into the current
+        snapshot phase's pinned buffer (gated by the snapshot event, like
+        the freed-page cursor).  Postprocessing reads them to roll back the
+        host seq-len shadow, update telemetry, and drive mode schedules —
+        replacing the per-cycle blocking ``.cpu()``, which is what unlocks
+        the overlapped loop for exact/mixed."""
+        g = exact_accept_len.numel()
+        self.exact_accept_host[self._snap_phase, :g].copy_(
+            exact_accept_len, non_blocking=True
+        )
+
     def rollback_seq_lens_host(
         self,
         exact_accept_len_cpu: torch.Tensor,
-        rows_cpu: Optional[torch.Tensor] = None,
+        slots_cpu: torch.Tensor,
     ) -> None:
         """Mirror the exact-mode rollback into the CPU seq-len shadow.
 
-        ``exact_accept_len_cpu`` must already be on the host (the exact
-        commit syncs it once per cycle and shares it with telemetry / mode
-        plans).  ``rows_cpu`` restricts to the exact groups' batch rows in
-        mixed batches.
+        ``slots_cpu`` are the ABSOLUTE slot ids captured at commit time
+        (group-contiguous, N per group) — not batch positions, because
+        under the overlapped loop a group can finalize between the commit
+        that staged this cycle's accept lengths and the postprocessing
+        that applies them.  A stale write to a since-freed slot is
+        harmless: ``allocate_slots`` overwrites the shadow on reuse and
+        freed slots are never read.
         """
         delta = (
             self.gamma_plus_1 - 1 - exact_accept_len_cpu
         ).repeat_interleave(self.n_particles)
-        idx = (
-            self.active_slots_cpu
-            if rows_cpu is None
-            else self.active_slots_cpu[rows_cpu]
-        )
-        self.seq_lens_host[idx] -= delta
+        self.seq_lens_host[slots_cpu] -= delta
 
     # ────────────────────────────────────────────────────────
     #  Host snapshot (postprocessing inputs, no stream-tail block)

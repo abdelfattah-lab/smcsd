@@ -294,21 +294,20 @@ class SMCScheduler(Scheduler):
             if _ov_env is not None
             else bool(getattr(server_args, "smc_enable_overlap", True))
         )
-        if self.smc_mode in ("exact", "mixed") and want_overlap:
-            # Exact-mode commits are variable-length: the host seq-len shadow
-            # is rolled back from a synced accept_len each cycle, which the
-            # one-step-late overlap loop would read stale.  Exact/mixed run
-            # the sequential loop.
-            logger.info(
-                "SMCScheduler: smc_mode=%r — overlapped scheduling "
-                "disabled (variable-length commits).",
-                self.smc_mode,
-            )
-            want_overlap = False
         self._use_overlap_loop = want_overlap
         # Per-cycle host stash: gid -> accepted draft tokens (exact groups
         # only), consumed by postprocessing telemetry / mode plans.
         self._cycle_exact_accept: Dict[str, int] = {}
+        # Exact-cycle metadata (group positions + host row subset), keyed by
+        # snapshot phase.  The commit stages the device accept lengths into
+        # the phase's pinned buffer (stage_exact_accept); postprocessing
+        # consumes both and rolls back the host seq-len shadow one step
+        # late — what makes exact/mixed variable-length commits compatible
+        # with the overlapped loop.  The one in-flight cycle sees a shadow
+        # that over-estimates by <= gamma+1, which only the conservative
+        # graph-bound check reads; cycles the graph can't cover flush the
+        # queue first (_cycle_graphable).
+        self._exact_meta = [None, None]
         if self._use_overlap_loop:
             logger.info("SMCScheduler: overlapped scheduling enabled.")
 
@@ -492,6 +491,18 @@ class SMCScheduler(Scheduler):
                 )
                 if self.token_to_kv_pool_allocator.available_size() < need:
                     self._flush_result_queue(result_queue)
+
+            # Exact/mixed: the host seq-len shadow is corrected one step
+            # late, so only graph-path cycles (which read device lengths)
+            # may launch over a stale shadow.  Anything the cycle graph
+            # can't cover settles pending postprocessing first.
+            if (
+                result_queue
+                and self.smc_mode != "smc"
+                and not self.slot_state.is_empty()
+                and not self._cycle_graphable()
+            ):
+                self._flush_result_queue(result_queue)
 
             batch, batch_kind = self._get_next_batch()
             tracking_batch = self._make_runtime_tracking_batch(batch)
@@ -1051,12 +1062,33 @@ class SMCScheduler(Scheduler):
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
 
-    def _stash_exact_accept(self, exact_gpos, accept_len_cpu) -> None:
-        """Record this cycle's per-group accepted counts (host) for
-        postprocessing telemetry and mode plans."""
-        ids = self.slot_state._sorted_group_ids
-        for pos, a in zip(exact_gpos.tolist(), accept_len_cpu.tolist()):
-            self._cycle_exact_accept[ids[pos]] = int(a)
+    def _cycle_graphable(self) -> bool:
+        """Whether the NEXT decode cycle will replay a cycle graph.
+
+        Conservative host-only check (no syncs): bucket/context caps from
+        the (possibly over-estimated) seq-len shadow, plus the batch's mode
+        partition — pure-SMC cycles replay the SMC variant, all-exact
+        cycles the exact variant; partial-mixed cycles are eager-only.
+        """
+        worker = self.draft_worker
+        runner = getattr(worker, "cycle_graph_runner", None)
+        if runner is None:
+            return False
+        bs = self.slot_state.num_active
+        if bs == 0 or bs > runner.max_bs:
+            return False
+        idx = self.slot_state.active_slots_cpu
+        max_len = int(self.slot_state.seq_lens_host[idx].max().item())
+        # + num_steps for this cycle's advance, + num_steps of possible
+        # shadow over-estimate from the one in-flight exact cycle.
+        if max_len + 2 * runner.num_steps > runner.max_context:
+            return False
+        exact_gpos, _, smc_rows, _ = self.slot_state.exact_partition()
+        if exact_gpos.numel() == 0:
+            return True
+        if smc_rows.numel() > 0:
+            return False
+        return bool(getattr(runner, "_exact_variant", False))
 
     def _exact_commit(self, result: GenerationBatchResult):
         """All-exact post-decode step (replaces ``_resample``'s body).
@@ -1083,10 +1115,15 @@ class SMCScheduler(Scheduler):
             next_draft.exact_accept_len, next_draft.exact_winner
         )
         self.coordinator.dispatch_resample_batch(plan, self.slot_state)
-        accept_cpu = next_draft.exact_accept_len.cpu()
-        self.slot_state.rollback_seq_lens_host(accept_cpu)
-        n_groups = accept_cpu.numel()
-        self._stash_exact_accept(torch.arange(n_groups), accept_cpu)
+        # Stage the accept lengths into the snapshot phase (pinned, async);
+        # postprocessing rolls back the host shadow + updates telemetry.
+        n_groups = next_draft.exact_accept_len.numel()
+        self.slot_state.stage_exact_accept(next_draft.exact_accept_len)
+        self._exact_meta[self.slot_state._snap_phase] = (
+            list(self.slot_state._sorted_group_ids),
+            self.slot_state.active_slots_cpu.clone(),
+            n_groups,
+        )
 
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
@@ -1152,11 +1189,14 @@ class SMCScheduler(Scheduler):
             rows=exact_rows,
         )
         self.coordinator.dispatch_resample_batch(plan2, self.slot_state)
-        accept_cpu = next_draft.exact_accept_len.cpu()
-        self.slot_state.rollback_seq_lens_host(
-            accept_cpu, rows_cpu=exact_rows_cpu
+        n_groups = next_draft.exact_accept_len.numel()
+        self.slot_state.stage_exact_accept(next_draft.exact_accept_len)
+        ids = self.slot_state._sorted_group_ids
+        self._exact_meta[self.slot_state._snap_phase] = (
+            [ids[pos] for pos in exact_gpos.tolist()],
+            self.slot_state.active_slots_cpu[exact_rows_cpu].clone(),
+            n_groups,
         )
-        self._stash_exact_accept(exact_gpos, accept_cpu)
 
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
@@ -1203,6 +1243,23 @@ class SMCScheduler(Scheduler):
         # final counters), then drain, then mode-plan switches for the
         # groups that remain.  All gated off on the pure-SMC engine.
         if self.smc_mode != "smc":
+            # Consume the cycle's staged accept lengths (pinned, gated by
+            # the snapshot event): host seq-len shadow rollback + telemetry
+            # stash.  Membership is stable between the commit that staged
+            # them and this postprocessing (nothing in between allocates or
+            # frees slots), so the row subset saved at commit still holds.
+            meta = self._exact_meta[snapshot.phase]
+            if meta is not None:
+                self._exact_meta[snapshot.phase] = None
+                gids, slots_cpu, n_groups = meta
+                accept_cpu = self.slot_state.exact_accept_host[
+                    snapshot.phase, :n_groups
+                ].clone()
+                self.slot_state.rollback_seq_lens_host(
+                    accept_cpu, slots_cpu
+                )
+                for gid, a in zip(gids, accept_cpu.tolist()):
+                    self._cycle_exact_accept[gid] = int(a)
             self._update_group_cycle_stats()
 
         # Drain finished groups, reading finish state from the pinned

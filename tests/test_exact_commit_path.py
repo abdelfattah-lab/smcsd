@@ -162,7 +162,7 @@ class TestExactCommitPath(unittest.TestCase):
             device=device, resample_threshold=0.5, resample_method="systematic"
         )
         coord.dispatch_resample_batch(plan, st)
-        st.rollback_seq_lens_host(accept_len.cpu())
+        st.rollback_seq_lens_host(accept_len.cpu(), st.active_slots_cpu)
         torch.cuda.synchronize()
 
         # -- lengths: rolled back everywhere, invariant restored --
@@ -298,7 +298,7 @@ class TestExactCommitPath(unittest.TestCase):
         )
         coord.dispatch_resample_batch(plan, st)
         st.rollback_seq_lens_host(
-            accept_len.cpu(), rows_cpu=exact_rows.cpu()
+            accept_len.cpu(), st.active_slots_cpu[exact_rows_cpu]
         )
         torch.cuda.synchronize()
 
