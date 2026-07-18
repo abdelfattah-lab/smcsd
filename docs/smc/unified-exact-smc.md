@@ -354,6 +354,48 @@ next cycle, one-step-late is fine).
   | mixed exact4/smc2 N=8 | 74.0% | 452 |
   | exact N=1 (vanilla speculative sampling) | 81.5% | 365 |
 
+  **Frontier sweep (2026-07-18)** — same harness, mapping the
+  speed/accuracy Pareto frontier (figure: `assets/pareto-gsm8k.png`):
+
+  Llama-3.1-8B + 3.2-1B draft (γ=8 unless noted):
+
+  | config | accuracy | tok/s | on frontier |
+  |---|---|---|---|
+  | SMC | 71.5% | 597 | ✓ (fast end) |
+  | mixed exact4/smc2 | 74.0% | 452 | ✓ |
+  | mixed exact4/smc1 | 79.0% | 435 | ✓ |
+  | mixed exact8/smc1 | 81.0% | 423 | ✓ |
+  | exact | 84.0% | 384 | ✓ (lossless end) |
+  | exact γ=12 | 81.5% | 389 | dominated |
+  | vanilla SD (exact N=1) | 81.5% | 365 | dominated |
+  | SMC threshold=0 | 63.0% | 392 | dominated |
+
+  Qwen3-8B + Qwen3-0.6B draft (γ=8, thinking disabled):
+
+  | config | accuracy | tok/s |
+  |---|---|---|
+  | SMC | 68.5% | 509 |
+  | mixed exact4/smc1 | 90.5% | 364 |
+  | mixed exact8/smc1 | 94.0% | 354 |
+  | exact | 94.5% | 342 |
+
+  Frontier reading: (1) mixed schedules trace a clean interior frontier;
+  accuracy tracks the SMC *token share* (SMC cycles commit γ+1 vs exact's
+  ~a+1, so exact4/smc2 is ~45% SMC tokens — near-SMC accuracy — while
+  exact8/smc1 is ~17% — near-exact accuracy).  The "barely slower than
+  exact, no accuracy loss" point exists (exact8/smc1); a "barely slower
+  than SMC at exact accuracy" point does NOT exist with blanket periodic
+  schedules — bias in SMC segments propagates through the chain.  Closing
+  that corner needs (a) SMC accuracy work (the defaults lose 12–26 pts to
+  lossless on these pairs — threshold=0 is worse, so it is not the
+  resampling knob alone), (b) targeted spans / the phase-3 auto policy,
+  or (c) faster exact (higher acceptance via the phase-4 draft head, exact
+  cycle graph, overlap).  (2) Multi-particle exact strictly dominates
+  vanilla speculative sampling (N=1): equal-or-better accuracy at +5–16%
+  speed — sibling candidates lengthen the accepted prefix at bs=1 for
+  nearly free.  (3) exact matches the target model's reference quality on
+  both pairs (84% Llama, 94.5% Qwen3), as losslessness requires.
+
   Reading: exact N=8 matches the target model's reference GSM8K quality
   (Llama-3.1-8B ≈ 84%) — as it must, being distribution-lossless — and
   multi-draft N=8 beats vanilla N=1 on BOTH axes (more sibling candidates
