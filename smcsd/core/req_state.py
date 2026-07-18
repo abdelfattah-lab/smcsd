@@ -1096,6 +1096,7 @@ class ScheduleBatchSMC:
         exact_accept_len: torch.Tensor,  # (G,) int64 in [0, gamma]
         verified_next: torch.Tensor,     # (G*N,) next-cycle seed per particle
         rows: Optional[torch.Tensor] = None,
+        prev_next: Optional[torch.Tensor] = None,  # token @ rolled-back S-1
     ) -> None:
         """Exact-mode write-back: commit ``accept_len+1`` tokens per group.
 
@@ -1135,9 +1136,13 @@ class ScheduleBatchSMC:
         )
         self.token_counts[active] += commit_len.to(torch.int32)
 
-        # b. Next-cycle seeds.
+        # b. Next-cycle seeds.  prev is the token at the rolled-back S-1
+        # (the deferred-bonus head seed); falls back to verified for
+        # callers that predate the deferred-exact path.
         self.verified_ids[active] = verified_next.to(torch.int32)
-        self.prev_last_draft_ids[active] = verified_next.to(torch.int32)
+        self.prev_last_draft_ids[active] = (
+            prev_next if prev_next is not None else verified_next
+        ).to(torch.int32)
 
         # c. Finish checks over the committed columns only.
         updated = self.token_counts[active]

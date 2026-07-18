@@ -1110,6 +1110,7 @@ class SMCScheduler(Scheduler):
             exact_tokens=next_draft.exact_tokens,
             exact_accept_len=next_draft.exact_accept_len,
             verified_next=next_draft.verified_id,
+            prev_next=next_draft.prev_last_draft_id,
         )
         plan = self.slot_state.collapse_exact(
             next_draft.exact_accept_len, next_draft.exact_winner
@@ -1182,6 +1183,11 @@ class SMCScheduler(Scheduler):
             exact_accept_len=next_draft.exact_accept_len,
             verified_next=next_draft.verified_id[exact_rows],
             rows=exact_rows,
+            prev_next=(
+                next_draft.prev_last_draft_id[exact_rows]
+                if next_draft.prev_last_draft_id is not None
+                else None
+            ),
         )
         plan2 = self.slot_state.collapse_exact(
             next_draft.exact_accept_len,

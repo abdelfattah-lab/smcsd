@@ -618,7 +618,6 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         self._exact_variant = (
             worker.smc_mode in ("exact", "mixed")
             and not self._hybrid_commit
-            and not worker.smc_defer_bonus
         )
         if self._exact_variant:
             n = int(worker.smc_n_particles)
@@ -666,6 +665,14 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
                 )
                 self.exact_accept_lens_out = torch.zeros(
                     (self.max_bs,), dtype=torch.int32
+                )
+                # Token at the rolled-back S-1 per particle: committed[a-1]
+                # for a>=1, else the cycle's x0 — the deferred-bonus head
+                # seed after an exact commit (the deferred KV hole only
+                # exists on full accepts, exactly where the next head
+                # rewrites position S-1).
+                self.exact_prev_out = torch.zeros(
+                    (self.max_bs,), dtype=torch.int64
                 )
             self.exact_graphs = {}
             self._q_capture_on = False
@@ -933,6 +940,16 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         self.exact_accept_lens_out[:bs].copy_(
             (lens + 1).repeat_interleave(n)[:bs].to(torch.int32)
         )
+        # prev @ new S-1: committed[a-1] for a>=1, else x0 (group-uniform).
+        x0_g = tokens_out[:, 0][::n][:n_groups]
+        prev_g = torch.where(
+            lens >= 1,
+            toks.gather(
+                1, (lens - 1).clamp(min=0).unsqueeze(1)
+            ).squeeze(1),
+            x0_g,
+        )
+        self.exact_prev_out[:bs].copy_(prev_g.repeat_interleave(n)[:bs])
         return (
             self.acc_len_buf,
             self.acc_tok_buf,
@@ -1012,13 +1029,19 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         cache_locs: torch.Tensor,
         ctx: SMCDecodeContext,
         req_pool_indices: torch.Tensor,
+        prev_last_draft_id: torch.Tensor = None,
     ):
         """Replay the exact-cycle graph.  Returns, sliced to the real batch:
         (accept_len_i32 (G,), tokens_i32 (G, gamma+1), winner_i32 (G,),
-        verified_bs (bs,), tokens_bs (bs, gamma+1), accept_lens_bs (bs,))."""
+        verified_bs (bs,), tokens_bs (bs, gamma+1), accept_lens_bs (bs,),
+        prev_bs (bs,))."""
         raw_bs, bs = self._stage_replay_inputs(
             verified_id, cache_locs, ctx, req_pool_indices
         )
+        if getattr(self, "deferred", False):
+            self._stage_deferred_head_inputs(
+                raw_bs, prev_last_draft_id, ctx, req_pool_indices
+            )
         if self._eager_replay_metadata:
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 self.fbs[bs], bs
@@ -1044,6 +1067,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self.exact_verified_out[:raw_bs],
             self.exact_tokens_bs_out[:raw_bs],
             self.exact_accept_lens_out[:raw_bs],
+            self.exact_prev_out[:raw_bs],
         )
 
     def replay(
@@ -1188,6 +1212,29 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             # Triton/FA3 drafts: the primary backend serves the head directly
             # (its verify-block-size global is pinned to 2 by the worker).
             self.head_backend = self.draft_primary_backend
+
+    def _stage_deferred_head_inputs(
+        self, raw_bs, prev_last_draft_id, ctx, req_pool_indices
+    ):
+        """Stage the two eager deferred-head inputs: the prev token and the
+        live S-1 block-table slot (post-resample/rollback correct); pad
+        rows keep page 0.  Everything else — head prefix lens, head/draft/
+        target metadata, verify staging — is captured in-graph."""
+        assert prev_last_draft_id is not None, (
+            "deferred cycle graph requires prev_last_draft_id "
+            "(seeded at allocate_slots, carried by resample)"
+        )
+        self.prev_input.zero_()
+        self.head_out_cache_loc.zero_()
+        self.prev_input[:raw_bs].copy_(prev_last_draft_id)
+        r2t = self.model_runner.req_to_token_pool.req_to_token
+        slot_sm1 = r2t[
+            req_pool_indices.to(torch.int64),
+            (ctx.orig_seq_lens - 1).to(torch.int64),
+        ]
+        self.head_out_cache_loc[: 2 * raw_bs].view(raw_bs, 2)[:, 0].copy_(
+            slot_sm1
+        )
 
     def _setup_head_capture(self, bs: int):
         """Build the head's ForwardBatch (TARGET_VERIFY on the draft model,
@@ -1373,6 +1420,32 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             graph, get_global_graph_memory_pool(), stream, run_once
         )
         set_global_graph_memory_pool(graph.pool())
+
+        if getattr(self, "_exact_variant", False):
+            egraph = self._create_graph()
+
+            def run_once_exact():
+                set_is_extend_in_batch(False)
+                self._metadata_in_graph(bs)
+                self._q_capture_on = True
+                try:
+                    self._draft_steps_in_graph(
+                        bs, forward, fb, input_ids, positions, ocl_steps
+                    )
+                finally:
+                    self._q_capture_on = False
+                return self._exact_tail_in_graph(
+                    bs, verify_fb, verify_input_ids, verify_positions
+                )
+
+            self._capture_init(run_once_exact)
+            self._capture_graph(
+                egraph, get_global_graph_memory_pool(), stream,
+                run_once_exact,
+            )
+            set_global_graph_memory_pool(egraph.pool())
+            self.exact_graphs[_default_make_graph_key(bs)] = egraph
+
         return graph, out
 
     def replay(
@@ -1383,29 +1456,11 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         req_pool_indices: torch.Tensor,
         prev_last_draft_id: torch.Tensor = None,
     ):
-        assert prev_last_draft_id is not None, (
-            "deferred cycle graph requires prev_last_draft_id "
-            "(seeded at allocate_slots, carried by resample)"
-        )
         raw_bs, bs = self._stage_replay_inputs(
             verified_id, cache_locs, ctx, req_pool_indices
         )
-        if bs != raw_bs:
-            self.prev_input.zero_()
-            self.head_out_cache_loc.zero_()  # pad rows scribble page 0
-        self.prev_input[:raw_bs].copy_(prev_last_draft_id)
-
-        # Deferred S-1 slot: live block-table lookup (post-resample
-        # correct), enqueued eagerly so pad rows keep page 0.  Everything
-        # else — head prefix lens, head/draft/target metadata, verify
-        # staging — is captured in-graph (_metadata_in_graph).
-        r2t = self.model_runner.req_to_token_pool.req_to_token
-        slot_sm1 = r2t[
-            req_pool_indices.to(torch.int64),
-            (ctx.orig_seq_lens - 1).to(torch.int64),
-        ]
-        self.head_out_cache_loc[: 2 * raw_bs].view(raw_bs, 2)[:, 0].copy_(
-            slot_sm1
+        self._stage_deferred_head_inputs(
+            raw_bs, prev_last_draft_id, ctx, req_pool_indices
         )
 
         if self._eager_replay_metadata:

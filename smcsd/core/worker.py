@@ -152,13 +152,16 @@ class SMCWorker(BaseSpecWorker):
             if _defer_env is not None
             else bool(getattr(server_args, "smc_defer_bonus", True))
         )
-        if self.smc_mode in ("exact", "mixed") and self.smc_defer_bonus:
-            # Exact mode commits a variable-length prefix; the deferred-bonus
-            # seed (prev_last_draft_id at S-1) is only correct for fixed
-            # gamma+1 commits.  Phase-1 exact runs the legacy draft schedule.
+        # Deferred bonus works for exact/mixed too: the exact commit sets
+        # prev_last_draft_id to the token at the rolled-back S-1
+        # (committed[a-1], or x0 at a=0), and the deferred KV hole only
+        # exists on full accepts — exactly where the next head rewrites
+        # S-1.  Tree drafting still needs the legacy schedule (coordinated
+        # step-0 sampling happens in the plain AR loop).
+        if getattr(server_args, "smc_tree_fanout", None) and self.smc_defer_bonus:
             logger.info(
-                "smc_mode='exact': disabling deferred-bonus draft schedule "
-                "(variable-length commits)."
+                "smc_tree_fanout set: disabling deferred-bonus draft "
+                "schedule (tree drafting uses the legacy AR loop)."
             )
             self.smc_defer_bonus = False
         # Only the dense-AR draft path is supported here.
@@ -848,6 +851,7 @@ class SMCWorker(BaseSpecWorker):
     def _draft_ar_deferred(
         self, ctx, draft_input, draft_fb, cache_locs,
         all_positions, all_seq_lens, batch, bs, gamma,
+        draft_q_probs=None,
     ):
         """Deferred-bonus draft AR (eager): head + gamma-1 single decodes, no
         over-draft.  Returns (all_tokens, draft_logprobs_stacked) with
@@ -936,6 +940,8 @@ class SMCWorker(BaseSpecWorker):
 
         d0, lp0 = self._sample_draft_token(head_logits)
         draft_logprobs.append(lp0)
+        if draft_q_probs is not None:
+            draft_q_probs.append(self._draft_probs(head_logits, d0))
         all_tokens.append(d0)
         current_ids = d0
 
@@ -948,8 +954,11 @@ class SMCWorker(BaseSpecWorker):
             draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
             draft_fb.seq_lens_cpu = ctx.orig_seq_lens_cpu + (step + 1)
             out = self.draft_runner.forward(draft_fb)
-            d, lp = self._sample_draft_token(out.logits_output.next_token_logits)
+            step_logits = out.logits_output.next_token_logits
+            d, lp = self._sample_draft_token(step_logits)
             draft_logprobs.append(lp)
+            if draft_q_probs is not None:
+                draft_q_probs.append(self._draft_probs(step_logits, d))
             all_tokens.append(d)
             current_ids = d
 
@@ -1074,16 +1083,18 @@ class SMCWorker(BaseSpecWorker):
             verified_bs,
             tokens_bs,
             accept_lens_bs,
+            prev_bs,
         ) = self.cycle_graph_runner.replay_exact(
             draft_input.verified_id,
             cache_locs,
             ctx,
             batch.req_pool_indices,
+            prev_last_draft_id=draft_input.prev_last_draft_id,
         )
 
         next_draft_input = SMCDraftInput(
             verified_id=verified_bs,
-            prev_last_draft_id=verified_bs,
+            prev_last_draft_id=prev_bs,
             logprob_diff=None,
             bonus_logz=None,
             num_tokens_per_req=self.speculative_num_draft_tokens,
@@ -1192,9 +1203,14 @@ class SMCWorker(BaseSpecWorker):
         draft_q_probs = []
         if self.smc_defer_bonus and not draft_fb.forward_mode.is_idle():
             # Deferred-bonus schedule: head + gamma-1 singles, no over-draft.
+            _capture_q = (
+                draft_input.exact_group_idx is not None
+                and draft_input.exact_group_idx.numel() > 0
+            )
             all_tokens, draft_logprobs_stacked = self._draft_ar_deferred(
                 ctx, draft_input, draft_fb, cache_locs,
                 all_positions, all_seq_lens, batch, bs, gamma,
+                draft_q_probs=draft_q_probs if _capture_q else None,
             )
         else:
             # Legacy gamma+1 single-token AR loop (over-draft included).
@@ -1333,6 +1349,7 @@ class SMCWorker(BaseSpecWorker):
                 bs,
                 gamma,
                 can_run_cuda_graph,
+                x0=all_tokens[0],
             )
 
         verify_scaled = (
@@ -1401,12 +1418,22 @@ class SMCWorker(BaseSpecWorker):
                 1, res.accept_len.unsqueeze(1)
             ).squeeze(1)
             ver_rows = last_committed.repeat_interleave(n)
+            # prev @ rolled-back S-1 for exact rows: committed[a-1], or the
+            # cycle's x0 at a=0 (deferred-bonus head seed).
+            x0_rows = all_tokens[0][rows]
+            prev_g = torch.where(
+                res.accept_len >= 1,
+                res.tokens.gather(
+                    1, (res.accept_len - 1).clamp(min=0).unsqueeze(1)
+                ).squeeze(1),
+                x0_rows[::n],
+            )
             output_token_ids[rows] = res.tokens.repeat_interleave(n, dim=0)
             next_token_ids = output_token_ids.reshape(-1)
             next_verified_id = next_verified_id.clone()
             next_verified_id[rows] = ver_rows
             prev_last_draft_id = prev_last_draft_id.clone()
-            prev_last_draft_id[rows] = ver_rows
+            prev_last_draft_id[rows] = prev_g.repeat_interleave(n)
             accept_lens[rows] = (
                 (res.accept_len + 1).repeat_interleave(n).to(torch.int32)
             )
@@ -1562,6 +1589,7 @@ class SMCWorker(BaseSpecWorker):
         bs: int,
         gamma: int,
         can_run_cuda_graph: bool,
+        x0: torch.Tensor,                # (bs,) the cycle's verified input
     ) -> GenerationBatchResult:
         """All-exact cycle: the accept operator replaces the whole SMC tail.
 
@@ -1577,11 +1605,22 @@ class SMCWorker(BaseSpecWorker):
         )
 
         # Last committed token (residual or bonus draw) seeds the next
-        # cycle's draft for every particle of the group.
+        # cycle's draft for every particle of the group; prev is the token
+        # at the rolled-back S-1 (committed[a-1], or x0 at a=0) — the
+        # deferred-bonus head seed.
         last_committed = res.tokens.gather(
             1, res.accept_len.unsqueeze(1)
         ).squeeze(1)                                            # (G,)
         verified_next = last_committed.repeat_interleave(N)     # (bs,)
+        x0_g = x0[::N]                                          # (G,)
+        prev_g = torch.where(
+            res.accept_len >= 1,
+            res.tokens.gather(
+                1, (res.accept_len - 1).clamp(min=0).unsqueeze(1)
+            ).squeeze(1),
+            x0_g,
+        )
+        prev_next = prev_g.repeat_interleave(N)                 # (bs,)
 
         next_token_ids = res.tokens.repeat_interleave(N, dim=0).reshape(-1)
         accept_lens = (
@@ -1594,9 +1633,7 @@ class SMCWorker(BaseSpecWorker):
 
         next_draft_input = SMCDraftInput(
             verified_id=verified_next,
-            # Deferred bonus is disabled in exact mode; keep the lineage
-            # tensor coherent for later mode switches.
-            prev_last_draft_id=verified_next,
+            prev_last_draft_id=prev_next,
             logprob_diff=logprob_diff,
             bonus_logz=None,
             num_tokens_per_req=self.speculative_num_draft_tokens,

@@ -125,20 +125,13 @@ class SMCEngine:
                 "mode='exact' targets the plain model distribution; "
                 "power_alpha must be 1.0."
             )
-        if mode in ("exact", "mixed"):
-            # Exact/mixed keep the cycle graph (the runner captures an
-            # EXACT variant per bucket alongside the SMC variant) and the
-            # overlapped loop (accept lengths ride the pinned snapshot; the
-            # scheduler flushes before any cycle the graph can't cover).
-            # Only the deferred-bonus draft schedule stays off — its S-1
-            # seed semantics assume fixed gamma+1 commits.
-            if defer_bonus:
-                logger.info(
-                    "SMCEngine(mode=%r): disabling deferred bonus "
-                    "(variable-length commits).",
-                    mode,
-                )
-            defer_bonus = False
+        # Exact/mixed keep the full perf path: cycle graph (SMC + exact
+        # variants per bucket), overlapped loop (accept lengths ride the
+        # pinned snapshot), and the deferred-bonus draft schedule (the
+        # exact commit seeds prev with the token at the rolled-back S-1,
+        # so the deferred KV-hole invariant holds under variable commits).
+        # tree_fanout is the one feature that pins the legacy schedule
+        # (the worker downgrades defer_bonus itself in that case).
 
         # -- 1. Build ServerArgs --
         # Each SMC group needs N+1 Req slots (1 parent + N particles co-exist
