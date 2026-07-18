@@ -333,6 +333,12 @@ class SMCDraftPhaseGraphRunner:
         Returns (idx, logp-or-None).  ``step`` selects the fused sampler's
         Philox counter range (disjoint per launch within a cycle).
         """
+        # Exact-variant capture: retain the full proposal dist q_t the draw
+        # below samples from (consumed by the in-graph accept kernel).
+        if getattr(self, "_q_capture_on", False) and step < self.gamma:
+            self.q_probs_buf[: logits.shape[0], step].copy_(
+                torch.softmax(logits / self.temperature, dim=-1)
+            )
         if self.use_fused_sampling:
             from smcsd.core.kernels.fused_sampling import fused_gumbel_sample
 
@@ -561,6 +567,72 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self._eager_replay_metadata or self._hybrid_commit
         )
 
+        # ── Exact-cycle variant (unified exact/SMC; engine modes "exact"
+        # and "mixed") ──
+        # A SECOND graph per bucket over the SAME staged buffers and
+        # attention-metadata state: identical draft AR + verify capture,
+        # but the tail retains the per-step proposal dists, softmaxes the
+        # verify logits into a target-prob buffer, and runs the fused
+        # multi-draft accept kernel in-graph (Philox seed from a device
+        # buffer bumped in-graph).  Replayed for cycles whose batch is
+        # entirely exact-mode groups; sharing one runner avoids
+        # re-initializing the multi-step backend's graph state (which would
+        # orphan the first runner's graphs).
+        self._exact_variant = (
+            worker.smc_mode in ("exact", "mixed")
+            and not self._hybrid_commit
+            and not worker.smc_defer_bonus
+        )
+        if self._exact_variant:
+            n = int(worker.smc_n_particles)
+            self.n_particles = n
+            vocab = self.target_runner.model_config.vocab_size
+            self._exact_vocab = vocab
+            rows = ((self.max_bs + n - 1) // n) * n
+            self.exact_max_groups = rows // n
+            with torch.device(self.model_runner.device):
+                # (rows, gamma, V) proposal dists / (rows, gamma+1, V)
+                # target dists.  ~V*(2*gamma+1)*rows*4B — e.g. 280 MB at
+                # max_bs=32, gamma=8, V=128k; bound SMC_DRAFT_GRAPH_MAX_BS
+                # if memory-constrained.
+                self.q_probs_buf = torch.zeros(
+                    (rows, self.gamma, vocab), dtype=torch.float32
+                )
+                self.p_probs_buf = torch.zeros(
+                    (rows, self.num_steps, vocab), dtype=torch.float32
+                )
+                self.d_i32_buf = torch.zeros(
+                    (rows, self.gamma), dtype=torch.int32
+                )
+                self.accept_beta_buf = torch.zeros(
+                    (self.exact_max_groups, vocab), dtype=torch.float32
+                )
+                self.acc_len_buf = torch.zeros(
+                    (self.exact_max_groups,), dtype=torch.int32
+                )
+                self.acc_tok_buf = torch.zeros(
+                    (self.exact_max_groups, self.num_steps), dtype=torch.int32
+                )
+                self.acc_win_buf = torch.zeros(
+                    (self.exact_max_groups,), dtype=torch.int32
+                )
+                self.accept_seed = torch.randint(
+                    0, 2**30, (1,), dtype=torch.int32
+                )
+                # Per-particle broadcasts consumed by the scheduler's exact
+                # commit (verified seed, committed block, accept lens).
+                self.exact_verified_out = torch.zeros(
+                    (self.max_bs,), dtype=torch.int64
+                )
+                self.exact_tokens_bs_out = torch.zeros(
+                    (self.max_bs, self.num_steps), dtype=torch.int64
+                )
+                self.exact_accept_lens_out = torch.zeros(
+                    (self.max_bs,), dtype=torch.int32
+                )
+            self.exact_graphs = {}
+            self._q_capture_on = False
+
     def _setup_verify_capture(self, bs: int):
         n_tokens = bs * self.num_steps
         verify_input_ids = self.verify_input_ids[:n_tokens]
@@ -754,6 +826,82 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             next_tokens_out,
         )
 
+    def _exact_tail_in_graph(
+        self, bs, fb, verify_input_ids, verify_positions
+    ):
+        """Exact-variant verify tail: target softmax + fused accept, in-graph.
+
+        Replaces the SMC weight-diff + bonus with: p-prob softmax into the
+        persistent buffer, drafted-token staging, one fused multi-draft
+        accept launch (device-seed Philox), and the per-particle broadcasts
+        the scheduler's exact commit consumes.  Group structure: the batch's
+        rows are group-contiguous with the global particle count N, so the
+        kernel grid is ceil(bs/N); phantom padded groups compute garbage
+        into output rows the replay slices off.
+        """
+        from smcsd.core.kernels.fused_mdsd_accept import fused_mdsd_accept_into
+
+        gamma = self.gamma
+        n = self.n_particles
+        tokens_out = self.tokens_out[:bs]
+
+        verify_input_ids.view(bs, self.num_steps).copy_(
+            tokens_out[:, : self.num_steps]
+        )
+        if self._target_is_mrope:
+            n_tokens = bs * self.num_steps
+            self.verify_mrope_positions[:, :n_tokens].copy_(
+                verify_positions.unsqueeze(0)
+            )
+        logits = self.target_runner.model.forward(
+            verify_input_ids, verify_positions, fb
+        ).next_token_logits
+
+        logits3 = logits.view(bs, self.num_steps, -1)
+        assert logits3.shape[-1] == self._exact_vocab, (
+            f"verify logits vocab {logits3.shape[-1]} != model_config "
+            f"vocab {self._exact_vocab}"
+        )
+        self.p_probs_buf[:bs].copy_(
+            torch.softmax(logits3 / self.target_temperature, dim=-1)
+        )
+        self.d_i32_buf[:bs].copy_(
+            tokens_out[:, 1 : gamma + 1].to(torch.int32)
+        )
+
+        n_groups = (bs + n - 1) // n
+        self.accept_seed.add_(1)  # captured: fresh Philox noise per replay
+        fused_mdsd_accept_into(
+            n_groups, n, gamma, self._exact_vocab,
+            self.d_i32_buf, self.q_probs_buf, self.p_probs_buf,
+            self.accept_beta_buf, self.acc_len_buf, self.acc_tok_buf,
+            self.acc_win_buf, self.accept_seed,
+        )
+
+        # Per-particle broadcasts: last committed token seeds every particle
+        # of the group next cycle; the committed block + lens ride along for
+        # the scheduler's write-back.
+        lens = self.acc_len_buf[:n_groups].to(torch.int64)
+        toks = self.acc_tok_buf[:n_groups].to(torch.int64)
+        last = toks.gather(1, lens.unsqueeze(1)).squeeze(1)
+        self.exact_verified_out[:bs].copy_(
+            last.repeat_interleave(n)[:bs]
+        )
+        self.exact_tokens_bs_out[:bs].copy_(
+            toks.repeat_interleave(n, dim=0)[:bs]
+        )
+        self.exact_accept_lens_out[:bs].copy_(
+            (lens + 1).repeat_interleave(n)[:bs].to(torch.int32)
+        )
+        return (
+            self.acc_len_buf,
+            self.acc_tok_buf,
+            self.acc_win_buf,
+            self.exact_verified_out,
+            self.exact_tokens_bs_out,
+            self.exact_accept_lens_out,
+        )
+
     def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
         graph = self._create_graph()
         stream = self.stream
@@ -780,7 +928,81 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             graph, get_global_graph_memory_pool(), stream, run_once
         )
         set_global_graph_memory_pool(graph.pool())
+
+        # Exact-variant second graph over the same buffers/metadata state.
+        if getattr(self, "_exact_variant", False):
+            egraph = self._create_graph()
+
+            def run_once_exact():
+                set_is_extend_in_batch(False)
+                self._metadata_in_graph(bs)
+                self._q_capture_on = True
+                try:
+                    self._draft_steps_in_graph(
+                        bs, forward, fb, input_ids, positions, ocl_steps
+                    )
+                finally:
+                    self._q_capture_on = False
+                return self._exact_tail_in_graph(
+                    bs, verify_fb, verify_input_ids, verify_positions
+                )
+
+            self._capture_init(run_once_exact)
+            self._capture_graph(
+                egraph, get_global_graph_memory_pool(), stream,
+                run_once_exact,
+            )
+            set_global_graph_memory_pool(egraph.pool())
+            self.exact_graphs[_default_make_graph_key(bs)] = egraph
+
         return graph, out
+
+    def can_run_exact(self, raw_bs: int, ctx: SMCDecodeContext) -> bool:
+        return (
+            getattr(self, "_exact_variant", False)
+            and raw_bs % self.n_particles == 0
+            and self.can_run(raw_bs, ctx)
+        )
+
+    def replay_exact(
+        self,
+        verified_id: torch.Tensor,
+        cache_locs: torch.Tensor,
+        ctx: SMCDecodeContext,
+        req_pool_indices: torch.Tensor,
+    ):
+        """Replay the exact-cycle graph.  Returns, sliced to the real batch:
+        (accept_len_i32 (G,), tokens_i32 (G, gamma+1), winner_i32 (G,),
+        verified_bs (bs,), tokens_bs (bs, gamma+1), accept_lens_bs (bs,))."""
+        raw_bs, bs = self._stage_replay_inputs(
+            verified_id, cache_locs, ctx, req_pool_indices
+        )
+        if self._eager_replay_metadata:
+            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+                self.fbs[bs], bs
+            )
+            _, verify_spec = self.verify_fbs[bs]
+            seq_lens_sum = int(self.seq_lens_cpu[:bs].sum().item())
+            self.target_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                self.req_pool_indices[:bs],
+                self.seq_lens[:bs],
+                seq_lens_sum,
+                None,
+                ForwardMode.TARGET_VERIFY,
+                verify_spec,
+                self.seq_lens_cpu[:bs],
+            )
+        self.exact_graphs[_default_make_graph_key(bs)].replay()
+        n_groups = raw_bs // self.n_particles
+        return (
+            self.acc_len_buf[:n_groups],
+            self.acc_tok_buf[:n_groups],
+            self.acc_win_buf[:n_groups],
+            self.exact_verified_out[:raw_bs],
+            self.exact_tokens_bs_out[:raw_bs],
+            self.exact_accept_lens_out[:raw_bs],
+        )
 
     def replay(
         self,

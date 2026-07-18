@@ -120,25 +120,18 @@ class SMCEngine:
                 "mode='exact' targets the plain model distribution; "
                 "power_alpha must be 1.0."
             )
-        if mode == "exact":
-            # All-exact engines run the eager sequential path; the worker
-            # and scheduler enforce the same downgrades defensively.
-            if defer_bonus or cycle_graph or enable_overlap:
-                logger.info(
-                    "SMCEngine(mode='exact'): disabling deferred bonus, "
-                    "cycle graph, and overlapped scheduling (eager exact "
-                    "path)."
-                )
-            defer_bonus = cycle_graph = enable_overlap = False
-        elif mode == "mixed":
-            # Mixed keeps the cycle graph — pure-SMC cycles replay it, and
-            # cycles carrying exact groups fall back to eager per batch.
-            # Deferred bonus and overlap stay off (variable-length commits).
+        if mode in ("exact", "mixed"):
+            # Exact/mixed keep the cycle graph: the runner captures an
+            # EXACT variant per bucket (draft + verify + fused accept
+            # in-graph) alongside the SMC variant, and the worker replays
+            # whichever matches the cycle.  Deferred bonus and overlap stay
+            # off (variable-length commits).
             if defer_bonus or enable_overlap:
                 logger.info(
-                    "SMCEngine(mode='mixed'): disabling deferred bonus and "
-                    "overlapped scheduling (variable-length commits); cycle "
-                    "graph stays on for pure-SMC cycles."
+                    "SMCEngine(mode=%r): disabling deferred bonus and "
+                    "overlapped scheduling (variable-length commits); the "
+                    "cycle graph stays on (SMC + exact variants).",
+                    mode,
                 )
             defer_bonus = enable_overlap = False
 

@@ -406,12 +406,35 @@ next cycle, one-step-late is fine).
   speed, while accuracy-targeted spans (or higher exact shares) are what
   move quality.  N.B. the SMC accuracy point is at default knobs
   (threshold 0.5, α=1); tuned SMC configs may close part of the gap.
-  EXACT cycle (all pieces are single fixed-shape launches now; the
-  accept kernel + collapse plan + dec_ref_tail are capture-friendly),
-  hybrid (Mamba) rollback commit
+
+- **Exact-cycle CUDA graph — IMPLEMENTED** (this branch): the full-cycle
+  runner captures an **exact variant** per bucket alongside the SMC
+  variant — same staged buffers and attention-metadata state (one runner,
+  so the multi-step backend's graph state is initialized once), same
+  draft AR + verify capture, but the tail retains the per-step proposal
+  dists, softmaxes the verify logits, and runs `fused_mdsd_accept`
+  **in-graph** (Philox seed from a device buffer bumped in-graph, like
+  `sample_seed`; `fused_mdsd_accept_into` is the alloc-free
+  seed-from-pointer launcher).  Engine modes "exact" and "mixed" both
+  keep `cycle_graph` on; the worker replays the matching variant per
+  cycle (SMC-only cycles → SMC graph, all-exact cycles → exact graph);
+  only partial-mixed batches fall back to eager.  Buffer note: the q/p
+  prob buffers cost ~`V·(2γ+1)·max_bs·4B` (~280 MB at max_bs=32, γ=8,
+  V=128k) — bound `SMC_DRAFT_GRAPH_MAX_BS` if memory-constrained.
+
+  Measured: small pair (Qwen2.5 1.5B/0.5B, N=8 γ=8, bs1) exact
+  334 → **490 tok/s**; Llama-8B/1B GSM8K 100q exact 384 → **439 tok/s
+  (+14%) at 83.0%** (lossless reference preserved); mixed exact8/smc1
+  423 → 449 tok/s at 75/100 (n=100; eager n=200 reference 81% — within
+  binomial noise).
+
+- **Phase 2 remainder (perf/coverage)** — hybrid (Mamba) rollback commit
   (`update_mamba_state_after_mtp_verify` already takes per-row
-  `accepted_steps`), overlap-loop compatibility (accept_len via the pinned
-  snapshot instead of a sync).
+  `accepted_steps`), overlap-loop compatibility (accept_len via the
+  pinned snapshot instead of a sync), fusing the exact COMMIT path
+  (write_back_exact + collapse plan are ~25 small torch ops per cycle —
+  the largest remaining non-forward cost), graph capture for
+  partial-mixed batches.
 - **Phase 3** — `"auto"` policy signals + API for span markers; benchmarks:
   GSM8K accuracy/exactness vs tok/s across mode schedules.
 - **Phase 4** — JetSpec-side: tree-dedup drafting (distinct-candidate MDSD

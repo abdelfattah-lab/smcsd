@@ -17,13 +17,14 @@ PROMPT = (
 )
 
 
-def bench(mode, gpu, tokens, n, gamma, mode_cycles=None, label=None):
+def bench(mode, gpu, tokens, n, gamma, mode_cycles=None, label=None,
+          model=None, draft=None):
     from smcsd import SMCEngine
 
     label = label or mode
     eng = SMCEngine(
-        model_path="Qwen/Qwen2.5-1.5B-Instruct",
-        draft_model_path="Qwen/Qwen2.5-0.5B-Instruct",
+        model_path=model or "Qwen/Qwen2.5-1.5B-Instruct",
+        draft_model_path=draft or "Qwen/Qwen2.5-0.5B-Instruct",
         mode=mode,
         mode_cycles=mode_cycles,
         n_particles=n,
@@ -60,18 +61,27 @@ if __name__ == "__main__":
     ap.add_argument("--gamma", type=int, default=8)
     ap.add_argument(
         "--only", default=None,
-        choices=[None, "smc", "exact", "sched42", "sched-mixedgraph"],
+        choices=[None, "smc", "exact", "sched42", "sched81"],
     )
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--draft", default=None)
     args = ap.parse_args()
 
+    mk = dict(model=args.model, draft=args.draft)
     runs = {
-        "smc": lambda: bench("smc", args.gpu, args.tokens, args.n, args.gamma),
+        "smc": lambda: bench(
+            "smc", args.gpu, args.tokens, args.n, args.gamma, **mk
+        ),
         "exact": lambda: bench(
-            "exact", args.gpu, args.tokens, args.n, args.gamma
+            "exact", args.gpu, args.tokens, args.n, args.gamma, **mk
         ),
         "sched42": lambda: bench(
             "mixed", args.gpu, args.tokens, args.n, args.gamma,
-            mode_cycles=[("exact", 4), ("smc", 2)], label="exact4/smc2",
+            mode_cycles=[("exact", 4), ("smc", 2)], label="exact4/smc2", **mk
+        ),
+        "sched81": lambda: bench(
+            "mixed", args.gpu, args.tokens, args.n, args.gamma,
+            mode_cycles=[("exact", 8), ("smc", 1)], label="exact8/smc1", **mk
         ),
     }
     for name, fn in runs.items():

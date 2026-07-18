@@ -323,18 +323,11 @@ class SMCWorker(BaseSpecWorker):
             else bool(getattr(server_args, "smc_cycle_graph", True))
         )
         want_phase = bool(int(os.environ.get("SMC_DRAFT_PHASE_GRAPH", "0")))
-        if self.smc_mode == "exact" and (want_cycle or want_phase):
-            # All-exact engines run the eager per-step path (the accept
-            # operator + variable-length collapse are not yet captured).
-            logger.info(
-                "smc_mode='exact': cycle/draft-phase CUDA graphs disabled "
-                "(eager exact path)."
-            )
-            want_cycle = want_phase = False
-        # smc_mode='mixed' keeps the cycle graph: pure-SMC cycles replay it
-        # (deferred bonus stays off, so the non-deferred runner is captured);
-        # cycles carrying exact groups fall back to the eager path via the
-        # per-batch gate in _forward_decode.
+        # smc_mode 'exact'/'mixed' keep the cycle graph: the runner captures
+        # an EXACT variant per bucket (draft AR + verify + fused accept
+        # in-graph) alongside the SMC variant; _forward_decode replays the
+        # matching one per cycle.  Only partial-mixed batches (some exact
+        # groups, some SMC) fall back to the eager path.
         if want_cycle or want_phase:
             from sglang.srt.layers.attention.triton_backend import (
                 TritonAttnBackend,
@@ -1022,6 +1015,68 @@ class SMCWorker(BaseSpecWorker):
             can_run_cuda_graph=True,
         )
 
+    def _forward_decode_exact_cycle_graph(
+        self,
+        batch: ModelWorkerBatch,
+        draft_input: SMCDraftInput,
+        ctx: SMCDecodeContext,
+    ) -> GenerationBatchResult:
+        """Run one ALL-EXACT decode cycle through the exact-variant cycle
+        graph: draft AR + TARGET_VERIFY + q/p softmax + fused multi-draft
+        accept, one launch.  The scheduler's exact commit consumes the
+        exact_* fields exactly as on the eager path."""
+        cache_locs = ctx.cache_locs
+        if cache_locs is None:
+            from smcsd.common.verify import assign_smc_cache_locs_kernel
+
+            bs = len(ctx.orig_seq_lens)
+            r2t = self.req_to_token_pool.req_to_token
+            out_cache_loc = torch.empty(
+                bs * (self.gamma + 1), dtype=torch.int64, device=self.device
+            )
+            assign_smc_cache_locs_kernel[(bs,)](
+                batch.req_pool_indices,
+                r2t,
+                ctx.orig_seq_lens,
+                out_cache_loc,
+                r2t.shape[1],
+                self.gamma + 1,
+            )
+            cache_locs = out_cache_loc.reshape(bs, self.gamma + 1)
+
+        (
+            acc_len_i32,
+            acc_tok_i32,
+            acc_win_i32,
+            verified_bs,
+            tokens_bs,
+            accept_lens_bs,
+        ) = self.cycle_graph_runner.replay_exact(
+            draft_input.verified_id,
+            cache_locs,
+            ctx,
+            batch.req_pool_indices,
+        )
+
+        next_draft_input = SMCDraftInput(
+            verified_id=verified_bs,
+            prev_last_draft_id=verified_bs,
+            logprob_diff=None,
+            bonus_logz=None,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+            exact_accept_len=acc_len_i32.to(torch.int64),
+            exact_tokens=acc_tok_i32.to(torch.int64),
+            exact_winner=acc_win_i32.to(torch.int64),
+        )
+        return GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=tokens_bs.reshape(-1),
+            accept_lens=accept_lens_bs,
+            next_draft_input=next_draft_input,
+            logprob_diff=None,
+            can_run_cuda_graph=True,
+        )
+
     def _forward_decode(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_idle():
             return self._forward_idle(batch)
@@ -1047,12 +1102,25 @@ class SMCWorker(BaseSpecWorker):
             draft_input.exact_group_idx is not None
             and draft_input.exact_group_idx.numel() > 0
         )
-        if (
-            self.cycle_graph_runner is not None
-            and not cycle_has_exact
-            and self.cycle_graph_runner.can_run(len(ctx.orig_seq_lens), ctx)
-        ):
-            return self._forward_decode_cycle_graph(batch, draft_input, ctx)
+        cycle_all_exact = cycle_has_exact and (
+            draft_input.smc_rows is not None
+            and draft_input.smc_rows.numel() == 0
+        )
+        if self.cycle_graph_runner is not None:
+            if not cycle_has_exact and self.cycle_graph_runner.can_run(
+                len(ctx.orig_seq_lens), ctx
+            ):
+                return self._forward_decode_cycle_graph(
+                    batch, draft_input, ctx
+                )
+            if cycle_all_exact and getattr(
+                self.cycle_graph_runner, "can_run_exact", None
+            ) and self.cycle_graph_runner.can_run_exact(
+                len(ctx.orig_seq_lens), ctx
+            ):
+                return self._forward_decode_exact_cycle_graph(
+                    batch, draft_input, ctx
+                )
 
         # ---- 1. Prepare draft ----
         draft_fb, can_cuda_graph, cache_locs, all_positions, all_seq_lens = (

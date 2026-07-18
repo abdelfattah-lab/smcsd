@@ -21,8 +21,10 @@ Semantics (identical to the torch operator, see exact_accept.py):
 
 RNG is Philox via ``tl.rand(seed, offset)`` with one unique offset per
 (group, depth, candidate) accept draw and per (group, depth) residual/bonus
-draw — a fresh host ``seed`` per call keeps cycles independent (same pattern
-as ``fused_collect``).
+draw.  The seed is loaded from a (1,) int32 DEVICE buffer that the caller
+bumps before each launch (``seed_buf.add_(1)``) — device-side so the launch
+is CUDA-graph-capturable (a replayed in-graph ``add_`` keeps every replay's
+noise fresh, the same pattern as the cycle runner's ``sample_seed``).
 
 The viability set is a bitmask (N <= 32).  ``beta`` lives in a (G, V) fp32
 scratch buffer; the residual update and the CDF-scan sample are V-block
@@ -49,13 +51,14 @@ def _mdsd_accept_kernel(
     out_len_ptr,  # (G,) int32
     out_tok_ptr,  # (G, GAMMA+1) int32
     out_win_ptr,  # (G,) int32
-    seed,         # int32 host seed for this call
+    seed_ptr,     # (1,) int32 device seed (bumped by the caller per launch)
     V,            # vocab size (runtime)
     N: tl.constexpr,
     GAMMA: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     g = tl.program_id(0)
+    seed = tl.load(seed_ptr)
 
     d_g = d_ptr + g * N * GAMMA
     q_g = q_ptr + g.to(tl.int64) * N * GAMMA * V
@@ -187,12 +190,48 @@ def _mdsd_accept_kernel(
     tl.store(out_win_ptr + g, winner)
 
 
+def fused_mdsd_accept_into(
+    n_groups: int,
+    n_particles: int,
+    gamma: int,
+    vocab: int,
+    d_i32: torch.Tensor,      # (>=G*N rows viewed (G,N,gamma)) int32
+    q_f32: torch.Tensor,      # (>=G*N, gamma, V) fp32, normalized
+    p_f32: torch.Tensor,      # (>=G*N, gamma+1, V) fp32, normalized
+    beta: torch.Tensor,       # (>=G, V) fp32 scratch
+    out_len: torch.Tensor,    # (>=G,) int32
+    out_tok: torch.Tensor,    # (>=G, gamma+1) int32
+    out_win: torch.Tensor,    # (>=G,) int32
+    seed_buf: torch.Tensor,   # (1,) int32 device seed (caller bumps it)
+) -> None:
+    """Launch into caller-owned buffers — no allocations, no dtype
+    conversion, seed from device memory: CUDA-graph-capturable."""
+    assert n_particles <= 32, "viability bitmask supports N <= 32"
+    _mdsd_accept_kernel[(n_groups,)](
+        d_i32, q_f32, p_f32, beta, out_len, out_tok, out_win,
+        seed_buf, vocab,
+        N=n_particles, GAMMA=gamma, BLOCK=1024,
+    )
+
+
+_seed_bufs = {}
+
+
+def _device_seed_buf(device) -> torch.Tensor:
+    buf = _seed_bufs.get(device)
+    if buf is None:
+        _seed_counter[0] = (_seed_counter[0] + 1) % (2**31 - 1)
+        buf = torch.tensor(
+            [_seed_counter[0]], dtype=torch.int32, device=device
+        )
+        _seed_bufs[device] = buf
+    return buf
+
+
 def fused_mdsd_accept(
     draft_tokens: torch.Tensor,   # (G, N, gamma) int
     draft_probs: torch.Tensor,    # (G, N, gamma, V) float
     target_probs: torch.Tensor,   # (G, N, gamma+1, V) float
-    *,
-    seed: int = None,
 ) -> ExactAcceptResult:
     """One-launch exact accept over G groups (see module docstring).
 
@@ -202,11 +241,6 @@ def fused_mdsd_accept(
     G, N, gamma = draft_tokens.shape
     V = draft_probs.shape[-1]
     device = draft_tokens.device
-    assert N <= 32, "viability bitmask supports N <= 32"
-
-    if seed is None:
-        _seed_counter[0] = (_seed_counter[0] + 1) % (2**31 - 1)
-        seed = _seed_counter[0]
 
     d = draft_tokens.to(torch.int32).contiguous()
     q = draft_probs.to(torch.float32).contiguous()
@@ -215,11 +249,11 @@ def fused_mdsd_accept(
     out_len = torch.empty(G, dtype=torch.int32, device=device)
     out_tok = torch.zeros(G, gamma + 1, dtype=torch.int32, device=device)
     out_win = torch.empty(G, dtype=torch.int32, device=device)
+    seed_buf = _device_seed_buf(device)
+    seed_buf.add_(1)  # device-side: no H2D on the hot path
 
-    _mdsd_accept_kernel[(G,)](
-        d, q, p, beta, out_len, out_tok, out_win,
-        seed, V,
-        N=N, GAMMA=gamma, BLOCK=1024,
+    fused_mdsd_accept_into(
+        G, N, gamma, V, d, q, p, beta, out_len, out_tok, out_win, seed_buf
     )
     return ExactAcceptResult(
         accept_len=out_len.to(torch.int64),
