@@ -343,7 +343,27 @@ next cycle, one-step-late is fine).
   eager-path overhead — addressed by capturing the exact cycle
   (draft AR + verify + fused accept + collapse are all fixed-shape now).
 
-- **Phase 2 remainder (perf/coverage)** — cycle-graph capture of the
+- **GSM8K sweep (2026-07-18)** — 200 questions, Llama-3.1-8B-Instruct
+  target + Llama-3.2-1B-Instruct draft, γ=8, temp 0.7 (draft & target),
+  batch 1, B200, `scripts/accuracy_test_gsm8k.py --smc-mode ...`:
+
+  | config | accuracy | tok/s |
+  |---|---|---|
+  | SMC N=8 | 71.5% | 597 |
+  | exact N=8 (multi-draft lossless) | **84.0%** | 384 |
+  | mixed exact4/smc2 N=8 | 74.0% | 452 |
+  | exact N=1 (vanilla speculative sampling) | 81.5% | 365 |
+
+  Reading: exact N=8 matches the target model's reference GSM8K quality
+  (Llama-3.1-8B ≈ 84%) — as it must, being distribution-lossless — and
+  multi-draft N=8 beats vanilla N=1 on BOTH axes (more sibling candidates
+  ⇒ longer accepted prefixes; extra particles are nearly free at bs=1
+  where decode is weight-bound).  The periodic 4/2 interleave interpolates
+  speed but accuracy stays near the SMC end: a sequence is a chain, so
+  bias injected in SMC segments propagates — blanket cycle ratios buy
+  speed, while accuracy-targeted spans (or higher exact shares) are what
+  move quality.  N.B. the SMC accuracy point is at default knobs
+  (threshold 0.5, α=1); tuned SMC configs may close part of the gap.
   EXACT cycle (all pieces are single fixed-shape launches now; the
   accept kernel + collapse plan + dec_ref_tail are capture-friendly),
   hybrid (Mamba) rollback commit
