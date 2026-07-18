@@ -113,7 +113,14 @@ def run_smc_engine_eval(args, prompts, labels):
         trust_remote_code=True,
         page_size=1,
         attention_backend=args.attention_backend,
+        mode=args.smc_mode,
+        base_gpu_id=args.base_gpu_id,
     )
+    if args.mode_cycles:
+        engine_kwargs["mode_cycles"] = [
+            (m, int(n))
+            for m, n in (e.split(":") for e in args.mode_cycles.split(","))
+        ]
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
     if args.resample_threshold is not None:
@@ -337,6 +344,15 @@ if __name__ == "__main__":
         "--resample-threshold", type=float, default=None,
         help="ESS resample threshold (default: 0.5, use 0 to disable resampling)",
     )
+    smc_grp.add_argument(
+        "--smc-mode", type=str, default="smc",
+        choices=["smc", "exact", "mixed"],
+        help="verification mode (docs/smc/unified-exact-smc.md)",
+    )
+    smc_grp.add_argument(
+        "--mode-cycles", type=str, default=None,
+        help="cyclic schedule, e.g. 'exact:4,smc:2' (implies --smc-mode mixed)",
+    )
     # Benchmark
     bench = parser.add_argument_group("benchmark")
     bench.add_argument("--num-questions", type=int, default=80)
@@ -376,6 +392,10 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Disable CUDA graphs (faster startup, slower decode; useful for smoke tests).",
+    )
+    eng.add_argument(
+        "--base-gpu-id", type=int, default=0,
+        help="first GPU id for the engine (default: 0)",
     )
     eng.add_argument(
         "--tp-size",
