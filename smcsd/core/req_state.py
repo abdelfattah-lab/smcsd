@@ -273,6 +273,24 @@ class ScheduleBatchSMC:
         self.group_log_Z_hat = torch.zeros(
             self.max_groups, dtype=torch.float64, device=device,
         )
+        # Per-group shared-prefix length: a LOWER BOUND on the number of
+        # leading block-table entries that every particle of the row holds
+        # in common.  Seeded with the prompt length at materialization (all
+        # particles clone one parent prefix) and advanced by the fused
+        # collect kernel whenever a resample collapses the row to a single
+        # surviving lineage — at that instant every table is a byte-for-byte
+        # copy of the survivor's, so the bound jumps to the survivor's
+        # seq_len.  Between collapses it stays put: particles append
+        # divergent drafts above the bound but can never disagree below it
+        # (a resample only ever copies a table that already agrees there),
+        # so the invariant `shared_len <= true common prefix` holds always.
+        #
+        # Consumers (group-shared / "cascade" attention) may read the shared
+        # range once per group instead of once per particle.  A stale-low
+        # value only costs performance; it can never read the wrong KV.
+        self.group_shared_len = torch.zeros(
+            self.max_groups, dtype=torch.int32, device=device,
+        )
         self.group_id_to_row: Dict[str, int] = {}
         self.row_to_group_id: Dict[int, str] = {}
         self._free_rows: List[int] = list(range(self.max_groups))
@@ -466,6 +484,9 @@ class ScheduleBatchSMC:
         row_idx = self._to_device_async([row], torch.int64)
         self.row_in_use.index_fill_(0, row_idx, 1)
         self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
+        # Every particle clones the same parent prefix, so the whole shared
+        # prompt is common from cycle 0.
+        self.group_shared_len.index_fill_(0, row_idx, shared_seq_len)
 
         self.rebuild_active_slots()
         return slots
@@ -488,6 +509,7 @@ class ScheduleBatchSMC:
             row_idx = self._to_device_async([row], torch.int64)
             self.row_in_use.index_fill_(0, row_idx, 0)
             self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
+            self.group_shared_len.index_fill_(0, row_idx, 0)
             self._free_rows.append(row)
 
         for slot in slots:

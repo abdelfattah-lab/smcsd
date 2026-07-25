@@ -138,6 +138,8 @@ class SMCCoordinator:
             slot_state.row_in_use,
             self.resample_threshold,
             step_counter=self._fast_step_counter,
+            seq_lens=slot_state.seq_lens,
+            group_shared_len=slot_state.group_shared_len,
         )
 
     def dispatch_resample_batch(

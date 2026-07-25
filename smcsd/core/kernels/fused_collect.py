@@ -5,6 +5,14 @@ resample → dead/excess compaction → atomic flat emission.  The output
 ``(dst_slots, src_slots, row_of_job)`` tensors feed directly into
 ``batched_resample_kv`` without any ``.tolist()`` on the hot path.
 
+The kernel also maintains ``group_shared_len`` — a per-row lower bound on
+the block-table prefix every particle of the row holds in common, which
+group-shared ("cascade") attention reads once per group instead of once per
+particle.  A row whose ``counts`` has exactly one non-zero column collapses
+to a single lineage, so the bound advances to that survivor's ``seq_len``;
+otherwise it is left alone.  See ``ScheduleBatchSMC.group_shared_len`` for
+why that is always a valid bound.
+
 Layout (post-refactor)
 ----------------------
 
@@ -35,6 +43,8 @@ Per-row data flow (worked example, N=4)
     For each draw k: ancestor_k = |{ j : cdf[j] < pos_k }|  (scalar)
                      counts[ancestor_k] += 1
     counts                    = [ 1 0 2 1 ]    (col 1 dead, col 2 has surplus)
+                              → 3 survivors, so group_shared_len[row] holds
+                                (a collapse to [ 0 0 4 0 ] would advance it)
 
     dead_flag = (counts == 0)            → 1 dst
     excess    = max(counts - 1, 0)       → 1 src
@@ -129,6 +139,10 @@ def _fused_collect_kernel(
     # per-group lookup and gate
     group_to_slots_ptr,       # (max_groups, N) int32
     row_in_use_ptr,           # (max_groups,)   int8 (bool)
+    # shared-prefix tracking (read-only seq_lens; group_shared_len MUTATED
+    # at rows that collapse to a single surviving lineage this step)
+    seq_lens_ptr,             # (max_slots,)    int64
+    group_shared_len_ptr,     # (max_groups,)   int32
     # monotonic host counter: combined with row via tl.rand(step_counter, row)
     # to produce a per-row Philox uniform without any host-side allocation
     # or device sync.
@@ -193,6 +207,21 @@ def _fused_collect_kernel(
             ancestor_k = tl.sum((cdf < pos_k).to(tl.int32), axis=0)
             counts = tl.where(cols == ancestor_k, counts + 1, counts)
 
+        # Shared-prefix bound.  Exactly one column with counts > 0 means
+        # every particle of this row becomes a copy of that one survivor,
+        # so all N block tables are identical up to the survivor's seq_len
+        # once `batched_resample_kv` runs.  Publish that as the row's new
+        # shared-prefix length.  With >1 survivor the row keeps distinct
+        # lineages and the previous bound still holds, so leave it alone —
+        # never lower it, or a consumer could read KV that only some
+        # particles own.  (Padded cols carry counts == 0 and seq 0, so they
+        # affect neither the survivor count nor the sum.)
+        n_survivors = tl.sum((counts > 0).to(tl.int32), axis=0)
+        if n_survivors == 1:
+            seq = tl.load(seq_lens_ptr + slots, mask=mask, other=0)
+            surv_seq = tl.sum(tl.where(counts > 0, seq, 0), axis=0)
+            tl.store(group_shared_len_ptr + row, surv_seq.to(tl.int32))
+
         # dead/excess compaction.  dst and src emission are both in
         # col-ascending order; `offset` reserves a contiguous slice of
         # the flat output buffers atomically.
@@ -235,6 +264,8 @@ def batched_collect_fused(
     threshold: float,
     *,
     step_counter: int,
+    seq_lens: Optional[torch.Tensor] = None,
+    group_shared_len: Optional[torch.Tensor] = None,
 ) -> BatchedResampleResult:
     """Launch the fused collect kernel against slot-major weights.
 
@@ -255,6 +286,15 @@ def batched_collect_fused(
         Monotonic host counter.  Must strictly increase across calls to
         avoid re-using the same Philox sequence.  Combined with the row
         id via ``tl.rand(step_counter, row)`` to seed each row.
+    seq_lens : (max_slots,) int64, optional
+        Per-slot sequence lengths, read only.  Required together with
+        ``group_shared_len``.
+    group_shared_len : (max_groups,) int32, optional, MUTATED
+        Per-group shared-prefix lower bound.  Rows whose resample collapses
+        to a single surviving lineage are advanced to that survivor's
+        ``seq_lens``; all other rows are left untouched.  Omit both this and
+        ``seq_lens`` to skip the tracking entirely (the kernel then writes
+        to a scratch row and the bound is simply never advanced).
 
     Returns
     -------
@@ -283,12 +323,29 @@ def batched_collect_fused(
     plan_counter = torch.zeros(1, dtype=torch.int32, device=device)
     plan_mask = torch.zeros(max_groups, dtype=torch.int32, device=device)
 
+    if (seq_lens is None) != (group_shared_len is None):
+        raise ValueError(
+            "batched_collect_fused: pass seq_lens and group_shared_len "
+            "together or not at all"
+        )
+    if seq_lens is None:
+        # Tracking disabled: give the kernel valid-but-throwaway targets so
+        # the store is harmless rather than branching inside the hot loop.
+        seq_lens = torch.zeros(
+            log_weights.numel(), dtype=torch.int64, device=device
+        )
+        group_shared_len = torch.zeros(
+            max_groups, dtype=torch.int32, device=device
+        )
+
     BLOCK = max(triton.next_power_of_2(N), 16)
     _fused_collect_kernel[(max_groups,)](
         interval_weights,
         log_weights,
         group_to_slots,
         row_in_use,
+        seq_lens,
+        group_shared_len,
         int(step_counter),
         plan_dst,
         plan_src,
