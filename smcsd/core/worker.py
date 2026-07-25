@@ -184,6 +184,8 @@ class SMCWorker(BaseSpecWorker):
             )
             self.draft_attn_backend = factory.create_decode_backend()
 
+        self._init_cascade_decode(server_args)
+
         # Restore cuda graph and capture for draft model
         server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
@@ -354,6 +356,75 @@ class SMCWorker(BaseSpecWorker):
                 )
 
                 self.draft_phase_graph_runner = SMCDraftPhaseGraphRunner(self)
+
+    def _init_cascade_decode(self, server_args) -> None:
+        """Bind the group-shared-prefix decode kernel to the draft backends.
+
+        SMC particles of a group share every KV page below the group's
+        shared-prefix bound, so the draft loop can stream that range once per
+        group instead of once per particle — the dominant cost of long-context
+        decode (~7.7 ms of a 27.8 ms cycle at 16k).
+
+        ``cascade_shared_lens`` is written in place by the scheduler each
+        cycle (``ScheduleBatchSMC.fill_cascade_shared_lens``) and read by the
+        backends.  It MUST be allocated here, before ``init_device_graphs``:
+        a captured graph bakes in the pointer, so the buffer has to outlive
+        every capture and never be reallocated.  For the same reason
+        ``smc_cascade`` is bound now rather than per cycle — ``forward_decode``
+        runs only at capture time, so a later rebind would silently miss the
+        captured path.
+
+        Skipped for hybrid (Mamba/GDN) drafts, whose multi-step backend is not
+        a stack of TritonAttnBackends, and when the vendored sglang lacks the
+        hook (older pin) — both degrade to the stock per-particle kernel.
+
+        OPT-IN (SMC_CASCADE_DECODE=1), because measured end to end it is a
+        trade, not a free win: +10% at 16k context but -8.5% at 512, with the
+        crossover near 8k (Llama-3.1-8B + 3.2-1B, N=8, gamma=8, B200; both
+        figures reproduced across runs).  Note that this is far below what the
+        kernel microbenchmark predicts (6.3x on the attention itself at 16k,
+        never losing) — against the real multi-GB KV pool the kernel realizes
+        only ~1.6x, so most of the theoretical win is still on the table and
+        the default should not flip until that gap is understood.
+        """
+        self.cascade_shared_lens = None
+        if os.environ.get("SMC_CASCADE_DECODE", "0") != "1":
+            return
+        n_particles = int(getattr(server_args, "smc_n_particles", 1) or 1)
+        if n_particles < 2 or self._draft_is_hybrid:
+            return
+        # Two distinct sets of backend objects serve the draft AR, and both
+        # must be bound or the fast path silently never runs:
+        #   * the multi-step backends, used when the SMC cycle graph drives
+        #     the loop and overrides fb.attn_backend per step, and
+        #   * draft_runner.attn_backend, a SEPARATE instance the model falls
+        #     back to whenever fb.attn_backend is not overridden (the
+        #     draft runner's own captured graphs, and the eager path).
+        # Only forward_decode consults the hook, so binding the shared runner
+        # backend cannot affect the draft prefill or the 2-token verify head.
+        backends = list(getattr(self.draft_attn_backend, "attn_backends", []))
+        runner_backend = getattr(self.draft_runner, "attn_backend", None)
+        if runner_backend is not None:
+            backends.append(runner_backend)
+        if not backends or not all(
+            hasattr(b, "smc_cascade") for b in backends
+        ):
+            logger.warning(
+                "SMC cascade decode unavailable (vendored sglang has no "
+                "smc_cascade hook); using the stock per-particle kernel."
+            )
+            return
+
+        max_bs = self.draft_runner.req_to_token_pool.size
+        self.cascade_shared_lens = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        for b in backends:
+            b.smc_cascade = (self.cascade_shared_lens, n_particles)
+        logger.info(
+            "SMC cascade decode enabled on %d draft step backends (N=%d)",
+            len(backends), n_particles,
+        )
 
     def _pin_draft_head_verify_qsl(self) -> None:
         """(Deferred-bonus, hybrid draft) Pin the shared linear backend's

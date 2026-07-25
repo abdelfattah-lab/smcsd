@@ -43,6 +43,8 @@ class CollectFixture:
     interval_weights: torch.Tensor    # (max_slots,) float64
     group_to_slots: torch.Tensor      # (max_groups, N) int32
     row_in_use: torch.Tensor          # (max_groups,) bool
+    seq_lens: torch.Tensor            # (max_slots,) int64
+    group_shared_len: torch.Tensor    # (max_groups,) int32
     slots_by_row: List[Optional[List[int]]]
 
     @classmethod
@@ -62,6 +64,10 @@ class CollectFixture:
                 (max_groups, n_particles), -1, dtype=torch.int32, device=dev
             ),
             row_in_use=torch.zeros(max_groups, dtype=torch.bool, device=dev),
+            seq_lens=torch.zeros(max_slots, dtype=torch.int64, device=dev),
+            group_shared_len=torch.zeros(
+                max_groups, dtype=torch.int32, device=dev
+            ),
             slots_by_row=[None] * max_groups,
         )
 
@@ -107,7 +113,16 @@ class CollectFixture:
         )
         return self.log_weights[slot_t].clone()
 
-    def run(self, threshold: float, step_counter: int):
+    def set_seq_len(self, row: int, value: int) -> None:
+        """Set a uniform sequence length across ``row``'s slots."""
+        slots = self.slots_by_row[row]
+        assert slots is not None, f"row {row} is free"
+        slot_t = torch.as_tensor(
+            slots, dtype=torch.int64, device=self.seq_lens.device
+        )
+        self.seq_lens[slot_t] = value
+
+    def run(self, threshold: float, step_counter: int, *, track_shared=True):
         return batched_collect_fused(
             self.log_weights,
             self.interval_weights,
@@ -115,6 +130,8 @@ class CollectFixture:
             self.row_in_use,
             threshold,
             step_counter=step_counter,
+            seq_lens=self.seq_lens if track_shared else None,
+            group_shared_len=self.group_shared_len if track_shared else None,
         )
 
 
@@ -532,6 +549,146 @@ class ResampleFixture:
             self.all_token_ids[src, :count].tolist(),
             f"all_token_ids[{dst}, :{count}] not copied from slot {src}",
         )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "Triton kernels require CUDA")
+class TestSharedPrefixTracking(CustomTestCase):
+    """``group_shared_len`` — the lower bound on a group's common block-table
+    prefix that group-shared ("cascade") attention reads.
+
+    The safety property under test is one-directional: the bound may lag the
+    true common prefix (costs performance) but must never exceed it (would
+    read KV that only some particles own).  It therefore advances only when a
+    resample collapses the row to ONE surviving lineage, which is the single
+    instant at which every table is provably a copy of the survivor's.
+    """
+
+    DEVICE = "cuda"
+
+    def _make(self, max_groups=4, n_particles=4, max_slots=512) -> CollectFixture:
+        return CollectFixture.build(
+            max_groups=max_groups,
+            n_particles=n_particles,
+            max_slots=max_slots,
+            device=self.DEVICE,
+        )
+
+    def _shared(self, fx: CollectFixture, row: int) -> int:
+        return int(fx.group_shared_len[row].item())
+
+    def test_full_collapse_advances_to_survivor_seq_len(self):
+        """One dominant particle → all N become its copies → the bound jumps
+        to that survivor's seq_len."""
+        fx = self._make(max_groups=2, n_particles=4)
+        fx.register(row=0, slots=[20, 21, 22, 23])
+        fx.set_seq_len(row=0, value=137)
+        fx.group_shared_len[0] = 40  # stale bound from an earlier collapse
+        fx.set_iw(row=0, values=[-1e10, 0.0, -1e10, -1e10])
+
+        result = fx.run(threshold=0.5, step_counter=1)
+
+        self.assertTrue(bool(result.resample_mask[0].item()))
+        self.assertEqual(self._shared(fx, 0), 137)
+
+    def test_multiple_survivors_leave_bound_untouched(self):
+        """Two equal-weight survivors → distinct lineages persist, so the
+        bound must NOT advance even though a resample fired."""
+        fx = self._make(max_groups=2, n_particles=4)
+        fx.register(row=0, slots=[30, 31, 32, 33])
+        fx.set_seq_len(row=0, value=200)
+        fx.group_shared_len[0] = 40
+        # weights ≈ [.5, .5, 0, 0] → ESS 2 < 0.9*4, systematic keeps both.
+        fx.set_iw(row=0, values=[0.0, 0.0, -1e10, -1e10])
+
+        result = fx.run(threshold=0.9, step_counter=1)
+
+        self.assertTrue(bool(result.resample_mask[0].item()))
+        self.assertEqual(self._shared(fx, 0), 40)
+
+    def test_no_resample_leaves_bound_untouched(self):
+        """ESS above threshold → no resample, no advance."""
+        fx = self._make(max_groups=2, n_particles=4)
+        fx.register(row=0, slots=[40, 41, 42, 43])
+        fx.set_seq_len(row=0, value=500)
+        fx.group_shared_len[0] = 64
+
+        result = fx.run(threshold=0.5, step_counter=1)
+
+        self.assertFalse(bool(result.resample_mask.any().item()))
+        self.assertEqual(self._shared(fx, 0), 64)
+
+    def test_bound_is_monotonic_across_steps(self):
+        """Growing seq_lens with intermittent collapses: the bound only ever
+        moves up, and never past the current seq_len."""
+        fx = self._make(max_groups=2, n_particles=4)
+        fx.register(row=0, slots=[50, 51, 52, 53])
+        collapse = [False, True, False, True, True]
+        prev = 0
+        for step, do_collapse in enumerate(collapse, start=1):
+            seq = 100 * step
+            fx.set_seq_len(row=0, value=seq)
+            if do_collapse:
+                fx.set_iw(row=0, values=[-1e10, 0.0, -1e10, -1e10])
+            else:
+                fx.set_iw(row=0, values=[0.0, 0.0, 0.0, 0.0])
+            fx.run(threshold=0.5, step_counter=step)
+            now = self._shared(fx, 0)
+            self.assertGreaterEqual(now, prev, f"bound regressed at step {step}")
+            self.assertLessEqual(now, seq, f"bound exceeds seq_len at step {step}")
+            if do_collapse:
+                self.assertEqual(now, seq)
+            prev = now
+
+    def test_other_rows_are_not_disturbed(self):
+        """A collapse on one row must not touch a sibling row's bound."""
+        fx = self._make(max_groups=4, n_particles=4)
+        fx.register(row=0, slots=[60, 61, 62, 63])
+        fx.register(row=2, slots=[70, 71, 72, 73])
+        fx.set_seq_len(row=0, value=300)
+        fx.set_seq_len(row=2, value=900)
+        fx.group_shared_len[2] = 111
+        fx.set_iw(row=0, values=[-1e10, 0.0, -1e10, -1e10])
+        # row 2 keeps equal weights → no resample there.
+
+        fx.run(threshold=0.5, step_counter=1)
+
+        self.assertEqual(self._shared(fx, 0), 300)
+        self.assertEqual(self._shared(fx, 2), 111)
+        self.assertEqual(self._shared(fx, 1), 0)  # free row, never claimed
+
+    def test_free_rows_never_advance(self):
+        """Rows not in use are skipped before any shared-len store."""
+        fx = self._make(max_groups=3, n_particles=4)
+        fx.seq_lens.fill_(999)
+        fx.run(threshold=0.5, step_counter=1)
+        self.assertEqual(fx.group_shared_len.tolist(), [0, 0, 0])
+
+    def test_tracking_is_optional(self):
+        """Omitting both tensors disables tracking without breaking the
+        resample plan itself."""
+        fx = self._make(max_groups=2, n_particles=4)
+        fx.register(row=0, slots=[80, 81, 82, 83])
+        fx.set_seq_len(row=0, value=137)
+        fx.set_iw(row=0, values=[-1e10, 0.0, -1e10, -1e10])
+
+        result = fx.run(threshold=0.5, step_counter=1, track_shared=False)
+
+        self.assertEqual(result.n_jobs_sync(), 3)
+        self.assertEqual(self._shared(fx, 0), 0)  # untouched
+
+    def test_mismatched_tracking_args_are_rejected(self):
+        fx = self._make(max_groups=2, n_particles=4)
+        fx.register(row=0, slots=[90, 91, 92, 93])
+        with self.assertRaises(ValueError):
+            batched_collect_fused(
+                fx.log_weights,
+                fx.interval_weights,
+                fx.group_to_slots,
+                fx.row_in_use,
+                0.5,
+                step_counter=1,
+                seq_lens=fx.seq_lens,  # group_shared_len omitted
+            )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Triton kernels require CUDA")

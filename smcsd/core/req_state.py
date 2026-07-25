@@ -273,6 +273,24 @@ class ScheduleBatchSMC:
         self.group_log_Z_hat = torch.zeros(
             self.max_groups, dtype=torch.float64, device=device,
         )
+        # Per-group shared-prefix length: a LOWER BOUND on the number of
+        # leading block-table entries that every particle of the row holds
+        # in common.  Seeded with the prompt length at materialization (all
+        # particles clone one parent prefix) and advanced by the fused
+        # collect kernel whenever a resample collapses the row to a single
+        # surviving lineage — at that instant every table is a byte-for-byte
+        # copy of the survivor's, so the bound jumps to the survivor's
+        # seq_len.  Between collapses it stays put: particles append
+        # divergent drafts above the bound but can never disagree below it
+        # (a resample only ever copies a table that already agrees there),
+        # so the invariant `shared_len <= true common prefix` holds always.
+        #
+        # Consumers (group-shared / "cascade" attention) may read the shared
+        # range once per group instead of once per particle.  A stale-low
+        # value only costs performance; it can never read the wrong KV.
+        self.group_shared_len = torch.zeros(
+            self.max_groups, dtype=torch.int32, device=device,
+        )
         self.group_id_to_row: Dict[str, int] = {}
         self.row_to_group_id: Dict[int, str] = {}
         self._free_rows: List[int] = list(range(self.max_groups))
@@ -466,6 +484,9 @@ class ScheduleBatchSMC:
         row_idx = self._to_device_async([row], torch.int64)
         self.row_in_use.index_fill_(0, row_idx, 1)
         self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
+        # Every particle clones the same parent prefix, so the whole shared
+        # prompt is common from cycle 0.
+        self.group_shared_len.index_fill_(0, row_idx, shared_seq_len)
 
         self.rebuild_active_slots()
         return slots
@@ -488,6 +509,7 @@ class ScheduleBatchSMC:
             row_idx = self._to_device_async([row], torch.int64)
             self.row_in_use.index_fill_(0, row_idx, 0)
             self.group_log_Z_hat.index_fill_(0, row_idx, 0.0)
+            self.group_shared_len.index_fill_(0, row_idx, 0)
             self._free_rows.append(row)
 
         for slot in slots:
@@ -580,11 +602,48 @@ class ScheduleBatchSMC:
         self.active_slots_cpu = torch.tensor(active_list, dtype=torch.int64)
         self._active_slots_list = active_list
         self.num_active = len(active_list)
+        # Batch position -> group row, for the group-shared-prefix gather.
+        # `active_slots` is group-major with exactly N contiguous slots per
+        # group (global-N invariant), so batch row i belongs to the
+        # (i // N)-th entry here.  Rebuilt only on membership change.
+        self.active_group_rows = torch.tensor(
+            [self.group_id_to_row[gid] for gid in self._sorted_group_ids],
+            dtype=torch.int64, device=self.device,
+        )
         # Invalidate the cached ModelWorkerBatch (membership changed).
         self._membership_version += 1
 
     def is_empty(self) -> bool:
         return self.num_active == 0
+
+    def fill_cascade_shared_lens(self, out: torch.Tensor) -> None:
+        """Broadcast each group's shared-prefix bound to its N batch rows.
+
+        ``out`` is a persistent device buffer owned by the worker and read
+        by the draft attention backends — including from inside a captured
+        CUDA graph, which bakes in the pointer, so it must be written in
+        place and never reallocated.
+
+        The whole buffer is zeroed first, which is what keeps padded
+        graph-replay rows safe: a bucket captured at bs=16 replayed with 8
+        live rows would otherwise leave the pad rows carrying a stale bound
+        far longer than their (fill-value) sequence length, and the kernel's
+        shared stage would read past the end of those rows' kv_indices.  At
+        zero the shared stage is a no-op for them and the suffix stage covers
+        their whole (tiny) range.
+
+        All-device: a zero_, an index_select over the (tiny) group-row map,
+        and a broadcast copy — no host sync.
+        """
+        out.zero_()
+        n_groups = self.num_active // self.n_particles
+        if n_groups == 0:
+            return
+        rows = self.active_group_rows[:n_groups]
+        per_group = self.group_shared_len.index_select(0, rows)
+        out[: self.num_active].view(n_groups, self.n_particles).copy_(
+            per_group.unsqueeze(1)
+        )
 
     # ────────────────────────────────────────────────────────
     #  Decode Preparation (sparse → vectorized KV alloc → sparse)
