@@ -33,7 +33,20 @@ import torch
 import triton
 import triton.language as tl
 
-CASCADE_SPLITS = 7  # +1 suffix slot = 8 partials (pow2 for the merge)
+# B200-swept (scripts/tune_cascade_decode.py) under CUDA-graph capture, which
+# is how the draft loop actually runs.  `splits + 1` must be a power of two:
+# stage 2 merges the partials with a tl.arange(0, S1).
+#
+# The original 7 splits left stage 1 at (n_groups, H_kv, 7) = 56 CTAs on a
+# 148-SM part — badly underfilled, and the reason the kernel looked like it
+# lost to stock below 2k context.  That deficit was in fact eager-launch
+# overhead (~10 us/launch x 3 launches) swamping a 20 us kernel; under
+# capture it disappears and this config wins at every context we run, from
+# 1.9x at 512 tokens to 9.4x at 32k.
+CASCADE_SPLITS = 31
+CASCADE_BLOCK_N = 32
+CASCADE_NUM_WARPS = 4
+CASCADE_NUM_STAGES = 2
 
 
 @triton.jit
@@ -306,11 +319,10 @@ def _cascade_stage2(
 _PART_CACHE: dict = {}
 
 
-def _parts(n_groups: int, h_kv: int, ng: int, lv: int, device):
-    key = (n_groups, h_kv, ng, lv, device)
+def _parts(n_groups: int, h_kv: int, ng: int, lv: int, device, s1: int):
+    key = (n_groups, h_kv, ng, lv, device, s1)
     b = _PART_CACHE.get(key)
     if b is None:
-        s1 = CASCADE_SPLITS + 1
         acc = torch.empty(
             (n_groups, h_kv, s1, ng, lv), dtype=torch.float32, device=device
         )
@@ -331,6 +343,11 @@ def cascade_decode_fwd(
     shared_lens: torch.Tensor,  # (bs,)
     group_size: int,            # N particles per group
     sm_scale: float,
+    *,
+    splits: int | None = None,
+    block_n: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> None:
     bs, h_q, lq = q.shape
     h_kv = k_buffer.shape[1]
@@ -341,12 +358,22 @@ def cascade_decode_fwd(
     n_groups = bs // N
     NG = N * G
 
-    part_acc, part_m, part_l = _parts(n_groups, h_kv, NG, lv, q.device)
+    # Overridable for autotuning sweeps; the module defaults are the swept
+    # winners.  ``splits + 1`` must stay a power of two — stage 2 merges the
+    # partials with a ``tl.arange(0, S1)``.
+    splits = CASCADE_SPLITS if splits is None else splits
+    block_n = CASCADE_BLOCK_N if block_n is None else block_n
+    num_warps = CASCADE_NUM_WARPS if num_warps is None else num_warps
+    num_stages = CASCADE_NUM_STAGES if num_stages is None else num_stages
+
+    part_acc, part_m, part_l = _parts(
+        n_groups, h_kv, NG, lv, q.device, splits + 1
+    )
 
     BLOCK_M = max(16, triton.next_power_of_2(NG))
     BLOCK_G = max(16, triton.next_power_of_2(G))
 
-    _cascade_stage1_shared[(n_groups, h_kv, CASCADE_SPLITS)](
+    _cascade_stage1_shared[(n_groups, h_kv, splits)](
         q, k_buffer, v_buffer,
         kv_indptr, kv_indices, shared_lens,
         part_acc, part_m, part_l,
@@ -356,9 +383,9 @@ def cascade_decode_fwd(
         v_buffer.stride(0), v_buffer.stride(1),
         part_acc.stride(0), part_acc.stride(1), part_acc.stride(2), part_acc.stride(3),
         part_m.stride(0), part_m.stride(1), part_m.stride(2),
-        N=N, G=G, NG=NG, SPLITS=CASCADE_SPLITS,
-        Lq=lq, Lv=lv, BLOCK_M=BLOCK_M, BLOCK_N=64,
-        num_warps=8, num_stages=3,
+        N=N, G=G, NG=NG, SPLITS=splits,
+        Lq=lq, Lv=lv, BLOCK_M=BLOCK_M, BLOCK_N=block_n,
+        num_warps=num_warps, num_stages=num_stages,
     )
     _cascade_stage1_suffix[(bs, h_kv)](
         q, k_buffer, v_buffer,
@@ -370,9 +397,9 @@ def cascade_decode_fwd(
         v_buffer.stride(0), v_buffer.stride(1),
         part_acc.stride(0), part_acc.stride(1), part_acc.stride(2), part_acc.stride(3),
         part_m.stride(0), part_m.stride(1), part_m.stride(2),
-        N=N, G=G, SPLITS=CASCADE_SPLITS,
-        Lq=lq, Lv=lv, BLOCK_G=BLOCK_G, BLOCK_N=64,
-        num_warps=4, num_stages=3,
+        N=N, G=G, SPLITS=splits,
+        Lq=lq, Lv=lv, BLOCK_G=BLOCK_G, BLOCK_N=block_n,
+        num_warps=4, num_stages=num_stages,
     )
     _cascade_stage2[(bs, h_q)](
         part_acc, part_m, part_l,
@@ -380,6 +407,6 @@ def cascade_decode_fwd(
         part_acc.stride(0), part_acc.stride(1), part_acc.stride(2), part_acc.stride(3),
         part_m.stride(0), part_m.stride(1), part_m.stride(2),
         o.stride(0), o.stride(1),
-        N=N, G=G, S1=CASCADE_SPLITS + 1, Lv=lv,
+        N=N, G=G, S1=splits + 1, Lv=lv,
         num_warps=1, num_stages=1,
     )
