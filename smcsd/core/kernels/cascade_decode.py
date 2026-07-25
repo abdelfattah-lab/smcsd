@@ -44,9 +44,12 @@ import triton.language as tl
 # capture it disappears and this config wins at every context we run, from
 # 1.9x at 512 tokens to 9.4x at 32k.
 CASCADE_SPLITS = 31
-CASCADE_BLOCK_N = 32
-CASCADE_NUM_WARPS = 4
+CASCADE_BLOCK_N = 64
 CASCADE_NUM_STAGES = 2
+# Warp count tracks the value head dim: 4 warps is best at d=64
+# (Llama-3.2-1B draft, 3.6x at 16k) and 8 at d=128 (Qwen3-0.6B, 4.4x).
+CASCADE_NUM_WARPS_BY_HEAD_DIM = {64: 4, 128: 8}
+CASCADE_NUM_WARPS_DEFAULT = 4
 
 
 @triton.jit
@@ -363,7 +366,10 @@ def cascade_decode_fwd(
     # partials with a ``tl.arange(0, S1)``.
     splits = CASCADE_SPLITS if splits is None else splits
     block_n = CASCADE_BLOCK_N if block_n is None else block_n
-    num_warps = CASCADE_NUM_WARPS if num_warps is None else num_warps
+    if num_warps is None:
+        num_warps = CASCADE_NUM_WARPS_BY_HEAD_DIM.get(
+            lv, CASCADE_NUM_WARPS_DEFAULT
+        )
     num_stages = CASCADE_NUM_STAGES if num_stages is None else num_stages
 
     part_acc, part_m, part_l = _parts(

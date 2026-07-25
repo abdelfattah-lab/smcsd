@@ -16,7 +16,7 @@ import torch
 
 from smcsd.core.kernels.cascade_decode import cascade_decode_fwd
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
-    decode_attention_fwd_normal,
+    decode_attention_fwd,
 )
 
 # (H_q, H_kv, d, layers, label) — the draft models we actually run.
@@ -115,9 +115,14 @@ def stock_fn(c, dev, n_splits=16):
                                device=dev)
 
     def run():
-        decode_attention_fwd_normal(
+        # The DISPATCHER, not decode_attention_fwd_normal: at kv_group_num > 1
+        # production takes decode_attention_fwd_grouped, which packs the GQA
+        # group and is ~2.4x faster than the MHA path at these shapes.  Benching
+        # against _normal silently compares to a kernel that never runs and
+        # overstates any GQA-aware replacement by that factor.
+        decode_attention_fwd(
             c["q"], c["k"], c["v"], c["o"], c["kv_indptr"], c["idx"],
-            attn_logits, attn_lse, num_kv_splits, n_splits, c["sm"], 1.0, 0.0)
+            attn_logits, attn_lse, num_kv_splits, n_splits, c["sm"], 1.0, 1.0)
     return run
 
 
