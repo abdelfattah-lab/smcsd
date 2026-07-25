@@ -19,7 +19,7 @@ from collections import defaultdict
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="exact", choices=["smc", "exact", "auto"])
+    ap.add_argument("--mode", default="smc", choices=["smc", "exact", "auto"])
     ap.add_argument("--gpu", type=int, default=4)
     ap.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
     ap.add_argument("--draft", default="meta-llama/Llama-3.2-1B-Instruct")
@@ -37,10 +37,9 @@ def main():
 
     from smcsd import SMCEngine
 
-    eng = SMCEngine(
+    kwargs = dict(
         model_path=args.model,
         draft_model_path=args.draft,
-        mode=args.mode,
         n_particles=args.n,
         gamma=args.gamma,
         draft_temperature=0.7,
@@ -51,6 +50,11 @@ def main():
         context_length=args.ctx + args.tokens + 512,
         log_level="error",
     )
+    # `mode` only exists on the exact/approx branches; main is SMC-only.
+    try:
+        eng = SMCEngine(mode=args.mode, **kwargs)
+    except TypeError:
+        eng = SMCEngine(**kwargs)
     sp = {"ignore_eos": True, "temperature": 0.7}
     prompt = "The quick brown fox jumps over the lazy dog. " * (args.ctx // 10)
     try:

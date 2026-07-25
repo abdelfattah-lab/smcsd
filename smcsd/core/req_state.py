@@ -602,11 +602,48 @@ class ScheduleBatchSMC:
         self.active_slots_cpu = torch.tensor(active_list, dtype=torch.int64)
         self._active_slots_list = active_list
         self.num_active = len(active_list)
+        # Batch position -> group row, for the group-shared-prefix gather.
+        # `active_slots` is group-major with exactly N contiguous slots per
+        # group (global-N invariant), so batch row i belongs to the
+        # (i // N)-th entry here.  Rebuilt only on membership change.
+        self.active_group_rows = torch.tensor(
+            [self.group_id_to_row[gid] for gid in self._sorted_group_ids],
+            dtype=torch.int64, device=self.device,
+        )
         # Invalidate the cached ModelWorkerBatch (membership changed).
         self._membership_version += 1
 
     def is_empty(self) -> bool:
         return self.num_active == 0
+
+    def fill_cascade_shared_lens(self, out: torch.Tensor) -> None:
+        """Broadcast each group's shared-prefix bound to its N batch rows.
+
+        ``out`` is a persistent device buffer owned by the worker and read
+        by the draft attention backends — including from inside a captured
+        CUDA graph, which bakes in the pointer, so it must be written in
+        place and never reallocated.
+
+        The whole buffer is zeroed first, which is what keeps padded
+        graph-replay rows safe: a bucket captured at bs=16 replayed with 8
+        live rows would otherwise leave the pad rows carrying a stale bound
+        far longer than their (fill-value) sequence length, and the kernel's
+        shared stage would read past the end of those rows' kv_indices.  At
+        zero the shared stage is a no-op for them and the suffix stage covers
+        their whole (tiny) range.
+
+        All-device: a zero_, an index_select over the (tiny) group-row map,
+        and a broadcast copy — no host sync.
+        """
+        out.zero_()
+        n_groups = self.num_active // self.n_particles
+        if n_groups == 0:
+            return
+        rows = self.active_group_rows[:n_groups]
+        per_group = self.group_shared_len.index_select(0, rows)
+        out[: self.num_active].view(n_groups, self.n_particles).copy_(
+            per_group.unsqueeze(1)
+        )
 
     # ────────────────────────────────────────────────────────
     #  Decode Preparation (sparse → vectorized KV alloc → sparse)

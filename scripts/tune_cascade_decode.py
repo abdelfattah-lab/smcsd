@@ -71,7 +71,15 @@ def bench_graph(fn, per_graph=10, iters=20, warmup=15):
     return (time.perf_counter() - t0) / iters / per_graph * 1e6
 
 
-def make_case(N, h_q, h_kv, d, L0, suffix, n_groups, dev):
+def make_case(N, h_q, h_kv, d, L0, suffix, n_groups, dev, scatter=True):
+    """Build one decode case.
+
+    ``scatter`` models what page_size=1 actually gives you: the group's
+    shared prefix is a list of L0 pool rows scattered over a fragmented
+    pool, not a contiguous run.  Benching against a contiguous range makes
+    both kernels look bandwidth-bound when the real one is gather-latency
+    bound, and badly overstates cascade's win.
+    """
     bs = n_groups * N
     S = L0 + suffix
     pool = bs * S + 16
@@ -83,15 +91,16 @@ def make_case(N, h_q, h_kv, d, L0, suffix, n_groups, dev):
     kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
     kv_indptr[1:] = torch.cumsum(seq_lens, 0)
     idx = torch.empty(bs * S, dtype=torch.int32, device=dev)
+    perm = (torch.randperm(pool, device=dev).to(torch.int32) if scatter
+            else torch.arange(pool, dtype=torch.int32, device=dev))
     for g in range(n_groups):
         base_g = g * (L0 + N * suffix)
-        shared = torch.arange(base_g, base_g + L0, dtype=torch.int32, device=dev)
+        shared = perm[base_g: base_g + L0]
         for n in range(N):
             b = g * N + n
             idx[b * S: b * S + L0] = shared
             base = base_g + L0 + n * suffix
-            idx[b * S + L0: (b + 1) * S] = torch.arange(
-                base, base + suffix, dtype=torch.int32, device=dev)
+            idx[b * S + L0: (b + 1) * S] = perm[base: base + suffix]
     shared_lens = torch.full((bs,), L0, dtype=torch.int32, device=dev)
     return dict(q=q, o=o, k=k, v=v, kv_indptr=kv_indptr, idx=idx,
                 shared_lens=shared_lens, bs=bs, sm=d ** -0.5, h_q=h_q, d=d)
@@ -118,6 +127,8 @@ def main():
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--suffix", type=int, default=8)
     ap.add_argument("--groups", type=int, default=1)
+    ap.add_argument("--contiguous", action="store_true",
+                    help="unrealistic contiguous shared range (overstates it)")
     ap.add_argument("--eager", action="store_true",
                     help="time eager launches instead of graph replay")
     args = ap.parse_args()
@@ -140,7 +151,7 @@ def main():
         cases, stock_us = {}, {}
         for L0 in CTXS:
             c = make_case(args.n, h_q, h_kv, d, L0, args.suffix,
-                          args.groups, dev)
+                          args.groups, dev, scatter=not args.contiguous)
             cases[L0] = c
             stock_us[L0] = timer(stock_fn(c, dev))
         print("stock:  " + "  ".join(f"{L0}:{stock_us[L0]:.0f}us"

@@ -836,6 +836,13 @@ class SMCScheduler(Scheduler):
         draft_input = self.slot_state.prepare_for_decode()
         if draft_input.decode_ctx is None:
             return None
+        # Refresh the group-shared-prefix bounds the draft attention backends
+        # read.  In place into the worker's persistent buffer: the captured
+        # draft graph holds a pointer to it, so this write is what makes each
+        # replay see the current cycle's bounds.
+        cascade_buf = getattr(self.draft_worker, "cascade_shared_lens", None)
+        if cascade_buf is not None:
+            self.slot_state.fill_cascade_shared_lens(cascade_buf)
         return self.slot_state.build_model_worker_batch(draft_input)
 
     def _resample(self, result: GenerationBatchResult):
