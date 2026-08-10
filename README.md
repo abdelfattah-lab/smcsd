@@ -121,6 +121,17 @@ At batch size 1 decode is weight-read-bound, so extra particles are nearly free 
 
 See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
+## Cross-tokenizer SMCSD
+
+SMCSD can use a draft and target with different tokenizers. The supported path
+keeps independent draft/target histories, maps draft proposals through
+canonical text, heals tokenizer-boundary mismatches, and scores the mapped
+target tokens before SMC resampling.
+
+For the inference quickstart, mapping-artifact workflow, validated
+Qwen3-4B/Llama-70B configuration, and target-SeqKD rank-64 LoRA training
+recipe, see [docs/cross_tokenizer.md](docs/cross_tokenizer.md).
+
 ## SMC-SD Parameters
 
 | Parameter | Flag | Description |

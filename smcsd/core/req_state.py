@@ -30,6 +30,7 @@ Invariants
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import os
@@ -52,6 +53,72 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 EMPTY_SLOT = -1
+
+
+def bonus_weight_mask(
+    *,
+    bonus_positions: torch.Tensor,
+    first_eos: torch.Tensor,
+    eos_hit: torch.Tensor,
+    max_tokens: torch.Tensor,
+    prior_token_counts: torch.Tensor,
+    prev_finished: torch.Tensor,
+    emit_bonus: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return rows whose sampled bonus is part of the visible sequence.
+
+    ``bonus_positions`` is the number of proposal tokens before the bonus.
+    A bonus contributes its power-normalizer only when it is emitted before
+    both EOS and the generation-length cap, and the particle was not already
+    in the absorbing finished state.
+    """
+    if emit_bonus is None:
+        emit_bonus = torch.ones_like(prev_finished, dtype=torch.bool)
+    remaining_capacity = (
+        max_tokens.to(torch.int64) - prior_token_counts.to(torch.int64)
+    )
+    eos_before_bonus = eos_hit & (
+        first_eos.to(torch.int64) < bonus_positions.to(torch.int64)
+    )
+    bonus_before_length = remaining_capacity > bonus_positions.to(torch.int64)
+    return (
+        emit_bonus.to(torch.bool)
+        & ~prev_finished.to(torch.bool)
+        & ~eos_before_bonus
+        & bonus_before_length
+    )
+
+
+def cross_weight_cutoff(
+    *,
+    proxy_lens: torch.Tensor,
+    n_weight_cols: int,
+    first_eos: torch.Tensor,
+    eos_hit: torch.Tensor,
+    length_hit: torch.Tensor,
+    max_tokens: torch.Tensor,
+    prior_token_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Return the inclusive visible-proxy weight cutoff for each particle.
+
+    ``first_eos`` is indexed in compact proxy-plus-bonus output space, while
+    ``logprob_diff`` has only proxy columns. An EOS in the bonus position
+    therefore retains the entire proxy. A length stop and an EOS stop can
+    coincide; importance weights only include their earliest visible prefix.
+    """
+    base_cutoff = proxy_lens.to(torch.int64) - 1
+    eos_col = torch.where(
+        first_eos >= proxy_lens.to(torch.int64),
+        base_cutoff,
+        first_eos.clamp(max=n_weight_cols - 1),
+    )
+    visible_before_length = max_tokens.to(torch.int64) - prior_token_counts
+    length_col = (visible_before_length - 1).clamp(max=n_weight_cols - 1)
+
+    cutoff = base_cutoff
+    cutoff = torch.where(eos_hit, torch.minimum(cutoff, eos_col), cutoff)
+    cutoff = torch.where(length_hit, torch.minimum(cutoff, length_col), cutoff)
+    return cutoff.clamp(max=n_weight_cols - 1)
 
 
 @dataclass
@@ -100,10 +167,27 @@ class ScheduleBatchSMC:
         model_config: "ModelConfig",
         enable_overlap: bool = False,
         n_particles: int = 1,
+        cross_tokenizer_enabled: bool = False,
+        final_selection: str = "posterior_sample",
     ):
         self.max_slots = max_num_reqs
         self.device = device
         self.gamma_plus_1 = gamma_plus_1
+        self.cross_tokenizer_enabled = bool(cross_tokenizer_enabled)
+        if final_selection not in {"posterior_sample", "max_weight"}:
+            raise ValueError(
+                "final_selection must be 'posterior_sample' or 'max_weight'."
+            )
+        self.final_selection = final_selection
+        self.draft_gamma_plus_1 = gamma_plus_1
+        if self.cross_tokenizer_enabled:
+            # A single target token can expand into many draft tokens. The
+            # Qwen3/Llama contract has observed expansions above eight, so keep
+            # enough default KV slack for the exact (untruncated) bonus lineage.
+            extra = int(os.environ.get("SMC_CROSS_DRAFT_BONUS_HEADROOM", "32"))
+            if extra < 0:
+                raise ValueError("SMC_CROSS_DRAFT_BONUS_HEADROOM must be >= 0")
+            self.draft_gamma_plus_1 = gamma_plus_1 + extra
         self.vocab_size = vocab_size
         self.max_output_len = max_output_len
         self.max_eos_count = max_eos_count
@@ -126,11 +210,6 @@ class ScheduleBatchSMC:
         # the admission/teardown uploads are truly async.  See
         # ``_to_device_async``.
         self._pin_host = torch.device(device).type == "cuda"
-        # Fused write-back (one triton launch) on CUDA; torch fallback
-        # otherwise or via SMC_FUSED_WRITE_BACK=0.
-        self._use_fused_write_back = self._pin_host and bool(
-            int(os.environ.get("SMC_FUSED_WRITE_BACK", "1"))
-        )
 
         # ── Slot lifecycle (CPU) ──
         self.free_slots: Deque[int] = deque(range(self.max_slots))
@@ -140,8 +219,14 @@ class ScheduleBatchSMC:
         self.req_pool_indices = torch.full(
             (self.max_slots,), EMPTY_SLOT, dtype=torch.int64, device=device
         )
+        self.draft_req_pool_indices = torch.full(
+            (self.max_slots,), EMPTY_SLOT, dtype=torch.int64, device=device
+        )
         self.seq_lens = torch.zeros(self.max_slots, dtype=torch.int64, device=device)
         self.kv_allocated_lens = torch.zeros(
+            self.max_slots, dtype=torch.int64, device=device
+        )
+        self.draft_kv_allocated_lens = torch.zeros(
             self.max_slots, dtype=torch.int64, device=device
         )
         self.verified_ids = torch.zeros(
@@ -154,6 +239,40 @@ class ScheduleBatchSMC:
         # idempotently.  Travels with lineage exactly like verified_ids.
         self.prev_last_draft_ids = torch.zeros(
             self.max_slots, dtype=torch.int32, device=device
+        )
+        # Cross-tokenizer mirrors.  The legacy fields above remain the active
+        # same-tokenizer path.  In cross-tokenizer mode these tensors carry
+        # independent target and draft lineage so resampling can copy both
+        # tokenizations consistently.
+        self.target_seq_lens = torch.zeros(
+            self.max_slots, dtype=torch.int64, device=device
+        )
+        self.draft_seq_lens = torch.zeros(
+            self.max_slots, dtype=torch.int64, device=device
+        )
+        self.target_verified_ids = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
+        )
+        self.draft_verified_ids = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
+        )
+        self.target_token_counts = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
+        )
+        self.draft_token_counts = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
+        )
+        # G8 pending draft suffix length.  Token ids are already part of
+        # draft_all_token_ids; this scalar tells the next draft step how many
+        # trailing draft tokens need KV materialization before the normal head.
+        self.pending_draft_suffix_lens = torch.zeros(
+            self.max_slots, dtype=torch.int16, device=device
+        )
+        self.proxy_target_lens = torch.zeros(
+            self.max_slots, dtype=torch.int32, device=device
+        )
+        self.proxy_bucket_ids = torch.zeros(
+            self.max_slots, dtype=torch.int16, device=device
         )
         self.token_counts = torch.zeros(
             self.max_slots, dtype=torch.int32, device=device
@@ -187,9 +306,10 @@ class ScheduleBatchSMC:
 
         # CPU mirror of ``seq_lens``, maintained arithmetically: set at
         # ``allocate_slots``, advanced by ``gamma_plus_1`` per decode step.
-        # Resampling never changes it — particles within a group are
-        # step-aligned, so ``seq_lens[dst] = seq_lens[src]`` is a no-op on
-        # lengths.  Lets batch construction provide ``seq_lens_cpu`` /
+        # Same-tokenizer particles are step-aligned, but cross-tokenizer
+        # particles can have different mapped proxy lengths.  Their shadows
+        # therefore follow lineage in ``apply_resample_host_shadows``.  This
+        # lets batch construction provide ``seq_lens_cpu`` /
         # ``seq_lens_sum`` (and the KV alloc count) without a device read,
         # which is what keeps the prepare path sync-free for overlapped
         # scheduling.  Verified against the device tensor when
@@ -210,6 +330,20 @@ class ScheduleBatchSMC:
         # ── Token history [max_slots, max_output_len] ──
         self.all_token_ids = torch.zeros(
             (self.max_slots, max_output_len), dtype=torch.int32, device=device
+        )
+        self.target_all_token_ids = torch.zeros(
+            (self.max_slots, max_output_len), dtype=torch.int32, device=device
+        )
+        self.draft_all_token_ids = torch.zeros(
+            (self.max_slots, max_output_len), dtype=torch.int32, device=device
+        )
+        self.mapping_boundary_state: Dict[int, object] = {}
+        self.draft_req_to_token_pool = None
+        self.draft_token_to_kv_pool_allocator = None
+        self.draft_tree_cache = None
+        self.draft_seq_lens_host = torch.zeros(self.max_slots, dtype=torch.int64)
+        self.pending_draft_suffix_lens_host = torch.zeros(
+            self.max_slots, dtype=torch.int16
         )
 
         # ── SamplingBatchInfo stubs ──
@@ -242,11 +376,6 @@ class ScheduleBatchSMC:
         self.active_slots_cpu = torch.empty(0, dtype=torch.int64)
         self._active_slots_list: List[int] = []
         self.num_active: int = 0
-        # ModelWorkerBatch cache: everything but the per-cycle fields is
-        # static between membership changes (issue #14, host-op slimming).
-        self._membership_version: int = 0
-        self._mwb_cache = None
-        self._mwb_version: int = -1
 
         # ── Group tracking ──
         # Per-group slot list (CPU authoritative view) — kept for O(1) Python
@@ -305,12 +434,37 @@ class ScheduleBatchSMC:
         self.kv_freed_count_host = torch.zeros(
             (2, 1), dtype=torch.int32, pin_memory=is_cuda
         )
+        self.draft_kv_freed_buf = None
+        self.draft_kv_freed_counter = None
+        self.draft_kv_freed_count_host = None
         self.finished_mask_host = torch.zeros(
             (2, self.max_slots), dtype=torch.bool, pin_memory=is_cuda
         )
         self._snap_events = [
             torch.cuda.Event() if is_cuda else None for _ in range(2)
         ]
+
+    def configure_draft_pools(
+        self,
+        *,
+        req_to_token_pool,
+        token_to_kv_pool_allocator,
+        tree_cache,
+    ) -> None:
+        self.draft_req_to_token_pool = req_to_token_pool
+        self.draft_token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.draft_tree_cache = tree_cache
+        is_cuda = torch.device(self.device).type == "cuda"
+        pool_cap = token_to_kv_pool_allocator.size + 1
+        self.draft_kv_freed_buf = torch.empty(
+            (2, pool_cap), dtype=torch.int32, device=self.device
+        )
+        self.draft_kv_freed_counter = torch.zeros(
+            (2, 1), dtype=torch.int32, device=self.device
+        )
+        self.draft_kv_freed_count_host = torch.zeros(
+            (2, 1), dtype=torch.int32, pin_memory=is_cuda
+        )
 
     # ────────────────────────────────────────────────────────
     #  Slot Allocation / Deallocation
@@ -372,22 +526,63 @@ class ScheduleBatchSMC:
 
         # ── Pure-CPU gather: per-particle values into host lists ──
         pool_idx_list: List[int] = []
+        draft_pool_idx_list: List[int] = []
         verified_list: List[int] = []
+        draft_verified_list: List[int] = []
+        prev_last_draft_list: List[int] = []
         token_count_list: List[int] = []
+        draft_token_count_list: List[int] = []
+        draft_seq_len_list: List[int] = []
+        draft_kv_allocated_list: List[int] = []
         ignore_eos_list: List[bool] = []
         max_new_tokens_list: List[int] = []
         eos_rows: List[List[int]] = []
         max_n_out = 0
+        max_n_draft_out = 0
         for slot, req in zip(slots, particle_reqs):
+            self.mapping_boundary_state.pop(slot, None)
             self.slot_to_req[slot] = req
             self.seq_lens_host[slot] = shared_seq_len
 
             pool_idx_list.append(req.req_pool_idx)
+            draft_pool_idx_list.append(
+                int(getattr(req, "smc_draft_req_pool_idx", EMPTY_SLOT))
+            )
             verified_list.append(req.output_ids[-1] if req.output_ids else 0)
+            draft_origin = list(
+                getattr(req, "smc_draft_origin_input_ids", req.origin_input_ids)
+            )
+            draft_output = list(getattr(req, "smc_draft_output_ids", []))
+            draft_verified_list.append(
+                int(getattr(req, "smc_draft_verified_id", draft_output[-1]))
+                if draft_output
+                else int(
+                    getattr(
+                        req,
+                        "smc_draft_verified_id",
+                        draft_origin[-1] if draft_origin else 0,
+                    )
+                )
+            )
+            committed_draft = draft_origin + draft_output
+            if committed_draft:
+                prev_last_draft_list.append(int(committed_draft[-1]))
+            else:
+                committed = req.origin_input_ids + req.output_ids
+                prev_last_draft_list.append(
+                    int(committed[shared_seq_len - 1]) if committed else 0
+                )
+            draft_token_count_list.append(len(draft_output))
+            draft_seq_len_list.append(len(draft_origin) + len(draft_output))
+            self.draft_seq_lens_host[slot] = len(draft_origin) + len(draft_output)
+            draft_kv_allocated_list.append(
+                int(getattr(req, "smc_draft_kv_allocated_len", len(draft_origin)))
+            )
             token_count_list.append(len(req.output_ids))
             ignore_eos_list.append(bool(req.sampling_params.ignore_eos))
             max_new_tokens_list.append(req.sampling_params.max_new_tokens)
             max_n_out = max(max_n_out, len(req.output_ids))
+            max_n_draft_out = max(max_n_draft_out, len(draft_output))
 
             # EOS token ids: gather from req.eos_token_ids, sampling_params
             # stop_token_ids, and the tokenizer.
@@ -410,24 +605,13 @@ class ScheduleBatchSMC:
 
         # ── Category 1: fields uniform across the group → index_fill_ ──
         self.seq_lens.index_fill_(0, idx, shared_seq_len)
+        self.target_seq_lens.index_fill_(0, idx, shared_seq_len)
         self.kv_allocated_lens.index_fill_(0, idx, shared_seq_len)
-        # Seed with the LAST COMMITTED token (position S-1 of the shared
-        # prefix; uniform across the group — every particle clones the same
-        # parent).  Its draft KV at S-1 was already written during prefill,
-        # so the deferred-bonus 2-token head's S-1 write is an idempotent
-        # rewrite on a group's first decode step — the head is universally
-        # valid and needs no step-0 special case.  (A -1 sentinel + batch
-        # global head selection was tried before and crashes whenever a new
-        # group joins a batch of already-decoding groups: the sentinel
-        # reaches the embedding as a token id.)
-        first_req = particle_reqs[0]
-        committed = first_req.origin_input_ids + first_req.output_ids
-        last_committed_token = int(committed[shared_seq_len - 1])
-        self.prev_last_draft_ids.index_fill_(0, idx, last_committed_token)
         self.finished_mask.index_fill_(0, idx, 0)
         self.finished_len.index_fill_(0, idx, 0)
         self.finish_reason_code.index_fill_(0, idx, 0)
         self.matched_eos_token.index_fill_(0, idx, 0)
+        self.pending_draft_suffix_lens.index_fill_(0, idx, 0)
         self.log_weights.index_fill_(0, idx, 0.0)
         self.interval_weights.index_fill_(0, idx, 0.0)
 
@@ -435,9 +619,33 @@ class ScheduleBatchSMC:
         self.req_pool_indices[idx] = self._to_device_async(
             pool_idx_list, torch.int64
         )
+        self.draft_req_pool_indices[idx] = self._to_device_async(
+            draft_pool_idx_list, torch.int64
+        )
         self.verified_ids[idx] = self._to_device_async(verified_list, torch.int32)
+        self.target_verified_ids[idx] = self._to_device_async(
+            verified_list, torch.int32
+        )
+        self.draft_verified_ids[idx] = self._to_device_async(
+            draft_verified_list, torch.int32
+        )
+        self.prev_last_draft_ids[idx] = self._to_device_async(
+            prev_last_draft_list, torch.int32
+        )
+        self.draft_seq_lens[idx] = self._to_device_async(
+            draft_seq_len_list, torch.int64
+        )
+        self.draft_kv_allocated_lens[idx] = self._to_device_async(
+            draft_kv_allocated_list, torch.int64
+        )
         self.token_counts[idx] = self._to_device_async(
             token_count_list, torch.int32
+        )
+        self.target_token_counts[idx] = self._to_device_async(
+            token_count_list, torch.int32
+        )
+        self.draft_token_counts[idx] = self._to_device_async(
+            draft_token_count_list, torch.int32
         )
         self.ignore_eos_t[idx] = self._to_device_async(ignore_eos_list, torch.bool)
         self.max_new_tokens_t[idx] = self._to_device_async(
@@ -457,6 +665,19 @@ class ScheduleBatchSMC:
             ]
             self.all_token_ids[idx, :max_n_out] = self._to_device_async(
                 prefix_rows, torch.int32
+            )
+            self.target_all_token_ids[idx, :max_n_out] = self._to_device_async(
+                prefix_rows, torch.int32
+            )
+        if max_n_draft_out > 0:
+            draft_rows = [
+                list(getattr(req, "smc_draft_output_ids", []))
+                + [0]
+                * (max_n_draft_out - len(getattr(req, "smc_draft_output_ids", [])))
+                for req in particle_reqs
+            ]
+            self.draft_all_token_ids[idx, :max_n_draft_out] = self._to_device_async(
+                draft_rows, torch.int32
             )
 
         self.group_slot_lists[group_id] = slots
@@ -520,8 +741,30 @@ class ScheduleBatchSMC:
                         _clear_draft_mamba_slot(draft_pool, saved_idx)
                     self.req_to_token_pool.free(req)
 
+            if self.cross_tokenizer_enabled and self.draft_req_to_token_pool is not None:
+                draft_pool_idx = int(self.draft_req_pool_indices[slot].item())
+                draft_alloc_len = int(self.draft_kv_allocated_lens[slot].item())
+                if draft_pool_idx != EMPTY_SLOT and draft_alloc_len > 0:
+                    draft_indices = self.draft_req_to_token_pool.req_to_token[
+                        draft_pool_idx, :draft_alloc_len
+                    ].to(dtype=torch.int64, copy=True)
+                    if hasattr(
+                        self.draft_token_to_kv_pool_allocator, "dec_ref_and_free"
+                    ):
+                        self.draft_token_to_kv_pool_allocator.dec_ref_and_free(
+                            draft_indices
+                        )
+                    else:
+                        self.draft_token_to_kv_pool_allocator.free(draft_indices)
+                    draft_req = getattr(self.slot_to_req.get(slot), "smc_draft_req", None)
+                    if draft_req is not None:
+                        self.draft_req_to_token_pool.free(draft_req)
+
             self.seq_lens_host[slot] = 0
+            self.draft_seq_lens_host[slot] = 0
+            self.pending_draft_suffix_lens_host[slot] = 0
             self.slot_to_req.pop(slot, None)
+            self.mapping_boundary_state.pop(slot, None)
             self.free_slots.append(slot)
 
         # Clear all released slots' device tensors to sentinels in one shot
@@ -531,11 +774,22 @@ class ScheduleBatchSMC:
         if slots:
             idx = self._to_device_async(slots, torch.int64)
             self.req_pool_indices.index_fill_(0, idx, EMPTY_SLOT)
+            self.draft_req_pool_indices.index_fill_(0, idx, EMPTY_SLOT)
             self.seq_lens.index_fill_(0, idx, 0)
+            self.target_seq_lens.index_fill_(0, idx, 0)
+            self.draft_seq_lens.index_fill_(0, idx, 0)
             self.kv_allocated_lens.index_fill_(0, idx, 0)
+            self.draft_kv_allocated_lens.index_fill_(0, idx, 0)
             self.verified_ids.index_fill_(0, idx, 0)
+            self.target_verified_ids.index_fill_(0, idx, 0)
+            self.draft_verified_ids.index_fill_(0, idx, 0)
             self.prev_last_draft_ids.index_fill_(0, idx, 0)
+            self.pending_draft_suffix_lens.index_fill_(0, idx, 0)
             self.token_counts.index_fill_(0, idx, 0)
+            self.target_token_counts.index_fill_(0, idx, 0)
+            self.draft_token_counts.index_fill_(0, idx, 0)
+            self.proxy_target_lens.index_fill_(0, idx, 0)
+            self.proxy_bucket_ids.index_fill_(0, idx, 0)
             self.finished_mask.index_fill_(0, idx, 0)
             self.finished_len.index_fill_(0, idx, 0)
             self.finish_reason_code.index_fill_(0, idx, 0)
@@ -545,6 +799,38 @@ class ScheduleBatchSMC:
             self.interval_weights.index_fill_(0, idx, 0.0)
 
         self.rebuild_active_slots()
+
+    def _trim_kv_slack_for_active(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_allocated_lens: torch.Tensor,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator,
+    ) -> None:
+        """Free unused per-slot KV tail pages and restore alloc == seq.
+
+        Cross-tokenizer write-back can commit fewer logical tokens than were
+        reserved for the verify/draft step.  The next decode allocation assumes
+        ``kv_allocated_lens == seq_lens``; leaving the unused tail referenced in
+        the block table drains the private cross-tokenizer draft pool.
+        """
+        for slot in self._active_slots_list:
+            pool_idx = int(req_pool_indices[slot].item())
+            seq_len = int(seq_lens[slot].item())
+            alloc_len = int(kv_allocated_lens[slot].item())
+            if pool_idx == EMPTY_SLOT or alloc_len <= seq_len:
+                continue
+
+            slack_indices = req_to_token_pool.req_to_token[
+                pool_idx, seq_len:alloc_len
+            ].to(dtype=torch.int64, copy=True)
+            if hasattr(token_to_kv_pool_allocator, "dec_ref_and_free"):
+                token_to_kv_pool_allocator.dec_ref_and_free(slack_indices)
+            else:
+                token_to_kv_pool_allocator.free(slack_indices)
+            kv_allocated_lens[slot] = seq_len
 
     def rebuild_active_slots(self) -> None:
         """Refresh ``active_slots``.
@@ -580,8 +866,62 @@ class ScheduleBatchSMC:
         self.active_slots_cpu = torch.tensor(active_list, dtype=torch.int64)
         self._active_slots_list = active_list
         self.num_active = len(active_list)
-        # Invalidate the cached ModelWorkerBatch (membership changed).
-        self._membership_version += 1
+
+    def apply_resample_host_shadows(self, plan) -> None:
+        """Mirror a completed resample into CPU-only cross-tokenizer metadata.
+
+        The fused resample kernel updates the device-resident state, including
+        target and draft sequence lengths.  Cross-tokenizer forwards also use
+        CPU shadow lengths to size attention metadata without a device sync.
+        Leaving destination slots' shadows at their pre-resample values makes
+        their host metadata disagree with the copied GPU KV state, which can
+        drive an attention kernel out of bounds on the following decode block.
+
+        This runs after the resample snapshot event has completed, so reading
+        the compact job plan is safe and it is outside the GPU hot path.
+        """
+        n_jobs = plan.n_jobs_sync()
+        if n_jobs == 0:
+            return
+        dst_slots = plan.dst_slots.to("cpu", dtype=torch.int64).tolist()
+        src_slots = plan.src_slots.to("cpu", dtype=torch.int64).tolist()
+        boundary_copies = {
+            int(src_slot): copy.deepcopy(
+                self.mapping_boundary_state.get(int(src_slot))
+            )
+            for src_slot in set(src_slots)
+        }
+        for dst_slot, src_slot in zip(dst_slots, src_slots, strict=True):
+            self.seq_lens_host[dst_slot] = self.seq_lens_host[src_slot]
+            if self.cross_tokenizer_enabled:
+                self.draft_seq_lens_host[dst_slot] = self.draft_seq_lens_host[
+                    src_slot
+                ]
+                self.pending_draft_suffix_lens_host[dst_slot] = (
+                    self.pending_draft_suffix_lens_host[src_slot]
+                )
+                source_boundary = boundary_copies[int(src_slot)]
+                if source_boundary is None:
+                    self.mapping_boundary_state.pop(int(dst_slot), None)
+                else:
+                    self.mapping_boundary_state[int(dst_slot)] = copy.deepcopy(
+                        source_boundary
+                    )
+
+    def set_mapping_boundary_states(self, states) -> None:
+        """Store worker-produced mapper state in current active-slot order."""
+
+        if states is None:
+            return
+        if len(states) != len(self._active_slots_list):
+            raise ValueError(
+                "mapping boundary-state row count must match active slots"
+            )
+        for slot, state in zip(self._active_slots_list, states, strict=True):
+            if state is None or getattr(state, "is_empty", False):
+                self.mapping_boundary_state.pop(int(slot), None)
+            else:
+                self.mapping_boundary_state[int(slot)] = copy.deepcopy(state)
 
     def is_empty(self) -> bool:
         return self.num_active == 0
@@ -591,17 +931,8 @@ class ScheduleBatchSMC:
     # ────────────────────────────────────────────────────────
 
     def prepare_for_decode(self) -> SMCDraftInput:
-        """Allocate KV for the cycle and produce the worker's inputs via
-        ONE fused kernel (issue #14, host-op slimming).
-
-        The fused kernel does, per active row: the slot gathers
-        (seq/verified/prev), the block-table write of the freshly-allocated
-        pages, and the seq/kv-alloc advance — replacing the ~12 separate
-        ops of the previous gather → assign → scatter sequence.  Under the
-        ``kv_allocated_lens == seq_lens`` invariant every row takes exactly
-        ``gamma+1`` pages, so the allocated page tensor IS the per-row
-        cache-locs table (carried on the ctx; nothing re-reads the block
-        table).
+        """Gather the live slot tensors, vectorised KV allocation, scatter
+        back, and return a ready-to-use ``SMCDraftInput`` for the worker.
         """
         if self.num_active == 0:
             return SMCDraftInput(
@@ -609,46 +940,91 @@ class ScheduleBatchSMC:
                 num_tokens_per_req=self.gamma_plus_1,
             )
 
-        from sglang.srt.mem_cache.common import alloc_token_slots
-        from smcsd.core.kernels.fused_prepare import fused_prepare_decode
-
         active = self.active_slots
-        bs = self.num_active
+
+        seq_lens_g = self.seq_lens[active]
+        kv_alloc_g = self.kv_allocated_lens[active]
+        pool_idx_g = self.req_pool_indices[active]
+        verified_g = self.verified_ids[active]
+        prev_last_draft_g = self.prev_last_draft_ids[active]
+        draft_verified_g = self.draft_verified_ids[active]
 
         # Host shadow gather — provides every CPU-side scalar the batch
         # build needs without reading the device tensors (which, under
         # overlapped scheduling, may not be computed yet).
         seq_lens_cpu_g = self.seq_lens_host[self.active_slots_cpu]
 
-        pages = alloc_token_slots(self.tree_cache, bs * self.gamma_plus_1)
-        orig_seq_lens, verified_g, prev_last_draft_g = fused_prepare_decode(
-            active,
-            self.seq_lens,
-            self.kv_allocated_lens,
-            self.req_pool_indices,
-            self.verified_ids,
-            self.prev_last_draft_ids,
-            pages,
-            self.req_to_token_pool.req_to_token,
-            self.gamma_plus_1,
+        ctx, new_kv_alloc = SMCDecodeContext.from_slot_gather(
+            seq_lens=seq_lens_g,
+            seq_lens_cpu=seq_lens_cpu_g,
+            kv_allocated_lens=kv_alloc_g,
+            req_pool_indices=pool_idx_g,
+            gamma_plus_1=self.gamma_plus_1,
+            req_to_token_pool=self.req_to_token_pool,
+            tree_cache=self.tree_cache,
         )
+
+        self.kv_allocated_lens[active] = new_kv_alloc
+        self.seq_lens[active] = ctx.new_seq_lens
         self.seq_lens_host[self.active_slots_cpu] = (
             seq_lens_cpu_g + self.gamma_plus_1
         )
 
-        ctx = SMCDecodeContext(
-            orig_seq_lens=orig_seq_lens,
-            orig_seq_lens_cpu=seq_lens_cpu_g,
-            orig_seq_lens_sum=int(seq_lens_cpu_g.sum().item()),
-            new_seq_lens=orig_seq_lens + self.gamma_plus_1,
-            gamma=self.gamma_plus_1 - 1,
-            cache_locs=pages.view(bs, self.gamma_plus_1),
-        )
+        draft_ctx = None
+        pending_suffix_ids_g = None
+        pending_suffix_lens_g = None
+        if self.cross_tokenizer_enabled:
+            if self.draft_req_to_token_pool is None:
+                raise RuntimeError("cross-tokenizer draft pools are not configured.")
+            draft_seq_lens_g = self.draft_seq_lens[active]
+            draft_kv_alloc_g = self.draft_kv_allocated_lens[active]
+            draft_pool_idx_g = self.draft_req_pool_indices[active]
+            draft_seq_lens_cpu_g = self.draft_seq_lens_host[self.active_slots_cpu]
+            pending_suffix_lens_g = self.pending_draft_suffix_lens[active].to(
+                torch.int64
+            )
+            max_pending_suffix = int(self.draft_gamma_plus_1)
+            pending_suffix_ids_g = None
+            if max_pending_suffix > 0:
+                draft_counts_g = self.draft_token_counts[active].to(torch.int64)
+                pending_cols = torch.arange(
+                    max_pending_suffix, dtype=torch.int64, device=self.device
+                )
+                pending_start = draft_counts_g - pending_suffix_lens_g
+                gather_cols = (
+                    pending_start.unsqueeze(1) + pending_cols.unsqueeze(0)
+                ).clamp(min=0, max=self.max_output_len - 1)
+                pending_suffix_ids_g = self.draft_all_token_ids[
+                    active.unsqueeze(1), gather_cols
+                ].to(torch.int64)
+            draft_ctx, new_draft_kv_alloc = SMCDecodeContext.from_slot_gather(
+                seq_lens=draft_seq_lens_g,
+                seq_lens_cpu=draft_seq_lens_cpu_g,
+                kv_allocated_lens=draft_kv_alloc_g,
+                req_pool_indices=draft_pool_idx_g,
+                gamma_plus_1=self.draft_gamma_plus_1,
+                req_to_token_pool=self.draft_req_to_token_pool,
+                tree_cache=self.draft_tree_cache,
+            )
+            self.draft_kv_allocated_lens[active] = new_draft_kv_alloc
+            self.draft_seq_lens[active] = draft_ctx.new_seq_lens
+            self.draft_seq_lens_host[self.active_slots_cpu] = (
+                draft_seq_lens_cpu_g + self.draft_gamma_plus_1
+            )
+
         return SMCDraftInput(
             verified_id=verified_g,
             prev_last_draft_id=prev_last_draft_g,
             num_tokens_per_req=self.gamma_plus_1,
             decode_ctx=ctx,
+            draft_decode_ctx=draft_ctx,
+            draft_verified_id=draft_verified_g,
+            pending_draft_suffix_ids=pending_suffix_ids_g,
+            pending_draft_suffix_lens=pending_suffix_lens_g,
+            mapping_boundary_states=[
+                copy.deepcopy(self.mapping_boundary_state.get(int(slot)))
+                for slot in self._active_slots_list
+            ],
         )
 
     def prepare_for_extend(self):
@@ -664,39 +1040,19 @@ class ScheduleBatchSMC:
         self,
         draft_input: SMCDraftInput,
     ) -> ModelWorkerBatch:
-        """Assemble a contiguous ``ModelWorkerBatch`` for the worker.
-
-        Under static membership everything except the per-cycle fields
-        (input_ids / seq_lens / seq_lens_cpu / seq_lens_sum / spec_info) is
-        identical between membership changes, so the batch object — incl.
-        the req_pool_indices gather, the Python ``reqs`` list, and the stub
-        SamplingBatchInfo — is cached and only those five fields are
-        refreshed per cycle (issue #14, host-op slimming).  Safe to mutate
-        in place: the previous cycle's consumers never read the batch after
-        launch (the overlap queue stores it only for prefill entries).
-        """
+        """Assemble a contiguous ``ModelWorkerBatch`` for the worker from
+        the live subset of slot-indexed tensors."""
+        active = self.active_slots
+        bs = self.num_active
         ctx = draft_input.decode_ctx
+
+        req_pool_indices = self.req_pool_indices[active]
+        seq_lens = ctx.new_seq_lens if ctx is not None else self.seq_lens[active]
         # CPU values from the host shadow — no device read.  The shadow was
         # already advanced by prepare_for_decode, so it equals new_seq_lens.
         seq_lens_cpu = self.seq_lens_host[self.active_slots_cpu]
         seq_lens_sum = int(seq_lens_cpu.sum().item())
 
-        cached = self._mwb_cache
-        if cached is not None and self._mwb_version == self._membership_version:
-            cached.input_ids = draft_input.verified_id
-            cached.seq_lens = (
-                ctx.new_seq_lens if ctx is not None
-                else self.seq_lens[self.active_slots]
-            )
-            cached.seq_lens_cpu = seq_lens_cpu
-            cached.seq_lens_sum = seq_lens_sum
-            cached.spec_info = draft_input
-            return cached
-
-        active = self.active_slots
-        bs = self.num_active
-        req_pool_indices = self.req_pool_indices[active]
-        seq_lens = ctx.new_seq_lens if ctx is not None else self.seq_lens[active]
         reqs = [self.slot_to_req[s] for s in self._active_slots_list]
 
         # Stub SamplingBatchInfo — SMC worker does its own sampling under
@@ -714,8 +1070,7 @@ class ScheduleBatchSMC:
             vocab_size=self.vocab_size,
         )
 
-        self._mwb_version = self._membership_version
-        self._mwb_cache = ModelWorkerBatch(
+        mwb = ModelWorkerBatch(
             forward_mode=ForwardMode.DECODE,
             input_ids=draft_input.verified_id,
             req_pool_indices=req_pool_indices,
@@ -750,7 +1105,46 @@ class ScheduleBatchSMC:
             capture_hidden_mode=CaptureHiddenMode.NULL,
             reqs=reqs,
         )
-        return self._mwb_cache
+        if self.cross_tokenizer_enabled:
+            mwb.smc_draft_req_pool_indices = self.draft_req_pool_indices[active]
+            if os.environ.get("SMC_TRACE_JSONL"):
+                target_counts = [
+                    int(x)
+                    for x in self.target_token_counts[active].detach().cpu().tolist()
+                ]
+                draft_counts = [
+                    int(x)
+                    for x in self.draft_token_counts[active].detach().cpu().tolist()
+                ]
+                max_target = max(target_counts, default=0)
+                max_draft = max(draft_counts, default=0)
+                target_rows = (
+                    self.target_all_token_ids[active, :max_target]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                    if max_target > 0
+                    else [[] for _ in target_counts]
+                )
+                draft_rows = (
+                    self.draft_all_token_ids[active, :max_draft]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                    if max_draft > 0
+                    else [[] for _ in draft_counts]
+                )
+                mwb.smc_trace_active_slots = list(self._active_slots_list)
+                mwb.smc_trace_target_prefix_ids = [
+                    list(req.origin_input_ids) + row[:count]
+                    for req, row, count in zip(reqs, target_rows, target_counts)
+                ]
+                mwb.smc_trace_draft_prefix_ids = [
+                    list(getattr(req, "smc_draft_origin_input_ids", req.origin_input_ids))
+                    + row[:count]
+                    for req, row, count in zip(reqs, draft_rows, draft_counts)
+                ]
+        return mwb
 
     # ────────────────────────────────────────────────────────
     #  Process Batch Result (write-back from forward pass)
@@ -783,38 +1177,7 @@ class ScheduleBatchSMC:
            are NOT touched; ``finalize_group`` reads the tensors lazily.
         d. Accumulate ``logprob_diff`` into the slot-indexed
            ``log_weights`` / ``interval_weights``.
-
-        On CUDA this is ONE fused triton launch (one program per row); the
-        torch implementation below remains as the reference / CPU fallback
-        (kill-switch: SMC_FUSED_WRITE_BACK=0).
         """
-        if self._use_fused_write_back:
-            from smcsd.core.kernels.fused_write_back import fused_write_back
-
-            fused_write_back(
-                self.active_slots,
-                next_token_ids,
-                logprob_diff,
-                bonus_ids,
-                prev_last_draft_ids,
-                all_token_ids=self.all_token_ids,
-                token_counts=self.token_counts,
-                verified_ids=self.verified_ids,
-                prev_ids=self.prev_last_draft_ids,
-                finished_mask=self.finished_mask,
-                finished_len=self.finished_len,
-                finish_reason_code=self.finish_reason_code,
-                matched_eos_token=self.matched_eos_token,
-                ignore_eos=self.ignore_eos_t,
-                max_new_tokens=self.max_new_tokens_t,
-                eos_token_ids=self.eos_token_ids_t,
-                log_weights=self.log_weights,
-                interval_weights=self.interval_weights,
-                gamma_plus_1=self.gamma_plus_1,
-                bonus_logz=bonus_logz,
-            )
-            return
-
         active = self.active_slots
         bs = self.num_active
         stride = self.gamma_plus_1
@@ -828,10 +1191,15 @@ class ScheduleBatchSMC:
             stride, dtype=torch.int64, device=self.device,
         )
         self.all_token_ids[row_idx, col_idx] = accepted_2d.to(self.all_token_ids.dtype)
+        self.target_all_token_ids[row_idx, col_idx] = accepted_2d.to(
+            self.target_all_token_ids.dtype
+        )
         self.token_counts[active] += stride
+        self.target_token_counts[active] += stride
 
         # b. Next step's seed token.
         self.verified_ids[active] = bonus_ids.to(dtype=torch.int32)
+        self.target_verified_ids[active] = bonus_ids.to(dtype=torch.int32)
         # This step's last drafted token, deferred into next step's leading
         # 2-token draft forward.  Carried but not yet consumed (Step 2).
         if prev_last_draft_ids is not None:
@@ -905,6 +1273,12 @@ class ScheduleBatchSMC:
         weight_cutoff = torch.full(
             (bs,), n_weight_cols - 1, dtype=torch.int64, device=self.device
         )
+        # Do not include drafted positions past a newly reached length cap.
+        # ``accepted_2d`` includes the bonus column, while ``logprob_diff``
+        # covers only draft columns, hence the inclusive ``-1`` index.
+        prior_token_counts = updated_counts.to(torch.int64) - stride
+        length_cutoff = max_tokens.to(torch.int64) - prior_token_counts - 1
+        weight_cutoff = torch.minimum(weight_cutoff, length_cutoff)
         # For the weight cutoff, EOS takes precedence even when the length
         # cap is hit in the same block (unlike the finish *reason*, where
         # length wins historically): once the sequence emitted EOS, the
@@ -912,7 +1286,11 @@ class ScheduleBatchSMC:
         # reason gets reported.
         eos_cut = newly_finished_mask & eos_hit
         weight_cutoff = torch.where(
-            eos_cut, first_eos.clamp(max=n_weight_cols - 1), weight_cutoff
+            eos_cut,
+            torch.minimum(
+                weight_cutoff, first_eos.clamp(max=n_weight_cols - 1)
+            ),
+            weight_cutoff,
         )
         weight_cutoff = torch.where(
             prev_finished_active,
@@ -931,18 +1309,357 @@ class ScheduleBatchSMC:
         cols = torch.arange(n_weight_cols, device=self.device).unsqueeze(0)
         keep = cols <= weight_cutoff.unsqueeze(1)
         d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
-
-        # Bonus-token normalizer log Z (joint-power target; 0 at alpha=1).  The
-        # bonus is part of the sequence — and so weighted — unless the particle
-        # was already finished or terminated via EOS within the draft columns
-        # 0..gamma-1 (an EOS in the bonus column itself still emits the bonus, so
-        # first_eos == n_weight_cols does NOT drop it).  Mirrors logprob_diff's
-        # EOS-cutoff convention: length-only termination keeps the full block.
         if bonus_logz is not None:
-            eos_in_draft = eos_cut & (first_eos < n_weight_cols)
-            add_bonus = (~prev_finished_active & ~eos_in_draft).to(torch.float64)
-            d = d + bonus_logz.to(torch.float64) * add_bonus
+            add_bonus = bonus_weight_mask(
+                bonus_positions=torch.full(
+                    (bs,),
+                    n_weight_cols,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                first_eos=first_eos,
+                eos_hit=eos_hit,
+                max_tokens=max_tokens,
+                prior_token_counts=prior_token_counts,
+                prev_finished=prev_finished_active,
+            )
+            d = d + bonus_logz.to(torch.float64) * add_bonus.to(torch.float64)
+        self.log_weights[active] += d
+        self.interval_weights[active] += d
 
+    def write_back_cross_tokenizer_gpu(
+        self,
+        next_token_ids: torch.Tensor,
+        logprob_diff: torch.Tensor,
+        bonus_ids: torch.Tensor,
+        *,
+        proxy_valid_mask: torch.Tensor,
+        proxy_lens: torch.Tensor,
+        emit_target_bonus: torch.Tensor | None,
+        bonus_logz: torch.Tensor | None,
+        draft_verified_ids: torch.Tensor,
+        draft_accepted_ids: torch.Tensor,
+        draft_accepted_lens: torch.Tensor | None = None,
+        draft_visible_lens: torch.Tensor | None = None,
+        prev_last_draft_ids: torch.Tensor | None = None,
+        identity_const_lens: bool = False,
+        proxy_lens_host: torch.Tensor | None = None,
+        draft_visible_lens_host: torch.Tensor | None = None,
+        fast_writeback_lens: bool = False,
+        emit_target_bonus_host: torch.Tensor | None = None,
+        pending_draft_suffix_lens: torch.Tensor | None = None,
+        pending_draft_suffix_lens_host: torch.Tensor | None = None,
+    ) -> None:
+        active = self.active_slots
+        bs = self.num_active
+        proxy_width = int(proxy_valid_mask.shape[1])
+        output_width = proxy_width + 1
+        accepted_2d = next_token_ids.reshape(bs, output_width)
+        if emit_target_bonus is None:
+            emit_target_bonus = torch.ones(
+                (bs,), dtype=torch.bool, device=self.device
+            )
+        else:
+            emit_target_bonus = emit_target_bonus.to(
+                device=self.device, dtype=torch.bool
+            )
+        accept_lens = proxy_lens.to(torch.int32) + emit_target_bonus.to(torch.int32)
+        offsets = self.token_counts[active].to(torch.int64)
+        row_idx = active.unsqueeze(1).expand(-1, output_width)
+
+        if identity_const_lens:
+            # Every row writes a full, contiguous gamma+1 block (proxy_lens ==
+            # gamma, all positions valid), so pos_cols collapses to
+            # arange(output_width) and output_valid is all-True.  Use the same
+            # contiguous scatter as the same-tokenizer write_back instead of a
+            # boolean-masked gather/scatter — the masking was the bulk of the
+            # cross write_back's per-step cost.
+            output_valid = None
+            col_idx = offsets.unsqueeze(1) + torch.arange(
+                output_width, dtype=torch.int64, device=self.device
+            )
+            self.all_token_ids[row_idx, col_idx] = accepted_2d.to(
+                self.all_token_ids.dtype
+            )
+            self.target_all_token_ids[row_idx, col_idx] = accepted_2d.to(
+                self.target_all_token_ids.dtype
+            )
+        else:
+            proxy_valid_mask = proxy_valid_mask.to(torch.bool)
+            output_valid = torch.cat(
+                [
+                    proxy_valid_mask,
+                    emit_target_bonus.unsqueeze(1),
+                ],
+                dim=1,
+            )
+            proxy_positions = torch.arange(
+                proxy_width, dtype=torch.int64, device=self.device
+            )
+            pos_cols = torch.cat(
+                [
+                    proxy_positions.unsqueeze(0).expand(bs, -1),
+                    proxy_lens.to(torch.int64).unsqueeze(1),
+                ],
+                dim=1,
+            )
+            col_idx = offsets.unsqueeze(1) + pos_cols
+            self.all_token_ids[row_idx[output_valid], col_idx[output_valid]] = (
+                accepted_2d[output_valid].to(self.all_token_ids.dtype)
+            )
+            self.target_all_token_ids[row_idx[output_valid], col_idx[output_valid]] = (
+                accepted_2d[output_valid].to(self.target_all_token_ids.dtype)
+            )
+
+        self.token_counts[active] += accept_lens
+        self.target_token_counts[active] += accept_lens
+        self.verified_ids[active] = bonus_ids.to(dtype=torch.int32)
+        self.target_verified_ids[active] = bonus_ids.to(dtype=torch.int32)
+
+        # Target KV was over-allocated by gamma+1.  Only the mapped proxy plus
+        # bonus is part of the visible target sequence.
+        target_delta = accept_lens.to(torch.int64)
+        self.seq_lens[active] = self.seq_lens[active] - self.gamma_plus_1 + target_delta
+        self.target_seq_lens[active] = self.seq_lens[active]
+        if identity_const_lens:
+            # accept_lens == gamma+1 for every row, so the host-mirror
+            # correction (-gamma_plus_1 + accept_lens) is identically zero:
+            # the shadow already holds the right value from prepare_for_decode's
+            # pre-increment.  Skipping it removes a device->host sync that would
+            # otherwise stall the launch pipeline on the hot path.
+            pass
+        elif (
+            fast_writeback_lens
+            and proxy_lens_host is not None
+            and emit_target_bonus_host is not None
+        ):
+            # G1: both terms were built from mapper host lists, so the host
+            # correction needs no device-to-host copy.
+            lens_cpu = (
+                proxy_lens_host.to(torch.int64)
+                + emit_target_bonus_host.to(torch.int64)
+            )
+            self.seq_lens_host[self.active_slots_cpu] = (
+                self.seq_lens_host[self.active_slots_cpu]
+                - self.gamma_plus_1
+                + lens_cpu
+            )
+        else:
+            lens_cpu = accept_lens.detach().cpu().to(torch.int64)
+            self.seq_lens_host[self.active_slots_cpu] = (
+                self.seq_lens_host[self.active_slots_cpu]
+                - self.gamma_plus_1
+                + lens_cpu
+            )
+        self._trim_kv_slack_for_active(
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            kv_allocated_lens=self.kv_allocated_lens,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
+
+        self.draft_verified_ids[active] = draft_verified_ids.to(dtype=torch.int32)
+        if prev_last_draft_ids is not None:
+            self.prev_last_draft_ids[active] = prev_last_draft_ids.to(dtype=torch.int32)
+        if pending_draft_suffix_lens is None:
+            pending_draft_suffix_lens = torch.zeros(
+                (bs,), dtype=torch.int64, device=self.device
+            )
+        else:
+            pending_draft_suffix_lens = pending_draft_suffix_lens.to(
+                device=self.device, dtype=torch.int64
+            )
+        self.pending_draft_suffix_lens[active] = pending_draft_suffix_lens.to(
+            dtype=self.pending_draft_suffix_lens.dtype
+        )
+        if pending_draft_suffix_lens_host is not None:
+            self.pending_draft_suffix_lens_host[self.active_slots_cpu] = (
+                pending_draft_suffix_lens_host.to(
+                    dtype=self.pending_draft_suffix_lens_host.dtype
+                )
+            )
+        else:
+            self.pending_draft_suffix_lens_host[self.active_slots_cpu] = (
+                pending_draft_suffix_lens.detach()
+                .cpu()
+                .to(dtype=self.pending_draft_suffix_lens_host.dtype)
+            )
+        if draft_visible_lens is None:
+            draft_visible_lens = torch.full(
+                (bs,), self.gamma_plus_1, dtype=torch.int64, device=self.device
+            )
+        else:
+            draft_visible_lens = draft_visible_lens.to(
+                device=self.device, dtype=torch.int64
+            )
+        self.draft_seq_lens[active] = (
+            self.draft_seq_lens[active]
+            - self.draft_gamma_plus_1
+            + draft_visible_lens
+        )
+        if identity_const_lens:
+            # draft_visible_lens == gamma+1 for every row, so the host-mirror
+            # correction is the per-step constant (gamma_plus_1 -
+            # draft_gamma_plus_1) == -bonus_headroom.  Apply it as host-only
+            # arithmetic to avoid the device->host copy on the hot path.
+            self.draft_seq_lens_host[self.active_slots_cpu] += (
+                self.gamma_plus_1 - self.draft_gamma_plus_1
+            )
+        elif fast_writeback_lens and draft_visible_lens_host is not None:
+            # G1: draft_visible_lens was built from a host list (lineage), so the
+            # host-mirror update needs no device->host copy.
+            self.draft_seq_lens_host[self.active_slots_cpu] = (
+                self.draft_seq_lens_host[self.active_slots_cpu]
+                - self.draft_gamma_plus_1
+                + draft_visible_lens_host.to(torch.int64)
+            )
+        else:
+            self.draft_seq_lens_host[self.active_slots_cpu] = (
+                self.draft_seq_lens_host[self.active_slots_cpu]
+                - self.draft_gamma_plus_1
+                + draft_visible_lens.detach().cpu().to(torch.int64)
+            )
+        self._trim_kv_slack_for_active(
+            req_pool_indices=self.draft_req_pool_indices,
+            seq_lens=self.draft_seq_lens,
+            kv_allocated_lens=self.draft_kv_allocated_lens,
+            req_to_token_pool=self.draft_req_to_token_pool,
+            token_to_kv_pool_allocator=self.draft_token_to_kv_pool_allocator,
+        )
+        max_draft_accept = int(draft_accepted_ids.shape[1])
+        if draft_accepted_lens is None:
+            draft_accepted_lens = torch.full(
+                (bs,), max_draft_accept, dtype=torch.int64, device=self.device
+            )
+        else:
+            draft_accepted_lens = draft_accepted_lens.to(
+                device=self.device, dtype=torch.int64
+            )
+        if max_draft_accept > 0:
+            draft_offsets = self.draft_token_counts[active].to(torch.int64)
+            draft_positions = torch.arange(
+                max_draft_accept, dtype=torch.int64, device=self.device
+            )
+            draft_cols = draft_offsets.unsqueeze(1) + draft_positions.unsqueeze(0)
+            draft_rows = active.unsqueeze(1).expand(-1, max_draft_accept)
+            if identity_const_lens:
+                # draft_accepted_lens == gamma+1 == max_draft_accept for every
+                # row, so the whole block is valid: contiguous scatter, no mask.
+                self.draft_all_token_ids[draft_rows, draft_cols] = (
+                    draft_accepted_ids.to(self.draft_all_token_ids.dtype)
+                )
+            else:
+                draft_valid = (
+                    draft_positions.unsqueeze(0) < draft_accepted_lens.unsqueeze(1)
+                )
+                self.draft_all_token_ids[
+                    draft_rows[draft_valid], draft_cols[draft_valid]
+                ] = draft_accepted_ids[draft_valid].to(self.draft_all_token_ids.dtype)
+        self.draft_token_counts[active] += draft_accepted_lens.to(
+            self.draft_token_counts.dtype
+        )
+
+        updated_counts = self.token_counts[active]
+        max_tokens = self.max_new_tokens_t[active]
+        length_hit = updated_counts >= max_tokens
+        eos_ids = self.eos_token_ids_t[active]
+        eos_eq = accepted_2d.unsqueeze(2).to(torch.int64) == eos_ids.unsqueeze(1)
+        if output_valid is not None:
+            # Mask out post-mapping padding columns; under identity every
+            # column is a real token so the mask is skipped.
+            eos_eq = eos_eq & output_valid.unsqueeze(2)
+        eos_match = eos_eq.any(dim=2)
+        eos_hit = eos_match.any(dim=1) & ~self.ignore_eos_t[active]
+        prev_finished_active = self.finished_mask[active]
+        newly_finished_mask = (length_hit | eos_hit) & ~prev_finished_active
+        self.finished_mask[active] = prev_finished_active | newly_finished_mask
+
+        if bool(int(os.environ.get("SMC_DEBUG_CROSS", "0"))):
+            sample = min(bs, 8)
+            print(
+                "[SMC_CROSS_DBG] "
+                f"counts={updated_counts[:sample].detach().cpu().tolist()} "
+                f"accept_lens={accept_lens[:sample].detach().cpu().tolist()} "
+                f"length_hit={length_hit[:sample].detach().cpu().tolist()} "
+                f"eos_hit={eos_hit[:sample].detach().cpu().tolist()} "
+                f"new_finish={newly_finished_mask[:sample].detach().cpu().tolist()}",
+                flush=True,
+            )
+
+        positions = torch.arange(
+            output_width, dtype=torch.int64, device=self.device
+        )
+        first_eos_storage = torch.where(
+            eos_match, positions, output_width
+        ).min(dim=1).values
+        matched_tok = accepted_2d.gather(
+            1, first_eos_storage.clamp(max=output_width - 1).unsqueeze(1)
+        ).squeeze(1)
+        # The padded proxy layout stores the bonus in the final physical
+        # column, but it is appended immediately after each row's variable
+        # proxy. Convert that physical index to its compact visible position.
+        first_eos = torch.where(
+            first_eos_storage == proxy_width,
+            proxy_lens.to(torch.int64),
+            first_eos_storage,
+        )
+        eos_branch = newly_finished_mask & ~length_hit
+        fin_len = torch.where(
+            length_hit,
+            max_tokens,
+            (
+                updated_counts.to(torch.int64)
+                - accept_lens.to(torch.int64)
+                + first_eos
+                + 1
+            ).to(max_tokens.dtype),
+        )
+        fin_code = torch.where(length_hit, 1, 2).to(self.finish_reason_code.dtype)
+        self.finished_len[active] = torch.where(
+            newly_finished_mask, fin_len, self.finished_len[active]
+        )
+        self.finish_reason_code[active] = torch.where(
+            newly_finished_mask, fin_code, self.finish_reason_code[active]
+        )
+        self.matched_eos_token[active] = torch.where(
+            eos_branch,
+            matched_tok.to(torch.int32),
+            self.matched_eos_token[active],
+        )
+
+        n_weight_cols = logprob_diff.shape[1]
+        prior_token_counts = updated_counts.to(torch.int64) - accept_lens.to(
+            torch.int64
+        )
+        weight_cutoff = cross_weight_cutoff(
+            proxy_lens=proxy_lens,
+            n_weight_cols=n_weight_cols,
+            first_eos=first_eos,
+            eos_hit=eos_hit,
+            length_hit=length_hit,
+            max_tokens=max_tokens,
+            prior_token_counts=prior_token_counts,
+        )
+        weight_cutoff = torch.where(
+            prev_finished_active,
+            torch.full_like(weight_cutoff, -1),
+            weight_cutoff,
+        )
+        cols = torch.arange(n_weight_cols, device=self.device).unsqueeze(0)
+        keep = cols <= weight_cutoff.unsqueeze(1)
+        d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
+        if bonus_logz is not None:
+            add_bonus = bonus_weight_mask(
+                bonus_positions=proxy_lens,
+                first_eos=first_eos,
+                eos_hit=eos_hit,
+                max_tokens=max_tokens,
+                prior_token_counts=prior_token_counts,
+                prev_finished=prev_finished_active,
+                emit_bonus=emit_target_bonus,
+            )
+            d = d + bonus_logz.to(torch.float64) * add_bonus.to(torch.float64)
         self.log_weights[active] += d
         self.interval_weights[active] += d
 
@@ -965,6 +1682,10 @@ class ScheduleBatchSMC:
         self.kv_freed_count_host[p].copy_(
             self.kv_freed_counter[p], non_blocking=True
         )
+        if self.draft_kv_freed_counter is not None:
+            self.draft_kv_freed_count_host[p].copy_(
+                self.draft_kv_freed_counter[p], non_blocking=True
+            )
         self.finished_mask_host[p].copy_(self.finished_mask, non_blocking=True)
         ev = self._snap_events[p]
         if ev is not None:
@@ -975,6 +1696,21 @@ class ScheduleBatchSMC:
     # ────────────────────────────────────────────────────────
     #  Unbiased log-Z bookkeeping
     # ────────────────────────────────────────────────────────
+
+    def ess_stats_in_use(self):
+        """Per-in-use-group ESS from interval_weights.
+
+        DIAGNOSTIC ONLY (SMC_LOG_ESS): must be called BEFORE the collect kernel
+        zeroes interval_weights.  ESS = (sum w)^2 / sum w^2 over the group's N
+        normalized particle weights; low ESS => weight degeneracy.
+        """
+        iw_rows = self.interval_weights[self.group_to_slots.to(torch.int64)]
+        m = iw_rows.max(dim=1, keepdim=True).values
+        w = torch.exp(iw_rows - m)
+        sw = w.sum(dim=1)
+        sw2 = (w * w).sum(dim=1)
+        ess = (sw * sw) / sw2.clamp_min(1e-30)
+        return ess, self.row_in_use
 
     def resample_logZ_increment(self) -> torch.Tensor:
         """Per-row log Z_hat increment for the current step, computed BEFORE the
@@ -1013,19 +1749,20 @@ class ScheduleBatchSMC:
         return FINISH_ABORT("SMC group finalized without a finished particle.")
 
     def finalize_group(self, group_id: str, parent_req: Req) -> Req:
-        """Finalize an SMC group: keep the posterior-sampled particle as the
-        primary output AND attach the full particle collection + unbiased
-        log Z_hat to ``parent_req``.
+        """Finalize an SMC group with the configured primary-output policy.
 
         ``parent_req.output_ids`` / ``finished_reason`` hold one particle drawn
-        from the posterior P(slot) ∝ exp(log_weights[slot]), preserving the
-        single-sequence API.  Additionally sets, for the whole group:
+        from the posterior P(slot) ∝ exp(log_weights[slot]) by default.  With
+        ``max_weight``, they instead hold the highest-weight particle (ties
+        choose the lowest particle index).  Additionally sets, for the whole
+        group:
 
           * ``smc_log_Z_hat``           — unbiased log normalizing-constant est.,
             the running per-resample product closed out with the final tail
             boundary ``logsumexp(interval_weights) - log(N)``.
           * ``smc_log_w_tilde``         — final per-particle log-weights.
           * ``smc_particle_output_ids`` — every particle's output token ids.
+          * ``smc_particle_slot_ids``   — slot ids aligned with particle outputs.
 
         Frees all group slots and returns ``parent_req`` ready for
         ``stream_output``.
@@ -1056,11 +1793,23 @@ class ScheduleBatchSMC:
             self.all_token_ids[s, :n].tolist() for s, n in zip(slots, fin_lens)
         ]
 
-        # Posterior sample over particles for the primary output. softmax
-        # handles the max-shift for numerical stability; multinomial respects
-        # the global torch RNG (seeded via ServerArgs.random_seed).
-        probs = torch.softmax(self.log_weights[slot_idx_t], dim=0)
-        pick = int(torch.multinomial(probs, num_samples=1).item())
+        if self.final_selection == "max_weight":
+            # ``slots`` are ordered by particle index at allocation time.
+            # The secondary key makes ties explicitly choose the lowest
+            # particle index without relying on device reduction tie behavior.
+            pick = max(
+                range(len(log_w_tilde)),
+                key=lambda particle_idx: (
+                    log_w_tilde[particle_idx],
+                    -particle_idx,
+                ),
+            )
+        else:
+            # Posterior sample over particles for the primary output. softmax
+            # handles the max-shift for numerical stability; multinomial
+            # respects the global torch RNG (seeded via ServerArgs.random_seed).
+            probs = torch.softmax(self.log_weights[slot_idx_t], dim=0)
+            pick = int(torch.multinomial(probs, num_samples=1).item())
         parent_req.output_ids = list(particle_output_ids[pick])
         parent_req.finished_reason = self._finish_reason_from_code(
             fin_codes[pick], fin_lens[pick], matched_toks[pick]
@@ -1074,6 +1823,7 @@ class ScheduleBatchSMC:
         parent_req.smc_log_Z_hat = log_Z_hat
         parent_req.smc_log_w_tilde = log_w_tilde
         parent_req.smc_particle_output_ids = particle_output_ids
+        parent_req.smc_particle_slot_ids = [int(s) for s in slots]
 
         self.free_group_slots(group_id)
         return parent_req

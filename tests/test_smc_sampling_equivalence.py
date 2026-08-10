@@ -151,7 +151,7 @@ class TestBonusLogZ(unittest.TestCase):
 
 
 def _weight_increment(logprob_diff, bonus_logz, first_eos, eos_hit,
-                      length_hit, prev_fin, gamma):
+                      length_hit, prev_fin, gamma, remaining_capacity=None):
     """Reimplements ``write_back_gpu``'s per-particle weight increment d,
     including the bonus-normalizer gating. Pure CPU, mirrors req_state.py."""
     cutoff = torch.full((logprob_diff.shape[0],), gamma - 1, dtype=torch.int64)
@@ -163,7 +163,13 @@ def _weight_increment(logprob_diff, bonus_logz, first_eos, eos_hit,
     keep = cols <= cutoff.unsqueeze(1)
     d = (logprob_diff.to(torch.float64) * keep).sum(dim=1)
     eos_in_draft = eos_cut & (first_eos < gamma)
-    add_bonus = (~prev_fin & ~eos_in_draft).to(torch.float64)
+    if remaining_capacity is None:
+        remaining_capacity = torch.full_like(first_eos, gamma + 1)
+    add_bonus = (
+        ~prev_fin
+        & ~eos_in_draft
+        & (remaining_capacity.to(torch.int64) > gamma)
+    ).to(torch.float64)
     d = d + bonus_logz.to(torch.float64) * add_bonus
     return d
 
@@ -180,22 +186,24 @@ class TestBonusWeightGating(unittest.TestCase):
         BZ = 10.0
         draft_full = 1.0 + 2.0 + 4.0  # 7.0
 
-        # (first_eos, eos_hit, length_hit, prev_fin) -> expected d
+        # (first_eos, eos_hit, length_hit, prev_fin, remaining) -> expected d
         cases = [
             # no EOS, alive            -> full draft + bonus
-            ((stride, False, False, False), draft_full + BZ),
+            ((stride, False, False, False, stride), draft_full + BZ),
             # EOS in draft col 1       -> cols 0..1, no bonus
-            ((1, True, False, False), 1.0 + 2.0),
+            ((1, True, False, False, stride), 1.0 + 2.0),
             # EOS in LAST draft col 2  -> cols 0..2, bonus is post-EOS -> dropped
-            ((2, True, False, False), draft_full),
+            ((2, True, False, False, stride), draft_full),
             # EOS in bonus col (==gamma) -> full draft + bonus (bonus emitted)
-            ((gamma, True, False, False), draft_full + BZ),
+            ((gamma, True, False, False, stride), draft_full + BZ),
             # already finished         -> nothing
-            ((stride, False, False, True), 0.0),
-            # length-only finish       -> full draft + bonus
-            ((stride, False, True, False), draft_full + BZ),
+            ((stride, False, False, True, stride), 0.0),
+            # Length cap includes bonus -> full draft + bonus.
+            ((stride, False, True, False, stride), draft_full + BZ),
+            # Length cap ends at last draft token -> no bonus normalizer.
+            ((stride, False, True, False, gamma), draft_full),
         ]
-        for (fe, eh, lh, pf), expected in cases:
+        for (fe, eh, lh, pf, remaining), expected in cases:
             d = _weight_increment(
                 lpd.unsqueeze(0),
                 torch.tensor([BZ]),
@@ -204,6 +212,7 @@ class TestBonusWeightGating(unittest.TestCase):
                 torch.tensor([lh]),
                 torch.tensor([pf]),
                 gamma,
+                torch.tensor([remaining]),
             )
             self.assertAlmostEqual(
                 d.item(), expected, places=6,

@@ -247,6 +247,17 @@ ctags/
 outputs/
 inputs/
 
+# Local cross-tokenizer experiments and generated model/data artifacts
+/artifacts/
+/benchmark_logs/
+/benchmark_reports/
+/runs/
+/.smcsd-experiments/
+/.nan_probe/
+/env.sh
+*.safetensors
+training_args.bin
+
 # Eval Cache
 .longbench_cache/
 

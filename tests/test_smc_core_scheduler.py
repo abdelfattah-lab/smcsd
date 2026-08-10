@@ -4,8 +4,9 @@ Covers:
 
 * ``SMCScheduler._admit_prefill_groups`` admission gating against
   ``slot_state.available_slot_count()``.
-* ``ScheduleBatchSMC.finalize_group`` — picks the highest-scoring particle
-  and respects each particle's ``finished_len`` watermark.
+* ``ScheduleBatchSMC.finalize_group`` — posterior-samples by default or picks
+  the highest-weight particle when configured, respecting each particle's
+  ``finished_len`` watermark.
 
 Pure CPU.  Mocks the KV pools / allocator so the test isolates the
 scheduler logic.  The fused resample path (Triton) is covered by
@@ -15,11 +16,13 @@ scheduler logic.  The fused resample path (Triton) is covered by
 import unittest
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from smcsd.core import scheduler as core_scheduler_mod
 from smcsd.core.req_state import ScheduleBatchSMC
+from smcsd.cross_tokenizer.mapper import BoundaryState
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,6 +30,7 @@ register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
 SMCScheduler = core_scheduler_mod.SMCScheduler
+SMCCoordinator = core_scheduler_mod.SMCCoordinator
 SequenceGroup = core_scheduler_mod.SequenceGroup
 
 
@@ -134,7 +138,15 @@ def _make_runtime_group(group_id, n_particles, *, pool_idx_base=0):
     )
 
 
-def _build_slot_state(*, max_num_reqs, rows, allocator_size=256, n_particles=1):
+def _build_slot_state(
+    *,
+    max_num_reqs,
+    rows,
+    allocator_size=256,
+    n_particles=1,
+    cross_tokenizer_enabled=False,
+    final_selection="posterior_sample",
+):
     return ScheduleBatchSMC(
         max_num_reqs=max_num_reqs,
         device="cpu",
@@ -146,6 +158,8 @@ def _build_slot_state(*, max_num_reqs, rows, allocator_size=256, n_particles=1):
         tree_cache=SimpleNamespace(),
         model_config=SimpleNamespace(),
         n_particles=n_particles,
+        cross_tokenizer_enabled=cross_tokenizer_enabled,
+        final_selection=final_selection,
     )
 
 
@@ -270,6 +284,58 @@ class TestSMCFinalizeGroup(CustomTestCase):
         self.assertIsInstance(parent_req.finished_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(freed, ["g"])
 
+    def test_finalize_max_weight_selects_highest_weight_particle(self):
+        """The explicit max-weight policy does not consume RNG state."""
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+            final_selection="max_weight",
+        )
+        self._arm_group(
+            slot_state,
+            log_weights=[-3.0, 2.0],
+            finished_lens=[1, 2],
+            reason_codes=[1, 1],
+            matched_toks=[0, 0],
+            outputs=[[5], [8, 9]],
+        )
+        slot_state.free_group_slots = lambda group_id: None
+
+        parent_req = SimpleNamespace(
+            output_ids=[], finished_reason=None, finished_len=None
+        )
+        slot_state.finalize_group("g", parent_req)
+
+        self.assertEqual(parent_req.output_ids, [8, 9])
+        self.assertEqual(parent_req.finished_len, 2)
+
+    def test_finalize_max_weight_breaks_ties_by_particle_index(self):
+        """Equal log weights always select the first particle."""
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+            final_selection="max_weight",
+        )
+        self._arm_group(
+            slot_state,
+            log_weights=[1.0, 1.0],
+            finished_lens=[1, 2],
+            reason_codes=[1, 1],
+            matched_toks=[0, 0],
+            outputs=[[5], [8, 9]],
+        )
+        slot_state.free_group_slots = lambda group_id: None
+
+        parent_req = SimpleNamespace(
+            output_ids=[], finished_reason=None, finished_len=None
+        )
+        slot_state.finalize_group("g", parent_req)
+
+        self.assertEqual(parent_req.output_ids, [5])
+        self.assertEqual(parent_req.finished_len, 1)
+
     def test_finalize_attaches_particle_collection_and_log_Z(self):
         """parent_req carries the full collection: per-particle outputs
         (sliced to finished_len), final log-weights, and the unbiased
@@ -308,6 +374,102 @@ class TestSMCFinalizeGroup(CustomTestCase):
         self.assertIsInstance(parent_req.finished_reason, FINISH_LENGTH)
         # math import is used implicitly above via the documented formula.
         del math
+
+
+class TestSMCResampleHostShadows(CustomTestCase):
+    """Cross-tokenizer host attention metadata follows resampled lineage."""
+
+    def test_copies_target_and_draft_host_lengths(self):
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+            cross_tokenizer_enabled=True,
+        )
+        slot_state.seq_lens_host[:] = torch.tensor([41, 19])
+        slot_state.draft_seq_lens_host[:] = torch.tensor([47, 21])
+        slot_state.pending_draft_suffix_lens_host[:] = torch.tensor([3, 1])
+        plan = SimpleNamespace(
+            n_jobs_sync=lambda: 1,
+            dst_slots=torch.tensor([1], dtype=torch.int32),
+            src_slots=torch.tensor([0], dtype=torch.int32),
+        )
+
+        slot_state.apply_resample_host_shadows(plan)
+
+        self.assertEqual(slot_state.seq_lens_host.tolist(), [41, 41])
+        self.assertEqual(slot_state.draft_seq_lens_host.tolist(), [47, 47])
+        self.assertEqual(
+            slot_state.pending_draft_suffix_lens_host.tolist(), [3, 3]
+        )
+
+    def test_copies_boundary_state_by_value(self):
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+            cross_tokenizer_enabled=True,
+        )
+        slot_state.mapping_boundary_state[0] = BoundaryState(
+            draft_suffix_ids=[7, 8],
+            draft_suffix_logprobs=[-0.2, -0.3],
+            target_suffix_ids=[17],
+            target_suffix_logq=[-0.5],
+        )
+        slot_state.mapping_boundary_state[1] = BoundaryState(
+            draft_suffix_ids=[9],
+            draft_suffix_logprobs=[-1.0],
+        )
+        plan = SimpleNamespace(
+            n_jobs_sync=lambda: 1,
+            dst_slots=torch.tensor([1], dtype=torch.int32),
+            src_slots=torch.tensor([0], dtype=torch.int32),
+        )
+
+        slot_state.apply_resample_host_shadows(plan)
+
+        source = slot_state.mapping_boundary_state[0]
+        copied = slot_state.mapping_boundary_state[1]
+        self.assertEqual(copied.draft_suffix_ids, [7, 8])
+        self.assertEqual(copied.target_suffix_ids, [17])
+        self.assertIsNot(copied, source)
+        copied.draft_suffix_ids.append(10)
+        self.assertEqual(source.draft_suffix_ids, [7, 8])
+
+    def test_cross_dispatch_passes_target_trace_mirrors_to_fused_copy(self):
+        """Cross-tokenizer resampling must copy the target-history tensors in
+        the same target-KV launch; the draft launch handles draft history."""
+        slot_state = _build_slot_state(
+            max_num_reqs=2,
+            rows=[[1, 0, 0, 0], [2, 0, 0, 0]],
+            n_particles=2,
+            cross_tokenizer_enabled=True,
+        )
+        plan = SimpleNamespace(
+            dst_flat=torch.tensor([1], dtype=torch.int32),
+            src_flat=torch.tensor([0], dtype=torch.int32),
+            counter=torch.tensor([1], dtype=torch.int32),
+        )
+
+        with patch(
+            "smcsd.core.kernels.fused_resample_kv.batched_resample_kv"
+        ) as resample:
+            SMCCoordinator.dispatch_resample_batch(
+                SimpleNamespace(), plan, slot_state
+            )
+
+        self.assertEqual(resample.call_count, 1)
+        kwargs = resample.call_args.kwargs
+        self.assertIs(kwargs["target_seq_lens"], slot_state.target_seq_lens)
+        self.assertIs(
+            kwargs["target_verified_ids"], slot_state.target_verified_ids
+        )
+        self.assertIs(
+            kwargs["target_token_counts"], slot_state.target_token_counts
+        )
+        self.assertIs(
+            kwargs["target_all_token_ids"], slot_state.target_all_token_ids
+        )
 
 
 class _FakeSamplingParams(SimpleNamespace):

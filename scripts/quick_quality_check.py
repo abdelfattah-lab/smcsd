@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import sglang as sgl
+from smcsd import SMCEngine
 
 DEFAULT_MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_PATH = "meta-llama/Llama-3.2-1B-Instruct"
@@ -29,6 +30,8 @@ def run_vanilla(prompts, sampling_params, args):
         model_path=args.model_path,
         mem_fraction_static=0.45,
         attention_backend="triton",
+        tp_size=args.tp,
+        base_gpu_id=args.base_gpu_id,
     )
     results = engine.generate(prompts, sampling_params)
     for i, r in enumerate(results):
@@ -41,18 +44,22 @@ def run_smc(prompts, sampling_params, args):
     print("=" * 60)
     print(f"SMC (particles={args.particles}, gamma={args.gamma})")
     print("=" * 60)
-    engine = sgl.Engine(
+    engine = SMCEngine(
         model_path=args.model_path,
-        speculative_algorithm="SMC",
-        speculative_draft_model_path=args.draft_model_path,
-        smc_n_particles=args.particles,
-        smc_gamma=args.gamma,
-        smc_draft_temperature=max(args.temperature, 0.01),
-        smc_target_temperature=max(args.temperature, 0.01),
+        draft_model_path=args.draft_model_path,
+        n_particles=args.particles,
+        gamma=args.gamma,
+        draft_temperature=max(args.temperature, 0.01),
+        target_temperature=max(args.temperature, 0.01),
         mem_fraction_static=0.45,
-        disable_piecewise_cuda_graph=False,
         cuda_graph_max_bs=16,
         attention_backend="triton",
+        tp_size=args.tp,
+        base_gpu_id=args.base_gpu_id,
+        cross_tokenizer=args.cross_tokenizer,
+        draft_tokenizer_path=args.draft_tokenizer_path,
+        cross_tokenizer_artifact_path=args.cross_tokenizer_artifact_path,
+        cross_tokenizer_mode=args.cross_tokenizer_mode,
     )
     results = engine.generate(prompts, sampling_params)
     for i, r in enumerate(results):
@@ -70,6 +77,12 @@ def main():
     parser.add_argument("--mode", choices=["vanilla", "smc", "both"], default="both")
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--gamma", type=int, default=4)
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--base-gpu-id", type=int, default=0)
+    parser.add_argument("--cross-tokenizer", action="store_true")
+    parser.add_argument("--draft-tokenizer-path", default=None)
+    parser.add_argument("--cross-tokenizer-artifact-path", default=None)
+    parser.add_argument("--cross-tokenizer-mode", choices=["live", "hybrid"], default="hybrid")
     args = parser.parse_args()
 
     sampling_params = {

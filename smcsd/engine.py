@@ -70,13 +70,20 @@ class SMCEngine:
         power_alpha: float = 1.0,
         resample_threshold: float = 0.5,
         resample_method: str = "systematic",
-        # Decode hot-path optimizations (all default ON; set False to disable)
+        # Decode hot-path optimizations (default on for same-tokenizer runs)
         defer_bonus: bool = True,
         cycle_graph: bool = True,
         enable_overlap: bool = True,
+        # Terminal particle policy
+        final_selection: str = "posterior_sample",
         # Hardware
         tp_size: int = 1,
         base_gpu_id: int = 0,
+        # Cross-tokenizer drafting
+        cross_tokenizer: bool = False,
+        draft_tokenizer_path: Optional[str] = None,
+        cross_tokenizer_artifact_path: Optional[str] = None,
+        cross_tokenizer_mode: str = "hybrid",
         # Extra ServerArgs overrides
         **kwargs,
     ):
@@ -138,10 +145,78 @@ class SMCEngine:
 
         if power_alpha <= 0:
             raise ValueError("power_alpha must be > 0.")
+        if final_selection not in {"posterior_sample", "max_weight"}:
+            raise ValueError(
+                "final_selection must be 'posterior_sample' or 'max_weight'."
+            )
         server_args.smc_power_alpha = float(power_alpha)
         server_args.smc_defer_bonus = bool(defer_bonus)
         server_args.smc_cycle_graph = bool(cycle_graph)
         server_args.smc_enable_overlap = bool(enable_overlap)
+        # ``posterior_sample`` preserves SMC's sampling semantics.  The
+        # explicit MAP policy is for quality-oriented evaluations, where a
+        # stochastic final particle draw would otherwise turn a correct
+        # highest-weight trajectory into a benchmark error.
+        server_args.smc_final_selection = final_selection
+        server_args.smc_cross_tokenizer = bool(cross_tokenizer)
+        server_args.smc_draft_tokenizer_path = draft_tokenizer_path or draft_model_path
+        server_args.smc_cross_tokenizer_artifact_path = cross_tokenizer_artifact_path
+        server_args.smc_cross_tokenizer_mode = cross_tokenizer_mode
+        if server_args.smc_cross_tokenizer:
+            if cross_tokenizer_mode not in {"live", "hybrid"}:
+                raise ValueError(
+                    "cross_tokenizer_mode must be 'live' or 'hybrid'."
+                )
+            if (
+                cross_tokenizer_mode == "hybrid"
+                and not cross_tokenizer_artifact_path
+            ):
+                raise ValueError(
+                    "hybrid cross-tokenizer mode requires "
+                    "cross_tokenizer_artifact_path; use mode='live' for "
+                    "artifact-free reference mapping."
+                )
+            if os.environ.get("SMC_CROSS_REPRODUCIBLE") == "1":
+                # Must be set before worker subprocesses initialize CUDA so
+                # cuBLAS uses deterministic workspace algorithms.  Worker-side
+                # flags below additionally make unsupported nondeterministic
+                # operations fail rather than silently perturbing a replay.
+                os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+                server_args.smc_cross_reproducible = True
+            # These switches deliberately make the draft context differ from
+            # the target-visible sequence.  Keep experimental paths available
+            # only behind an explicit acknowledgement so normal cross-tokenizer
+            # runs cannot silently trade correctness for throughput.
+            unsafe_cross_flags = {
+                "SMC_CROSS_PENDING_SUFFIX": os.environ.get(
+                    "SMC_CROSS_PENDING_SUFFIX", "0"
+                ),
+            }
+            enabled_unsafe = {
+                name: value
+                for name, value in unsafe_cross_flags.items()
+                if int(value) != 0
+            }
+            if enabled_unsafe and os.environ.get(
+                "SMC_CROSS_ALLOW_UNSAFE_EXPERIMENTS"
+            ) != "1":
+                flags = ", ".join(
+                    f"{name}={value}" for name, value in enabled_unsafe.items()
+                )
+                raise ValueError(
+                    f"Unsafe cross-tokenizer mode(s) enabled: {flags}. "
+                    "Set SMC_CROSS_ALLOW_UNSAFE_EXPERIMENTS=1 only for "
+                    "explicit development experiments."
+                )
+            # Cross-tokenizer Qwen-family drafts can report a shorter derived
+            # context than the Llama target; this is the validated default for
+            # the current hybrid cross-tokenizer path and remains overrideable.
+            os.environ.setdefault("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", "1")
+        # SMCEngine consumes SMCParticleOutput itself (both scheduler sockets
+        # point back at this process), so opt in to the scheduler's particle
+        # collection emission.  HTTP launches never set this: there the same
+        # socket feeds a real DetokenizerManager, whose TypeBasedDispatcher
+        # raises ValueError on unknown message types.
         server_args.smc_emit_particle_output = True
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
@@ -154,6 +229,13 @@ class SMCEngine:
             server_args.tokenizer_path or model_path,
             trust_remote_code=server_args.trust_remote_code,
         )
+        self.cross_tokenizer = bool(cross_tokenizer)
+        self.draft_tokenizer = None
+        if self.cross_tokenizer:
+            self.draft_tokenizer = AutoTokenizer.from_pretrained(
+                server_args.smc_draft_tokenizer_path,
+                trust_remote_code=server_args.trust_remote_code,
+            )
 
         # -- 4. Allocate IPC channels --
         port_args = PortArgs.init_new(server_args)
@@ -227,12 +309,22 @@ class SMCEngine:
             ids_list: List[List[int]] = [
                 self.tokenizer.encode(p) for p in prompts
             ]
+            draft_ids_list: Optional[List[List[int]]] = None
+            if self.cross_tokenizer:
+                draft_ids_list = [
+                    self.draft_tokenizer.encode(p) for p in prompts
+                ]
         elif input_ids is not None:
             if is_single:
                 ids_list = [input_ids]
             else:
                 ids_list = list(input_ids)
             prompts = [self.tokenizer.decode(ids) for ids in ids_list]
+            draft_ids_list = None
+            if self.cross_tokenizer:
+                draft_ids_list = [
+                    self.draft_tokenizer.encode(text) for text in prompts
+                ]
         else:
             raise ValueError("Either prompt or input_ids must be provided.")
 
@@ -245,7 +337,12 @@ class SMCEngine:
 
         # -- Build and send requests --
         rids: List[str] = []
-        for text, ids, sp_dict in zip(prompts, ids_list, sampling_params_list):
+        if not self.cross_tokenizer:
+            draft_ids_list = [None] * len(ids_list)
+
+        for text, ids, draft_ids, sp_dict in zip(
+            prompts, ids_list, draft_ids_list, sampling_params_list
+        ):
             rid = uuid.uuid4().hex
             rids.append(rid)
 
@@ -264,6 +361,8 @@ class SMCEngine:
                 token_ids_logprob=[],
                 stream=False,
             )
+            if self.cross_tokenizer:
+                req.smc_draft_input_ids = draft_ids
             self.send_to_scheduler.send_pyobj(req)
 
         # -- Collect results --
@@ -310,6 +409,7 @@ class SMCEngine:
                     entry["smc_log_Z_hat"] = msg.log_Z_hat
                     entry["smc_log_w_tilde"] = msg.log_w_tilde
                     entry["smc_particle_output_ids"] = msg.particle_output_ids
+                    entry["smc_particle_slot_ids"] = msg.particle_slot_ids
                 continue
 
             if not isinstance(msg, BatchTokenIDOutput):
@@ -354,6 +454,7 @@ class SMCEngine:
             out_ids = entry["output_ids"]
             text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
             out = {
+                "rid": rid,
                 "text": text,
                 "output_ids": out_ids,
                 "prompt_tokens": entry["prompt_tokens"],
@@ -365,6 +466,7 @@ class SMCEngine:
                 out["smc_log_Z_hat"] = entry.get("smc_log_Z_hat")
                 out["smc_log_w_tilde"] = entry.get("smc_log_w_tilde")
                 out["smc_particle_output_ids"] = particle_ids
+                out["smc_particle_slot_ids"] = entry.get("smc_particle_slot_ids")
                 out["smc_particle_texts"] = [
                     self.tokenizer.decode(pids, skip_special_tokens=True)
                     for pids in particle_ids

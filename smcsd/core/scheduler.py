@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
@@ -196,7 +198,119 @@ class SMCCoordinator:
             all_token_ids=slot_state.all_token_ids,
             freed_buf=slot_state.kv_freed_buf[slot_state._snap_phase],
             freed_counter=slot_state.kv_freed_counter[slot_state._snap_phase],
+            pending_suffix_lens=slot_state.pending_draft_suffix_lens,
+            target_seq_lens=(
+                slot_state.target_seq_lens
+                if slot_state.cross_tokenizer_enabled
+                else None
+            ),
+            target_verified_ids=(
+                slot_state.target_verified_ids
+                if slot_state.cross_tokenizer_enabled
+                else None
+            ),
+            target_token_counts=(
+                slot_state.target_token_counts
+                if slot_state.cross_tokenizer_enabled
+                else None
+            ),
+            target_all_token_ids=(
+                slot_state.target_all_token_ids
+                if slot_state.cross_tokenizer_enabled
+                else None
+            ),
         )
+        if (
+            slot_state.cross_tokenizer_enabled
+            and slot_state.draft_req_to_token_pool is not None
+            and slot_state.draft_kv_freed_buf is not None
+        ):
+            draft_allocator = slot_state.draft_token_to_kv_pool_allocator
+            if hasattr(draft_allocator, "slot_ref_count"):
+                batched_resample_kv(
+                    slot_state.draft_req_to_token_pool.req_to_token,
+                    draft_allocator.slot_ref_count,
+                    plan_dst=plan.dst_flat,
+                    plan_src=plan.src_flat,
+                    plan_counter=plan.counter,
+                    max_jobs=max_jobs,
+                    req_pool_indices=slot_state.draft_req_pool_indices,
+                    kv_allocated_lens=slot_state.draft_kv_allocated_lens,
+                    seq_lens=slot_state.draft_seq_lens,
+                    verified_ids=slot_state.draft_verified_ids,
+                    prev_last_draft_ids=slot_state.prev_last_draft_ids,
+                    finished_mask=slot_state.finished_mask,
+                    finished_len=slot_state.finished_len,
+                    finish_reason_code=slot_state.finish_reason_code,
+                    matched_eos_token=slot_state.matched_eos_token,
+                    token_counts=slot_state.draft_token_counts,
+                    all_token_ids=slot_state.draft_all_token_ids,
+                    freed_buf=slot_state.draft_kv_freed_buf[slot_state._snap_phase],
+                    freed_counter=slot_state.draft_kv_freed_counter[
+                        slot_state._snap_phase
+                    ],
+                )
+            else:
+                self._dispatch_private_draft_resample_host(plan, slot_state)
+
+    def _dispatch_private_draft_resample_host(self, plan, slot_state) -> None:
+        """Correct fallback for private non-refcounted draft KV pools.
+
+        Cross-tokenizer draft workers use their own normal SGLang allocator.
+        Those KV pages cannot be shared with refcounts, so resampling must make
+        an owning physical copy for every dst <- src lineage copy.
+        """
+        n_jobs = plan.n_jobs_sync()
+        if n_jobs == 0:
+            return
+
+        allocator = slot_state.draft_token_to_kv_pool_allocator
+        req_to_token = slot_state.draft_req_to_token_pool.req_to_token
+        dst_slots = plan.dst_slots.to("cpu").tolist()
+        src_slots = plan.src_slots.to("cpu").tolist()
+
+        for dst_slot, src_slot in zip(dst_slots, src_slots):
+            dst_slot = int(dst_slot)
+            src_slot = int(src_slot)
+            dst_pool = int(slot_state.draft_req_pool_indices[dst_slot].item())
+            src_pool = int(slot_state.draft_req_pool_indices[src_slot].item())
+            dst_alloc = int(slot_state.draft_kv_allocated_lens[dst_slot].item())
+            src_alloc = int(slot_state.draft_kv_allocated_lens[src_slot].item())
+
+            if dst_alloc > 0:
+                old_dst = req_to_token[dst_pool, :dst_alloc].to(
+                    dtype=torch.int64, copy=True
+                )
+                allocator.free(old_dst)
+
+            if src_alloc > 0:
+                src_indices = req_to_token[src_pool, :src_alloc].to(
+                    dtype=torch.int64, copy=True
+                )
+                dst_indices = allocator.alloc(src_alloc)
+                if dst_indices is None:
+                    raise RuntimeError("draft KV pool full during SMC resample.")
+                kv_copy = allocator.get_cpu_copy(src_indices)
+                allocator.load_cpu_copy(kv_copy, dst_indices.to(torch.int64))
+                req_to_token[
+                    dst_pool, :src_alloc
+                ] = dst_indices.to(dtype=req_to_token.dtype)
+
+            slot_state.draft_seq_lens[dst_slot] = slot_state.draft_seq_lens[src_slot]
+            slot_state.draft_kv_allocated_lens[dst_slot] = (
+                slot_state.draft_kv_allocated_lens[src_slot]
+            )
+            slot_state.draft_verified_ids[dst_slot] = (
+                slot_state.draft_verified_ids[src_slot]
+            )
+            src_count = int(slot_state.draft_token_counts[src_slot].item())
+            slot_state.draft_token_counts[dst_slot] = (
+                slot_state.draft_token_counts[src_slot]
+            )
+            if src_count > 0:
+                slot_state.draft_all_token_ids[dst_slot, :src_count] = (
+                    slot_state.draft_all_token_ids[src_slot, :src_count]
+                )
 
 
 class SMCScheduler(Scheduler):
@@ -233,6 +347,7 @@ class SMCScheduler(Scheduler):
         self.waiting_groups: Deque[SequenceGroup] = deque()
         self.prefill_groups: List[SequenceGroup] = []
         self.running_groups: List[SequenceGroup] = []
+        self._smc_pending_draft_input_ids: Dict[str, List[int]] = {}
         # Slots reserved by admission but not yet claimed by allocate_slots.
         # allocate_slots runs in prefill POSTPROCESSING, which the overlap
         # loop defers by one iteration — without this reservation the next
@@ -253,7 +368,21 @@ class SMCScheduler(Scheduler):
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             n_particles=n_particles,
+            cross_tokenizer_enabled=getattr(
+                server_args, "smc_cross_tokenizer", False
+            ),
+            final_selection=getattr(
+                server_args, "smc_final_selection", "posterior_sample"
+            ),
         )
+        if getattr(server_args, "smc_cross_tokenizer", False):
+            self.slot_state.configure_draft_pools(
+                req_to_token_pool=self.model_worker.draft_req_to_token_pool,
+                token_to_kv_pool_allocator=(
+                    self.model_worker.draft_token_to_kv_pool_allocator
+                ),
+                tree_cache=self.model_worker._draft_tree_cache,
+            )
         self.coordinator = SMCCoordinator(
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
@@ -271,6 +400,10 @@ class SMCScheduler(Scheduler):
             if _ov_env is not None
             else bool(getattr(server_args, "smc_enable_overlap", True))
         )
+        # The cross-tokenizer mapper and boundary-state updates are host-side
+        # and must complete before the next cycle consumes their lineages.
+        if getattr(server_args, "smc_cross_tokenizer", False):
+            want_overlap = False
         self._use_overlap_loop = want_overlap
         if self._use_overlap_loop:
             logger.info("SMCScheduler: overlapped scheduling enabled.")
@@ -289,6 +422,72 @@ class SMCScheduler(Scheduler):
         )
         self._last_alloc_retries = 0
 
+        # SMC_SCHED_PROFILE=1: time each sequential decode-step phase
+        # (batch-build, forward, resample, postprocess) with a cuda sync at
+        # each boundary, accumulate, and log a rolling average.  Profiling
+        # only — the syncs it adds serialize the loop, so never leave it on
+        # for a throughput measurement.
+        self._sched_profile = bool(int(os.environ.get("SMC_SCHED_PROFILE", "0")))
+        self._sched_prof_acc = {"build": 0.0, "fwd": 0.0, "resample": 0.0, "post": 0.0}
+        self._resample_sub_acc = {"wb": 0.0, "collect": 0.0, "dispatch": 0.0}
+        self._sched_prof_n = 0
+        self._sched_prof_every = int(os.environ.get("SMC_SCHED_PROFILE_EVERY", "100"))
+
+        # SMC_LOG_ESS=1: accumulate per-step effective sample size (ESS) and
+        # resample rate across in-use groups, log a rolling average.  Adds a
+        # host sync per step (the .item() reads) — diagnostic only, never on a
+        # throughput run.
+        self._log_ess = bool(int(os.environ.get("SMC_LOG_ESS", "0")))
+        self._ess_acc = 0.0
+        self._ess_min_acc = 0.0
+        self._ess_n = 0
+        self._ess_resamples = 0
+        self._ess_every = int(os.environ.get("SMC_LOG_ESS_EVERY", "200"))
+        self._smc_trace_jsonl = os.environ.get("SMC_TRACE_JSONL")
+        self._smc_trace_resample_limit = int(
+            os.environ.get("SMC_TRACE_RESAMPLE_LIMIT", "0")
+        )
+        self._smc_trace_resample_rows = 0
+
+    def _sched_clock(self) -> float:
+        """Wall clock with a device sync, so each phase delta is true GPU+host
+        time for that phase (profiling only)."""
+        torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _sched_prof_record(
+        self, build: float, fwd: float, resample: float, post: float
+    ) -> None:
+        a = self._sched_prof_acc
+        a["build"] += build
+        a["fwd"] += fwd
+        a["resample"] += resample
+        a["post"] += post
+        self._sched_prof_n += 1
+        if self._sched_prof_n == 1:
+            print("[SMC_SCHED_PROFILE] profiled decode path active", flush=True)
+        if self._sched_prof_n % self._sched_prof_every == 0:
+            w = self._sched_prof_every  # windowed average (reset below)
+            tot = a["build"] + a["fwd"] + a["resample"] + a["post"]
+            print(
+                f"[SMC_SCHED_PROFILE] n={self._sched_prof_n} win-avg ms/step: "
+                f"build={1e3 * a['build'] / w:.3f} fwd={1e3 * a['fwd'] / w:.3f} "
+                f"resample={1e3 * a['resample'] / w:.3f} post={1e3 * a['post'] / w:.3f} "
+                f"total={1e3 * tot / w:.3f}",
+                flush=True,
+            )
+            s = self._resample_sub_acc
+            print(
+                f"[SMC_SCHED_PROFILE]   resample split ms/step: "
+                f"wb={1e3 * s['wb'] / w:.3f} collect={1e3 * s['collect'] / w:.3f} "
+                f"dispatch={1e3 * s['dispatch'] / w:.3f}",
+                flush=True,
+            )
+            for k in a:
+                a[k] = 0.0
+            for k in s:
+                s[k] = 0.0
+
     def _maybe_log_alloc_retries(self) -> None:
         """Log when the CUDA caching allocator hit cudaMalloc failure and
         synchronized to retry — the serialization mechanism that masquerades
@@ -306,6 +505,79 @@ class SMCScheduler(Scheduler):
                 torch.cuda.memory_allocated() / 1e6,
             )
             self._last_alloc_retries = retries
+
+    def _maybe_dump_smc_resample_trace(
+        self,
+        plan,
+        pre_interval_weights: torch.Tensor | None = None,
+    ) -> None:
+        if not self._smc_trace_jsonl:
+            return
+        if (
+            self._smc_trace_resample_limit > 0
+            and self._smc_trace_resample_rows >= self._smc_trace_resample_limit
+        ):
+            return
+        try:
+            if pre_interval_weights is None:
+                # This fallback is only for externally constructed plans. The
+                # production caller supplies a pre-collect clone because
+                # fused_collect zeroes every row that resamples.
+                pre_interval_weights = self.slot_state.interval_weights
+            group_slots = self.slot_state.group_to_slots.detach().cpu()
+            in_use = self.slot_state.row_in_use.detach().cpu()
+            pre_weights = pre_interval_weights.detach().cpu()
+            pre_resample_rows = []
+            for row, is_in_use in enumerate(in_use.tolist()):
+                if not is_in_use:
+                    continue
+                slots = group_slots[row, : self.slot_state.n_particles].to(
+                    torch.int64
+                )
+                log_weights = pre_weights[slots]
+                normalized = torch.softmax(log_weights, dim=0)
+                ess = 1.0 / torch.sum(normalized.square())
+                pre_resample_rows.append(
+                    {
+                        "row": int(row),
+                        "slots": [int(slot) for slot in slots.tolist()],
+                        "interval_log_weights": [
+                            float(value) for value in log_weights.tolist()
+                        ],
+                        "normalized_weights": [
+                            float(value) for value in normalized.tolist()
+                        ],
+                        "ess": float(ess.item()),
+                    }
+                )
+            active_slots = self.slot_state.active_slots.detach().cpu().tolist()
+            active_pool = self.slot_state.req_pool_indices[
+                self.slot_state.active_slots
+            ].detach().cpu().tolist()
+            resample_mask = plan.resample_mask.detach().cpu().tolist()
+            row_jobs = plan.row_of_job.detach().cpu().tolist()
+            src_jobs = plan.src_slots.detach().cpu().tolist()
+            dst_jobs = plan.dst_slots.detach().cpu().tolist()
+            record = {
+                "trace_kind": "smc_resample_step",
+                "tp_rank": self.tp_rank,
+                "active_slots": [int(x) for x in active_slots],
+                "active_req_pool_indices": [int(x) for x in active_pool],
+                "pre_resample_rows": pre_resample_rows,
+                "in_use": [bool(value) for value in in_use.tolist()],
+                "resample_mask": [bool(x) for x in resample_mask],
+                "jobs": [
+                    {"row": int(row), "src_slot": int(src), "dst_slot": int(dst)}
+                    for row, src, dst in zip(row_jobs, src_jobs, dst_jobs)
+                ],
+                "threshold": float(self.coordinator.resample_threshold),
+                "n_particles": int(self.slot_state.n_particles),
+            }
+            with open(self._smc_trace_jsonl, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._smc_trace_resample_rows += 1
+        except Exception as exc:
+            logger.warning("SMC resample trace dump failed: %s", exc)
 
     def _make_runtime_tracking_batch(
         self,
@@ -384,6 +656,9 @@ class SMCScheduler(Scheduler):
                 self.cancel_bubble_timer()
                 continue
 
+            _prof = self._sched_profile
+            _t = self._sched_clock if _prof else None
+            _b0 = _t() if _prof else 0.0
             batch, batch_kind = self._get_next_batch()
             tracking_batch = self._make_runtime_tracking_batch(batch)
             self.cur_batch = tracking_batch
@@ -392,17 +667,27 @@ class SMCScheduler(Scheduler):
             )
 
             if batch is not None:
-                result = self.run_batch(batch)
-                if batch_kind == "prefill":
-                    self._process_prefill_result(
-                        batch, result, self._take_prefill_groups()
-                    )
-                else:
-                    # GPU-side step first (write-back + fused resample,
-                    # enqueued behind the decode forward), then host-side
-                    # postprocessing (the sync quarantine).
+                if _prof and batch_kind == "decode":
+                    _b1 = _t()
+                    result = self.run_batch(batch)
+                    _b2 = _t()
                     plan, snapshot = self._resample(result)
+                    _b3 = _t()
                     self._process_decode_result(result, plan, snapshot)
+                    _b4 = _t()
+                    self._sched_prof_record(_b1 - _b0, _b2 - _b1, _b3 - _b2, _b4 - _b3)
+                else:
+                    result = self.run_batch(batch)
+                    if batch_kind == "prefill":
+                        self._process_prefill_result(
+                            batch, result, self._take_prefill_groups()
+                        )
+                    else:
+                        # GPU-side step first (write-back + fused resample,
+                        # enqueued behind the decode forward), then host-side
+                        # postprocessing (the sync quarantine).
+                        plan, snapshot = self._resample(result)
+                        self._process_decode_result(result, plan, snapshot)
             else:
                 # self_check_during_idle was removed in upstream sglang;
                 # only self_check_during_busy remains.
@@ -562,6 +847,12 @@ class SMCScheduler(Scheduler):
 
     # ── Request Admission ──
 
+    def handle_generate_request(self, recv_req):
+        draft_ids = getattr(recv_req, "smc_draft_input_ids", None)
+        if draft_ids is not None and recv_req.rid is not None:
+            self._smc_pending_draft_input_ids[str(recv_req.rid)] = list(draft_ids)
+        return super().handle_generate_request(recv_req)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if is_retracted:
             # SMC has no retraction path: particle groups are atomic and
@@ -573,6 +864,9 @@ class SMCScheduler(Scheduler):
             )
         if self.disaggregation_mode != DisaggregationMode.NULL:
             raise RuntimeError("SMCScheduler only supports non-disaggregated generation.")
+        draft_ids = self._smc_pending_draft_input_ids.pop(str(req.rid), None)
+        if draft_ids is not None:
+            req.smc_draft_origin_input_ids = draft_ids
         if not self._set_or_validate_priority(req):
             return
         if self._abort_on_queue_limit(req):
@@ -633,8 +927,9 @@ class SMCScheduler(Scheduler):
 
     def _admit_prefill_groups(self) -> List[SequenceGroup]:
         admitted: List[SequenceGroup] = []
+        pending_admitted_slots = getattr(self, "_pending_admitted_slots", 0)
         remaining_capacity = (
-            self.slot_state.available_slot_count() - self._pending_admitted_slots
+            self.slot_state.available_slot_count() - pending_admitted_slots
         )
 
         while self.waiting_groups:
@@ -643,7 +938,8 @@ class SMCScheduler(Scheduler):
             if group_size > remaining_capacity:
                 break
             admitted.append(self.waiting_groups.popleft())
-            self._pending_admitted_slots += group_size
+            pending_admitted_slots += group_size
+            self._pending_admitted_slots = pending_admitted_slots
             remaining_capacity -= group_size
             if remaining_capacity <= 0:
                 break
@@ -718,6 +1014,17 @@ class SMCScheduler(Scheduler):
             req.output_ids.append(next_token_id)
             req.check_finished()
 
+            if bool(int(os.environ.get("SMC_DEBUG_CROSS", "0"))):
+                print(
+                    "[SMC_CROSS_DBG] "
+                    f"prefill rid={req.rid} next={next_token_id} "
+                    f"out_len={len(req.output_ids)} "
+                    f"max_new={req.sampling_params.max_new_tokens} "
+                    f"finished={req.finished()} "
+                    f"reason={req.finished_reason}",
+                    flush=True,
+                )
+
             if req.finished():
                 release_kv_cache(req, self.tree_cache)
                 req.time_stats.set_completion_time()
@@ -726,6 +1033,12 @@ class SMCScheduler(Scheduler):
 
             error_msg = self._materialize_group(group)
             if error_msg is not None:
+                if bool(int(os.environ.get("SMC_DEBUG_CROSS", "0"))):
+                    print(
+                        "[SMC_CROSS_DBG] "
+                        f"materialize_error rid={req.rid} error={error_msg}",
+                        flush=True,
+                    )
                 self._abort_group(group, error_msg)
                 continue
 
@@ -736,13 +1049,16 @@ class SMCScheduler(Scheduler):
         group: SequenceGroup,
     ) -> Optional[str]:
         parent_req = group.parent_req
-        try:
-            self.model_worker.materialize_smc_parent_draft_prefix(parent_req)
-        except Exception as exc:
-            return f"SMC parent draft prefill failed: {exc}"
-
         group.materialize_particles()
         particle_reqs = list(group.particle_reqs.values())
+        try:
+            self.model_worker.materialize_smc_parent_draft_prefix(
+                parent_req, particle_reqs
+            )
+        except Exception as exc:
+            group.clear_particles()
+            return f"SMC parent draft prefill failed: {exc}"
+
         if self.req_to_token_pool.alloc(particle_reqs) is None:
             group.clear_particles()
             return "SMC particle allocation failed: req_to_token_pool full."
@@ -872,30 +1188,107 @@ class SMCScheduler(Scheduler):
         prev_last_draft_ids = (
             next_draft.prev_last_draft_id if next_draft is not None else None
         )
-        # Per-particle bonus-token normalizer log Z, accumulated into the weight
-        # alongside logprob_diff (0 at power_alpha=1).
-        bonus_logz = next_draft.bonus_logz if next_draft is not None else None
 
-        # GPU write-back: token scatter, finish flags, weight accumulation.
-        # Sync-free — finish state lands in slot tensors, not Req objects.
-        self.slot_state.write_back_gpu(
-            next_token_ids=result.next_token_ids,
-            logprob_diff=logprob_diff,
-            bonus_ids=bonus_ids,
-            prev_last_draft_ids=prev_last_draft_ids,
-            bonus_logz=bonus_logz,
-        )
+        if self._sched_profile:
+            torch.cuda.synchronize()
+            _r0 = time.perf_counter()
+
+        if (
+            getattr(self.server_args, "smc_cross_tokenizer", False)
+            and next_draft is not None
+            and next_draft.proxy_valid_mask is not None
+        ):
+            self.slot_state.set_mapping_boundary_states(
+                next_draft.mapping_boundary_states
+            )
+            self.slot_state.write_back_cross_tokenizer_gpu(
+                next_token_ids=result.next_token_ids,
+                logprob_diff=logprob_diff,
+                bonus_ids=bonus_ids,
+                proxy_valid_mask=next_draft.proxy_valid_mask,
+                proxy_lens=next_draft.proxy_lens,
+                emit_target_bonus=next_draft.emit_target_bonus,
+                bonus_logz=next_draft.bonus_logz,
+                draft_verified_ids=next_draft.draft_verified_id,
+                draft_accepted_ids=next_draft.draft_accepted_ids,
+                draft_accepted_lens=next_draft.draft_accepted_lens,
+                draft_visible_lens=next_draft.draft_visible_lens,
+                prev_last_draft_ids=prev_last_draft_ids,
+                identity_const_lens=next_draft.identity_const_lens,
+                proxy_lens_host=next_draft.proxy_lens_host,
+                draft_visible_lens_host=next_draft.draft_visible_lens_host,
+                fast_writeback_lens=next_draft.fast_writeback_lens,
+                emit_target_bonus_host=next_draft.emit_target_bonus_host,
+                pending_draft_suffix_lens=next_draft.pending_draft_suffix_lens,
+                pending_draft_suffix_lens_host=(
+                    getattr(next_draft, "pending_draft_suffix_lens_host", None)
+                ),
+            )
+        else:
+            # GPU write-back: token scatter, finish flags, weight accumulation.
+            # Sync-free — finish state lands in slot tensors, not Req objects.
+            self.slot_state.write_back_gpu(
+                next_token_ids=result.next_token_ids,
+                logprob_diff=logprob_diff,
+                bonus_ids=bonus_ids,
+                prev_last_draft_ids=prev_last_draft_ids,
+                bonus_logz=next_draft.bonus_logz,
+            )
+
+        if self._sched_profile:
+            torch.cuda.synchronize()
+            _r1 = time.perf_counter()
 
         # Snapshot the per-row log Z_hat increment BEFORE the resample kernel
         # zeroes weights, then fold it into group_log_Z_hat for the rows that
         # actually resample (unbiased-estimator product over resample steps).
         logZ_inc = self.slot_state.resample_logZ_increment()
 
+        if self._log_ess:
+            _ess, _in_use = self.slot_state.ess_stats_in_use()
+            _n = int(_in_use.sum().item())
+            if _n > 0:
+                _ess_iu = _ess[_in_use]
+                self._ess_acc += float(_ess_iu.mean().item())
+                self._ess_min_acc += float(_ess_iu.min().item())
+                _thr = self.coordinator.resample_threshold * self.slot_state.n_particles
+                self._ess_resamples += int((_ess_iu < _thr).sum().item())
+                self._ess_n += 1
+                if self._ess_n % self._ess_every == 0:
+                    _N = self.slot_state.n_particles
+                    print(
+                        f"[SMC_ESS] steps={self._ess_n} N={_N} "
+                        f"mean_ESS={self._ess_acc / self._ess_n:.3f} "
+                        f"min_ESS={self._ess_min_acc / self._ess_n:.3f} "
+                        f"resample_rate="
+                        f"{self._ess_resamples / (self._ess_n * max(_n, 1)):.3f} "
+                        f"(ESS/N mean={(self._ess_acc / self._ess_n) / _N:.3f})",
+                        flush=True,
+                    )
+
+        # ``fused_collect`` zeroes interval weights for rows that resample.
+        # Trace the values which actually drove the ESS decision, not the
+        # post-reset state. Cloning is trace-only, keeping production decode
+        # free from a max-slot-sized allocation/copy.
+        trace_pre_interval_weights = None
+        if (
+            self._smc_trace_jsonl
+            and (
+                self._smc_trace_resample_limit <= 0
+                or self._smc_trace_resample_rows < self._smc_trace_resample_limit
+            )
+        ):
+            trace_pre_interval_weights = self.slot_state.interval_weights.clone()
+
         # Resample all groups via the fused systematic kernel.
         plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
+        self._maybe_dump_smc_resample_trace(plan, trace_pre_interval_weights)
         self.slot_state.group_log_Z_hat += torch.where(
             plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
         )
+        if self._sched_profile:
+            torch.cuda.synchronize()
+            _r2 = time.perf_counter()
         self.coordinator.dispatch_resample_batch(plan, self.slot_state)
 
         copy_smc_resampled_hybrid_state(
@@ -910,6 +1303,13 @@ class SMCScheduler(Scheduler):
             device=self.device,
         )
 
+        if self._sched_profile:
+            torch.cuda.synchronize()
+            _r3 = time.perf_counter()
+            s = self._resample_sub_acc
+            s["wb"] += _r1 - _r0
+            s["collect"] += _r2 - _r1
+            s["dispatch"] += _r3 - _r2
         snapshot = self.slot_state.snapshot_to_host()
         return plan, snapshot
 
@@ -931,6 +1331,7 @@ class SMCScheduler(Scheduler):
         lifetime).
         """
         snapshot.wait()
+        self.slot_state.apply_resample_host_shadows(plan)
 
         # Free the KV pages the resample kernel released into this phase's
         # capture buffer.  Deferred from dispatch: refcount-0 pages are
@@ -946,6 +1347,17 @@ class SMCScheduler(Scheduler):
                 )
             )
             self.slot_state.kv_freed_counter[snapshot.phase].zero_()
+        if self.slot_state.draft_kv_freed_count_host is not None:
+            n_draft_freed = int(
+                self.slot_state.draft_kv_freed_count_host[snapshot.phase].item()
+            )
+            if n_draft_freed > 0:
+                self.slot_state.draft_token_to_kv_pool_allocator.free(
+                    self.slot_state.draft_kv_freed_buf[
+                        snapshot.phase, :n_draft_freed
+                    ].to(torch.int64)
+                )
+                self.slot_state.draft_kv_freed_counter[snapshot.phase].zero_()
 
         # No rebuild here: neither finishing (absorbing-state semantics) nor
         # resampling changes slot membership — only allocate_slots /
@@ -997,6 +1409,7 @@ class SMCScheduler(Scheduler):
                     log_Z_hat=parent_req.smc_log_Z_hat,
                     log_w_tilde=parent_req.smc_log_w_tilde,
                     particle_output_ids=parent_req.smc_particle_output_ids,
+                    particle_slot_ids=getattr(parent_req, "smc_particle_slot_ids", None),
                 )
             )
         self.stream_output([parent_req], False)

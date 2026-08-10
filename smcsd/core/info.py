@@ -14,7 +14,7 @@ from __future__ import annotations
 import copy
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, List, Optional, Tuple
 
 import torch
 
@@ -50,6 +50,27 @@ class SMCParticleOutput:
     log_Z_hat: float
     log_w_tilde: List[float]
     particle_output_ids: List[List[int]]
+    particle_slot_ids: Optional[List[int]] = None
+
+
+@dataclass
+class SMCCrossTokenizerStep:
+    """Per-step cross-tokenizer mapping metadata.
+
+    This is intentionally plain data: target proxy IDs are represented in
+    target-vocabulary space, proposal log-probabilities are conserved over
+    mapped text segments, and ``valid_mask`` gates padded proxy buckets.
+    """
+
+    proxy_target_ids: torch.Tensor
+    proxy_target_logq: torch.Tensor
+    valid_mask: torch.Tensor
+    proxy_lens: torch.Tensor
+    bucket_size: int
+    trie_hits: int = 0
+    single_hits: int = 0
+    cache_hits: int = 0
+    dtw_fallbacks: int = 0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -68,10 +89,9 @@ class SMCDecodeContext:
     orig_seq_lens_sum: int  # scalar sum
     new_seq_lens: torch.Tensor  # (bs,) AFTER advance by gamma+1
     gamma: int  # speculative steps (gamma, NOT gamma+1)
-    # (bs, gamma+1) cache locations of this cycle's freshly-allocated pages,
-    # carried from the fused prepare kernel (the allocation IS the per-row
-    # cache-locs table under the kv_allocated == seq invariant).  None only
-    # for legacy callers of from_slot_gather, which re-read the block table.
+    # Freshly allocated pages for this cycle, laid out per request. Full-cycle
+    # CUDA graphs consume this directly; legacy callers may leave it unset and
+    # let prepare_for_draft reconstruct locations from the block table.
     cache_locs: Optional[torch.Tensor] = None
 
     @staticmethod
@@ -114,6 +134,15 @@ class SMCDecodeContext:
         # invariant kv_allocated_lens == seq_lens at prepare time (set at
         # allocate, both advanced to seq + gamma+1 here, both copied
         # together on resample), so every row needs exactly gamma+1 pages.
+        if os.environ.get("SMC_DEBUG_KV_INVARIANT", "0") == "1":
+            bad = torch.nonzero(kv_allocated_lens != seq_lens).flatten()
+            if bad.numel() > 0:
+                first = int(bad[0].item())
+                raise RuntimeError(
+                    "SMC KV invariant violated before decode allocation: "
+                    f"row={first}, seq_len={int(seq_lens[first].item())}, "
+                    f"kv_allocated_len={int(kv_allocated_lens[first].item())}"
+                )
         alloc_start = torch.maximum(kv_allocated_lens, seq_lens)
         needed_len = seq_lens + gamma_plus_1
         new_alloc = torch.clamp(needed_len - alloc_start, min=0)
@@ -139,6 +168,7 @@ class SMCDecodeContext:
             orig_seq_lens_sum=orig_seq_lens_sum,
             new_seq_lens=new_seq_lens,
             gamma=gamma_plus_1 - 1,
+            cache_locs=out_cache_loc.reshape(bs, gamma_plus_1),
         )
         return ctx, nxt_kv_lens
 
@@ -162,9 +192,6 @@ class SMCDecodeContext:
         device = orig_seq_lens.device
         gamma = self.gamma
 
-        # Cache locations for the gamma+1 new tokens: carried from the fused
-        # prepare kernel when available; legacy fallback re-reads the block
-        # table.
         if self.cache_locs is not None:
             cache_locs = self.cache_locs
         else:
@@ -211,6 +238,7 @@ class SMCDecodeContext:
         all_tokens: list,
         cache_locs: torch.Tensor,
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        proxy_token_num: Optional[int] = None,
     ) -> Tuple[ForwardBatch, bool]:
         """Prepare batch and create ForwardBatch for score model verification.
 
@@ -219,10 +247,15 @@ class SMCDecodeContext:
         gamma = self.gamma
         bs = len(batch.req_pool_indices)
         device = batch.seq_lens.device
-        draft_token_num = gamma + 1
+        proxy_token_num = gamma if proxy_token_num is None else int(proxy_token_num)
+        if proxy_token_num < 0 or proxy_token_num > gamma:
+            raise ValueError(
+                f"proxy_token_num must be in [0, {gamma}], got {proxy_token_num}."
+            )
+        draft_token_num = proxy_token_num + 1
 
         # Build score input: [x0, ..., x(gamma)]
-        score_token_ids = torch.stack(all_tokens[: gamma + 1], dim=1)  # (bs, gamma+1)
+        score_token_ids = torch.stack(all_tokens[:draft_token_num], dim=1)
         score_input_ids = score_token_ids.reshape(-1)
 
         orig_seq_lens = self.orig_seq_lens
@@ -257,6 +290,8 @@ class SMCDecodeContext:
         )
 
         graph_runner = target_worker.model_runner.graph_runner
+        if proxy_token_num != gamma:
+            graph_runner = None
         verify_forward_batch = ForwardBatch.init_new(
             batch, target_worker.model_runner
         )
@@ -389,15 +424,52 @@ class SMCDraftInput(SpecInput):
     # (continuous batching) are handled uniformly.
     prev_last_draft_id: Optional[torch.Tensor] = None
     logprob_diff: Optional[torch.Tensor] = None  # (bs, gamma) per-position, last step
-    # (bs,) per-particle log-normalizer of the bonus token's power draw,
-    # log Z = logsumexp(alpha*logits/T) - alpha*logsumexp(logits/T).  The bonus
-    # is sampled from the locally normalized power conditional p_T^alpha / Z, so
-    # under the joint-power target its incremental importance weight is Z (not 1).
-    # Identically 0 at alpha=1.  Accumulated alongside logprob_diff in
-    # write_back_gpu, gated by the same EOS/finish logic.
-    bonus_logz: Optional[torch.Tensor] = None  # (bs,) last step
+    # Per-row log-normalizer for a bonus sampled from the locally normalized
+    # power conditional. It is the bonus's incremental importance weight under
+    # the sequence-wise unnormalized power target, and is zero at alpha=1.
+    bonus_logz: Optional[torch.Tensor] = None
     num_tokens_per_req: int = -1  # gamma + 1
     decode_ctx: Optional[SMCDecodeContext] = None  # attached by prepare_for_decode
+    draft_decode_ctx: Optional[SMCDecodeContext] = None
+    draft_verified_id: Optional[torch.Tensor] = None
+    proxy_valid_mask: Optional[torch.Tensor] = None
+    proxy_lens: Optional[torch.Tensor] = None
+    # Per-row target emission mode. False means the mapper retained an unsafe
+    # suffix: commit only the stable proxy (possibly empty), do not append a
+    # target bonus, and keep byte order by carrying the suffix to the next step.
+    emit_target_bonus: Optional[torch.Tensor] = None
+    emit_target_bonus_host: Optional[torch.Tensor] = None
+    draft_accepted_ids: Optional[torch.Tensor] = None
+    draft_accepted_lens: Optional[torch.Tensor] = None
+    draft_visible_lens: Optional[torch.Tensor] = None
+    # G8: cross-tokenizer pending draft suffixes.  When enabled, the worker can
+    # defer suffix KV writes out of the post-verify path and materialize the
+    # trailing draft tokens at the start of the next draft step.  The ids are a
+    # padded (bs, max_pending) int64 tensor; lens is (bs,).  The suffix always
+    # occupies the final `lens[row]` draft-token positions immediately before
+    # `draft_verified_id` in that row's draft lineage.
+    pending_draft_suffix_ids: Optional[torch.Tensor] = None
+    pending_draft_suffix_lens: Optional[torch.Tensor] = None
+    pending_draft_suffix_lens_host: Optional[torch.Tensor] = None
+    # Identity-vocab fast path: every row's accepted length is the constant
+    # gamma+1 (target) and draft_visible is gamma+1, so write_back's host-mirror
+    # corrections are constant — no per-step accept_lens/draft_visible_lens
+    # device->host copy is needed.  Lets write_back stay sync-free like the
+    # same-tokenizer path.  Only set when the cross mapper is identity-vocab.
+    identity_const_lens: bool = False
+    # G1: host-known per-row lengths for the NON-identity cross path.  proxy_lens
+    # and draft_visible_lens are both built from host lists in the worker
+    # (mapped.proxy_lens, lineage.draft_visible_lens), so carrying those lists as
+    # CPU tensors lets write_back update its host seq-len mirrors without copying
+    # the device tensors back -- removing the two per-step D2H syncs that the
+    # identity fast path already avoids.  Only set when SMC_CROSS_HOST_LENS=1.
+    proxy_lens_host: Optional[torch.Tensor] = None
+    draft_visible_lens_host: Optional[torch.Tensor] = None
+    fast_writeback_lens: bool = False
+    # CPU-only mapper stream state, one entry per active particle row. It
+    # follows scheduler/worker/resampling lineage and is consumed by the
+    # opt-in boundary-carry runtime.
+    mapping_boundary_states: Optional[List[Any]] = None
 
     # Class-level constant set during worker init
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 1

@@ -26,6 +26,7 @@ import torch
 
 from smcsd.core.kernels.fused_collect import batched_collect_fused
 from smcsd.core.kernels.fused_resample_kv import batched_resample_kv
+from smcsd.common.verify import assign_smc_cache_locs_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -432,6 +433,10 @@ class ResampleFixture:
     matched_eos_token: torch.Tensor
     token_counts: torch.Tensor
     all_token_ids: torch.Tensor
+    target_seq_lens: torch.Tensor
+    target_verified_ids: torch.Tensor
+    target_token_counts: torch.Tensor
+    target_all_token_ids: torch.Tensor
     freed_buf: torch.Tensor
     freed_counter: torch.Tensor
 
@@ -467,11 +472,24 @@ class ResampleFixture:
                 1000 * (1 + ids.to(torch.int32)).unsqueeze(1)
                 + torch.arange(8, dtype=torch.int32, device=dev)
             ),
+            target_seq_lens=(400 + ids).to(torch.int64),
+            target_verified_ids=(500 + ids).to(torch.int32),
+            target_token_counts=torch.tensor(
+                [max(0, count - 1) for count in used],
+                dtype=torch.int32,
+                device=dev,
+            ),
+            target_all_token_ids=(
+                2000 * (1 + ids.to(torch.int32)).unsqueeze(1)
+                + torch.arange(8, dtype=torch.int32, device=dev)
+            ),
             freed_buf=torch.zeros(refcount_size, dtype=torch.int32, device=dev),
             freed_counter=torch.zeros(1, dtype=torch.int32, device=dev),
         )
 
-    def run(self, dst_slots, src_slots, *, max_jobs=None) -> None:
+    def run(
+        self, dst_slots, src_slots, *, max_jobs=None, target_lineage=False
+    ) -> None:
         dev = self.req_to_token.device
         n_jobs = len(dst_slots)
         if max_jobs is None:
@@ -509,6 +527,18 @@ class ResampleFixture:
             all_token_ids=self.all_token_ids,
             freed_buf=self.freed_buf,
             freed_counter=self.freed_counter,
+            target_seq_lens=(
+                self.target_seq_lens if target_lineage else None
+            ),
+            target_verified_ids=(
+                self.target_verified_ids if target_lineage else None
+            ),
+            target_token_counts=(
+                self.target_token_counts if target_lineage else None
+            ),
+            target_all_token_ids=(
+                self.target_all_token_ids if target_lineage else None
+            ),
         )
 
     def freed(self) -> list:
@@ -531,6 +561,23 @@ class ResampleFixture:
             self.all_token_ids[dst, :count].tolist(),
             self.all_token_ids[src, :count].tolist(),
             f"all_token_ids[{dst}, :{count}] not copied from slot {src}",
+        )
+
+    def assert_target_lineage_copied(self, test, dst: int, src: int) -> None:
+        for name in (
+            "target_seq_lens", "target_verified_ids", "target_token_counts",
+        ):
+            tensor = getattr(self, name)
+            test.assertEqual(
+                tensor[dst].item(),
+                tensor[src].item(),
+                f"{name}[{dst}] not copied from slot {src}",
+            )
+        count = int(self.target_token_counts[src].item())
+        test.assertEqual(
+            self.target_all_token_ids[dst, :count].tolist(),
+            self.target_all_token_ids[src, :count].tolist(),
+            f"target_all_token_ids[{dst}, :{count}] not copied from slot {src}",
         )
 
 
@@ -585,6 +632,23 @@ class TestFusedResampleKernel(CustomTestCase):
         self.assertEqual(fx.freed(), [11, 12, 13])
         fx.assert_lineage_copied(self, dst=0, src=2)
         fx.assert_lineage_copied(self, dst=1, src=3)
+
+    def test_cross_tokenizer_target_trace_lineage_follows_source(self):
+        """Independent target-history mirrors follow the resampled source."""
+        fx = ResampleFixture.build(
+            [[11, 12, 0, 0], [21, 22, 23, 0]], device=self.DEVICE
+        )
+        fx.target_token_counts[:] = torch.tensor(
+            [1, 2], dtype=torch.int32, device=self.DEVICE
+        )
+        before_tail = fx.target_all_token_ids[0, 2:].clone()
+
+        fx.run(dst_slots=[0], src_slots=[1], target_lineage=True)
+
+        fx.assert_target_lineage_copied(self, dst=0, src=1)
+        self.assertTrue(
+            torch.equal(fx.target_all_token_ids[0, 2:], before_tail)
+        )
 
     def test_shared_old_kv_only_freed_when_refcount_hits_zero(self):
         """If a dec_ref'd dst page still has another owner (refcount ≥ 2
@@ -811,3 +875,56 @@ class TestFusedWriteBack(CustomTestCase):
                         torch.equal(ref[name], fused[name]),
                         f"seed={seed}: {name} mismatch",
                     )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "Triton kernels require CUDA")
+class TestSMCVerifyCacheLocations(CustomTestCase):
+    """Regression coverage for repeated N=8, gamma=8 verify layouts."""
+
+    DEVICE = "cuda"
+
+    def test_n8_gamma8_multiblock_verify_locations(self):
+        particles = 8
+        verify_width = 9
+        context_capacity = 512
+        req_pool_indices = torch.arange(
+            particles, dtype=torch.int32, device=self.DEVICE
+        )
+        req_to_token = torch.arange(
+            particles * context_capacity,
+            dtype=torch.int32,
+            device=self.DEVICE,
+        ).reshape(particles, context_capacity)
+
+        for block in range(24):
+            seq_lens = torch.full(
+                (particles,),
+                32 + block * verify_width,
+                dtype=torch.int64,
+                device=self.DEVICE,
+            )
+            cache_locs = torch.empty(
+                particles * verify_width,
+                dtype=torch.int64,
+                device=self.DEVICE,
+            )
+            assign_smc_cache_locs_kernel[(particles,)](
+                req_pool_indices,
+                req_to_token,
+                seq_lens,
+                cache_locs,
+                context_capacity,
+                verify_width,
+            )
+            expected = torch.stack(
+                [
+                    req_to_token[row, start : start + verify_width]
+                    for row, start in enumerate(seq_lens.tolist())
+                ]
+            )
+            self.assertTrue(
+                torch.equal(
+                    cache_locs.reshape(particles, verify_width),
+                    expected,
+                )
+            )

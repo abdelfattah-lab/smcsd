@@ -45,6 +45,7 @@ def _fused_resample_kernel(
     seq_lens_ptr,  # (max_slots,) int64
     verified_ids_ptr,  # (max_slots,) int32
     prev_last_draft_ids_ptr,  # (max_slots,) int32
+    pending_suffix_lens_ptr,  # (max_slots,) int16, optional via HAS_PENDING
     finished_mask_ptr,  # (max_slots,) int8 (bool view)
     finished_len_ptr,  # (max_slots,) int32
     finish_reason_code_ptr,  # (max_slots,) int8
@@ -52,6 +53,14 @@ def _fused_resample_kernel(
     token_counts_ptr,  # (max_slots,) int32
     all_token_ids_ptr,  # (max_slots, max_output_len) int32
     all_token_ids_stride,  # row stride
+    # Cross-tokenizer target lineage mirrors, optional via HAS_TARGET_LINEAGE.
+    # These are distinct from the active target tensors above because traces
+    # read their own target-tokenizer history after resampling.
+    target_seq_lens_ptr,  # (max_slots,) int64
+    target_verified_ids_ptr,  # (max_slots,) int32
+    target_token_counts_ptr,  # (max_slots,) int32
+    target_all_token_ids_ptr,  # (max_slots, max_output_len) int32
+    target_all_token_ids_stride,  # row stride
     # KV pool
     req_to_token_ptr,  # (pool_size, max_ctx_len) int32
     req_to_token_stride,  # row stride
@@ -60,6 +69,8 @@ def _fused_resample_kernel(
     freed_buf_ptr,  # (kv_pool_size+,) int32
     freed_counter_ptr,  # (1,) int32 atomic cursor
     BLOCK_SIZE: tl.constexpr,
+    HAS_PENDING: tl.constexpr,
+    HAS_TARGET_LINEAGE: tl.constexpr,
 ):
     job = tl.program_id(0)
     n_jobs = tl.load(plan_counter_ptr)
@@ -118,6 +129,11 @@ def _fused_resample_kernel(
         prev_last_draft_ids_ptr + dst_slot,
         tl.load(prev_last_draft_ids_ptr + src_slot),
     )
+    if HAS_PENDING:
+        tl.store(
+            pending_suffix_lens_ptr + dst_slot,
+            tl.load(pending_suffix_lens_ptr + src_slot),
+        )
     tl.store(
         finished_mask_ptr + dst_slot, tl.load(finished_mask_ptr + src_slot)
     )
@@ -147,6 +163,36 @@ def _fused_resample_kernel(
         tok = tl.load(src_tok + offset, mask=mask)
         tl.store(dst_tok + offset, tok, mask=mask)
 
+    # Cross-tokenizer traces retain independent target and draft histories.
+    # The draft pass reuses the generic copies above for draft state; this
+    # target-pool pass must also move the separate target mirrors.
+    if HAS_TARGET_LINEAGE:
+        tl.store(
+            target_seq_lens_ptr + dst_slot,
+            tl.load(target_seq_lens_ptr + src_slot),
+        )
+        tl.store(
+            target_verified_ids_ptr + dst_slot,
+            tl.load(target_verified_ids_ptr + src_slot),
+        )
+        target_src_count = tl.load(target_token_counts_ptr + src_slot)
+        tl.store(target_token_counts_ptr + dst_slot, target_src_count)
+
+        dst_target_tok = (
+            target_all_token_ids_ptr
+            + dst_slot.to(tl.int64) * target_all_token_ids_stride
+        )
+        src_target_tok = (
+            target_all_token_ids_ptr
+            + src_slot.to(tl.int64) * target_all_token_ids_stride
+        )
+        num_target_tok_iters = tl.cdiv(target_src_count, BLOCK_SIZE)
+        for i in range(num_target_tok_iters):
+            offset = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offset < target_src_count
+            tok = tl.load(src_target_tok + offset, mask=mask)
+            tl.store(dst_target_tok + offset, tok, mask=mask)
+
 
 def batched_resample_kv(
     req_to_token: torch.Tensor,
@@ -169,6 +215,11 @@ def batched_resample_kv(
     all_token_ids: torch.Tensor,
     freed_buf: torch.Tensor,
     freed_counter: torch.Tensor,
+    pending_suffix_lens: torch.Tensor | None = None,
+    target_seq_lens: torch.Tensor | None = None,
+    target_verified_ids: torch.Tensor | None = None,
+    target_token_counts: torch.Tensor | None = None,
+    target_all_token_ids: torch.Tensor | None = None,
 ) -> None:
     """Apply a device-resident resample plan in one launch — no host sync.
 
@@ -179,9 +230,23 @@ def batched_resample_kv(
     Pages whose refcount hits zero land in ``freed_buf[:freed_counter]``;
     the caller reads the cursor and frees them in postprocessing, then
     resets the cursor.
+
+    When supplied together, the ``target_*`` tensors are cross-tokenizer
+    target-lineage mirrors.  They are copied in the same device launch as
+    the primary target KV/state lineage so trace histories stay aligned.
     """
     if max_jobs == 0:
         return
+
+    target_lineage = (
+        target_seq_lens,
+        target_verified_ids,
+        target_token_counts,
+        target_all_token_ids,
+    )
+    has_target_lineage = all(tensor is not None for tensor in target_lineage)
+    if any(tensor is not None for tensor in target_lineage) and not has_target_lineage:
+        raise ValueError("target lineage tensors must be supplied together")
 
     _fused_resample_kernel[(max_jobs,)](
         plan_counter,
@@ -192,6 +257,7 @@ def batched_resample_kv(
         seq_lens,
         verified_ids,
         prev_last_draft_ids,
+        pending_suffix_lens if pending_suffix_lens is not None else prev_last_draft_ids,
         finished_mask.view(torch.int8),
         finished_len,
         finish_reason_code,
@@ -199,10 +265,25 @@ def batched_resample_kv(
         token_counts,
         all_token_ids,
         all_token_ids.stride(0),
+        target_seq_lens if target_seq_lens is not None else seq_lens,
+        (
+            target_verified_ids
+            if target_verified_ids is not None
+            else verified_ids
+        ),
+        target_token_counts if target_token_counts is not None else token_counts,
+        target_all_token_ids if target_all_token_ids is not None else all_token_ids,
+        (
+            target_all_token_ids.stride(0)
+            if target_all_token_ids is not None
+            else all_token_ids.stride(0)
+        ),
         req_to_token,
         req_to_token.stride(0),
         refcount,
         freed_buf,
         freed_counter,
         BLOCK_SIZE=128,
+        HAS_PENDING=pending_suffix_lens is not None,
+        HAS_TARGET_LINEAGE=has_target_lineage,
     )

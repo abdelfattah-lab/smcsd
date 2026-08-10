@@ -11,6 +11,25 @@ requires-python = ">=3.12"
 # before (or together with) this package.
 dependencies = []
 
+[project.optional-dependencies]
+train = [
+    "accelerate",
+    "datasets",
+    "peft",
+    "transformers",
+]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+norecursedirs = [
+    "3rdparty",
+    ".venv",
+    "artifacts",
+    "benchmark_logs",
+    "benchmark_reports",
+    "runs",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["smcsd*"]

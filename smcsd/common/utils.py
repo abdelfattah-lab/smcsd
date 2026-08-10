@@ -218,6 +218,20 @@ def clone_req_for_smc_particle(
         parent_req.output_ids if output_ids is None else output_ids
     )
     particle_req.tokenizer = parent_req.tokenizer
+    if hasattr(parent_req, "smc_draft_origin_input_ids"):
+        particle_req.smc_draft_origin_input_ids = list(
+            parent_req.smc_draft_origin_input_ids
+        )
+    for attr in (
+        "smc_draft_verified_id",
+        "smc_draft_kv_committed_len",
+        "smc_draft_kv_allocated_len",
+        "smc_draft_req_pool_idx",
+    ):
+        if hasattr(parent_req, attr):
+            setattr(particle_req, attr, getattr(parent_req, attr))
+    if hasattr(parent_req, "smc_draft_output_ids"):
+        particle_req.smc_draft_output_ids = list(parent_req.smc_draft_output_ids)
     particle_req.decoded_text = parent_req.decoded_text
     particle_req.surr_offset = parent_req.surr_offset
     particle_req.read_offset = parent_req.read_offset
@@ -256,7 +270,10 @@ def _release_internal_req(
         indices = req_to_token_pool.req_to_token[
             req.req_pool_idx, :allocated_len
         ].to(dtype=torch.int64, copy=True)
-        token_to_kv_pool_allocator.dec_ref_and_free(indices)
+        if hasattr(token_to_kv_pool_allocator, "dec_ref_and_free"):
+            token_to_kv_pool_allocator.dec_ref_and_free(indices)
+        else:
+            token_to_kv_pool_allocator.free(indices)
 
     if (
         hasattr(req_to_token_pool, "free_mamba_cache")

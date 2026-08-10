@@ -62,15 +62,27 @@ def copy_block_table(
     seq_len: int,
     token_to_kv_pool_allocator: SMCRefCountedTokenAllocator,
 ):
-    """Copy ``seq_len`` block-table entries from ``src`` to ``dst`` and bump
-    the refcount on each copied slot so the donor and recipient both retain
-    ownership.
+    """Copy ``seq_len`` block-table entries from ``src`` to ``dst``.
 
-    Used by SMC parent->particle fan-out and any code path that hands an
-    existing prefix to a fresh request.
+    Refcounted SMC pools share the source KV slots and bump refcounts. Private
+    non-refcounted draft pools cannot share safely, so they allocate fresh KV
+    slots and copy the cache payload into the destination block table.
     """
     if seq_len <= 0:
         return
     copied = req_to_token_pool.req_to_token[src_req_pool_idx, :seq_len].clone()
-    token_to_kv_pool_allocator.inc_ref(copied.to(torch.int64))
-    req_to_token_pool.write((dst_req_pool_idx, slice(0, seq_len)), copied)
+    copied_i64 = copied.to(torch.int64)
+    if hasattr(token_to_kv_pool_allocator, "inc_ref"):
+        token_to_kv_pool_allocator.inc_ref(copied_i64)
+        req_to_token_pool.write((dst_req_pool_idx, slice(0, seq_len)), copied)
+        return
+
+    dst_indices = token_to_kv_pool_allocator.alloc(seq_len)
+    if dst_indices is None:
+        raise RuntimeError("KV pool full while cloning SMC draft prefix.")
+    kv_copy = token_to_kv_pool_allocator.get_cpu_copy(copied_i64)
+    token_to_kv_pool_allocator.load_cpu_copy(kv_copy, dst_indices.to(torch.int64))
+    req_to_token_pool.write(
+        (dst_req_pool_idx, slice(0, seq_len)),
+        dst_indices.to(dtype=req_to_token_pool.req_to_token.dtype),
+    )
