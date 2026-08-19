@@ -1,4 +1,4 @@
-From e46857caea5a4e431329eac5a40126b45eeb5964 Mon Sep 17 00:00:00 2001
+From 366c54960f9f08516cafc02fc36883ad05a07c47 Mon Sep 17 00:00:00 2001
 From: Magpie <ccbrian830@gmail.com>
 Date: Wed, 19 Aug 2026 01:51:38 +0000
 Subject: [PATCH] SMC speculative decoding: consolidated core hooks (v0.5.17)
@@ -69,6 +69,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  python/sglang/srt/configs/model_config.py     |  17 ++
  .../attention/hybrid_linear_attn_backend.py   |  46 +++-
  .../srt/layers/attention/triton_backend.py    | 215 +++++++++++++-----
+ python/sglang/srt/managers/scheduler.py       |  15 +-
  python/sglang/srt/managers/utils.py           |   3 +
  .../srt/mem_cache/kv_cache_configurator.py    |   1 +
  .../srt/mem_cache/unified_memory_pool.py      |   9 +-
@@ -77,10 +78,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  .../runner/decode_cuda_graph_runner.py        |   7 +-
  python/sglang/srt/server_args.py              |  71 +++++-
  python/sglang/srt/speculative/spec_info.py    |  21 ++
- 13 files changed, 436 insertions(+), 69 deletions(-)
+ 14 files changed, 445 insertions(+), 75 deletions(-)
 
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
-index 427acdd381..8c8adbd43a 100644
+index 427acdd38..8c8adbd43 100644
 --- a/python/sglang/srt/arg_groups/speculative_hook.py
 +++ b/python/sglang/srt/arg_groups/speculative_hook.py
 @@ -144,6 +144,86 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
@@ -171,7 +172,7 @@ index 427acdd381..8c8adbd43a 100644
      from sglang.srt.arg_groups.overrides import resolved_view
  
 diff --git a/python/sglang/srt/compilation/compile.py b/python/sglang/srt/compilation/compile.py
-index c39175a5ce..015095f250 100644
+index c39175a5c..015095f25 100644
 --- a/python/sglang/srt/compilation/compile.py
 +++ b/python/sglang/srt/compilation/compile.py
 @@ -156,6 +156,15 @@ def install_torch_compiled(
@@ -191,7 +192,7 @@ index c39175a5ce..015095f250 100644
      if not callable(unbound_fwd):
          raise TypeError("module.__class__.forward must be callable")
 diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
-index 15b84ed239..4d0e3d2250 100644
+index 15b84ed23..4d0e3d225 100644
 --- a/python/sglang/srt/configs/model_config.py
 +++ b/python/sglang/srt/configs/model_config.py
 @@ -574,9 +574,26 @@ class ModelConfig:
@@ -222,7 +223,7 @@ index 15b84ed239..4d0e3d2250 100644
              "DeepseekV3ForCausalLM",
              "DeepseekV32ForCausalLM",
 diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
-index f62abfe89c..69788f2243 100644
+index f62abfe89..69788f224 100644
 --- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 +++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 @@ -410,16 +410,48 @@ class MambaAttnBackendBase(AttentionBackend):
@@ -282,7 +283,7 @@ index f62abfe89c..69788f2243 100644
                  torch.full(
                      (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
 diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
-index c378c80ab0..d244708a32 100644
+index c378c80ab..d244708a3 100644
 --- a/python/sglang/srt/layers/attention/triton_backend.py
 +++ b/python/sglang/srt/layers/attention/triton_backend.py
 @@ -1,5 +1,6 @@
@@ -540,8 +541,34 @@ index c378c80ab0..d244708a32 100644
          # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
          # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
          # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index a9615a14c..549527b8d 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3671,12 +3671,15 @@ class Scheduler(
+                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                 batch.input_ids = None  # rebuilt next iter from draft_token
+                 self.update_cache_from_scheduler(batch, batch_result)
+-                # Sync D2H so the result processor can read CPU tensors.
+-                batch_result.copy_done = self.device_module.Event()
+-                batch_result.copy_to_cpu(
+-                    return_logprob=batch.return_logprob,
+-                    return_hidden_states=batch.return_hidden_states,
+-                )
++                # SMC postprocessing consumes these tensors on-GPU (fused
++                # write-back / resample kernels); keep them device-resident.
++                if not batch.spec_algorithm.is_smc():
++                    # Sync D2H so the result processor can read CPU tensors.
++                    batch_result.copy_done = self.device_module.Event()
++                    batch_result.copy_to_cpu(
++                        return_logprob=batch.return_logprob,
++                        return_hidden_states=batch.return_hidden_states,
++                    )
+             else:
+                 kwargs = (
+                     {"pp_proxy_tensors": pp_proxy_tensors}
 diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
-index fe883c264d..a5eba34c97 100644
+index fe883c264..a5eba34c9 100644
 --- a/python/sglang/srt/managers/utils.py
 +++ b/python/sglang/srt/managers/utils.py
 @@ -81,6 +81,7 @@ class GenerationBatchResult:
@@ -562,7 +589,7 @@ index fe883c264d..a5eba34c97 100644
          if self.block_accept_lens is not None:
              self.block_accept_lens = _async_d2h(self.block_accept_lens)
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index de9efbf202..0603f0f5bd 100644
+index de9efbf20..0603f0f5b 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
 @@ -494,6 +494,7 @@ class KVCacheConfigurator:
@@ -574,7 +601,7 @@ index de9efbf202..0603f0f5bd 100644
              kv_lora_rank=(
                  self.model_config.kv_lora_rank if self.use_mla_backend else None
 diff --git a/python/sglang/srt/mem_cache/unified_memory_pool.py b/python/sglang/srt/mem_cache/unified_memory_pool.py
-index 1575616ac0..bcde04cac0 100644
+index 1575616ac..bcde04cac 100644
 --- a/python/sglang/srt/mem_cache/unified_memory_pool.py
 +++ b/python/sglang/srt/mem_cache/unified_memory_pool.py
 @@ -1014,6 +1014,7 @@ def init_unified_mamba_pools(
@@ -602,7 +629,7 @@ index 1575616ac0..bcde04cac0 100644
      token_to_kv_pool = HybridLinearKVPool(
          page_size=page_size,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 8e957f6615..a143a13f70 100644
+index 8e957f661..a143a13f7 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -1187,6 +1187,22 @@ class ModelRunner:
@@ -629,7 +656,7 @@ index 8e957f6615..a143a13f70 100644
      def effective_max_total_num_tokens(self):
          """Return the max token pool size considering hybrid swa settings."""
 diff --git a/python/sglang/srt/model_executor/runner/base_runner.py b/python/sglang/srt/model_executor/runner/base_runner.py
-index 656b070d56..8a01a4fc67 100644
+index 656b070d5..8a01a4fc6 100644
 --- a/python/sglang/srt/model_executor/runner/base_runner.py
 +++ b/python/sglang/srt/model_executor/runner/base_runner.py
 @@ -514,13 +514,9 @@ class BaseRunner(ABC):
@@ -650,7 +677,7 @@ index 656b070d56..8a01a4fc67 100644
              mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
          ):
 diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
-index c7a20c8ef2..67ea098c68 100644
+index c7a20c8ef..67ea098c6 100644
 --- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
 @@ -268,7 +268,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -668,7 +695,7 @@ index c7a20c8ef2..67ea098c68 100644
                  # Draft workers can use TARGET_VERIFY mode.
                  if (
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 18664959e9..5e1c8c6e2d 100644
+index 18664959e..5e1c8c6e2 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -2023,7 +2023,7 @@ class ServerArgs:
@@ -764,7 +791,7 @@ index 18664959e9..5e1c8c6e2d 100644
              (
                  "CPU offload / hierarchical cache",
 diff --git a/python/sglang/srt/speculative/spec_info.py b/python/sglang/srt/speculative/spec_info.py
-index 440bcc0bec..3d5617cc0d 100644
+index 440bcc0be..3d5617cc0 100644
 --- a/python/sglang/srt/speculative/spec_info.py
 +++ b/python/sglang/srt/speculative/spec_info.py
 @@ -40,6 +40,7 @@ class SpeculativeAlgorithm(Enum):
