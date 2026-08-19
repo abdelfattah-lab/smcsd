@@ -698,10 +698,14 @@ class SMCScheduler(Scheduler):
         if not groups:
             raise RuntimeError("Prefill result without active prefill group.")
 
-        # `result.copy_done` is always None on the SMC path: the SMC server
-        # args force disable_overlap_schedule, so the inherited run_batch
-        # never takes the overlap branch that creates it.  The .tolist()
-        # below is a synchronous device read — safe without an event.
+        # The patched run_batch keeps SMC result tensors device-resident
+        # (no copy_to_cpu), so the .tolist() below is a synchronous device
+        # read.  If a future sglang bump loses that guard, result tensors
+        # arrive as pinned CPU buffers filled by an async D2H — then the
+        # copy_done wait below is what stands between us and reading a
+        # garbage x0.
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
