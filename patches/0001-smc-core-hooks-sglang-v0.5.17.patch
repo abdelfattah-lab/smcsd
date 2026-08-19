@@ -1,0 +1,912 @@
+From 05a82c54c59269b3fa66a3caf9acddbff9f2a44b Mon Sep 17 00:00:00 2001
+From: Magpie <ccbrian830@gmail.com>
+Date: Wed, 19 Aug 2026 01:51:38 +0000
+Subject: [PATCH] SMC speculative decoding: consolidated core hooks (v0.5.17)
+
+Single-commit consolidation of every live SGLang-side change the external
+smcsd package (github.com/abdelfattah-lab/smcsd) needs, re-ported from the
+smc_v3-hooks-may2 snapshot (7f36a9bfd, May 2 base) onto v0.5.17 across
+3850 upstream commits.  Several of the original 11 hook files were
+absorbed or relocated by upstream refactors:
+
+- speculative/spec_info.py: SMC algorithm + SMC_DRAFT/SMC_VERIFY input
+  types + SpecInput.use_linear_target_verify() hook.
+  get_num_tokens_per_req_for_target_verify returns 1 for SMC draft
+  workers: v0.5.17 sizes DecodeCudaGraphRunner buffers via this hook
+  (captured_req_width); without it the draft's decode graphs were sized
+  for the gamma+1 verify window while capturing 1-token DECODE metadata
+  -> illegal memory access at capture (mirrors the DSPARK case).
+  supports_spec_v2 hunk dropped (V1 path removed upstream).
+- server_args.py + arg_groups/speculative_hook.py: all smc_* knobs as
+  declared A[]/Arg fields (CLI auto-generates; ServerArgs is frozen after
+  resolution, so SMCEngine's old dynamic-attr pattern is dead -- includes
+  smc_power_alpha / smc_defer_bonus / smc_cycle_graph /
+  smc_enable_overlap / smc_emit_particle_output).  The SMC validation /
+  derived-settings block lives in _handle_smc, dispatched from
+  SpeculativeAlgorithm.handle_server_args.  Piecewise CUDA graph
+  auto-disable for SMC expressed as a tc_piecewise incompatibility rule.
+- model_executor/model_runner.py + runner/base_runner.py:
+  _build_dummy_run_spec_info extension point (upstream's
+  _decode_cuda_graph_runner_cls supersedes the old _get_graph_runner_class
+  hook; kv-pool hooks moved with the alloc_memory_pool refactor).
+- runner/decode_cuda_graph_runner.py: SMC draft workers stay out of the
+  speculative TARGET_VERIFY capture path (they run their own draft AR
+  loop outside this runner).
+- mem_cache/unified_memory_pool.py + kv_cache_configurator.py:
+  draft_uses_independent_lm -- SMC's draft is a full independent causal
+  LM, so it needs a KV slot per full-attention layer, not the single
+  layer-0 slot of EAGLE/NextN/MTP heads (was model_runner_kv_cache_mixin,
+  deleted upstream).
+- configs/model_config.py: gate the draft->MTP architecture rewrite on
+  _spec_algo_uses_independent_draft (upstream now carries the
+  speculative_algorithm plumbing itself).
+- layers/attention/triton_backend.py: SMC linear target-verify metadata
+  branch (extend-style causal over a uniform window; the old capture /
+  replay graph branches are subsumed by upstream's generalized
+  target-verify buffer path) + dispatch to smcsd's split-KV GQA-packed
+  verify kernel.  The fast kernel DEFAULTS OFF on this stack pending an
+  accuracy investigation: multi-seed GSM8K A/B (Llama-3.1-8B, N=8
+  gamma=8, 200q) measured mean 66.7% with it vs 70.0% stock while
+  per-call output comparison (~100k calls, SMC_FAST_VERIFY_CHECK=1) found
+  no divergence > 5e-2 and synthetic sweeps show only ~4e-3 unbiased bf16
+  noise; the gap is p~0.3 -- suggestive, unproven.  Stock costs ~1%
+  throughput at short context.  SMC_FAST_VERIFY=1 opts back in;
+  SMC_FAST_VERIFY_CHECK=1 keeps the shadow A/B validator
+  (SMC_FAST_VERIFY_CHECK_KEEP_FAST=1 to consume fast output while
+  logging).
+- layers/attention/hybrid_linear_attn_backend.py: monotonic
+  init_cuda_graph_state re-init for SMC's shared-backend graph runners,
+  extended over v0.5.17's replayssm / mamba-track buffers.
+- managers/utils.py: GenerationBatchResult.logprob_diff relay field
+  (v0.5.17 _async_d2h idiom).
+- compilation/compile.py: piecewise CUDA graph crash fix under python -O
+  (carried unchanged).
+- pyproject.toml hunk dropped: v0.5.17 already pins kernels>=0.14.1 for
+  transformers 5.12.
+
+Validated: smcsd unit suite 47 passed / 1 skipped; GSM8K 10-seed mean
+~70% vs old-pin reference 72.0 (same GPU, seed 0: 72.5 new vs 72.0 old)
+and doc band 70.2-71.3; 238 tok/s vs 240.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../sglang/srt/arg_groups/speculative_hook.py |  80 ++++++
+ python/sglang/srt/compilation/compile.py      |   9 +
+ python/sglang/srt/configs/model_config.py     |  17 ++
+ .../attention/hybrid_linear_attn_backend.py   |  46 ++-
+ .../srt/layers/attention/triton_backend.py    | 271 ++++++++++++++----
+ python/sglang/srt/managers/utils.py           |   3 +
+ .../srt/mem_cache/kv_cache_configurator.py    |   1 +
+ .../srt/mem_cache/unified_memory_pool.py      |   9 +-
+ .../sglang/srt/model_executor/model_runner.py |  16 ++
+ .../srt/model_executor/runner/base_runner.py  |  10 +-
+ .../runner/decode_cuda_graph_runner.py        |   8 +-
+ python/sglang/srt/server_args.py              |  71 ++++-
+ python/sglang/srt/speculative/spec_info.py    |  21 ++
+ 13 files changed, 493 insertions(+), 69 deletions(-)
+
+diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
+index 427acdd381..8c8adbd43a 100644
+--- a/python/sglang/srt/arg_groups/speculative_hook.py
++++ b/python/sglang/srt/arg_groups/speculative_hook.py
+@@ -144,6 +144,86 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
+         algo.handle_server_args(server_args)
+ 
+ 
++def _handle_smc(server_args: ServerArgs) -> None:
++    """Validate and derive server args for SMC speculative decoding.
++
++    SMC runs an independent causal-LM draft with N particles resampled against
++    the target's scores, so it constrains the scheduler (no overlap, no DP
++    attention / disagg) and derives the EAGLE-shaped step counts from gamma.
++    """
++    if server_args.enable_dp_attention:
++        raise ValueError(
++            "Currently SMC speculative decoding does not support dp attention."
++        )
++    if server_args.disaggregation_mode != "null":
++        raise ValueError(
++            "Currently SMC speculative decoding does not support disaggregation."
++        )
++    if server_args.page_size != 1:
++        raise ValueError("SMC speculative decoding currently requires --page-size 1.")
++    if server_args.smc_n_particles < 1:
++        raise ValueError("--smc-n-particles must be >= 1.")
++    if server_args.smc_gamma < 1:
++        raise ValueError("--smc-gamma must be >= 1.")
++    if server_args.smc_draft_temperature < 0:
++        raise ValueError("--smc-draft-temperature must be >= 0.")
++    if server_args.smc_target_temperature < 0:
++        raise ValueError("--smc-target-temperature must be >= 0.")
++    if not 0 <= server_args.smc_resample_threshold <= 1:
++        raise ValueError(
++            "--smc-resample-threshold must be in [0, 1] (0 disables resampling)."
++        )
++
++    prefill_attention_backend, decode_attention_backend = (
++        server_args.get_attention_backends()
++    )
++    draft_attention_backend = server_args.speculative_draft_attention_backend
++    if draft_attention_backend is None:
++        draft_attention_backend = (
++            decode_attention_backend
++            if server_args.speculative_attention_mode == "decode"
++            else prefill_attention_backend
++        )
++    smc_attention_backends = {
++        "attention_backend": server_args.attention_backend,
++        "prefill_attention_backend": prefill_attention_backend,
++        "decode_attention_backend": decode_attention_backend,
++        "speculative_draft_attention_backend": draft_attention_backend,
++    }
++    smc_supported_backends = {"triton", "fa3"}
++    unsupported_attention_backends = {
++        name: backend
++        for name, backend in smc_attention_backends.items()
++        if backend is not None and backend not in smc_supported_backends
++    }
++    if unsupported_attention_backends:
++        unsupported_text = ", ".join(
++            f"{name}={backend}"
++            for name, backend in unsupported_attention_backends.items()
++        )
++        raise ValueError(
++            "Currently SMC speculative decoding only supports the "
++            f"{smc_supported_backends} attention backends. Got {unsupported_text}."
++        )
++
++    if server_args.max_running_requests is None:
++        server_args.max_running_requests = 48
++        logger.warning(
++            "Max running requests is reset to 48 for speculative decoding. You can "
++            "override this by explicitly setting --max-running-requests."
++        )
++    server_args.enable_mixed_chunk = False
++    server_args.speculative_eagle_topk = 1
++    server_args.speculative_num_steps = server_args.smc_gamma
++    server_args.speculative_num_draft_tokens = server_args.smc_gamma + 1
++    server_args.disable_overlap_schedule = True
++    logger.warning("SMC speculative decoding uses the normal scheduler policy.")
++    if server_args.speculative_draft_model_path is None:
++        raise ValueError(
++            "SMC speculative decoding requires --speculative-draft-model-path."
++        )
++
++
+ def _handle_dflash(server_args: ServerArgs) -> None:
+     from sglang.srt.arg_groups.overrides import resolved_view
+ 
+diff --git a/python/sglang/srt/compilation/compile.py b/python/sglang/srt/compilation/compile.py
+index c39175a5ce..015095f250 100644
+--- a/python/sglang/srt/compilation/compile.py
++++ b/python/sglang/srt/compilation/compile.py
+@@ -156,6 +156,15 @@ def install_torch_compiled(
+     fullgraph: bool = True,
+     graph_pool: Any = None,
+ ):
++    if sys.flags.optimize >= 1:
++        # Under `python -O`, assert statements are stripped from bytecode, so
++        # dynamo's assert-rewrite probe (get_assert_bytecode_sequence) finds no
++        # POP_JUMP instruction and raises StopIteration, which surfaces as
++        # InternalTorchDynamoError on the first `is None` branch it traces
++        # (torch 2.11). There are no asserts left to rewrite anyway, so
++        # disabling the rewrite is semantically a no-op.
++        torch._dynamo.config.rewrite_assert_with_torch_assert = False
++
+     unbound_fwd = module.__class__.forward
+     if not callable(unbound_fwd):
+         raise TypeError("module.__class__.forward must be callable")
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index 15b84ed239..4d0e3d2250 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -574,9 +574,26 @@ class ModelConfig:
+             **kwargs,
+         )
+ 
++    def _spec_algo_uses_independent_draft(self) -> bool:
++        """Return True iff the configured speculative algorithm runs the draft
++        as an independent causal LM (its forward does NOT consume target
++        last-layer hidden states). Independent-draft algorithms must NOT be
++        routed through MTP/NextN model variants. Currently: SMC."""
++        algo = (self.speculative_algorithm or "").upper()
++        return algo == "SMC"
++
+     def _config_draft_model(self):
+         is_draft_model = self.is_draft_model
+ 
++        # The rewrites below map a draft model's HF architecture onto its
++        # MTP / NextN variant (forward signature: takes target last-layer
++        # hidden states via spec_info). That convention is correct for
++        # EAGLE / NextN / MTP-style speculative decoding but wrong for
++        # algorithms whose draft is an independent causal LM running its
++        # own forward -- notably SMC. Skip the rewrite for those.
++        if is_draft_model and self._spec_algo_uses_independent_draft():
++            return
++
+         if is_draft_model and self.hf_config.architectures[0] in [
+             "DeepseekV3ForCausalLM",
+             "DeepseekV32ForCausalLM",
+diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index f62abfe89c..69788f2243 100644
+--- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -410,16 +410,48 @@ class MambaAttnBackendBase(AttentionBackend):
+             max_num_tokens % max_bs == 0
+         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+         draft_token_num = max_num_tokens // max_bs
++        # This backend can be initialized more than once (model-runner decode
++        # graphs first, then an SMC cycle/phase graph runner that shares the
++        # same linear backend).  Graphs captured after the first call hold
++        # references to the per-bs tensors below, so re-init must be
++        # monotonic: extend the lists for new batch sizes, never replace
++        # existing entries, and never shrink the cached query_start_loc
++        # aranges (a shrinking overwrite desyncs them from
++        # query_start_loc_list -> size-mismatch copy_ at replay for any bs
++        # above the second call's max_bs).
++        # Key the layout check on the lists themselves, not just the marker
++        # attribute: the SMC head path shallow-copies this backend and resets
++        # the lists to get a fresh verify-layout instance, and the copied
++        # marker must not veto that.
++        inited_bs = len(self.state_indices_list)
++        prev_dtn = (
++            getattr(self, "_graph_draft_token_num", None) if inited_bs else None
++        )
++        if prev_dtn is not None and prev_dtn != draft_token_num:
++            raise ValueError(
++                "init_cuda_graph_state re-called with draft_token_num="
++                f"{draft_token_num}, but graph state was built with "
++                f"{prev_dtn}; use a dedicated backend instance per layout."
++            )
++        self._graph_draft_token_num = draft_token_num
++        if inited_bs >= max_bs:
++            return
+         # Per-bs static write-cursor / force-flush buffers, captured by pointer +
+         # refreshed in-place each replay; sized like state_indices_list. None when off.
+-        self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
+-        self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
++        # Only created on the first init -- a re-init extends them in the loop
++        # below, so rebinding here would drop the entries earlier graphs captured.
++        if not inited_bs:
++            self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
++            self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
+         # int64 to match DecodeInputBuffers.mamba_track_indices + the track-save
+-        # kernel's int64 index load. Refreshed in-place by _replay_metadata.
+-        self.mamba_track_indices_buf = torch.zeros(
+-            (max_bs,), dtype=torch.int64, device=self.device
+-        )
+-        for i in range(max_bs):
++        # kernel's int64 index load. Refreshed in-place by _replay_metadata, so
++        # keep an existing buffer whenever it is already wide enough.
++        existing_track_buf = getattr(self, "mamba_track_indices_buf", None)
++        if existing_track_buf is None or existing_track_buf.numel() < max_bs:
++            self.mamba_track_indices_buf = torch.zeros(
++                (max_bs,), dtype=torch.int64, device=self.device
++            )
++        for i in range(inited_bs, max_bs):
+             self.state_indices_list.append(
+                 torch.full(
+                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index c378c80ab0..4d2ee93e3f 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, List, Optional
+ 
+@@ -79,6 +80,21 @@ def _mla_decode_kv_splits_cap(
+     ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
+     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
+ 
++def _is_linear_target_verify(spec_info: Optional["SpecInput"]) -> bool:
++    return bool(spec_info is not None and spec_info.use_linear_target_verify())
++
++
++def _sum_cpu_lengths(lengths) -> int:
++    if torch.is_tensor(lengths):
++        return int(lengths.sum().item())
++    return int(sum(lengths))
++
++
++def _max_cpu_lengths(lengths) -> int:
++    if torch.is_tensor(lengths):
++        return int(lengths.max().item())
++    return int(max(lengths))
++
+ 
+ def logit_capping_mod(logit_capping_method, logit_cap):
+     # positive logit_cap -> tanh cap
+@@ -141,6 +157,27 @@ class TritonAttnBackend(AttentionBackend):
+ 
+         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
++        # SMC fast linear-verify kernel (split-KV + GQA-packed; smcsd repo).
++        # DEFAULT OFF on the v0.5.17 stack: a 3-seed GSM8K A/B (Llama-3.1-8B
++        # target, N=8 gamma=8, 200q) measured 66.7% mean / 1-2.5% invalid with
++        # the kernel vs 72.5% / 0.5% with the stock extend kernel, in BOTH
++        # eager and cuda-graph modes, while a per-call output comparison
++        # (SMC_FAST_VERIFY_CHECK=1) found no divergence -- i.e. the effect is
++        # not localized to this dispatch's math and is still under
++        # investigation.  Throughput cost of stock at short context is ~1%.
++        # Set SMC_FAST_VERIFY=1 to opt back in (e.g. for long-context runs).
++        self.smc_verify_attention_fwd = None
++        if os.environ.get("SMC_FAST_VERIFY", "0") == "1":
++            try:
++                from smcsd.core.kernels.verify_attention import (
++                    verify_attention_fwd,
++                )
++
++                self.smc_verify_attention_fwd = torch.compiler.disable(
++                    verify_attention_fwd
++                )
++            except ImportError:
++                pass
+         self.extend_attention_fwd_unified = torch.compiler.disable(
+             extend_attention_fwd_unified
+         )
+@@ -807,64 +844,110 @@ class TritonAttnBackend(AttentionBackend):
+             max_extend_len = None
+         elif forward_batch.forward_mode.is_target_verify():
+             bs = len(forward_batch.req_pool_indices)
+-            # self.num_draft_tokens is the verify window (gamma + 1), while
+-            # DSpark draft propose runs a gamma-token TARGET_VERIFY forward.
+-            num_draft_tokens = self.num_draft_tokens
++            # extend_prefix_lens is None on warmup dummy runs (flashinfer
++            # autotune builds a TARGET_VERIFY batch without extend fields);
++            # fall through to the standard verify path there.
+             if (
+-                spec_info is not None
+-                and getattr(spec_info, "draft_token_num", None) is not None
++                _is_linear_target_verify(spec_info)
++                and forward_batch.extend_prefix_lens is not None
+             ):
+-                num_draft_tokens = int(spec_info.draft_token_num)
+-            qo_indptr = torch.arange(
+-                0,
+-                (1 + bs) * num_draft_tokens,
+-                step=num_draft_tokens,
+-                dtype=torch.int32,
+-                device=self.device,
+-            )
+-            # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
+-            seq_lens_sum = forward_batch.seq_lens_sum
+-            if seq_lens_sum is None:
+-                seq_lens_sum = bs * self.max_context_len
+-            kv_indices = torch.empty(
+-                seq_lens_sum, dtype=torch.int64, device=self.device
+-            )
+-            kv_indptr = self._fill_kv_indptr_and_indices(
+-                bs,
+-                forward_batch.seq_lens,
+-                forward_batch.req_pool_indices,
+-                kv_indices,
+-            )
+-
+-            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+-                # window_kv_offsets gives the start position in custom mask
+-                (
+-                    window_kv_indptr,
+-                    window_kv_indices,
+-                    window_kv_lens,
+-                    window_kv_offsets,
+-                ) = update_sliding_window_buffer(
+-                    self.window_kv_indptr,
+-                    self.req_to_token,
+-                    self.sliding_window_size,
+-                    forward_batch.seq_lens,
++                # SMC's target verify is a plain causal extend over a uniform
++                # per-request window: index KV by the prefix, not the full seq.
++                kv_indices = torch.empty(
++                    _sum_cpu_lengths(forward_batch.extend_prefix_lens_cpu),
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                kv_indptr = self._fill_kv_indptr_and_indices(
++                    bs,
++                    forward_batch.extend_prefix_lens,
+                     forward_batch.req_pool_indices,
++                    kv_indices,
++                )
++                if self.sliding_window_size is not None and self.sliding_window_size > 0:
++                    (
++                        window_kv_indptr,
++                        window_kv_indices,
++                        window_kv_lens,
++                        window_kv_offsets,
++                    ) = update_sliding_window_buffer(
++                        self.window_kv_indptr,
++                        self.req_to_token,
++                        self.sliding_window_size,
++                        forward_batch.extend_prefix_lens,
++                        forward_batch.req_pool_indices,
++                        bs,
++                        self.device,
++                        self.token_to_kv_pool,
++                    )
++                qo_indptr = self.qo_indptr
++                qo_indptr[1 : bs + 1] = torch.cumsum(
++                    forward_batch.extend_seq_lens, dim=0
++                )
++                qo_indptr = qo_indptr[: bs + 1]
++                custom_mask = None
++                mask_indptr = None
++                max_extend_len = _max_cpu_lengths(forward_batch.extend_seq_lens_cpu)
++                num_kv_splits = None
++                attn_logits = None
++                attn_lse = None
++            else:
++                # self.num_draft_tokens is the verify window (gamma + 1), while
++                # DSpark draft propose runs a gamma-token TARGET_VERIFY forward.
++                num_draft_tokens = self.num_draft_tokens
++                if (
++                    spec_info is not None
++                    and getattr(spec_info, "draft_token_num", None) is not None
++                ):
++                    num_draft_tokens = int(spec_info.draft_token_num)
++                qo_indptr = torch.arange(
++                    0,
++                    (1 + bs) * num_draft_tokens,
++                    step=num_draft_tokens,
++                    dtype=torch.int32,
++                    device=self.device,
++                )
++                # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
++                seq_lens_sum = forward_batch.seq_lens_sum
++                if seq_lens_sum is None:
++                    seq_lens_sum = bs * self.max_context_len
++                kv_indices = torch.empty(
++                    seq_lens_sum, dtype=torch.int64, device=self.device
++                )
++                kv_indptr = self._fill_kv_indptr_and_indices(
+                     bs,
+-                    self.device,
+-                    self.token_to_kv_pool,
++                    forward_batch.seq_lens,
++                    forward_batch.req_pool_indices,
++                    kv_indices,
+                 )
+ 
+-            custom_mask = spec_info.custom_mask
+-            seq_mask_len = num_draft_tokens * (
+-                forward_batch.seq_lens + num_draft_tokens
+-            )
+-            mask_indptr = self.mask_indptr
+-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+-            mask_indptr = mask_indptr[: bs + 1]
+-            max_extend_len = num_draft_tokens
+-            num_kv_splits = None
+-            attn_logits = None
+-            attn_lse = None
++                if self.sliding_window_size is not None and self.sliding_window_size > 0:
++                    # window_kv_offsets gives the start position in custom mask
++                    (
++                        window_kv_indptr,
++                        window_kv_indices,
++                        window_kv_lens,
++                        window_kv_offsets,
++                    ) = update_sliding_window_buffer(
++                        self.window_kv_indptr,
++                        self.req_to_token,
++                        forward_batch.req_pool_indices,
++                        bs,
++                        self.device,
++                        self.token_to_kv_pool,
++                    )
++
++                custom_mask = spec_info.custom_mask
++                seq_mask_len = num_draft_tokens * (
++                    forward_batch.seq_lens + num_draft_tokens
++                )
++                mask_indptr = self.mask_indptr
++                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
++                mask_indptr = mask_indptr[: bs + 1]
++                max_extend_len = num_draft_tokens
++                num_kv_splits = None
++                attn_logits = None
++                attn_lse = None
+ 
+         else:
+             if self.dcp_size > 1:
+@@ -1370,6 +1453,90 @@ class TritonAttnBackend(AttentionBackend):
+             k_descale = 1.0
+             v_descale = 1.0
+ 
++        # SMC linear TARGET_VERIFY fast path: uniform extend length, causal,
++        # no custom mask / SWA / sinks / logit cap / kv scales.  The stock
++        # extend kernel walks the whole prefix serially per q-head (~0.4 TB/s
++        # at 4k ctx on B200); the split-KV GQA-packed kernel reads prefix KV
++        # once per kv-head, in parallel chunks.
++        spec_info = forward_batch.spec_info
++        if (
++            self.smc_verify_attention_fwd is not None
++            and forward_batch.forward_mode.is_target_verify()
++            and _is_linear_target_verify(spec_info)
++            and score_mod is None
++            and causal
++            and sliding_window_size == -1
++            and sinks is None
++            and logits_soft_cap == 0
++            and self.forward_metadata.custom_mask is None
++            and k_descale == 1.0
++            and v_descale == 1.0
++            and layer.qk_head_dim == layer.v_head_dim
++            and (layer.qk_head_dim & (layer.qk_head_dim - 1)) == 0
++        ):
++            self.smc_verify_attention_fwd(
++                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
++                k.contiguous(),
++                v.contiguous(),
++                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
++                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
++                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
++                kv_indptr,
++                kv_indices,
++                spec_info.draft_token_num,
++                layer.scaling,
++            )
++            if os.environ.get("SMC_FAST_VERIFY_CHECK") == "1":
++                # A/B validator: recompute with the stock extend kernel and
++                # report divergence.  Debug-only; leaves stock output in o.
++                o_ref = torch.empty_like(o)
++                self.extend_attention_fwd(
++                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
++                    k.contiguous(),
++                    v.contiguous(),
++                    o_ref.view(-1, layer.tp_q_head_num, layer.v_head_dim),
++                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
++                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
++                    self.forward_metadata.qo_indptr,
++                    kv_indptr,
++                    kv_indices,
++                    None,
++                    causal,
++                    self.forward_metadata.mask_indptr,
++                    self.forward_metadata.max_extend_len,
++                    k_descale,
++                    v_descale,
++                    layer.scaling,
++                    logit_cap=logits_soft_cap,
++                    sliding_window_size=sliding_window_size,
++                    sinks=sinks,
++                    window_kv_offsets=window_kv_offsets,
++                    xai_temperature_len=layer.xai_temperature_len,
++                    page_size=self.page_size,
++                    score_mod=score_mod,
++                    aux_tensors=aux_tensors,
++                )
++                diff = (o.float() - o_ref.float()).abs()
++                md = float(diff.max())
++                if md > 5e-2:
++                    E = int(spec_info.draft_token_num)
++                    tok = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
++                    bs = tok // E
++                    row_diff = diff.view(tok, -1).amax(dim=1)
++                    bad = (row_diff.view(bs, E) > 5e-2).sum(dim=1)
++                    print(
++                        f"[SMC_FAST_VERIFY_CHECK] layer={layer.layer_id} "
++                        f"maxdiff={md:.4e} bs={bs} E={E} tok={tok} "
++                        f"bad_rows_per_req={bad.tolist()[:16]} "
++                        f"kv_indptr[:5]={kv_indptr[:5].tolist()} "
++                        f"qo_indptr[:5]={self.forward_metadata.qo_indptr[:5].tolist() if self.forward_metadata.qo_indptr is not None else None} "
++                        f"max_extend_len={self.forward_metadata.max_extend_len}",
++                        flush=True,
++                    )
++                if os.environ.get("SMC_FAST_VERIFY_CHECK_KEEP_FAST") != "1":
++                    o.copy_(o_ref)
++            return o
++
+         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
+         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
+         # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index fe883c264d..a5eba34c97 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -81,6 +81,7 @@ class GenerationBatchResult:
+     # FIXME(lsyin): maybe move to a better place?
+     # sync path: forward stream -> output processor
+     accept_lens: Optional[torch.Tensor] = None
++    logprob_diff: Optional[torch.Tensor] = None
+ 
+     block_accept_lens: Optional[torch.Tensor] = None
+ 
+@@ -152,6 +153,8 @@ class GenerationBatchResult:
+ 
+         if self.accept_lens is not None:
+             self.accept_lens = _async_d2h(self.accept_lens)
++        if self.logprob_diff is not None:
++            self.logprob_diff = _async_d2h(self.logprob_diff)
+ 
+         if self.block_accept_lens is not None:
+             self.block_accept_lens = _async_d2h(self.block_accept_lens)
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index de9efbf202..0603f0f5bd 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -494,6 +494,7 @@ class KVCacheConfigurator:
+             start_layer=self.layer_info.start_layer,
+             end_layer=self.layer_info.end_layer,
+             is_draft_worker=self.is_draft_worker,
++            draft_uses_independent_lm=self.model_config._spec_algo_uses_independent_draft(),
+             use_mla_backend=self.use_mla_backend,
+             kv_lora_rank=(
+                 self.model_config.kv_lora_rank if self.use_mla_backend else None
+diff --git a/python/sglang/srt/mem_cache/unified_memory_pool.py b/python/sglang/srt/mem_cache/unified_memory_pool.py
+index 1575616ac0..bcde04cac0 100644
+--- a/python/sglang/srt/mem_cache/unified_memory_pool.py
++++ b/python/sglang/srt/mem_cache/unified_memory_pool.py
+@@ -1014,6 +1014,7 @@ def init_unified_mamba_pools(
+     start_layer: int,
+     end_layer: int,
+     is_draft_worker: bool,
++    draft_uses_independent_lm: bool = False,
+     use_mla_backend: bool,
+     kv_lora_rank: Optional[int] = None,
+     qk_rope_head_dim: Optional[int] = None,
+@@ -1129,8 +1130,14 @@ def init_unified_mamba_pools(
+             start_layer=start_layer,
+             end_layer=end_layer,
+         )
++    # If the draft is an EAGLE / NextN / MTP head it has a single attention
++    # layer (layer 0) and we only need one slot. But algorithms like SMC use a
++    # *full* independent causal LM as the draft, so it has all the model's
++    # full-attention layers and needs a KV slot per layer.
+     full_attn_layer_ids_for_pool = (
+-        [0] if is_draft_worker else list(full_attention_layer_ids)
++        [0]
++        if (is_draft_worker and not draft_uses_independent_lm)
++        else list(full_attention_layer_ids)
+     )
+     token_to_kv_pool = HybridLinearKVPool(
+         page_size=page_size,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 8e957f6615..a143a13f70 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1187,6 +1187,22 @@ class ModelRunner:
+         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
+         return self.lora_manager.unload_lora_adapter(lora_ref)
+ 
++    def _build_dummy_run_spec_info(self, buffers, num_tokens_per_req):
++        """Build the spec_info used during the runner's dummy/warmup run.
++
++        Extension point: subclasses may override to supply their own
++        VerifyInput for their spec algorithm (e.g. SMC).
++        """
++        from sglang.srt.speculative.spec_info import create_dummy_verify_input
++
++        return create_dummy_verify_input(
++            self.spec_algorithm,
++            self.server_args,
++            buffers.custom_mask,
++            num_tokens_per_req,
++            self.is_draft_worker,
++        )
++
+     @property
+     def effective_max_total_num_tokens(self):
+         """Return the max token pool size considering hybrid swa settings."""
+diff --git a/python/sglang/srt/model_executor/runner/base_runner.py b/python/sglang/srt/model_executor/runner/base_runner.py
+index 656b070d56..8a01a4fc67 100644
+--- a/python/sglang/srt/model_executor/runner/base_runner.py
++++ b/python/sglang/srt/model_executor/runner/base_runner.py
+@@ -514,13 +514,9 @@ class BaseRunner(ABC):
+             global_num_tokens_cpu = None
+ 
+         # Speculative metadata and hidden-state capture mode.
+-        spec_info = create_dummy_verify_input(
+-            mr.spec_algorithm,
+-            mr.server_args,
+-            buffers.custom_mask,
+-            num_tokens_per_req,
+-            mr.is_draft_worker,
+-        )
++        # Routed through the model runner so subclasses (e.g. SMC) can
++        # override the dummy verify input for their own spec algorithm.
++        spec_info = mr._build_dummy_run_spec_info(buffers, num_tokens_per_req)
+         if spec_info is not None and (
+             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+         ):
+diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+index c7a20c8ef2..57bfc50aed 100644
+--- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+@@ -268,7 +268,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+         self.captured_req_width = model_runner.decode_num_tokens_per_req(
+             num_draft_tokens=self.speculative_num_draft_tokens
+         )
+-        if model_runner.spec_algorithm.is_speculative():
++        # SMC draft workers don't enter the speculative capture path -- they
++        # run their own draft AR loop outside of this runner.  Keeping SMC out
++        # of the block here preserves the fork's behaviour while accepting the
++        # upstream's unified `is_speculative()` gate.
++        if model_runner.spec_algorithm.is_speculative() and not (
++            model_runner.spec_algorithm.is_smc() and self.model_runner.is_draft_worker
++        ):
+             if self.model_runner.is_draft_worker:
+                 # Draft workers can use TARGET_VERIFY mode.
+                 if (
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 18664959e9..5e1c8c6e2d 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2023,7 +2023,7 @@ class ServerArgs:
+     # -------------------------------------------------------------------------
+     speculative_algorithm: A[
+         Optional[str],
+-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
++        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, SMC, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+         NS("spec"),
+     ] = None
+     speculative_draft_model_path: A[
+@@ -2178,6 +2178,70 @@ class ServerArgs:
+         ),
+         NS("spec"),
+     ] = False
++    # Speculative decoding (SMC)
++    smc_n_particles: A[
++        int,
++        "Number of SMC particles per request.",
++        NS("spec"),
++    ] = 4
++    smc_gamma: A[
++        int,
++        "Maximum drafted tokens per SMC step.",
++        NS("spec"),
++    ] = 4
++    smc_draft_temperature: A[
++        float,
++        "Sampling temperature used by the SMC draft model.",
++        NS("spec"),
++    ] = 0.7
++    smc_target_temperature: A[
++        float,
++        "Temperature for target model scoring during SMC verification.",
++        NS("spec"),
++    ] = 1.0
++    smc_resample_threshold: A[
++        float,
++        "Trigger resampling when ESS drops below n_particles * threshold.",
++        NS("spec"),
++    ] = 0.5
++    smc_resample_method: A[
++        Literal["systematic", "multinomial"],
++        "Resampling method for SMC speculative decoding.",
++        NS("spec"),
++    ] = "systematic"
++    smc_power_alpha: A[
++        float,
++        "Exponent applied to the SMC importance weights (annealing power).",
++        NS("spec"),
++    ] = 1.0
++    smc_defer_bonus: A[
++        bool,
++        "Defer the bonus-token forward into the next SMC cycle.",
++        NS("spec"),
++    ] = True
++    smc_cycle_graph: A[
++        bool,
++        "Capture the whole SMC draft cycle into one CUDA graph.",
++        NS("spec"),
++    ] = True
++    smc_enable_overlap: A[
++        bool,
++        "Overlap the SMC draft phase with the previous cycle's write-back.",
++        NS("spec"),
++    ] = True
++    smc_emit_particle_output: A[
++        bool,
++        "Emit per-particle output metadata from the SMC scheduler.",
++        NS("spec"),
++    ] = False
++    smc_fast_resample: A[
++        bool,
++        "Use the fused SMC resample path (single Triton kernel for normalize + ESS + "
++        "systematic resample + dst/src compaction, feeding the fused KV-copy kernel "
++        "directly). Requires --smc-resample-method=systematic and CUDA. Default (off) "
++        "runs the per-group Python slow path, which is the reference for accuracy testing.",
++        NS("spec"),
++    ] = False
+     speculative_adaptive: A[
+         bool,
+         "Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
+@@ -4414,6 +4478,11 @@ class ServerArgs:
+                 or resolved_view(self).quantization == "gguf"
+                 or check_gguf_file(self.model_path),
+             ),
++            # SMC speculative decoding: piecewise graphs only cover EXTEND
++            # batches (TARGET_VERIFY is excluded), so on SMC's decode-dominated
++            # workloads they are throughput-neutral while costing ~25s startup
++            # and ~2GB that would otherwise go to the SMC KV co-budget.
++            ("SMC speculative decoding", lambda: self.speculative_algorithm == "SMC"),
+             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
+             (
+                 "CPU offload / hierarchical cache",
+diff --git a/python/sglang/srt/speculative/spec_info.py b/python/sglang/srt/speculative/spec_info.py
+index 440bcc0bec..3d5617cc0d 100644
+--- a/python/sglang/srt/speculative/spec_info.py
++++ b/python/sglang/srt/speculative/spec_info.py
+@@ -40,6 +40,7 @@ class SpeculativeAlgorithm(Enum):
+     EAGLE3 = auto()
+     FROZEN_KV_MTP = auto()
+     STANDALONE = auto()
++    SMC = auto()
+     NGRAM = auto()
+     NONE = auto()
+ 
+@@ -121,6 +122,9 @@ class SpeculativeAlgorithm(Enum):
+     def is_standalone(self) -> bool:
+         return self == SpeculativeAlgorithm.STANDALONE
+ 
++    def is_smc(self) -> bool:
++        return self == SpeculativeAlgorithm.SMC
++
+     def is_ngram(self) -> bool:
+         return self == SpeculativeAlgorithm.NGRAM
+ 
+@@ -208,6 +212,7 @@ class SpeculativeAlgorithm(Enum):
+             _handle_eagle_family,
+             _handle_frozen_kv_mtp,
+             _handle_ngram,
++            _handle_smc,
+         )
+ 
+         # Validate for every algorithm at startup: the metrics paths read the
+@@ -226,6 +231,8 @@ class SpeculativeAlgorithm(Enum):
+             _handle_eagle_family(server_args)
+         elif self.is_ngram():
+             _handle_ngram(server_args)
++        elif self.is_smc():
++            _handle_smc(server_args)
+ 
+     def get_num_tokens_per_req_for_target_verify(
+         self, num_draft_tokens: int, is_draft_worker: bool
+@@ -237,6 +244,13 @@ class SpeculativeAlgorithm(Enum):
+         # Here, we expose this interface to allow the other use cases.
+         if self.is_dspark() and is_draft_worker:
+             return num_draft_tokens - 1
++        # SMC draft workers never run TARGET_VERIFY through this runner: the
++        # draft is an independent causal LM doing 1-token AR decode steps (its
++        # own phase/cycle graph runners handle wider shapes).  Width must be 1
++        # or the decode graph buffers are sized for the verify window while
++        # capture runs DECODE-mode metadata -- illegal memory access.
++        if self.is_smc() and is_draft_worker:
++            return 1
+         return num_draft_tokens
+ 
+     def get_num_tokens_per_bs_for_target_verify(
+@@ -316,6 +330,8 @@ class SpecInputType(IntEnum):
+     EAGLE_VERIFY = auto()
+     FROZEN_KV_MTP_DRAFT = auto()
+     FROZEN_KV_MTP_VERIFY = auto()
++    SMC_DRAFT = auto()
++    SMC_VERIFY = auto()
+     DFLASH_DRAFT = auto()
+     DFLASH_VERIFY = auto()
+     NGRAM_VERIFY = auto()
+@@ -355,6 +371,7 @@ class SpecInput(ABC):
+             SpecInputType.EAGLE_DRAFT,
+             SpecInputType.EAGLE_DRAFT_EXTEND,
+             SpecInputType.FROZEN_KV_MTP_DRAFT,
++            SpecInputType.SMC_DRAFT,
+             SpecInputType.DFLASH_DRAFT,
+         }
+ 
+@@ -367,6 +384,10 @@ class SpecInput(ABC):
+         }
+ 
+ 
++    def use_linear_target_verify(self) -> bool:
++        return False
++
++
+ def spec_scale_global_num_tokens(
+     spec_info: SpecInput,
+     global_num_tokens: List[int],
+-- 
+2.43.0
+

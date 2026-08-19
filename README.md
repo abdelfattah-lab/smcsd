@@ -18,28 +18,34 @@ Blog posts:
 
 ## Installation
 
-This repo vendors a patched SGLang as a git submodule at `3rdparty/sglang`.
+This repo vendors **pristine upstream SGLang** (`sgl-project/sglang@v0.5.17`) as a
+git submodule at `3rdparty/sglang`, plus the SMC core hooks as git patches under
+`patches/`.  `scripts/apply_sglang_patches.sh` applies them onto the submodule as
+a local commit — no SGLang fork is required.  Re-run it after every
+`git submodule update` (updating resets the submodule to the pristine pin);
+re-running is a no-op, and `--reverse` removes the patches again.
 
-- **`main`** — pins SGLang at `smc_v2_clean-upstream-sync-2` (`smc_v2_clean` + latest `upstream/main` merged in). Requires **CUDA 13**, `torch==2.11.0`, and `sglang-kernel==0.4.2` (formerly `sgl-kernel`; same import path, new pip name).
-- **`upstream`** — development/tracking branch for the same `smc_v2_clean-upstream-sync-2` snapshot.
+**Host requirements:** CUDA 13 toolkit installed (provides `libnvrtc.so.13`), a
+Rust toolchain (`rustup`, for the sglang grpc extension), and `protobuf-compiler`
+(`protoc`).  On CUDA 12 systems the prebuilt `sglang-kernel` wheel fails to load
+with a `libnvrtc.so.13: cannot open shared object file` error.  The Python deps
+(`torch==2.11.0`, `flashinfer_python==0.6.15.post1`, `transformers==5.12.1`) are
+pinned by the SGLang submodule's `pyproject.toml` and resolve automatically.
 
-For a CUDA 12 / `torch ~2.9` build, point the submodule at the older `smc_v2_clean` snapshot instead (`git -C 3rdparty/sglang checkout smc_v2_clean`).
-
-**Host requirements:** CUDA 13 toolkit installed (provides `libnvrtc.so.13`). On CUDA 12 systems the prebuilt `sglang-kernel` wheel will fail to load with an undefined-symbol or `libnvrtc.so.13: cannot open shared object file` error. The Python deps (`torch==2.11.0`, `sglang-kernel==0.4.2`) are pinned by the SGLang submodule's `pyproject.toml` and will be resolved automatically.
-
-`SMCEngine` will not import until the patched SGLang submodule is both checked out and installed. If you hit `ModuleNotFoundError: No module named 'sglang'`, run:
+`SMCEngine` will not import until the patched SGLang submodule is checked out,
+patched, and installed.  If you hit `ModuleNotFoundError: No module named
+'sglang'`, run:
 
 ```bash
 git submodule update --init --recursive
+scripts/apply_sglang_patches.sh
 uv pip install -e 3rdparty/sglang/python
 uv pip install -e .
 ```
 
 ```bash
-# 1. Clone with submodules — pick the branch you want
-git clone --recurse-submodules --branch main     https://github.com/abdelfattah-lab/smcsd.git
-# OR for the latest upstream-merged build (needs CUDA 13):
-# git clone --recurse-submodules --branch upstream https://github.com/abdelfattah-lab/smcsd.git
+# 1. Clone with submodules
+git clone --recurse-submodules https://github.com/abdelfattah-lab/smcsd.git
 cd smcsd
 
 # If you already cloned without --recurse-submodules, initialise now:
@@ -49,7 +55,8 @@ cd smcsd
 uv venv --python 3.12
 source .venv/bin/activate
 
-# 3. Install the patched SGLang (from the submodule), then this package
+# 3. Apply the SMC patches onto the vendored SGLang, then install both
+scripts/apply_sglang_patches.sh
 uv pip install -e 3rdparty/sglang/python
 uv pip install -e .
 ```
