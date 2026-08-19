@@ -16,6 +16,8 @@ from typing import Deque, Dict, List, Optional, Type, TypeVar, Union
 import zmq
 from transformers import AutoTokenizer
 
+from array import array
+
 from sglang.srt.entrypoints.engine import Engine, _set_envs_and_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -96,6 +98,8 @@ class SMCEngine:
         else:
             expanded = None
 
+        if power_alpha <= 0:
+            raise ValueError("power_alpha must be > 0.")
         forced = dict(
             model_path=model_path,
             speculative_algorithm="SMC",
@@ -109,6 +113,11 @@ class SMCEngine:
             smc_target_temperature=target_temperature,
             smc_resample_threshold=resample_threshold,
             smc_resample_method=resample_method,
+            smc_power_alpha=float(power_alpha),
+            smc_defer_bonus=bool(defer_bonus),
+            smc_cycle_graph=bool(cycle_graph),
+            smc_enable_overlap=bool(enable_overlap),
+            smc_emit_particle_output=True,
             tp_size=tp_size,
             base_gpu_id=base_gpu_id,
         )
@@ -133,16 +142,18 @@ class SMCEngine:
         # default ON via the smc_* server_args attrs set below; the worker
         # and scheduler downgrade gracefully on unsupported configs.  The
         # SMC_* env vars remain as kill switches that override the kwargs.
+        # SGLang's cuda-graph knobs are per phase; keep SMCEngine's public
+        # cuda_graph_max_bs kwarg stable and translate to the decode knob.
+        if "cuda_graph_max_bs" in merged:
+            merged.setdefault(
+                "cuda_graph_max_bs_decode", merged.pop("cuda_graph_max_bs")
+            )
+
         server_args = ServerArgs(**merged)
         self.server_args = server_args
 
-        if power_alpha <= 0:
-            raise ValueError("power_alpha must be > 0.")
-        server_args.smc_power_alpha = float(power_alpha)
-        server_args.smc_defer_bonus = bool(defer_bonus)
-        server_args.smc_cycle_graph = bool(cycle_graph)
-        server_args.smc_enable_overlap = bool(enable_overlap)
-        server_args.smc_emit_particle_output = True
+        # ServerArgs is frozen after resolution, so these are declared smc_*
+        # server args passed at construction (see `forced` above).
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
         configure_logger(server_args)
@@ -255,8 +266,12 @@ class SMCEngine:
             req = TokenizedGenerateReqInput(
                 rid=rid,
                 input_text=text,
-                input_ids=ids,
+                # Req's token-id contract is array("q") end-to-end
+                # (_refresh_fill_ids concatenates with output_ids arrays).
+                input_ids=array("q", ids),
+                input_embeds=None,
                 mm_inputs=None,
+                token_type_ids=None,
                 sampling_params=sp,
                 return_logprob=False,
                 logprob_start_len=0,

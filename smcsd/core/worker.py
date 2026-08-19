@@ -20,8 +20,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config as _hybrid_gdn_config,
+)
+
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -47,6 +51,12 @@ class SMCDenseDraftTpModelWorker(TpModelWorker):
     architecture rewrite.
     """
 
+    @property
+    def draft_runner(self):
+        # kv_cache_builder.get_draft_kv_pool reaches for
+        # draft_worker.draft_worker.draft_runner on V2-shaped spec workers.
+        return self.model_runner
+
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
 
@@ -65,17 +75,17 @@ class SMCWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        # BaseSpecWorker.__init__ seeds the graph memory/time usage dicts
+        # that the scheduler's startup summary reads.
+        super().__init__()
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
+        self.ps = ps
+        self.tp_rank = ps.tp_rank
         self.device = server_args.device
         self._target_worker = target_worker  # score model
 
@@ -122,25 +132,29 @@ class SMCWorker(BaseSpecWorker):
         # Set class-level constant for KV allocation
         SMCDraftInput.ALLOC_LEN_PER_DECODE = self.speculative_num_draft_tokens
 
-        server_args.context_length = target_worker.model_runner.model_config.context_len
         self.score_runner = self._target_worker.model_runner
 
         # Do not capture cuda graph during TpModelWorker init —
-        # we capture manually after the draft model is fully set up
+        # we capture manually after the draft model is fully set up.
+        # ServerArgs is frozen after resolution, so the draft gets its own
+        # copy with an explicit override rather than a mutate-and-restore on
+        # the shared instance.
+        from copy import deepcopy
+
         backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        draft_server_args = deepcopy(server_args)
+        draft_server_args.override(
+            "smc_draft_worker",
+            disable_cuda_graph=True,
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         # Dense AR draft worker — no MTP-architecture rewrite, no shared
         # embed/lm_head with the target.
         self._draft_worker = SMCDenseDraftTpModelWorker(
-            server_args=server_args,
+            server_args=draft_server_args,
             gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            pp_rank=0,
-            dp_rank=dp_rank,
-            moe_ep_rank=moe_ep_rank,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
+            ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
             req_to_token_pool=self.req_to_token_pool,
@@ -148,10 +162,34 @@ class SMCWorker(BaseSpecWorker):
             memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
         self.draft_runner = self._draft_worker.model_runner
+        self._backup_disable_cuda_graph = backup_disable_cuda_graph
+
+    # Worker bring-up is phased, driven by the scheduler: __init__ (weights)
+    # -> alloc_memory_pool -> init_attention_backends -> init_cuda_graphs.
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        if req_to_token_pool is not None:
+            self.req_to_token_pool = req_to_token_pool
+        if token_to_kv_pool_allocator is not None:
+            self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self._draft_worker.alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
 
         # Hybrid Qwen3.5/3.6 drafts need an isolated MambaPool sized to the
         # draft's recurrent state shape (different from the target's).
         self._maybe_isolate_dense_hybrid_draft_state()
+
+    def init_attention_backends(self):
+        server_args = self.server_args
+        backup_disable_cuda_graph = self._backup_disable_cuda_graph
 
         # Multi-step draft attention backend.
         # DraftBackendFactory.create_decode_backend() returns a flat-attention
@@ -161,7 +199,7 @@ class SMCWorker(BaseSpecWorker):
         # backend whose per-step backends are HybridLinearAttnBackend
         # instances that delegate full-attn vs linear-attn per layer_id.
         draft_is_hybrid = (
-            getattr(self.draft_runner, "hybrid_gdn_config", None) is not None
+            _hybrid_gdn_config(self.draft_runner.model_config) is not None
         )
         self._draft_is_hybrid = draft_is_hybrid
         if draft_is_hybrid:
@@ -184,11 +222,24 @@ class SMCWorker(BaseSpecWorker):
             )
             self.draft_attn_backend = factory.create_decode_backend()
 
+        self._draft_worker.init_attention_backends()
+
+    def init_cuda_graphs(self):
+        server_args = self.server_args
+        backup_disable_cuda_graph = self._backup_disable_cuda_graph
+
         # Restore cuda graph and capture for draft model
-        server_args.disable_cuda_graph = backup_disable_cuda_graph
-        self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
-        if not backup_disable_cuda_graph:
-            self.draft_runner.init_device_graphs()
+        self.draft_runner.server_args.override(
+            "smc_draft_worker.restore",
+            disable_cuda_graph=backup_disable_cuda_graph,
+        )
+        # init_cuda_graphs must run even when capture is disabled: it
+        # installs eager_runner / prefill_cuda_graph_runner /
+        # decode_cuda_graph_runner (as None/eager), which _forward_raw reads
+        # on every forward.
+        self._draft_worker.init_cuda_graphs(
+            capture_decode_cuda_graph=not backup_disable_cuda_graph
+        )
 
         # Deferred-bonus: pin the DRAFT backend's verify-block-size global to
         # the head's 2 tokens.  The vendored verify-metadata paths read this
@@ -218,7 +269,7 @@ class SMCWorker(BaseSpecWorker):
                 draft_ab.num_draft_tokens = 2
             elif isinstance(draft_ab, FlashAttentionBackend):
                 draft_ab.speculative_num_draft_tokens = 2
-            elif self.draft_runner.hybrid_gdn_config is not None:
+            elif _hybrid_gdn_config(self.draft_runner.model_config) is not None:
                 # Hybrid (Mamba/GDN) draft: the 2-token head uses per-batch
                 # linear-verify metadata (head_spec.draft_token_num=2 +
                 # populate_linear_verify_metadata in prepare_for_draft_head).
@@ -310,7 +361,7 @@ class SMCWorker(BaseSpecWorker):
 
             target_ab = self.score_runner.attn_backend
             target_ok = isinstance(target_ab, TritonAttnBackend) or (
-                self.score_runner.hybrid_gdn_config is not None
+                _hybrid_gdn_config(self.score_runner.model_config) is not None
                 and hasattr(target_ab, "update_mamba_state_after_mtp_verify")
             )
             if want_cycle and not target_ok:
@@ -370,7 +421,7 @@ class SMCWorker(BaseSpecWorker):
         cache back to step-1).  The decode cache is a separate buffer and is
         untouched.  No-op for non-hybrid drafts or when cuda graphs are off.
         """
-        if getattr(self.draft_runner, "hybrid_gdn_config", None) is None:
+        if _hybrid_gdn_config(self.draft_runner.model_config) is None:
             return
         lin = getattr(self.draft_runner.attn_backend, "linear_attn_backend", None)
         cached = getattr(lin, "cached_cuda_graph_verify_query_start_loc", None)
@@ -385,8 +436,8 @@ class SMCWorker(BaseSpecWorker):
         )
 
     def _dense_hybrid_state_shape(self) -> Optional[Tuple[Tuple, Tuple]]:
-        target_cfg = getattr(self.score_runner, "hybrid_gdn_config", None)
-        draft_cfg = getattr(self.draft_runner, "hybrid_gdn_config", None)
+        target_cfg = _hybrid_gdn_config(self.score_runner.model_config)
+        draft_cfg = _hybrid_gdn_config(self.draft_runner.model_config)
         if target_cfg is None or draft_cfg is None:
             return None
 
@@ -419,14 +470,16 @@ class SMCWorker(BaseSpecWorker):
         """
         shapes = self._dense_hybrid_state_shape()
         target_shape, draft_shape = shapes or (None, None)
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.runtime_context import get_parallel
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             HybridReqToTokenPool,
         )
 
         target_pool = self.req_to_token_pool
-        draft_config = self.draft_runner.mambaish_config
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        draft_config = mambaish_config(self.draft_runner.model_config)
         _smc_debug = bool(os.environ.get("SMCSD_HYBRID_DEBUG"))
         if _smc_debug:
             print(
@@ -493,7 +546,7 @@ class SMCWorker(BaseSpecWorker):
             size=self.draft_runner.max_total_num_tokens,
             dtype=self.draft_runner.kv_cache_dtype,
             head_num=self.draft_runner.model_config.get_num_kv_heads(
-                get_attention_tp_size()
+                get_parallel().attn_tp_size
             ),
             head_dim=self.draft_runner.model_config.head_dim,
             full_attention_layer_ids=[
@@ -629,9 +682,6 @@ class SMCWorker(BaseSpecWorker):
     # ── Main entry point ──
 
     def forward_batch_generation(self, batch):
-        if isinstance(batch, ScheduleBatch):
-            batch = batch.get_model_worker_batch()
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             return self._forward_extend(batch)
         else:
@@ -639,20 +689,21 @@ class SMCWorker(BaseSpecWorker):
 
     # ── EXTEND (prefill) ──
 
-    def _forward_extend(self, batch: ModelWorkerBatch):
+    def _forward_extend(self, batch: ScheduleBatch):
         bs = len(batch.seq_lens)
 
         # Score model prefill — authoritative prompt KV + score state.  FULL
         # hidden capture: x0's logits are projected from this same forward's
         # hidden states (below), so no second target pass over the prompt.
-        score_batch = dataclasses.replace(
+        score_result = self._target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
-        score_result = self._target_worker.forward_batch_generation(score_batch)
 
         # Draft model prefill — populate the draft's prompt KV; token discarded.
         draft_batch = self._make_clean_batch(batch)
-        self._draft_worker.forward_batch_generation(draft_batch)
+        self._draft_worker.forward_batch_generation(
+            draft_batch, capture_hidden_mode=CaptureHiddenMode.NULL
+        )
 
         # x0 seed from the TARGET's real first-token distribution.
         #
@@ -815,7 +866,7 @@ class SMCWorker(BaseSpecWorker):
             self.draft_runner,
         )
         hgr = self.draft_head_graph_runner
-        if hgr is not None and hgr.can_run(head_fb):
+        if hgr is not None and hgr.can_run_graph(head_fb):
             # Graph path: replay the dedicated num_tokens_per_bs=2 head
             # runner.  replay() runs replay_prepare → attn metadata + buffer
             # copy itself, and returns a LogitsProcessorOutput directly.
@@ -824,7 +875,7 @@ class SMCWorker(BaseSpecWorker):
             with torch.profiler.record_function(
                 f"step[DECODE smc-head-graph bs={bs} toks={2 * bs}]"
             ):
-                head_logits_full = hgr.replay(head_fb).next_token_logits
+                head_logits_full = hgr.execute(head_fb).next_token_logits
         else:
             # Eager fallback (no head graph captured, or bs beyond the
             # captured range).  The draft's *primary* graph runner is
@@ -833,7 +884,7 @@ class SMCWorker(BaseSpecWorker):
             # null it for just this call and init metadata eagerly.
             self.draft_runner.attn_backend.init_forward_metadata(head_fb)
             saved_gr = getattr(self.draft_runner, "graph_runner", None)
-            self.draft_runner.graph_runner = None
+            self.draft_runner.decode_cuda_graph_runner = None
             try:
                 # Outer span labels the head; the inner forward emits a
                 # step[TARGET_VERIFY ...] span (vendored naming), nested.
@@ -844,7 +895,7 @@ class SMCWorker(BaseSpecWorker):
                         head_fb, skip_attn_backend_init=True
                     ).logits_output.next_token_logits
             finally:
-                self.draft_runner.graph_runner = saved_gr
+                self.draft_runner.decode_cuda_graph_runner = saved_gr
         # Hybrid draft: the verify-style head defers its recurrent-state update
         # (like the target verify), so the draft's live Mamba state is still at
         # S-2 after the head forward.  Commit the S-position (index 1 = verified
@@ -892,7 +943,7 @@ class SMCWorker(BaseSpecWorker):
 
     def _forward_decode_cycle_graph(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         draft_input: SMCDraftInput,
         ctx: SMCDecodeContext,
     ) -> GenerationBatchResult:
@@ -970,7 +1021,7 @@ class SMCWorker(BaseSpecWorker):
             can_run_cuda_graph=True,
         )
 
-    def _forward_decode(self, batch: ModelWorkerBatch):
+    def _forward_decode(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
             return self._forward_idle(batch)
 
@@ -1000,7 +1051,7 @@ class SMCWorker(BaseSpecWorker):
                 draft_input.verified_id,
                 self.req_to_token_pool,
                 batch,
-                self.draft_runner.graph_runner
+                self.draft_runner.decode_cuda_graph_runner
                 if hasattr(self.draft_runner, "graph_runner")
                 else None,
                 self.draft_runner,
@@ -1065,10 +1116,19 @@ class SMCWorker(BaseSpecWorker):
                 draft_fb.out_cache_loc = cache_locs[:, step].contiguous()
 
                 if use_multistep:
-                    draft_fb.attn_backend = self.draft_attn_backend.attn_backends[step]
-                    draft_out = self.draft_runner.forward(
-                        draft_fb, skip_attn_backend_init=True
+                    # Attention dispatch reads get_attn_backend() from the
+                    # ForwardContext; ModelRunner.forward respects an existing
+                    # context (has_forward_context() -> nullcontext).
+                    from sglang.srt.model_executor.forward_context import (
+                        ForwardContext,
+                        forward_context,
                     )
+
+                    step_backend = self.draft_attn_backend.attn_backends[step]
+                    with forward_context(ForwardContext(attn_backend=step_backend)):
+                        draft_out = self.draft_runner.forward(
+                            draft_fb, skip_attn_backend_init=True
+                        )
                 else:
                     draft_fb.seq_lens = all_seq_lens[:, step].contiguous()
                     draft_fb.seq_lens_sum = ctx.orig_seq_lens_sum + bs * (step + 1)
@@ -1102,12 +1162,12 @@ class SMCWorker(BaseSpecWorker):
         )
 
         score_result = self._target_worker.forward_batch_generation(
-            model_worker_batch=None,
+            batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
         )
-        if self.score_runner.hybrid_gdn_config is not None:
+        if _hybrid_gdn_config(self.score_runner.model_config) is not None:
             accepted_steps = torch.full(
                 (bs,), gamma, dtype=torch.int64, device=self.device
             )
@@ -1208,7 +1268,7 @@ class SMCWorker(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
-    def _forward_idle(self, batch: ModelWorkerBatch):
+    def _forward_idle(self, batch: ScheduleBatch):
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=torch.empty(0, dtype=torch.int64, device=self.device),
@@ -1216,8 +1276,6 @@ class SMCWorker(BaseSpecWorker):
             next_draft_input=SMCDraftInput.create_idle_input(self.device),
         )
 
-    def _make_clean_batch(self, batch: ModelWorkerBatch) -> ModelWorkerBatch:
+    def _make_clean_batch(self, batch: ScheduleBatch) -> ScheduleBatch:
         """Copy batch with no spec_info (for draft model)."""
-        return dataclasses.replace(
-            batch, spec_info=None, capture_hidden_mode=CaptureHiddenMode.NULL
-        )
+        return dataclasses.replace(batch, spec_info=None)

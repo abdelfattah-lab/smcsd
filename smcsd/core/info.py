@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
-from sglang.srt.mem_cache.common import alloc_token_slots
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.allocation import alloc_token_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -148,7 +148,7 @@ class SMCDecodeContext:
         self,
         verified_id: torch.Tensor,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         cuda_graph_runner,
         draft_model_runner: "ModelRunner",
     ) -> Tuple[ForwardBatch, bool, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -198,15 +198,20 @@ class SMCDecodeContext:
         # Clear spec_info for ForwardBatch creation and CUDA graph compatibility.
         # Positions are derived from seq_lens via clamp_position() in init_new.
         draft_batch.spec_info = None
-        forward_batch = ForwardBatch.init_new(draft_batch, draft_model_runner)
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        forward_batch = ForwardBatch.init_new(
+            draft_batch,
+            draft_model_runner,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
+        )
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(forward_batch)
 
         return forward_batch, can_cuda_graph, cache_locs, all_positions, all_seq_lens
 
     def prepare_for_verify(
         self,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         target_worker: "TpModelWorker",
         all_tokens: list,
         cache_locs: torch.Tensor,
@@ -256,20 +261,23 @@ class SMCDecodeContext:
             ForwardMode.IDLE if is_idle else ForwardMode.TARGET_VERIFY
         )
 
-        graph_runner = target_worker.model_runner.graph_runner
+        graph_runner = target_worker.model_runner.decode_cuda_graph_runner
         verify_forward_batch = ForwardBatch.init_new(
-            batch, target_worker.model_runner
+            batch,
+            target_worker.model_runner,
+            capture_hidden_mode=capture_hidden_mode,
+            return_hidden_states_before_norm=False,
         )
 
         can_run_cuda_graph = bool(
-            graph_runner and graph_runner.can_run(verify_forward_batch)
+            graph_runner and graph_runner.can_run_graph(verify_forward_batch)
         )
 
         if not is_idle:
             verify_spec_info.populate_linear_verify_metadata(verify_forward_batch)
 
         if can_run_cuda_graph:
-            graph_runner.replay_prepare(verify_forward_batch)
+            graph_runner.load_batch(verify_forward_batch)
         else:
             if not is_idle:
                 target_worker.model_runner.attn_backend.init_forward_metadata(
@@ -284,7 +292,7 @@ class SMCDecodeContext:
         verified_id: torch.Tensor,
         cache_locs: torch.Tensor,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         draft_model_runner: "ModelRunner",
     ) -> ForwardBatch:
         """Build the deferred-bonus 2-token draft head (eager, no CUDA graph).
@@ -358,7 +366,12 @@ class SMCDecodeContext:
         head_batch.capture_hidden_mode = CaptureHiddenMode.NULL
         head_batch.forward_mode = ForwardMode.TARGET_VERIFY
 
-        forward_batch = ForwardBatch.init_new(head_batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(
+            head_batch,
+            draft_model_runner,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
+        )
         head_spec.populate_linear_verify_metadata(forward_batch)
         # Attention metadata is set up by the caller: replay_prepare (graph
         # path) or attn_backend.init_forward_metadata (eager fallback).

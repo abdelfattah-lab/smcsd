@@ -44,6 +44,13 @@ def _prepare_req_for_private_prefill(req: Req) -> None:
     req.mamba_branching_seqlen = None
     req.cache_protected_len = 0
     req.init_next_round_input(tree_cache=None)
+    # Req.extend_range is normally set by the PrefillAdder in
+    # schedule_policy.  SMC builds its prefill batches itself, so set the
+    # full (unchunked, prefix-free) window here -- get_fill_ids() reads
+    # extend_range.end.
+    req.set_extend_range(
+        len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+    )
 
 
 @dataclass
@@ -246,7 +253,9 @@ class SMCScheduler(Scheduler):
             device=self.device,
             gamma_plus_1=server_args.speculative_num_draft_tokens,
             vocab_size=self.model_config.vocab_size,
-            max_output_len=server_args.context_length,
+            # ServerArgs is frozen; read the resolved context length from
+            # the model config rather than a back-filled server arg.
+            max_output_len=self.model_config.context_len,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -333,13 +342,8 @@ class SMCScheduler(Scheduler):
 
         self.tp_worker = SMCTpModelWorker(
             server_args=self.server_args,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            moe_ep_rank=self.moe_ep_rank,
-            pp_rank=self.pp_rank,
-            attn_cp_rank=self.attn_cp_rank,
-            moe_dp_rank=self.moe_dp_rank,
-            dp_rank=self.dp_rank,
+            gpu_id=self.ps.gpu_id,
+            ps=self.ps,
             nccl_port=self.nccl_port,
         )
 
@@ -352,14 +356,10 @@ class SMCScheduler(Scheduler):
 
         draft_worker_kwargs = dict(
             server_args=self.server_args,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            moe_ep_rank=self.moe_ep_rank,
+            gpu_id=self.ps.gpu_id,
+            ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
-            dp_rank=self.dp_rank,
-            attn_cp_rank=self.attn_cp_rank,
-            moe_dp_rank=self.moe_dp_rank,
         )
         self.draft_worker = SMCWorker(**draft_worker_kwargs)
 
@@ -378,7 +378,7 @@ class SMCScheduler(Scheduler):
     @DynamicGradMode()
     def _event_loop(self) -> None:
         while True:
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 self.cancel_bubble_timer()
@@ -437,7 +437,7 @@ class SMCScheduler(Scheduler):
         result_queue: Deque = deque()
 
         while True:
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 self._flush_result_queue(result_queue)
@@ -600,9 +600,9 @@ class SMCScheduler(Scheduler):
 
     def _emit_abort(self, req: Req, error_msg: str) -> None:
         req.set_finish_with_abort(error_msg)
-        req.check_finished()
+        req.update_finish_state()
         req.time_stats.set_completion_time()
-        self.stream_output([req], False)
+        self.output_streamer.stream_output([req], False)
 
     # ── Batch Selection ──
 
@@ -698,10 +698,14 @@ class SMCScheduler(Scheduler):
         if not groups:
             raise RuntimeError("Prefill result without active prefill group.")
 
-        # `result.copy_done` is always None on the SMC path: the SMC server
-        # args force disable_overlap_schedule, so the inherited run_batch
-        # never takes the overlap branch that creates it.  The .tolist()
-        # below is a synchronous device read — safe without an event.
+        # The patched run_batch keeps SMC result tensors device-resident
+        # (no copy_to_cpu), so the .tolist() below is a synchronous device
+        # read.  If a future sglang bump loses that guard, result tensors
+        # arrive as pinned CPU buffers filled by an async D2H — then the
+        # copy_done wait below is what stands between us and reading a
+        # garbage x0.
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
 
@@ -716,12 +720,11 @@ class SMCScheduler(Scheduler):
             self._pending_admitted_slots -= group.n_particles
 
             req.output_ids.append(next_token_id)
-            req.check_finished()
-
+            req.update_finish_state()
             if req.finished():
                 release_kv_cache(req, self.tree_cache)
                 req.time_stats.set_completion_time()
-                self.stream_output([req], False)
+                self.output_streamer.stream_output([req], False)
                 continue
 
             error_msg = self._materialize_group(group)
@@ -812,6 +815,7 @@ class SMCScheduler(Scheduler):
 
     def _abort_group(self, group: SequenceGroup, error_msg: str) -> None:
         parent_req = group.parent_req
+        logger.warning("SMC group %s aborted: %s", group.group_id, error_msg)
         parent_req.finished_reason = FINISH_ABORT(error_msg)
         parent_req.finished_len = len(parent_req.output_ids)
         if group.has_materialized_particles():
@@ -825,12 +829,12 @@ class SMCScheduler(Scheduler):
         if parent_req.req_pool_idx is not None:
             release_kv_cache(parent_req, self.tree_cache)
         parent_req.time_stats.set_completion_time()
-        self.stream_output([parent_req], False)
+        self.output_streamer.stream_output([parent_req], False)
 
     # ── Decode (slot-based, no ScheduleGroupBatch) ──
 
     def _prepare_decode_batch(self):
-        """Prepare decode via slot state. Returns ModelWorkerBatch or None."""
+        """Prepare decode via slot state. Returns ScheduleBatch or None."""
         draft_input = self.slot_state.prepare_for_decode()
         if draft_input.decode_ctx is None:
             return None
@@ -974,7 +978,7 @@ class SMCScheduler(Scheduler):
             parent_req = group.parent_req
             release_kv_cache(parent_req, self.tree_cache)
             parent_req.time_stats.set_completion_time()
-            self.stream_output([parent_req], False)
+            self.output_streamer.stream_output([parent_req], False)
             return
 
         parent_req = self.slot_state.finalize_group(group.group_id, group.parent_req)
@@ -991,7 +995,7 @@ class SMCScheduler(Scheduler):
         # an ungated send kills the detokenizer on the first finalized
         # group.  parent_req.smc_* stay populated either way.
         if getattr(self.server_args, "smc_emit_particle_output", False):
-            self.send_to_detokenizer.send_output(
+            self.output_streamer.send_to_detokenizer.send_output(
                 SMCParticleOutput(
                     rid=parent_req.rid,
                     log_Z_hat=parent_req.smc_log_Z_hat,
@@ -999,7 +1003,7 @@ class SMCScheduler(Scheduler):
                     particle_output_ids=parent_req.smc_particle_output_ids,
                 )
             )
-        self.stream_output([parent_req], False)
+        self.output_streamer.stream_output([parent_req], False)
 
 
 def run_smc_scheduler_process(
@@ -1020,6 +1024,12 @@ def run_smc_scheduler_process(
     dp_rank = configure_scheduler_process(
         server_args, gpu_id, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
+
+    # Project the config namespaces before Scheduler.__init__ reads them
+    # (mirrors upstream run_scheduler_process).
+    from sglang.srt.runtime_context import publish
+
+    publish(server_args, role="scheduler")
 
     parent_process = psutil.Process().parent()
 

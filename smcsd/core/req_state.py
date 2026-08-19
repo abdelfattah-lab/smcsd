@@ -7,7 +7,7 @@ Each particle gets a fixed slot (``int in [0, max_slots)``) for its lifetime.
 All per-particle state — sequence lengths, KV allocation, cumulative log
 weights, output history, sampling params — lives in ``(max_slots,)``- or
 ``(max_slots, X)``-shaped tensors on device.  The forward pass gathers only
-the LIVE subset into a contiguous ``ModelWorkerBatch`` via ``active_slots``.
+the LIVE subset into a contiguous ``ScheduleBatch`` via ``active_slots``.
 
 Group bookkeeping is intentionally minimal.  Each active group occupies one
 row in ``group_to_slots[max_groups, N]``, which the fused resample kernel
@@ -37,9 +37,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Deque, Dict, List, Optional
 
+from array import array
+
 import torch
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -216,7 +218,7 @@ class ScheduleBatchSMC:
         # SMC bypasses sglang's sampler (the worker does its own draft proposal
         # and bonus sampling under engine-wide smc_* params), so per-request
         # temperature / top_p / top_k / min_p are never read on this path.  We
-        # still need a SamplingBatchInfo to satisfy ModelWorkerBatch's schema,
+        # still need a SamplingBatchInfo to satisfy ScheduleBatch's schema,
         # so we keep one set of constant placeholder tensors sized to
         # max_slots and slice [:bs] at build time.
         self._stub_temperatures = torch.ones(
@@ -233,7 +235,7 @@ class ScheduleBatchSMC:
         )
 
         # ── Active batch index ──
-        # `active_slots` maps contiguous ModelWorkerBatch indices → slot ids.
+        # `active_slots` maps contiguous ScheduleBatch indices → slot ids.
         # Rebuilt on membership change (allocate / free / particle finish).
         # `_active_slots_list` mirrors `active_slots` on CPU so hot-path
         # callers (`build_model_worker_batch`) can resolve slot → Req without
@@ -242,7 +244,7 @@ class ScheduleBatchSMC:
         self.active_slots_cpu = torch.empty(0, dtype=torch.int64)
         self._active_slots_list: List[int] = []
         self.num_active: int = 0
-        # ModelWorkerBatch cache: everything but the per-cycle fields is
+        # ScheduleBatch cache: everything but the per-cycle fields is
         # static between membership changes (issue #14, host-op slimming).
         self._membership_version: int = 0
         self._mwb_cache = None
@@ -451,8 +453,10 @@ class ScheduleBatchSMC:
         if max_n_out > 0:
             # Right-pad ragged prefixes to a rectangle; only [:n_out] of
             # each row is meaningful (token_counts gates later reads).
+            # Req.output_ids is array("q"); build plain lists for the
+            # host->device copy.
             prefix_rows = [
-                req.output_ids + [0] * (max_n_out - len(req.output_ids))
+                list(req.output_ids) + [0] * (max_n_out - len(req.output_ids))
                 for req in particle_reqs
             ]
             self.all_token_ids[idx, :max_n_out] = self._to_device_async(
@@ -550,7 +554,7 @@ class ScheduleBatchSMC:
         """Refresh ``active_slots``.
 
         ``active_slots`` is the contiguous-batch → slot gather index used to
-        build a ``ModelWorkerBatch``.  Slots are grouped by group_id (sorted)
+        build a ``ScheduleBatch``.  Slots are grouped by group_id (sorted)
         so per-group slices of the forward-pass output tensors (e.g.
         ``logprob_diff``) are contiguous.
 
@@ -580,7 +584,7 @@ class ScheduleBatchSMC:
         self.active_slots_cpu = torch.tensor(active_list, dtype=torch.int64)
         self._active_slots_list = active_list
         self.num_active = len(active_list)
-        # Invalidate the cached ModelWorkerBatch (membership changed).
+        # Invalidate the cached ScheduleBatch (membership changed).
         self._membership_version += 1
 
     def is_empty(self) -> bool:
@@ -609,7 +613,7 @@ class ScheduleBatchSMC:
                 num_tokens_per_req=self.gamma_plus_1,
             )
 
-        from sglang.srt.mem_cache.common import alloc_token_slots
+        from sglang.srt.mem_cache.allocation import alloc_token_slots
         from smcsd.core.kernels.fused_prepare import fused_prepare_decode
 
         active = self.active_slots
@@ -657,14 +661,14 @@ class ScheduleBatchSMC:
         pass
 
     # ────────────────────────────────────────────────────────
-    #  Build ModelWorkerBatch (slot-major → contiguous gather)
+    #  Build ScheduleBatch (slot-major → contiguous gather)
     # ────────────────────────────────────────────────────────
 
     def build_model_worker_batch(
         self,
         draft_input: SMCDraftInput,
-    ) -> ModelWorkerBatch:
-        """Assemble a contiguous ``ModelWorkerBatch`` for the worker.
+    ) -> ScheduleBatch:
+        """Assemble a contiguous ``ScheduleBatch`` for the worker.
 
         Under static membership everything except the per-cycle fields
         (input_ids / seq_lens / seq_lens_cpu / seq_lens_sum / spec_info) is
@@ -708,6 +712,8 @@ class ScheduleBatchSMC:
             top_ks=self._stub_top_ks[:bs],
             min_ps=self._stub_min_ps[:bs],
             is_all_greedy=False,
+            # SMC samples at temperature > 0 on every row.
+            is_any_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
             need_min_p_sampling=False,
@@ -715,7 +721,8 @@ class ScheduleBatchSMC:
         )
 
         self._mwb_version = self._membership_version
-        self._mwb_cache = ModelWorkerBatch(
+        self._mwb_cache = ScheduleBatch(
+            reqs=reqs,
             forward_mode=ForwardMode.DECODE,
             input_ids=draft_input.verified_id,
             req_pool_indices=req_pool_indices,
@@ -729,13 +736,10 @@ class ScheduleBatchSMC:
             global_num_tokens=None,
             global_num_tokens_for_logprob=None,
             is_extend_in_batch=False,
-            all_extend_in_batch=False,
             can_run_dp_cuda_graph=False,
             tbo_split_seq_index=None,
             global_forward_mode=None,
             extend_num_tokens=None,
-            extend_seq_lens=None,
-            extend_prefix_lens=None,
             extend_logprob_start_lens=None,
             extend_input_logprob_token_ids=None,
             multimodal_inputs=[None] * bs,
@@ -743,12 +747,20 @@ class ScheduleBatchSMC:
             encoder_lens=None,
             encoder_lens_cpu=None,
             encoder_out_cache_loc=None,
-            lora_ids=None,
             sampling_info=sampling_info,
             spec_algorithm=SpeculativeAlgorithm.SMC,
             spec_info=draft_input,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            reqs=reqs,
+        )
+        # SamplingBatchInfo.copy_for_forward() dereferences
+        # penalizer_orchestrator.  SMC does its own sampling and applies no
+        # penalties, so attach an orchestrator with an empty penalizer set
+        # (is_required=False -> every method is a no-op).
+        from sglang.srt.sampling.penaltylib.orchestrator import (
+            BatchedPenalizerOrchestrator,
+        )
+
+        sampling_info.penalizer_orchestrator = BatchedPenalizerOrchestrator(
+            self.vocab_size, self._mwb_cache, set()
         )
         return self._mwb_cache
 
@@ -1061,7 +1073,9 @@ class ScheduleBatchSMC:
         # the global torch RNG (seeded via ServerArgs.random_seed).
         probs = torch.softmax(self.log_weights[slot_idx_t], dim=0)
         pick = int(torch.multinomial(probs, num_samples=1).item())
-        parent_req.output_ids = list(particle_output_ids[pick])
+        # Req.output_ids must stay an array("q"): the detokenizer
+        # concatenates it with origin_input_ids_unpadded.
+        parent_req.output_ids = array("q", particle_output_ids[pick])
         parent_req.finished_reason = self._finish_reason_from_code(
             fin_codes[pick], fin_lens[pick], matched_toks[pick]
         )

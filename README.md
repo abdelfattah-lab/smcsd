@@ -18,28 +18,34 @@ Blog posts:
 
 ## Installation
 
-This repo vendors a patched SGLang as a git submodule at `3rdparty/sglang`.
+This repo vendors **pristine upstream SGLang** (`sgl-project/sglang@v0.5.17`) as a
+git submodule at `3rdparty/sglang`, plus the SMC core hooks as git patches under
+`patches/`.  `scripts/apply_sglang_patches.sh` applies them onto the submodule as
+a local commit — no SGLang fork is required.  Re-run it after every
+`git submodule update` (updating resets the submodule to the pristine pin);
+re-running is a no-op, and `--reverse` removes the patches again.
 
-- **`main`** — pins SGLang at `smc_v2_clean-upstream-sync-2` (`smc_v2_clean` + latest `upstream/main` merged in). Requires **CUDA 13**, `torch==2.11.0`, and `sglang-kernel==0.4.2` (formerly `sgl-kernel`; same import path, new pip name).
-- **`upstream`** — development/tracking branch for the same `smc_v2_clean-upstream-sync-2` snapshot.
+**Host requirements:** CUDA 13 toolkit installed (provides `libnvrtc.so.13`), a
+Rust toolchain (`rustup`, for the sglang grpc extension), and `protobuf-compiler`
+(`protoc`).  On CUDA 12 systems the prebuilt `sglang-kernel` wheel fails to load
+with a `libnvrtc.so.13: cannot open shared object file` error.  The Python deps
+(`torch==2.11.0`, `flashinfer_python==0.6.15.post1`, `transformers==5.12.1`) are
+pinned by the SGLang submodule's `pyproject.toml` and resolve automatically.
 
-For a CUDA 12 / `torch ~2.9` build, point the submodule at the older `smc_v2_clean` snapshot instead (`git -C 3rdparty/sglang checkout smc_v2_clean`).
-
-**Host requirements:** CUDA 13 toolkit installed (provides `libnvrtc.so.13`). On CUDA 12 systems the prebuilt `sglang-kernel` wheel will fail to load with an undefined-symbol or `libnvrtc.so.13: cannot open shared object file` error. The Python deps (`torch==2.11.0`, `sglang-kernel==0.4.2`) are pinned by the SGLang submodule's `pyproject.toml` and will be resolved automatically.
-
-`SMCEngine` will not import until the patched SGLang submodule is both checked out and installed. If you hit `ModuleNotFoundError: No module named 'sglang'`, run:
+`SMCEngine` will not import until the patched SGLang submodule is checked out,
+patched, and installed.  If you hit `ModuleNotFoundError: No module named
+'sglang'`, run:
 
 ```bash
 git submodule update --init --recursive
+scripts/apply_sglang_patches.sh
 uv pip install -e 3rdparty/sglang/python
 uv pip install -e .
 ```
 
 ```bash
-# 1. Clone with submodules — pick the branch you want
-git clone --recurse-submodules --branch main     https://github.com/abdelfattah-lab/smcsd.git
-# OR for the latest upstream-merged build (needs CUDA 13):
-# git clone --recurse-submodules --branch upstream https://github.com/abdelfattah-lab/smcsd.git
+# 1. Clone with submodules
+git clone --recurse-submodules https://github.com/abdelfattah-lab/smcsd.git
 cd smcsd
 
 # If you already cloned without --recurse-submodules, initialise now:
@@ -49,10 +55,27 @@ cd smcsd
 uv venv --python 3.12
 source .venv/bin/activate
 
-# 3. Install the patched SGLang (from the submodule), then this package
+# 3. Apply the SMC patches onto the vendored SGLang, then install both
+scripts/apply_sglang_patches.sh
 uv pip install -e 3rdparty/sglang/python
 uv pip install -e .
 ```
+
+### Bumping the vendored SGLang
+
+The pin lives in the gitlink; the SMC hooks live in `patches/`.  To move to a
+newer upstream release:
+
+```bash
+cd 3rdparty/sglang
+git fetch origin --tags && git checkout <new-tag>       # move the pristine pin
+cd ../.. && scripts/apply_sglang_patches.sh             # 3-way re-apply (resolve if needed)
+git -C 3rdparty/sglang format-patch <new-tag> -o patches/  # re-export the patch
+git update-index --cacheinfo 160000,$(git -C 3rdparty/sglang rev-parse <new-tag>^{commit}),3rdparty/sglang
+```
+
+Then reinstall, run the unit suite (`pytest tests/`), and re-run the GSM8K
+accuracy gate before committing the new pin + patch.
 
 ## Quick Start
 
@@ -64,10 +87,10 @@ python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
   --speculative-draft-model-path meta-llama/Llama-3.2-1B-Instruct \
   --smc-n-particles 8 --smc-gamma 8 \
   --smc-draft-temperature 0.7 --smc-target-temperature 0.7 \
-  --attention-backend fa3 \
+  --attention-backend triton \
   --mem-fraction-static 0.60 \
   --max-running-requests 1 \
-  --cuda-graph-max-bs 8 \
+  --cuda-graph-max-bs-decode 8 \
   --dataset-name sharegpt \
   --num-prompts 200
 ```
@@ -80,14 +103,15 @@ python scripts/accuracy_test_gsm8k.py \
   --draft-model meta-llama/Llama-3.2-1B-Instruct \
   --particles 12 --gamma 8 \
   --temperature 0.7 \
-  --attention-backend fa3 \
+  --attention-backend triton \
   --num-questions 400
 ```
 
-
-
-> [!NOTE] 
-> When using non-Hopper GPU (such as A100, A6000), specify `--attention-backend` to be `triton`
+> [!NOTE]
+> SMC supports the `triton` and `fa3` attention backends. The v0.5.17 port is
+> validated end-to-end on `triton` (10-seed GSM8K, Blackwell); `fa3` is
+> Hopper-class only (H100/H200) and has not been re-validated since the bump —
+> run one smoke test before relying on it.
 
 ### Performance optimizations (on by default)
 
@@ -133,7 +157,7 @@ See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
 ## Architecture
 
-SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via a handful of extension points (`ModelRunner._init_pools`, `ModelRunner._build_dummy_run_spec_info`, `ModelRunner._get_graph_runner_class`, `CudaGraphRunner.get_spec_info`, `Scheduler.init_tp_model_worker`, `TpModelWorker._init_model_runner`).
+SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via a handful of extension points (`ModelRunner.alloc_memory_pool`, `ModelRunner._build_dummy_run_spec_info`, `ModelRunner._decode_cuda_graph_runner_cls`, `DecodeCudaGraphRunner.get_spec_info`, `Scheduler.init_tp_model_worker` / `maybe_init_draft_worker`, `TpModelWorker._init_model_runner`).
 
 | Path | Description |
 | --- | --- |
@@ -142,7 +166,7 @@ SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via
 | `smcsd/core/worker.py` | `SMCWorker` — draft AR loop + target scoring + importance weights |
 | `smcsd/core/req_state.py` | `ScheduleBatchSMC` — per-slot decode state, flat slot-major weights, and group lookup |
 | `smcsd/core/info.py` | `SMCDraftInput`, `SMCDecodeContext` — spec-info wiring |
-| `smcsd/core/kernels/` | Fused Triton kernels (`fused_collect`, `fused_resample_kv`) |
+| `smcsd/core/kernels/` | Fused Triton kernels (collect, resample-KV/Mamba, sampling, write-back, split-KV verify attention) |
 | `smcsd/managers/smc_tp_worker.py` | `SMCTpModelWorker` — wires `SMCModelRunner` into the target TP worker |
 | `smcsd/model_executor/smc_model_runner.py` | `SMCModelRunner` — installs refcounted allocator + SMC warmup spec-info |
 | `smcsd/model_executor/smc_cuda_graph_runner.py` | `SMCCudaGraphRunner` — `SMCVerifyInput` during CUDA graph capture |

@@ -57,18 +57,38 @@ import copy
 from typing import TYPE_CHECKING
 
 import torch
+import tqdm
 
-from sglang.srt.model_executor.cuda_graph_runner import (
-    CUDA_GRAPH_CAPTURE_FAILED_MSG,
-    CudaGraphRunner,
-    DeepEPCudaGraphRunnerAdapter,
-    _default_make_graph_key,
-    get_batch_sizes_to_capture,
-    get_global_graph_memory_pool,
-    model_capture_mode,
-    set_global_graph_memory_pool,
-    set_is_extend_in_batch,
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config as _hybrid_gdn_config,
 )
+
+from sglang.srt.layers.dp_attention import set_is_extend_in_batch
+from sglang.srt.utils import get_available_gpu_memory
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    get_batch_sizes_to_capture,
+)
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner as CudaGraphRunner,
+)
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend_utils import (
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.model_executor.runner_utils.deepep_adapter import (
+    DeepEPCudaGraphRunnerAdapter,
+)
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_global_graph_memory_pool,
+    set_global_graph_memory_pool,
+)
+
+
+def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
+    """Key helper for the graph dicts below (ShapeKey keyed by capture bs)."""
+    return ShapeKey(size=bs, stream_idx=stream_idx, variant_label=variant_label)
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -252,7 +272,44 @@ class SMCDraftPhaseGraphRunner:
     # ── Capture ──
 
     def capture(self):
-        CudaGraphRunner.capture(self)
+        # DecodeCudaGraphRunner.capture carries warmup / buffer-registry /
+        # backend-session machinery this standalone runner doesn't use, so
+        # run a local thin capture loop instead.
+        from sglang.srt.compilation.torch_compile_decoration import patch_model
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+        from sglang.srt.distributed.parallel_state import graph_capture
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            freeze_gc,
+        )
+
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            with graph_capture() as graph_capture_context:
+                self.stream = graph_capture_context.stream
+                capture_range = (
+                    tqdm.tqdm(list(reversed(self.capture_bs)))
+                    if get_tensor_model_parallel_rank() == 0
+                    else reversed(self.capture_bs)
+                )
+                for bs in capture_range:
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.model_runner.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        capture_range.set_description(
+                            f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                        )
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        graph, output_buffers = self.capture_one_shape(bs, forward)
+                        key = _default_make_graph_key(bs)
+                        self.graphs[key] = graph
+                        self.output_buffers[key] = output_buffers
 
     def _create_graph(self):
         return torch.cuda.CUDAGraph()
@@ -292,8 +349,6 @@ class SMCDraftPhaseGraphRunner:
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=int(seq_lens.sum().item()),
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc_steps[0],
             return_logprob=False,
             positions=positions,
@@ -307,7 +362,7 @@ class SMCDraftPhaseGraphRunner:
             # in sync with `positions` each step.
             fb.mrope_positions = self.mrope_positions[:, :bs]
         self.fbs[bs] = fb
-        self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(fb)
+        self.draft_attn_backend.init_forward_metadata_out_graph(fb, in_capture=True)
         return fb, input_ids, positions, out_cache_loc_steps
 
     def _metadata_in_graph(self, bs: int):
@@ -323,9 +378,7 @@ class SMCDraftPhaseGraphRunner:
         increments happen after, exactly like the eager ordering.
         """
         if not self._eager_replay_metadata:
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                self.fbs[bs], bs
-            )
+            self.draft_attn_backend.init_forward_metadata_out_graph(self.fbs[bs])
 
     def _sample_step_in_graph(self, logits, step: int, need_logp: bool):
         """One in-graph draft draw: fused kernel or the torch Gumbel chain.
@@ -364,7 +417,6 @@ class SMCDraftPhaseGraphRunner:
         if self.use_fused_sampling:
             self.sample_seed.add_(1)  # captured: fresh noise every replay
         for s in range(self.num_steps):
-            fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
             if self._draft_is_mrope:
                 # Keep mrope_positions in sync with the current `positions`
@@ -372,8 +424,11 @@ class SMCDraftPhaseGraphRunner:
                 # broadcasts (1, bs) -> (3, bs); in-graph and fixed-shape.
                 self.mrope_positions[:, :bs].copy_(positions.unsqueeze(0))
             # `forward` is the (patched) model.forward — returns a
-            # LogitsProcessorOutput directly.
-            logits = forward(input_ids, positions, fb).next_token_logits
+            # LogitsProcessorOutput directly.  Attention dispatches via
+            # get_attn_backend() from the ForwardContext, so the per-step
+            # backend is installed contextually.
+            with forward_context(ForwardContext(attn_backend=backends[s])):
+                logits = forward(input_ids, positions, fb).next_token_logits
             idx, logp = self._sample_step_in_graph(
                 logits, s, need_logp=s < self.gamma
             )
@@ -384,7 +439,9 @@ class SMCDraftPhaseGraphRunner:
             positions.add_(1)
         return tokens_out, logprobs_out
 
-    def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
+    def capture_one_shape(
+        self, num_seqs: int, forward, stream_idx=None, variant_label=None
+    ):
         graph = self._create_graph()
         stream = self.stream
         bs = num_seqs
@@ -461,9 +518,7 @@ class SMCDraftPhaseGraphRunner:
         # Attention metadata is captured in-graph for triton backends
         # (_metadata_in_graph); hybrid backends refresh eagerly here.
         if self._eager_replay_metadata:
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                self.fbs[bs], bs
-            )
+            self.draft_attn_backend.init_forward_metadata_out_graph(self.fbs[bs])
         # capture() stores keys via _default_make_graph_key(bs, None, None),
         # which is the plain bs int.
         self.graphs[_default_make_graph_key(bs)].replay()
@@ -547,7 +602,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         # init_forward_metadata_replay_cuda_graph before graph.replay(), so the
         # captured scatter targets the current step's mamba slots.
         self._hybrid_commit = (
-            worker.score_runner.hybrid_gdn_config is not None
+            _hybrid_gdn_config(worker.score_runner.model_config) is not None
             and hasattr(self.target_backend, "update_mamba_state_after_mtp_verify")
         )
         if self._hybrid_commit:
@@ -586,9 +641,6 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=int(seq_lens.sum().item()),
-            req_to_token_pool=self.target_runner.req_to_token_pool,
-            token_to_kv_pool=self.target_runner.token_to_kv_pool,
-            attn_backend=self.target_backend,
             out_cache_loc=verify_ocl,
             return_logprob=False,
             positions=verify_positions,
@@ -603,15 +655,7 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         # NOTE: reuses the target backend's existing cuda-graph metadata
         # buffers (allocated by the target's own graph runner) — do NOT call
         # init_cuda_graph_state here, it would orphan the target's graphs.
-        self.target_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            n_tokens,
-            req_pool_indices,
-            seq_lens,
-            None,
-            ForwardMode.TARGET_VERIFY,
-            verify_spec,
-        )
+        self.target_backend.init_forward_metadata_out_graph(fb, in_capture=True)
         return fb, verify_input_ids, verify_positions
 
     def _metadata_in_graph(self, bs: int):
@@ -640,17 +684,8 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         # 0 would be silent.  Re-verify on submodule bumps (an assert in
         # the vendored branch is queued for the next bump).
         if not self._eager_replay_metadata:
-            _, verify_spec = self.verify_fbs[bs]
-            self.target_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                self.req_pool_indices[:bs],
-                self.seq_lens[:bs],
-                0,      # seq_lens_sum: placeholder, see seam note above
-                None,
-                ForwardMode.TARGET_VERIFY,
-                verify_spec,
-                None,   # seq_lens_cpu: placeholder, see seam note above
-            )
+            verify_fb, _ = self.verify_fbs[bs]
+            self.target_backend.init_forward_metadata_out_graph(verify_fb)
 
     def _verify_in_graph(self, bs, fb, verify_input_ids, verify_positions):
         gamma = self.gamma
@@ -671,9 +706,10 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             self.verify_mrope_positions[:, :n_tokens].copy_(
                 verify_positions.unsqueeze(0)
             )
-        logits = self.target_runner.model.forward(
-            verify_input_ids, verify_positions, fb
-        ).next_token_logits
+        with forward_context(ForwardContext(attn_backend=self.target_backend)):
+            logits = self.target_runner.model.forward(
+                verify_input_ids, verify_positions, fb
+            ).next_token_logits
 
         # Hybrid target: commit the accepted recurrent state IN-GRAPH, right
         # after the verify forward that produced the intermediate states.
@@ -754,7 +790,9 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
             next_tokens_out,
         )
 
-    def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
+    def capture_one_shape(
+        self, num_seqs: int, forward, stream_idx=None, variant_label=None
+    ):
         graph = self._create_graph()
         stream = self.stream
         bs = num_seqs
@@ -795,21 +833,9 @@ class SMCFullCycleGraphRunner(SMCDraftPhaseGraphRunner):
         # Verify staging is captured in-graph; attention metadata is
         # in-graph for triton backends, eager here for hybrid ones.
         if self._eager_replay_metadata:
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                self.fbs[bs], bs
-            )
-            _, verify_spec = self.verify_fbs[bs]
-            seq_lens_sum = int(self.seq_lens_cpu[:bs].sum().item())
-            self.target_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                self.req_pool_indices[:bs],
-                self.seq_lens[:bs],
-                seq_lens_sum,
-                None,
-                ForwardMode.TARGET_VERIFY,
-                verify_spec,
-                self.seq_lens_cpu[:bs],
-            )
+            self.draft_attn_backend.init_forward_metadata_out_graph(self.fbs[bs])
+            verify_fb, _ = self.verify_fbs[bs]
+            self.target_backend.init_forward_metadata_out_graph(verify_fb)
         self.graphs[_default_make_graph_key(bs)].replay()
         return (
             self.tokens_out[:raw_bs],
@@ -876,7 +902,7 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         self._draft_head_commit = hasattr(
             self.draft_primary_backend, "update_mamba_state_after_mtp_verify"
         ) and (
-            getattr(self.model_runner, "hybrid_gdn_config", None) is not None
+            _hybrid_gdn_config(self.model_runner.model_config) is not None
         )
         if self._draft_head_commit:
             with torch.device(self.model_runner.device):
@@ -956,9 +982,6 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             seq_lens=head_seq_lens,
             seq_lens_cpu=head_seq_lens_cpu,
             seq_lens_sum=int(head_seq_lens.sum().item()),
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.head_backend,
             out_cache_loc=head_ocl,
             return_logprob=False,
             positions=head_positions,
@@ -976,15 +999,7 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         # for triton/FA3 drafts it aliases the primary backend, reusing its
         # existing buffers (do NOT call init_cuda_graph_state — rebinding
         # hazard, see module docstring).
-        self.head_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            n_tokens,
-            req_pool_indices,
-            head_seq_lens,
-            None,
-            ForwardMode.TARGET_VERIFY,
-            head_spec,
-        )
+        self.head_backend.init_forward_metadata_out_graph(fb, in_capture=True)
         return fb
 
     def _metadata_in_graph(self, bs: int):
@@ -995,17 +1010,8 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         host-side value."""
         torch.sub(self.seq_lens[:bs], 1, out=self.head_seq_lens[:bs])
         if not self._eager_replay_metadata:
-            _, head_spec = self.head_fbs[bs]
-            self.head_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                self.req_pool_indices[:bs],
-                self.head_seq_lens[:bs],
-                0,      # seq_lens_sum: unused by the linear-verify branch
-                None,
-                ForwardMode.TARGET_VERIFY,
-                head_spec,
-                None,   # seq_lens_cpu: unused by the linear-verify branch
-            )
+            head_fb, _ = self.head_fbs[bs]
+            self.head_backend.init_forward_metadata_out_graph(head_fb)
         super()._metadata_in_graph(bs)
 
     def _draft_steps_in_graph(self, bs, forward, fb, input_ids, positions,
@@ -1040,11 +1046,12 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
                 self.head_positions[:n_head].unsqueeze(0)
             )
 
-        logits2 = forward(
-            self.head_input_ids[:n_head],
-            self.head_positions[:n_head],
-            head_fb,
-        ).next_token_logits
+        with forward_context(ForwardContext(attn_backend=self.head_backend)):
+            logits2 = forward(
+                self.head_input_ids[:n_head],
+                self.head_positions[:n_head],
+                head_fb,
+            ).next_token_logits
 
         # Hybrid draft: commit the S-position (index 1) recurrent state
         # IN-GRAPH, right after the head forward, so the gamma-1 singles (and
@@ -1070,11 +1077,11 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
 
         # gamma-1 singles: forward(d_{s-1}) @ S+s for s = 1..gamma-1.
         for s in range(1, self.gamma):
-            fb.attn_backend = backends[s]
             fb.out_cache_loc = out_cache_loc_steps[s]
             if self._draft_is_mrope:
                 self.mrope_positions[:, :bs].copy_(positions.unsqueeze(0))
-            logits = forward(input_ids, positions, fb).next_token_logits
+            with forward_context(ForwardContext(attn_backend=backends[s])):
+                logits = forward(input_ids, positions, fb).next_token_logits
             idx, logp = self._sample_step_in_graph(logits, s, need_logp=True)
             tokens_out[:, s + 1] = idx
             logprobs_out[:, s] = logp
@@ -1082,7 +1089,9 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             positions.add_(1)
         return tokens_out, logprobs_out
 
-    def capture_one_batch_size(self, num_seqs: int, forward, stream_idx: int = 0):
+    def capture_one_shape(
+        self, num_seqs: int, forward, stream_idx=None, variant_label=None
+    ):
         graph = self._create_graph()
         stream = self.stream
         bs = num_seqs
@@ -1150,21 +1159,9 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             # capture); triton backends do all of this inside the captured
             # graph via _metadata_in_graph.  Verify staging (positions /
             # cache-locs) is device-only and always captured in-graph.
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                self.fbs[bs], bs
-            )
-            verify_fb, verify_spec = self.verify_fbs[bs]
-            seq_lens_sum = int(self.seq_lens_cpu[:bs].sum().item())
-            self.target_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                self.req_pool_indices[:bs],
-                self.seq_lens[:bs],
-                seq_lens_sum,
-                None,
-                ForwardMode.TARGET_VERIFY,
-                verify_spec,
-                self.seq_lens_cpu[:bs],
-            )
+            self.draft_attn_backend.init_forward_metadata_out_graph(self.fbs[bs])
+            verify_fb, _ = self.verify_fbs[bs]
+            self.target_backend.init_forward_metadata_out_graph(verify_fb)
             # Head metadata: for hybrid drafts this writes the DEDICATED head
             # backend's own persistent buffers (verify layout), so it cannot
             # clobber — nor be clobbered by — the singles' decode metadata
@@ -1172,18 +1169,8 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
             # _draft_steps_in_graph) reads the buffers refreshed here.
             torch.sub(self.seq_lens[:bs], 1, out=self.head_seq_lens[:bs])
             self.head_seq_lens_cpu[:bs].copy_(self.seq_lens_cpu[:bs] - 1)
-            head_sum = int(self.head_seq_lens_cpu[:bs].sum().item())
-            _, head_spec = self.head_fbs[bs]
-            self.head_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                self.req_pool_indices[:bs],
-                self.head_seq_lens[:bs],
-                head_sum,
-                None,
-                ForwardMode.TARGET_VERIFY,
-                head_spec,
-                self.head_seq_lens_cpu[:bs],
-            )
+            head_fb, _ = self.head_fbs[bs]
+            self.head_backend.init_forward_metadata_out_graph(head_fb)
 
         self.graphs[_default_make_graph_key(bs)].replay()
 

@@ -62,9 +62,13 @@ def _init_sglang_single_process(port: int):
             backend="gloo",
         )
         initialize_model_parallel(1, 1)
-    import sglang.srt.server_args as server_args_mod
+    # Config flows through the published RuntimeContext bags.
+    # override_server_args on the unpublished context installs a
+    # default-valued ServerArgs projection — exactly the "every flag
+    # unset/disabled" stub this test wants.
+    from sglang.srt.runtime_context import get_context
 
-    server_args_mod.set_global_server_args_for_scheduler(_StubServerArgs())
+    get_context().override_server_args().install()
     _stub_dp_attention()
 
 
@@ -182,9 +186,9 @@ def _tp2_worker(rank, world, port, out_path):
             backend="gloo",
         )
         initialize_model_parallel(world, 1)
-        import sglang.srt.server_args as server_args_mod
+        from sglang.srt.runtime_context import get_context
 
-        server_args_mod.set_global_server_args_for_scheduler(_StubServerArgs())
+        get_context().override_server_args().install()
         _stub_dp_attention()
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 

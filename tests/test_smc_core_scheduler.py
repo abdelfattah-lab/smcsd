@@ -164,6 +164,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
             waiting_groups=deque([queued_group]),
             max_running_requests=4,
             slot_state=SimpleNamespace(available_slot_count=lambda: 0),
+            _pending_admitted_slots=0,
         )
         scheduler._emit_abort = lambda req, error_msg: self.fail(
             f"unexpected abort for {req.rid}: {error_msg}"
@@ -184,6 +185,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
             waiting_groups=deque([g0, g1]),
             max_running_requests=4,
             slot_state=SimpleNamespace(available_slot_count=lambda: 4),
+            _pending_admitted_slots=0,
         )
         scheduler._emit_abort = lambda req, error_msg: self.fail(
             f"unexpected abort for {req.rid}: {error_msg}"
@@ -204,6 +206,7 @@ class TestSMCSchedulerAdmission(CustomTestCase):
             waiting_groups=deque([oversized]),
             max_running_requests=4,
             slot_state=SimpleNamespace(available_slot_count=lambda: 4),
+            _pending_admitted_slots=0,
         )
         scheduler._emit_abort = lambda req, error_msg: self.fail(
             f"unexpected abort for {req.rid}: {error_msg}"
@@ -264,7 +267,7 @@ class TestSMCFinalizeGroup(CustomTestCase):
         finalized = slot_state.finalize_group("g", parent_req)
 
         self.assertIs(finalized, parent_req)
-        self.assertEqual(parent_req.output_ids, [5, 7])
+        self.assertEqual(list(parent_req.output_ids), [5, 7])
         self.assertEqual(parent_req.finished_len, 2)
         from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
         self.assertIsInstance(parent_req.finished_reason, FINISH_MATCHED_TOKEN)
