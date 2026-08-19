@@ -61,6 +61,22 @@ uv pip install -e 3rdparty/sglang/python
 uv pip install -e .
 ```
 
+### Bumping the vendored SGLang
+
+The pin lives in the gitlink; the SMC hooks live in `patches/`.  To move to a
+newer upstream release:
+
+```bash
+cd 3rdparty/sglang
+git fetch origin --tags && git checkout <new-tag>       # move the pristine pin
+cd ../.. && scripts/apply_sglang_patches.sh             # 3-way re-apply (resolve if needed)
+git -C 3rdparty/sglang format-patch <new-tag> -o patches/  # re-export the patch
+git update-index --cacheinfo 160000,$(git -C 3rdparty/sglang rev-parse <new-tag>^{commit}),3rdparty/sglang
+```
+
+Then reinstall, run the unit suite (`pytest tests/`), and re-run the GSM8K
+accuracy gate before committing the new pin + patch.
+
 ## Quick Start
 
 ```bash
@@ -71,10 +87,10 @@ python -O scripts/tps_benchmark_scripts/bench_offline_throughput.py \
   --speculative-draft-model-path meta-llama/Llama-3.2-1B-Instruct \
   --smc-n-particles 8 --smc-gamma 8 \
   --smc-draft-temperature 0.7 --smc-target-temperature 0.7 \
-  --attention-backend fa3 \
+  --attention-backend triton \
   --mem-fraction-static 0.60 \
   --max-running-requests 1 \
-  --cuda-graph-max-bs 8 \
+  --cuda-graph-max-bs-decode 8 \
   --dataset-name sharegpt \
   --num-prompts 200
 ```
@@ -87,14 +103,15 @@ python scripts/accuracy_test_gsm8k.py \
   --draft-model meta-llama/Llama-3.2-1B-Instruct \
   --particles 12 --gamma 8 \
   --temperature 0.7 \
-  --attention-backend fa3 \
+  --attention-backend triton \
   --num-questions 400
 ```
 
-
-
-> [!NOTE] 
-> When using non-Hopper GPU (such as A100, A6000), specify `--attention-backend` to be `triton`
+> [!NOTE]
+> SMC supports the `triton` and `fa3` attention backends. The v0.5.17 port is
+> validated end-to-end on `triton` (10-seed GSM8K, Blackwell); `fa3` is
+> Hopper-class only (H100/H200) and has not been re-validated since the bump —
+> run one smoke test before relying on it.
 
 ### Performance optimizations (on by default)
 
@@ -126,6 +143,11 @@ python scripts/accuracy_test_gsm8k.py \
 
 At batch size 1 decode is weight-read-bound, so extra particles are nearly free up to N≈8 (use the headroom to raise γ); beyond that KV/attention traffic starts to cost — N=8 γ=8 is the fastest measured setting, N=12 γ=8 the most accurate. `SMC_DEFER_BONUS` helps short/medium generations (+5–9%) but can cost ~1–2% on very long (3k+ token) single streams.
 
+The split-KV fast-verify kernel (`smcsd/core/kernels/verify_attention.py`) currently
+**defaults off** on the v0.5.17 stack pending an accuracy investigation (see the
+patch commit message); opt back in with `SMC_FAST_VERIFY=1` — its payoff is at
+long context (4k+), and the stock kernel costs only ~1% at short context.
+
 See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
 ## SMC-SD Parameters
@@ -140,7 +162,7 @@ See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
 ## Architecture
 
-SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via a handful of extension points (`ModelRunner._init_pools`, `ModelRunner._build_dummy_run_spec_info`, `ModelRunner._get_graph_runner_class`, `CudaGraphRunner.get_spec_info`, `Scheduler.init_tp_model_worker`, `TpModelWorker._init_model_runner`).
+SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via a handful of extension points (`ModelRunner.alloc_memory_pool`, `ModelRunner._build_dummy_run_spec_info`, `ModelRunner._decode_cuda_graph_runner_cls`, `DecodeCudaGraphRunner.get_spec_info`, `Scheduler.init_tp_model_worker` / `maybe_init_draft_worker`, `TpModelWorker._init_model_runner`).
 
 | Path | Description |
 | --- | --- |
@@ -149,7 +171,7 @@ SMC lives in the top-level `smcsd/` package, layered over the patched SGLang via
 | `smcsd/core/worker.py` | `SMCWorker` — draft AR loop + target scoring + importance weights |
 | `smcsd/core/req_state.py` | `ScheduleBatchSMC` — per-slot decode state, flat slot-major weights, and group lookup |
 | `smcsd/core/info.py` | `SMCDraftInput`, `SMCDecodeContext` — spec-info wiring |
-| `smcsd/core/kernels/` | Fused Triton kernels (`fused_collect`, `fused_resample_kv`) |
+| `smcsd/core/kernels/` | Fused Triton kernels (collect, resample-KV/Mamba, sampling, write-back, split-KV verify attention) |
 | `smcsd/managers/smc_tp_worker.py` | `SMCTpModelWorker` — wires `SMCModelRunner` into the target TP worker |
 | `smcsd/model_executor/smc_model_runner.py` | `SMCModelRunner` — installs refcounted allocator + SMC warmup spec-info |
 | `smcsd/model_executor/smc_cuda_graph_runner.py` | `SMCCudaGraphRunner` — `SMCVerifyInput` during CUDA graph capture |
