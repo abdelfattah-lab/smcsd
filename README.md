@@ -143,11 +143,6 @@ python scripts/accuracy_test_gsm8k.py \
 
 At batch size 1 decode is weight-read-bound, so extra particles are nearly free up to N≈8 (use the headroom to raise γ); beyond that KV/attention traffic starts to cost — N=8 γ=8 is the fastest measured setting, N=12 γ=8 the most accurate. `SMC_DEFER_BONUS` helps short/medium generations (+5–9%) but can cost ~1–2% on very long (3k+ token) single streams.
 
-The split-KV fast-verify kernel (`smcsd/core/kernels/verify_attention.py`) currently
-**defaults off** on the v0.5.17 stack pending an accuracy investigation (see the
-patch commit message); opt back in with `SMC_FAST_VERIFY=1` — its payoff is at
-long context (4k+), and the stock kernel costs only ~1% at short context.
-
 See [scripts/README.md](scripts/README.md) for more benchmark entrypoints.
 
 ## SMC-SD Parameters
