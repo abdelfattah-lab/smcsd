@@ -62,10 +62,10 @@ def _init_sglang_single_process(port: int):
             backend="gloo",
         )
         initialize_model_parallel(1, 1)
-    # v0.5.17: config flows through the published RuntimeContext bags, not a
-    # module global.  override_server_args on the unpublished context installs
-    # a default-valued ServerArgs projection, which is exactly the
-    # "every flag unset/disabled" stub this test wants.
+    # Config flows through the published RuntimeContext bags.
+    # override_server_args on the unpublished context installs a
+    # default-valued ServerArgs projection — exactly the "every flag
+    # unset/disabled" stub this test wants.
     from sglang.srt.runtime_context import get_context
 
     get_context().override_server_args().install()

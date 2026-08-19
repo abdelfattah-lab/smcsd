@@ -142,9 +142,8 @@ class SMCEngine:
         # default ON via the smc_* server_args attrs set below; the worker
         # and scheduler downgrade gracefully on unsupported configs.  The
         # SMC_* env vars remain as kill switches that override the kwargs.
-        # v0.5.17 split the cuda-graph knobs per phase: cuda_graph_max_bs ->
-        # cuda_graph_max_bs_decode / _prefill.  Keep SMCEngine's public kwarg
-        # name stable and translate here.
+        # SGLang's cuda-graph knobs are per phase; keep SMCEngine's public
+        # cuda_graph_max_bs kwarg stable and translate to the decode knob.
         if "cuda_graph_max_bs" in merged:
             merged.setdefault(
                 "cuda_graph_max_bs_decode", merged.pop("cuda_graph_max_bs")
@@ -153,8 +152,8 @@ class SMCEngine:
         server_args = ServerArgs(**merged)
         self.server_args = server_args
 
-        # v0.5.17 freezes ServerArgs after resolution, so these are passed at
-        # construction (declared as real smc_* server args) rather than set here.
+        # ServerArgs is frozen after resolution, so these are declared smc_*
+        # server args passed at construction (see `forced` above).
 
         # -- 2. Global env / config (mirrors Engine._launch_subprocesses) --
         configure_logger(server_args)
@@ -267,10 +266,9 @@ class SMCEngine:
             req = TokenizedGenerateReqInput(
                 rid=rid,
                 input_text=text,
-                # v0.5.17's Req contract is array("q", ...) end-to-end
+                # Req's token-id contract is array("q") end-to-end
                 # (_refresh_fill_ids concatenates with output_ids arrays).
                 input_ids=array("q", ids),
-                # v0.5.17 added these as required fields on the msgspec struct.
                 input_embeds=None,
                 mm_inputs=None,
                 token_type_ids=None,

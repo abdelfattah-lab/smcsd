@@ -453,8 +453,8 @@ class ScheduleBatchSMC:
         if max_n_out > 0:
             # Right-pad ragged prefixes to a rectangle; only [:n_out] of
             # each row is meaningful (token_counts gates later reads).
-            # v0.5.17's Req.output_ids is array("q"), which only concatenates
-            # with another array -- build plain lists for the host->device copy.
+            # Req.output_ids is array("q"); build plain lists for the
+            # host->device copy.
             prefix_rows = [
                 list(req.output_ids) + [0] * (max_n_out - len(req.output_ids))
                 for req in particle_reqs
@@ -712,8 +712,7 @@ class ScheduleBatchSMC:
             top_ks=self._stub_top_ks[:bs],
             min_ps=self._stub_min_ps[:bs],
             is_all_greedy=False,
-            # v0.5.17 added is_any_greedy alongside is_all_greedy; SMC
-            # samples at temperature > 0 on every row.
+            # SMC samples at temperature > 0 on every row.
             is_any_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
@@ -752,10 +751,10 @@ class ScheduleBatchSMC:
             spec_algorithm=SpeculativeAlgorithm.SMC,
             spec_info=draft_input,
         )
-        # v0.5.17's SamplingBatchInfo.copy_for_forward() calls update_penalties(),
-        # which dereferences penalizer_orchestrator.  SMC does its own sampling
-        # and applies no penalties, so attach an orchestrator with an empty
-        # penalizer set (is_required=False -> every method is a no-op).
+        # SamplingBatchInfo.copy_for_forward() dereferences
+        # penalizer_orchestrator.  SMC does its own sampling and applies no
+        # penalties, so attach an orchestrator with an empty penalizer set
+        # (is_required=False -> every method is a no-op).
         from sglang.srt.sampling.penaltylib.orchestrator import (
             BatchedPenalizerOrchestrator,
         )
@@ -1074,8 +1073,8 @@ class ScheduleBatchSMC:
         # the global torch RNG (seeded via ServerArgs.random_seed).
         probs = torch.softmax(self.log_weights[slot_idx_t], dim=0)
         pick = int(torch.multinomial(probs, num_samples=1).item())
-        # v0.5.17 requires Req.output_ids to stay an array("q"): the
-        # detokenizer concatenates it with origin_input_ids_unpadded.
+        # Req.output_ids must stay an array("q"): the detokenizer
+        # concatenates it with origin_input_ids_unpadded.
         parent_req.output_ids = array("q", particle_output_ids[pick])
         parent_req.finished_reason = self._finish_reason_from_code(
             fin_codes[pick], fin_lens[pick], matched_toks[pick]

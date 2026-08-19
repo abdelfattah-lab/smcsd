@@ -53,7 +53,7 @@ class SMCDenseDraftTpModelWorker(TpModelWorker):
 
     @property
     def draft_runner(self):
-        # v0.5.17's kv_cache_builder.get_draft_kv_pool reaches for
+        # kv_cache_builder.get_draft_kv_pool reaches for
         # draft_worker.draft_worker.draft_runner on V2-shaped spec workers.
         return self.model_runner
 
@@ -79,8 +79,8 @@ class SMCWorker(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # v0.5.17's BaseSpecWorker.__init__ seeds the graph memory/time usage
-        # dicts that the scheduler's startup summary reads.
+        # BaseSpecWorker.__init__ seeds the graph memory/time usage dicts
+        # that the scheduler's startup summary reads.
         super().__init__()
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -141,8 +141,9 @@ class SMCWorker(BaseSpecWorker):
 
         # Do not capture cuda graph during TpModelWorker init —
         # we capture manually after the draft model is fully set up.
-        # v0.5.17 freezes ServerArgs, so the draft gets its own copy with an
-        # explicit override instead of a mutate-and-restore on the shared one.
+        # ServerArgs is frozen after resolution, so the draft gets its own
+        # copy with an explicit override rather than a mutate-and-restore on
+        # the shared instance.
         from copy import deepcopy
 
         backup_disable_cuda_graph = server_args.disable_cuda_graph
@@ -168,9 +169,8 @@ class SMCWorker(BaseSpecWorker):
         self.draft_runner = self._draft_worker.model_runner
         self._backup_disable_cuda_graph = backup_disable_cuda_graph
 
-    # v0.5.17 splits worker bring-up into phases driven by the scheduler:
-    # __init__ (weights) -> alloc_memory_pool -> init_attention_backends ->
-    # init_cuda_graphs.  The body below used to run inline in __init__.
+    # Worker bring-up is phased, driven by the scheduler: __init__ (weights)
+    # -> alloc_memory_pool -> init_attention_backends -> init_cuda_graphs.
 
     def alloc_memory_pool(
         self,
@@ -238,10 +238,10 @@ class SMCWorker(BaseSpecWorker):
             "smc_draft_worker.restore",
             disable_cuda_graph=backup_disable_cuda_graph,
         )
-        # v0.5.17 replaced ModelRunner.init_device_graphs with init_cuda_graphs,
-        # which must run even when capture is disabled: it is what installs
-        # eager_runner / prefill_cuda_graph_runner / decode_cuda_graph_runner
-        # (as None/eager) that _forward_raw reads on every forward.
+        # init_cuda_graphs must run even when capture is disabled: it
+        # installs eager_runner / prefill_cuda_graph_runner /
+        # decode_cuda_graph_runner (as None/eager), which _forward_raw reads
+        # on every forward.
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=not backup_disable_cuda_graph
         )
@@ -482,7 +482,6 @@ class SMCWorker(BaseSpecWorker):
         )
 
         target_pool = self.req_to_token_pool
-        # v0.5.17 moved mambaish_config off ModelRunner into configs.hybrid_arch.
         from sglang.srt.configs.hybrid_arch import mambaish_config
 
         draft_config = mambaish_config(self.draft_runner.model_config)
@@ -688,8 +687,6 @@ class SMCWorker(BaseSpecWorker):
     # ── Main entry point ──
 
     def forward_batch_generation(self, batch):
-        # v0.5.17 removed the ModelWorkerBatch indirection: the ScheduleBatch
-        # is what the model runner consumes directly.
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             return self._forward_extend(batch)
         else:
@@ -703,8 +700,6 @@ class SMCWorker(BaseSpecWorker):
         # Score model prefill — authoritative prompt KV + score state.  FULL
         # hidden capture: x0's logits are projected from this same forward's
         # hidden states (below), so no second target pass over the prompt.
-        # v0.5.17: capture_hidden_mode is a forward_batch_generation kwarg
-        # rather than a batch field.
         score_result = self._target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
@@ -1140,9 +1135,9 @@ class SMCWorker(BaseSpecWorker):
                 draft_fb.out_cache_loc = cache_locs[:, step].contiguous()
 
                 if use_multistep:
-                    # v0.5.17: attention dispatch reads get_attn_backend() from
-                    # the ForwardContext; ModelRunner.forward respects an
-                    # existing context (has_forward_context() -> nullcontext).
+                    # Attention dispatch reads get_attn_backend() from the
+                    # ForwardContext; ModelRunner.forward respects an existing
+                    # context (has_forward_context() -> nullcontext).
                     from sglang.srt.model_executor.forward_context import (
                         ForwardContext,
                         forward_context,
@@ -1302,9 +1297,5 @@ class SMCWorker(BaseSpecWorker):
         )
 
     def _make_clean_batch(self, batch: ScheduleBatch) -> ScheduleBatch:
-        """Copy batch with no spec_info (for draft model).
-
-        v0.5.17 dropped capture_hidden_mode from the batch (it is a
-        forward_batch_generation kwarg now), so only spec_info is cleared.
-        """
+        """Copy batch with no spec_info (for draft model)."""
         return dataclasses.replace(batch, spec_info=None)

@@ -29,11 +29,12 @@ logger = logging.getLogger(__name__)
 
 class SMCModelRunner(ModelRunner):
     def alloc_memory_pool(self, memory_pool_config=None):
-        """v0.5.17 replaced ModelRunner._init_pools with alloc_memory_pool().
+        """Mirror of ModelRunner.alloc_memory_pool with the allocator swap inlined.
 
-        We inline upstream's body (rather than calling super) so the SMC
-        allocator swap happens BEFORE _init_post_memory_pool_components(),
-        which captures token_to_kv_pool_allocator by reference.
+        The SMC allocator swap must happen BEFORE
+        _init_post_memory_pool_components(), which captures
+        token_to_kv_pool_allocator by reference — hence the inlined body
+        rather than a super() call.
         """
         self.init_kv_cache_configurator()
         if memory_pool_config is None and not (
@@ -99,7 +100,7 @@ class SMCModelRunner(ModelRunner):
 
     def _resolve_memory_pool_config(self, pre_model_load_memory):
         if self.is_draft_worker or self.spec_algorithm.is_none():
-            # No upstream base in v0.5.17: None means 'use stock sizing'.
+            # None -> stock sizing (no base implementation to defer to).
             return self.memory_pool_config
 
         from sglang.srt.configs.hybrid_arch import mambaish_config

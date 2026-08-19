@@ -86,8 +86,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 
 
 def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
-    """v0.5.17 replaced the module-level key helper with ShapeKey; keep the
-    old call shape so the graph dict lookups below stay unchanged."""
+    """Key helper for the graph dicts below (ShapeKey keyed by capture bs)."""
     return ShapeKey(size=bs, stream_idx=stream_idx, variant_label=variant_label)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_batch_info import (
@@ -273,10 +272,9 @@ class SMCDraftPhaseGraphRunner:
     # ── Capture ──
 
     def capture(self):
-        # The old fork reused CudaGraphRunner.capture (a thin loop over
-        # capture_one_batch_size).  v0.5.17's DecodeCudaGraphRunner.capture
-        # grew warmup/registry/backend-session machinery this standalone
-        # runner doesn't carry, so reproduce the thin loop locally.
+        # DecodeCudaGraphRunner.capture carries warmup / buffer-registry /
+        # backend-session machinery this standalone runner doesn't use, so
+        # run a local thin capture loop instead.
         from sglang.srt.compilation.torch_compile_decoration import patch_model
         from sglang.srt.distributed import get_tensor_model_parallel_rank
         from sglang.srt.distributed.parallel_state import graph_capture
@@ -426,9 +424,9 @@ class SMCDraftPhaseGraphRunner:
                 # broadcasts (1, bs) -> (3, bs); in-graph and fixed-shape.
                 self.mrope_positions[:, :bs].copy_(positions.unsqueeze(0))
             # `forward` is the (patched) model.forward — returns a
-            # LogitsProcessorOutput directly.  v0.5.17 dispatches attention
-            # via get_attn_backend() from the ForwardContext, so the per-step
-            # backend is installed contextually (fb.attn_backend is gone).
+            # LogitsProcessorOutput directly.  Attention dispatches via
+            # get_attn_backend() from the ForwardContext, so the per-step
+            # backend is installed contextually.
             with forward_context(ForwardContext(attn_backend=backends[s])):
                 logits = forward(input_ids, positions, fb).next_token_logits
             idx, logp = self._sample_step_in_graph(

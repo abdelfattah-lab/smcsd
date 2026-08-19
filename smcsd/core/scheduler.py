@@ -44,10 +44,10 @@ def _prepare_req_for_private_prefill(req: Req) -> None:
     req.mamba_branching_seqlen = None
     req.cache_protected_len = 0
     req.init_next_round_input(tree_cache=None)
-    # v0.5.17 moved extend-window bookkeeping onto Req.extend_range, normally
-    # set by the PrefillAdder in schedule_policy.  SMC builds its prefill
-    # batches itself, so set the full (unchunked, prefix-free) window here --
-    # get_fill_ids() reads extend_range.end.
+    # Req.extend_range is normally set by the PrefillAdder in
+    # schedule_policy.  SMC builds its prefill batches itself, so set the
+    # full (unchunked, prefix-free) window here -- get_fill_ids() reads
+    # extend_range.end.
     req.set_extend_range(
         len(req.prefix_indices), len(req.full_untruncated_fill_ids)
     )
@@ -253,8 +253,8 @@ class SMCScheduler(Scheduler):
             device=self.device,
             gamma_plus_1=server_args.speculative_num_draft_tokens,
             vocab_size=self.model_config.vocab_size,
-            # v0.5.17 freezes ServerArgs, so context_length is no longer
-            # back-filled onto it by the worker; read the resolved value.
+            # ServerArgs is frozen; read the resolved context length from
+            # the model config rather than a back-filled server arg.
             max_output_len=self.model_config.context_len,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1021,8 +1021,8 @@ def run_smc_scheduler_process(
         server_args, gpu_id, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
 
-    # v0.5.17 requires the config namespaces to be projected before
-    # Scheduler.__init__ reads them (mirrors upstream run_scheduler_process).
+    # Project the config namespaces before Scheduler.__init__ reads them
+    # (mirrors upstream run_scheduler_process).
     from sglang.srt.runtime_context import publish
 
     publish(server_args, role="scheduler")

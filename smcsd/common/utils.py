@@ -183,7 +183,7 @@ def clone_req_for_smc_particle(
 
     particle_req = Req(
         rid=f"{parent_req.rid}_smc_p{particle_idx}_particle",
-        # v0.5.17 accepts origin_input_text but no longer stores it on Req.
+        # Req accepts origin_input_text but does not store it.
         origin_input_text=None,
         origin_input_ids=array("q", parent_req.origin_input_ids),
         sampling_params=sampling_params,
@@ -219,7 +219,7 @@ def clone_req_for_smc_particle(
         http_worker_ipc=None,
         time_stats=None,
     )
-    # v0.5.17's Req.output_ids is array("q"); keeping a list here breaks the
+    # Req.output_ids is array("q"); a list here breaks the
     # origin_input_ids + output_ids concatenations downstream.
     particle_req.output_ids = array(
         "q", parent_req.output_ids if output_ids is None else output_ids
@@ -295,10 +295,9 @@ def _release_smc_parent_req(
     zero instead of removing only the parent's reference. Use `dec_ref` here so
     the particle-owned copies keep correct lifetime accounting.
     """
-    # v0.5.17 replaced pop_committed_kv_cache / pop_overallocated_kv_cache
-    # (and the kv_committed_freed flag) with req.kv bookkeeping: the committed
-    # length is effective_kv_committed_len() and the overallocated range runs
-    # from there to req.kv.kv_allocated_len.  Clearing req.kv marks it freed.
+    # KV bookkeeping lives on req.kv (ReqKvInfo): the committed length is
+    # effective_kv_committed_len(), the overallocated range runs from there to
+    # req.kv.kv_allocated_len, and clearing req.kv marks it freed.
     if req.req_pool_idx is None or req.kv is None:
         return
 

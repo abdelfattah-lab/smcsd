@@ -25,8 +25,8 @@ is *shared* across steps. Sharing the Mamba backend is correct because:
    shape for every decode step in the SMC AR loop.
 
 The SMC worker installs ``self.attn_backends[step]`` for each AR step via
-``forward_context(ForwardContext(attn_backend=...))`` (the v0.5.17 dispatch
-path) and invokes ``draft_runner.forward(draft_fb, skip_attn_backend_init=True)``.
+``forward_context(ForwardContext(attn_backend=...))`` and invokes
+``draft_runner.forward(draft_fb, skip_attn_backend_init=True)``.
 """
 
 from __future__ import annotations
@@ -155,10 +155,9 @@ class HybridLinearAttnMultiStepBackend:
     def init_forward_metadata_out_graph(
         self, forward_batch: "ForwardBatch", in_capture: bool = False
     ) -> None:
-        """v0.5.17 2-method graph-metadata ABC (replaces the old capture/replay
-        pair).  ``in_capture=True`` is capture-prep; ``False`` is the eager
-        replay-prep.  The draft fbs passed here are DECODE-mode, so the
-        sub-backends see the same forward_mode the old explicit args pinned.
+        """Graph-metadata prep: ``in_capture=True`` at capture time, ``False``
+        for the eager replay-prep.  The draft fbs passed here are DECODE-mode,
+        which is what the per-step sub-backends expect.
         """
         assert forward_batch.spec_info is not None
         if self._triton_multistep is not None:
