@@ -181,6 +181,7 @@ def run_baseline_eval(args, prompts, labels):
     engine_kwargs = dict(
         model_path=args.model,
         trust_remote_code=True,
+        attention_backend=args.attention_backend,
     )
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
