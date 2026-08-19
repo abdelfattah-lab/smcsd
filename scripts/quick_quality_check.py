@@ -38,20 +38,23 @@ def run_vanilla(prompts, sampling_params, args):
 
 
 def run_smc(prompts, sampling_params, args):
+    # SMC is served by the dedicated SMCEngine, not the stock sgl.Engine
+    # (the vendored tree's stock scheduler has no SMC worker path).
+    from smcsd.engine import SMCEngine
+
     print("=" * 60)
     print(f"SMC (particles={args.particles}, gamma={args.gamma})")
     print("=" * 60)
-    engine = sgl.Engine(
+    engine = SMCEngine(
         model_path=args.model_path,
-        speculative_algorithm="SMC",
-        speculative_draft_model_path=args.draft_model_path,
-        smc_n_particles=args.particles,
-        smc_gamma=args.gamma,
-        smc_draft_temperature=max(args.temperature, 0.01),
-        smc_target_temperature=max(args.temperature, 0.01),
+        draft_model_path=args.draft_model_path,
+        n_particles=args.particles,
+        gamma=args.gamma,
+        draft_temperature=max(args.temperature, 0.01),
+        target_temperature=max(args.temperature, 0.01),
         mem_fraction_static=0.45,
         page_size=1,
-        cuda_graph_max_bs_decode=16,
+        cuda_graph_max_bs=16,
         attention_backend="triton",
     )
     results = engine.generate(prompts, sampling_params)

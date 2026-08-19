@@ -1,4 +1,4 @@
-From e308d579495bd5552fd31f71c92d5c62f5ea83ef Mon Sep 17 00:00:00 2001
+From 8dc03878fa14cf728cfb724dd571407447eba3e8 Mon Sep 17 00:00:00 2001
 From: Magpie <ccbrian830@gmail.com>
 Date: Wed, 19 Aug 2026 01:51:38 +0000
 Subject: [PATCH] SMC speculative decoding: consolidated core hooks (v0.5.17)
@@ -77,8 +77,8 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  .../srt/model_executor/runner/base_runner.py  |  10 +-
  .../runner/decode_cuda_graph_runner.py        |   7 +-
  python/sglang/srt/server_args.py              |  71 +++++-
- python/sglang/srt/speculative/spec_info.py    |  21 ++
- 14 files changed, 449 insertions(+), 75 deletions(-)
+ python/sglang/srt/speculative/spec_info.py    |  26 +++
+ 14 files changed, 454 insertions(+), 75 deletions(-)
 
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
 index 427acdd38..8c8adbd43 100644
@@ -795,7 +795,7 @@ index 18664959e..5e1c8c6e2 100644
              (
                  "CPU offload / hierarchical cache",
 diff --git a/python/sglang/srt/speculative/spec_info.py b/python/sglang/srt/speculative/spec_info.py
-index 440bcc0be..3d5617cc0 100644
+index 440bcc0be..57783bb69 100644
 --- a/python/sglang/srt/speculative/spec_info.py
 +++ b/python/sglang/srt/speculative/spec_info.py
 @@ -40,6 +40,7 @@ class SpeculativeAlgorithm(Enum):
@@ -847,7 +847,19 @@ index 440bcc0be..3d5617cc0 100644
          return num_draft_tokens
  
      def get_num_tokens_per_bs_for_target_verify(
-@@ -316,6 +330,8 @@ class SpecInputType(IntEnum):
+@@ -304,6 +318,11 @@ class SpeculativeAlgorithm(Enum):
+             from sglang.srt.speculative.ngram_worker import NGRAMWorker
+ 
+             return NGRAMWorker
++        elif self.is_smc():
++            raise ValueError(
++                "speculative_algorithm='SMC' is not served by the stock engine; "
++                "use smcsd.engine.SMCEngine (offline) or smcsd.http_server (server)."
++            )
+ 
+         raise ValueError("Unreachable code path in create_worker.")
+ 
+@@ -316,6 +335,8 @@ class SpecInputType(IntEnum):
      EAGLE_VERIFY = auto()
      FROZEN_KV_MTP_DRAFT = auto()
      FROZEN_KV_MTP_VERIFY = auto()
@@ -856,7 +868,7 @@ index 440bcc0be..3d5617cc0 100644
      DFLASH_DRAFT = auto()
      DFLASH_VERIFY = auto()
      NGRAM_VERIFY = auto()
-@@ -355,6 +371,7 @@ class SpecInput(ABC):
+@@ -355,6 +376,7 @@ class SpecInput(ABC):
              SpecInputType.EAGLE_DRAFT,
              SpecInputType.EAGLE_DRAFT_EXTEND,
              SpecInputType.FROZEN_KV_MTP_DRAFT,
@@ -864,7 +876,7 @@ index 440bcc0be..3d5617cc0 100644
              SpecInputType.DFLASH_DRAFT,
          }
  
-@@ -367,6 +384,10 @@ class SpecInput(ABC):
+@@ -367,6 +389,10 @@ class SpecInput(ABC):
          }
  
  
