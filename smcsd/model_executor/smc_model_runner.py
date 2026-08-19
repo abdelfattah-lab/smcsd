@@ -18,7 +18,7 @@ import logging
 
 import torch
 
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import get_available_gpu_memory
@@ -28,8 +28,36 @@ logger = logging.getLogger(__name__)
 
 
 class SMCModelRunner(ModelRunner):
-    def _init_pools(self):
-        super()._init_pools()
+    def alloc_memory_pool(self, memory_pool_config=None):
+        """v0.5.17 replaced ModelRunner._init_pools with alloc_memory_pool().
+
+        We inline upstream's body (rather than calling super) so the SMC
+        allocator swap happens BEFORE _init_post_memory_pool_components(),
+        which captures token_to_kv_pool_allocator by reference.
+        """
+        self.init_kv_cache_configurator()
+        if memory_pool_config is None and not (
+            self.is_draft_worker or self.spec_algorithm.is_none()
+        ):
+            memory_pool_config = self._resolve_memory_pool_config(
+                self.pre_model_load_memory
+            )
+        if memory_pool_config is not None:
+            self.memory_pool_config = memory_pool_config
+        result = self.kv_cache_configurator.configure(
+            pre_model_load_memory=self.pre_model_load_memory
+        )
+        self.max_total_num_tokens = result.max_total_num_tokens
+        self.max_running_requests = result.max_running_requests
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool = result.token_to_kv_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.memory_pool_config = result.memory_pool_config
+        if self.is_hybrid_swa:
+            self.full_max_total_num_tokens = result.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
+        self._unified_memory_pool = result.unified_memory_pool
+
         # Swap standard allocator for SMC refcount-tracking variant when the
         # standard one was constructed.  Skipped for the draft worker (which
         # is passed the target's allocator), and for SWA / paged / NPU
@@ -46,6 +74,8 @@ class SMCModelRunner(ModelRunner):
                 need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
             )
 
+        self._init_post_memory_pool_components()
+
     def _build_dummy_run_spec_info(self, buffers, num_tokens_per_bs):
         if self.spec_algorithm.is_smc() and not self.is_draft_worker:
             from smcsd.common.verify import SMCVerifyInput
@@ -58,24 +88,28 @@ class SMCModelRunner(ModelRunner):
             )
         return super()._build_dummy_run_spec_info(buffers, num_tokens_per_bs)
 
-    def _get_graph_runner_class(self):
+    def _decode_cuda_graph_runner_cls(self):
         if self.device == "cuda":
             from smcsd.model_executor.smc_cuda_graph_runner import (
                 SMCCudaGraphRunner,
             )
 
             return SMCCudaGraphRunner
-        return super()._get_graph_runner_class()
+        return super()._decode_cuda_graph_runner_cls()
 
     def _resolve_memory_pool_config(self, pre_model_load_memory):
         if self.is_draft_worker or self.spec_algorithm.is_none():
-            return super()._resolve_memory_pool_config(pre_model_load_memory)
+            # No upstream base in v0.5.17: None means 'use stock sizing'.
+            return self.memory_pool_config
 
+        from sglang.srt.configs.hybrid_arch import mambaish_config
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+
+        kvc = self.kv_cache_configurator
         if (
-            self.mambaish_config is not None
+            mambaish_config(self.model_config) is not None
             and self.server_args.max_mamba_cache_size is None
             and self.server_args.max_running_requests is not None
         ):
@@ -83,9 +117,9 @@ class SMCModelRunner(ModelRunner):
                 self.server_args.max_running_requests
             )
 
-        available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        available_bytes = kvc._profile_available_bytes(pre_model_load_memory)
         page_size = self.server_args.page_size
-        configurator = create_memory_pool_configurator(self)
+        configurator = create_memory_pool_configurator(kvc)
 
         cobudget = self._cobudget_pool_sizes(available_bytes, page_size, configurator)
         config = (
@@ -95,12 +129,12 @@ class SMCModelRunner(ModelRunner):
         )
 
         # Mirror the tail of the stock _resolve_memory_pool_config.
-        constrained = self._apply_token_constraints(config.max_total_num_tokens)
+        constrained = kvc._apply_token_constraints(config.max_total_num_tokens)
         if constrained != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 constrained, page_size
             )
-        config.max_running_requests = self._resolve_max_num_reqs(
+        config.max_running_requests = kvc.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
         config.mem_fraction_static = self.server_args.mem_fraction_static
@@ -111,7 +145,7 @@ class SMCModelRunner(ModelRunner):
         static budget, or None if this model shape isn't supported (caller
         falls back to stock sizing)."""
         from sglang.srt.configs.model_config import AttentionArch
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.runtime_context import get_parallel
         from sglang.srt.model_executor.pool_configurator import (
             DefaultPoolConfigurator,
             MemoryPoolConfig,
@@ -139,7 +173,7 @@ class SMCModelRunner(ModelRunner):
         ):
             return _skip("MLA / hybrid-SWA draft unsupported")
 
-        tp = get_attention_tp_size()
+        tp = get_parallel().attn_tp_size
         kv_bytes = torch._utils._element_size(self.kv_cache_dtype)
         gib = 1 << 30
 
@@ -270,7 +304,9 @@ class SMCModelRunner(ModelRunner):
             self.is_draft_worker = True  # match the real draft runner
             if orig_cache is not missing:
                 del self._linear_attn_registry_cache
-            return self.mambaish_config
+            from sglang.srt.configs.hybrid_arch import mambaish_config
+
+            return mambaish_config(self.model_config)
         finally:
             self.model_config = orig_cfg
             self.is_draft_worker = orig_draft

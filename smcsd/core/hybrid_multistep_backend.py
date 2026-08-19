@@ -24,9 +24,9 @@ is *shared* across steps. Sharing the Mamba backend is correct because:
  * ``Mamba2Metadata`` is just chunk-size + per-token bookkeeping, identical
    shape for every decode step in the SMC AR loop.
 
-The SMC worker swaps ``forward_batch.attn_backend = self.attn_backends[step]``
-for each AR step (matching the existing non-hybrid multi-step contract) and
-invokes ``draft_runner.forward(draft_fb, skip_attn_backend_init=True)``.
+The SMC worker installs ``self.attn_backends[step]`` for each AR step via
+``forward_context(ForwardContext(attn_backend=...))`` (the v0.5.17 dispatch
+path) and invokes ``draft_runner.forward(draft_fb, skip_attn_backend_init=True)``.
 """
 
 from __future__ import annotations
@@ -152,71 +152,36 @@ class HybridLinearAttnMultiStepBackend:
                 max_bs, max_num_tokens
             )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self, forward_batch: "ForwardBatch"
+    def init_forward_metadata_out_graph(
+        self, forward_batch: "ForwardBatch", in_capture: bool = False
     ) -> None:
-        # Match FlashAttentionMultiStepBackend.init_forward_metadata_capture_cuda_graph:
-        # call the per-step full-attn capture with explicit args.
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
+        """v0.5.17 2-method graph-metadata ABC (replaces the old capture/replay
+        pair).  ``in_capture=True`` is capture-prep; ``False`` is the eager
+        replay-prep.  The draft fbs passed here are DECODE-mode, so the
+        sub-backends see the same forward_mode the old explicit args pinned.
+        """
         assert forward_batch.spec_info is not None
         if self._triton_multistep is not None:
-            self._triton_multistep.init_forward_metadata_capture_cuda_graph(
+            self._triton_multistep.init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+        else:
+            for hb in self.attn_backends:
+                hb.full_attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=in_capture
+                )
+        if self.attn_backends:
+            self.attn_backends[0].linear_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch") -> None:
+        if self._triton_multistep is not None:
+            self._triton_multistep.init_forward_metadata_in_graph(forward_batch)
+        else:
+            for hb in self.attn_backends:
+                hb.full_attn_backend.init_forward_metadata_in_graph(forward_batch)
+        if self.attn_backends:
+            self.attn_backends[0].linear_attn_backend.init_forward_metadata_in_graph(
                 forward_batch
-            )
-        else:
-            for hb in self.attn_backends:
-                hb.full_attn_backend.init_forward_metadata_capture_cuda_graph(
-                    forward_batch.batch_size,
-                    forward_batch.batch_size * self.topk,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    encoder_lens=forward_batch.encoder_lens,
-                    forward_mode=ForwardMode.DECODE,
-                    spec_info=forward_batch.spec_info,
-                )
-        if self.attn_backends:
-            self.attn_backends[0].linear_attn_backend.init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: "ForwardBatch", bs: int
-    ) -> None:
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-        assert forward_batch.spec_info is not None
-        if self._triton_multistep is not None:
-            self._triton_multistep.init_forward_metadata_replay_cuda_graph(
-                forward_batch, bs
-            )
-        else:
-            for hb in self.attn_backends:
-                hb.full_attn_backend.init_forward_metadata_replay_cuda_graph(
-                    bs,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    encoder_lens=forward_batch.encoder_lens,
-                    forward_mode=ForwardMode.DECODE,
-                    spec_info=forward_batch.spec_info,
-                    seq_lens_cpu=forward_batch.seq_lens_cpu,
-                    out_cache_loc=forward_batch.out_cache_loc,
-                )
-        if self.attn_backends:
-            self.attn_backends[0].linear_attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )

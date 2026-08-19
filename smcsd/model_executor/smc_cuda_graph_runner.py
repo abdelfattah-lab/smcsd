@@ -6,7 +6,9 @@ attention path.  Non-SMC paths (draft worker, other spec algos) delegate
 to the base class.
 """
 
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner as CudaGraphRunner,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
 
@@ -19,10 +21,10 @@ class SMCCudaGraphRunner(CudaGraphRunner):
             from smcsd.common.verify import SMCVerifyInput
 
             return SMCVerifyInput(
-                draft_token_num=self.num_tokens_per_bs,
+                draft_token_num=self.captured_req_width,
                 positions=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_tokens_per_req=self.num_tokens_per_bs,
+                num_tokens_per_req=self.captured_req_width,
             )
         return super().get_spec_info(num_tokens)
 

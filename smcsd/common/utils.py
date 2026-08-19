@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
+from array import array
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align
@@ -181,15 +183,18 @@ def clone_req_for_smc_particle(
 
     particle_req = Req(
         rid=f"{parent_req.rid}_smc_p{particle_idx}_particle",
-        origin_input_text=parent_req.origin_input_text,
-        origin_input_ids=list(parent_req.origin_input_ids),
+        # v0.5.17 accepts origin_input_text but no longer stores it on Req.
+        origin_input_text=None,
+        origin_input_ids=array("q", parent_req.origin_input_ids),
         sampling_params=sampling_params,
         return_logprob=return_logprob,
         top_logprobs_num=0,
         dllm_config=None,
         token_ids_logprob=None,
         stream=False,
-        origin_input_ids_unpadded=tuple(parent_req.origin_input_ids_unpadded),
+        origin_input_ids_unpadded=array(
+            "q", parent_req.origin_input_ids_unpadded
+        ),
         lora_id=parent_req.lora_id,
         input_embeds=parent_req.input_embeds,
         token_type_ids=parent_req.token_type_ids,
@@ -214,8 +219,10 @@ def clone_req_for_smc_particle(
         http_worker_ipc=None,
         time_stats=None,
     )
-    particle_req.output_ids = list(
-        parent_req.output_ids if output_ids is None else output_ids
+    # v0.5.17's Req.output_ids is array("q"); keeping a list here breaks the
+    # origin_input_ids + output_ids concatenations downstream.
+    particle_req.output_ids = array(
+        "q", parent_req.output_ids if output_ids is None else output_ids
     )
     particle_req.tokenizer = parent_req.tokenizer
     particle_req.decoded_text = parent_req.decoded_text
@@ -288,18 +295,22 @@ def _release_smc_parent_req(
     zero instead of removing only the parent's reference. Use `dec_ref` here so
     the particle-owned copies keep correct lifetime accounting.
     """
-    if req.req_pool_idx is None:
+    # v0.5.17 replaced pop_committed_kv_cache / pop_overallocated_kv_cache
+    # (and the kv_committed_freed flag) with req.kv bookkeeping: the committed
+    # length is effective_kv_committed_len() and the overallocated range runs
+    # from there to req.kv.kv_allocated_len.  Clearing req.kv marks it freed.
+    if req.req_pool_idx is None or req.kv is None:
         return
 
-    kv_committed_len = req.pop_committed_kv_cache()
+    kv_committed_len = req.effective_kv_committed_len()
     if req.cache_protected_len < kv_committed_len:
         committed_indices = req_to_token_pool.req_to_token[
             req.req_pool_idx, req.cache_protected_len : kv_committed_len
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(committed_indices)
 
-    start_p, end_p = req.pop_overallocated_kv_cache()
-    page_size = get_global_server_args().page_size
+    start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
+    page_size = token_to_kv_pool_allocator.page_size
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
     if start_p < end_p:
@@ -317,6 +328,7 @@ def _release_smc_parent_req(
         draft_pool = getattr(req_to_token_pool, "_smc_draft_hybrid_pool", None)
         _clear_draft_mamba_slot(draft_pool, saved_idx)
     req_to_token_pool.free(req)
+    req.kv = None
     if req.last_node is not None:
         tree_cache.dec_lock_ref(req.last_node)
 

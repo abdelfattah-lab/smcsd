@@ -88,7 +88,7 @@ def test_verify_attention_matches_reference(bs, E, h_q, h_kv, d, prefix_lo, pref
 @torch.inference_mode()
 def test_verify_attention_matches_stock_extend_kernel():
     """Bit-comparable path check vs the kernel it replaces."""
-    from sglang.srt.layers.attention.triton_ops.extend_attention import (
+    from sglang.kernels.ops.attention.extend_attention import (
         extend_attention_fwd,
     )
 
