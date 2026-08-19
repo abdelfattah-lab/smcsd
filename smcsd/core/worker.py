@@ -100,11 +100,6 @@ class SMCWorker(BaseSpecWorker):
         # ServerArgs instance (keeps the vendored class unmodified); defaults
         # to 1.0 (plain p) for launches that don't go through SMCEngine.
         self.smc_power_alpha = float(getattr(server_args, "smc_power_alpha", 1.0))
-        # SMC_GRAPH_STATS=1: count which decode path serves each cycle
-        # (cycle graph vs fallback tiers); summary printed every 100 cycles.
-        self._graph_stats = (
-            {} if os.environ.get("SMC_GRAPH_STATS") == "1" else None
-        )
         # Debug-only: dump draft KV positions / cache-loc mapping for the first
         # few decode calls to confirm the prefill→step-0 position convention
         # before the deferred-bonus rework.  No behavior change when unset.
@@ -871,9 +866,6 @@ class SMCWorker(BaseSpecWorker):
             self.draft_runner,
         )
         hgr = self.draft_head_graph_runner
-        self._graph_stat(
-            "head_graph" if hgr is not None and hgr.can_run_graph(head_fb) else "head_eager"
-        )
         if hgr is not None and hgr.can_run_graph(head_fb):
             # Graph path: replay the dedicated num_tokens_per_bs=2 head
             # runner.  replay() runs replay_prepare → attn metadata + buffer
@@ -1029,15 +1021,6 @@ class SMCWorker(BaseSpecWorker):
             can_run_cuda_graph=True,
         )
 
-    def _graph_stat(self, key: str) -> None:
-        st = self._graph_stats
-        if st is None:
-            return
-        st[key] = st.get(key, 0) + 1
-        st["_n"] = st.get("_n", 0) + 1
-        if st["_n"] % 100 == 0:
-            print(f"[SMC_GRAPH_STATS] {st}", flush=True)
-
     def _forward_decode(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
             return self._forward_idle(batch)
@@ -1060,9 +1043,7 @@ class SMCWorker(BaseSpecWorker):
         if self.cycle_graph_runner is not None and self.cycle_graph_runner.can_run(
             len(ctx.orig_seq_lens), ctx
         ):
-            self._graph_stat("cycle_graph")
             return self._forward_decode_cycle_graph(batch, draft_input, ctx)
-        self._graph_stat("cycle_fallback")
 
         # ---- 1. Prepare draft ----
         draft_fb, can_cuda_graph, cache_locs, all_positions, all_seq_lens = (
@@ -1179,7 +1160,6 @@ class SMCWorker(BaseSpecWorker):
             cache_locs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        self._graph_stat("verify_graph" if can_run_cuda_graph else "verify_eager")
 
         score_result = self._target_worker.forward_batch_generation(
             batch=None,
