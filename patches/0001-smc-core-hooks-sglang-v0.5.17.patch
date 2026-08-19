@@ -1,4 +1,4 @@
-From 366c54960f9f08516cafc02fc36883ad05a07c47 Mon Sep 17 00:00:00 2001
+From e308d579495bd5552fd31f71c92d5c62f5ea83ef Mon Sep 17 00:00:00 2001
 From: Magpie <ccbrian830@gmail.com>
 Date: Wed, 19 Aug 2026 01:51:38 +0000
 Subject: [PATCH] SMC speculative decoding: consolidated core hooks (v0.5.17)
@@ -68,7 +68,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  python/sglang/srt/compilation/compile.py      |   9 +
  python/sglang/srt/configs/model_config.py     |  17 ++
  .../attention/hybrid_linear_attn_backend.py   |  46 +++-
- .../srt/layers/attention/triton_backend.py    | 215 +++++++++++++-----
+ .../srt/layers/attention/triton_backend.py    | 219 +++++++++++++-----
  python/sglang/srt/managers/scheduler.py       |  15 +-
  python/sglang/srt/managers/utils.py           |   3 +
  .../srt/mem_cache/kv_cache_configurator.py    |   1 +
@@ -78,7 +78,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  .../runner/decode_cuda_graph_runner.py        |   7 +-
  python/sglang/srt/server_args.py              |  71 +++++-
  python/sglang/srt/speculative/spec_info.py    |  21 ++
- 14 files changed, 445 insertions(+), 75 deletions(-)
+ 14 files changed, 449 insertions(+), 75 deletions(-)
 
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
 index 427acdd38..8c8adbd43 100644
@@ -283,7 +283,7 @@ index f62abfe89..69788f224 100644
                  torch.full(
                      (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
 diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
-index c378c80ab..d244708a3 100644
+index c378c80ab..ec106a770 100644
 --- a/python/sglang/srt/layers/attention/triton_backend.py
 +++ b/python/sglang/srt/layers/attention/triton_backend.py
 @@ -1,5 +1,6 @@
@@ -315,7 +315,7 @@ index c378c80ab..d244708a3 100644
  
  def logit_capping_mod(logit_capping_method, logit_cap):
      # positive logit_cap -> tanh cap
-@@ -141,6 +157,20 @@ class TritonAttnBackend(AttentionBackend):
+@@ -141,6 +157,22 @@ class TritonAttnBackend(AttentionBackend):
  
          self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
          self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
@@ -331,12 +331,14 @@ index c378c80ab..d244708a3 100644
 +                self.smc_verify_attention_fwd = torch.compiler.disable(
 +                    verify_attention_fwd
 +                )
-+            except ImportError:
++            except Exception:
++                # Never let an smcsd import problem break plain sglang use
++                # of this tree; the stock verify path is always available.
 +                pass
          self.extend_attention_fwd_unified = torch.compiler.disable(
              extend_attention_fwd_unified
          )
-@@ -807,64 +837,110 @@ class TritonAttnBackend(AttentionBackend):
+@@ -807,64 +839,112 @@ class TritonAttnBackend(AttentionBackend):
              max_extend_len = None
          elif forward_batch.forward_mode.is_target_verify():
              bs = len(forward_batch.req_pool_indices)
@@ -479,6 +481,8 @@ index c378c80ab..d244708a3 100644
 +                    ) = update_sliding_window_buffer(
 +                        self.window_kv_indptr,
 +                        self.req_to_token,
++                        self.sliding_window_size,
++                        forward_batch.seq_lens,
 +                        forward_batch.req_pool_indices,
 +                        bs,
 +                        self.device,
@@ -499,7 +503,7 @@ index c378c80ab..d244708a3 100644
  
          else:
              if self.dcp_size > 1:
-@@ -1370,6 +1446,41 @@ class TritonAttnBackend(AttentionBackend):
+@@ -1370,6 +1450,41 @@ class TritonAttnBackend(AttentionBackend):
              k_descale = 1.0
              v_descale = 1.0
  
