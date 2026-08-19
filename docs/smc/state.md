@@ -87,7 +87,7 @@ grammars, returned logprobs / hidden states, stop strings, regex stop.
 Persistent batch state. One slot per particle, claimed at materialize,
 freed at finalize. All GPU tensors are of shape `[max_slots]` (or
 `[max_slots, ...]`) and sparse — each iteration we gather the active ones
-into a dense `ModelWorkerBatch` and scatter results back.
+into a dense `ScheduleBatch` and scatter results back.
 
 ### 2.1 Per-slot tensors
 

@@ -502,63 +502,14 @@ class SMCScheduler(Scheduler):
             self._process_queued_result(result_queue)
         self.last_batch = None
 
-    # ── Runtime Memory Checks (override base mixin) ──
+    # ── Runtime Memory Checks ──
     #
-    # SMC keeps its decode KV slots inside ScheduleBatchSMC, which the base
-    # SchedulerRuntimeCheckerMixin doesn't know about.  We override the two
-    # idle-path leak checks so slot-held tokens/reqs are folded into the
-    # conservation formulas — without leaking SMC concepts into core scheduler
-    # code.  Refcount state is already reflected via available_size (a shared
-    # page stays out of free_pages until its last refcount drops).
-    #
-    # self_check_during_busy is intentionally NOT overridden: _event_loop
-    # never dispatches it (matching the PP / disagg / multiplex loops, which
-    # also omit the busy check).
-
-    def _check_radix_cache_memory(self):
-        _, _, available_size, evictable_size = self._get_token_info()
-        protected_size = self.tree_cache.protected_size()
-        session_held = self._session_held_tokens()
-        slot_held = self.slot_state.held_token_count()
-        memory_leak = (available_size + evictable_size) != (
-            self.max_total_num_tokens - protected_size - session_held - slot_held
-        )
-        token_msg = (
-            f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, "
-            f"{protected_size=}, {session_held=}, {slot_held=}\n"
-        )
-        return memory_leak, token_msg
-
-    def _check_req_pool(self):
-        from sglang.srt.environ import envs
-        from sglang.srt.utils.common import raise_error_or_warn
-
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            req_total_size = (
-                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
-            )
-        else:
-            req_total_size = self.req_to_token_pool.size
-
-        session_req_count = self._session_held_req_count()
-        slot_req_count = self.slot_state.held_req_count()
-        if (
-            len(self.req_to_token_pool.free_slots) + session_req_count + slot_req_count
-            != req_total_size
-        ):
-            msg = (
-                "req_to_token_pool memory leak detected!"
-                f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"session_held={session_req_count}, "
-                f"slot_held={slot_req_count}, "
-                f"total_size={self.req_to_token_pool.size}\n"
-            )
-            raise_error_or_warn(
-                self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
-                "count_req_pool_leak_warnings",
-                msg,
-            )
+    # v0.5.17 moved the idle-path leak checks off the Scheduler onto the
+    # SchedulerInvariantChecker component, and the SMC event loops never
+    # dispatch idle self-checks (matching the PP / disagg / multiplex
+    # loops).  If idle checking is ever enabled for SMC, the checker's
+    # conservation formulas need slot-held tokens/reqs folded in — see
+    # ScheduleBatchSMC.held_token_count / held_req_count.
 
     # ── Request Admission ──
 

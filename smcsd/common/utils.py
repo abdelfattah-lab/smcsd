@@ -258,7 +258,10 @@ def _release_internal_req(
     if req.req_pool_idx is None:
         return
 
-    allocated_len = int(req.kv_allocated_len)
+    # kv_allocated_len is back-filled per particle only after its
+    # copy_block_table succeeds; a particle abandoned mid-materialization
+    # may not have it yet.
+    allocated_len = int(getattr(req, "kv_allocated_len", 0) or 0)
     if allocated_len > 0:
         indices = req_to_token_pool.req_to_token[
             req.req_pool_idx, :allocated_len

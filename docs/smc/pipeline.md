@@ -30,7 +30,7 @@ while True:
     batch, kind = _get_next_batch()      one of:
                                            • prefill ScheduleBatch
                                              (admitted parents only)
-                                           • decode ModelWorkerBatch
+                                           • decode ScheduleBatch
                                              (from slot_state)
                                            • None (idle)
 
@@ -170,7 +170,7 @@ One cycle does seven things, in order:
 ```
   ┌─────────────────────────────────────────────────────────────────┐
   │  4.1  prepare_for_decode      sparse→gather→KV alloc→scatter    │
-  │  4.2  build_model_worker_batch dense ModelWorkerBatch           │
+  │  4.2  build_model_worker_batch dense ScheduleBatch           │
   │  4.3  draft AR × (γ+1)        on the draft model                │
   │  4.4  TARGET_VERIFY            on the score model               │
   │  4.5  process_batch_result    dense→scatter; weight accum;      │
@@ -219,7 +219,7 @@ the draft loop can set per-step positions without another CPU sync.
 
 ### 4.2 `build_model_worker_batch`
 
-A straight gather of slot tensors into a dense `ModelWorkerBatch`. No SMC
+A straight gather of slot tensors into a dense `ScheduleBatch`. No SMC
 math — just layout. The `SamplingBatchInfo` is minimal (greedy flags False,
 temp/top-p/top-k tensors gathered from slots) because the SMC worker does
 its own temperature adjustment. `spec_info = SMCDraftInput`.
@@ -489,7 +489,7 @@ One glance, one decode cycle:
                  │    ↓                           │     all_token_ids,
                  │   SMCDecodeContext             │     verified_ids,
                  │    ↓ (γ+1 KV alloc)            │     finished_mask
-                 │   ModelWorkerBatch             │
+                 │   ScheduleBatch                │
                  │    ↓                           │
                  │   draft AR × (γ+1)             │
                  │    ↓                           │
