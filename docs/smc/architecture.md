@@ -181,7 +181,7 @@ Each cycle does:
   prepare_for_decode       sparse slots → gather(active) → vectorised KV alloc
        │                   for γ+1 tokens → scatter new lens back to slots
        ▼
-  build_model_worker_batch gather active slot tensors → dense ModelWorkerBatch
+  build_model_worker_batch gather active slot tensors → dense ScheduleBatch
        │
        ▼
   SMCWorker              draft AR × (γ+1) → TARGET_VERIFY → logprob_diff + bonus

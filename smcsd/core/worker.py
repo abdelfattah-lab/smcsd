@@ -883,7 +883,7 @@ class SMCWorker(BaseSpecWorker):
             # would wrongly replay a 1-token graph for this 2-token forward;
             # null it for just this call and init metadata eagerly.
             self.draft_runner.attn_backend.init_forward_metadata(head_fb)
-            saved_gr = getattr(self.draft_runner, "graph_runner", None)
+            saved_gr = self.draft_runner.decode_cuda_graph_runner
             self.draft_runner.decode_cuda_graph_runner = None
             try:
                 # Outer span labels the head; the inner forward emits a
@@ -1051,9 +1051,7 @@ class SMCWorker(BaseSpecWorker):
                 draft_input.verified_id,
                 self.req_to_token_pool,
                 batch,
-                self.draft_runner.decode_cuda_graph_runner
-                if hasattr(self.draft_runner, "graph_runner")
-                else None,
+                getattr(self.draft_runner, "decode_cuda_graph_runner", None),
                 self.draft_runner,
             )
         )

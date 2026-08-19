@@ -51,6 +51,10 @@ cd smcsd
 # If you already cloned without --recurse-submodules, initialise now:
 # git submodule update --init --recursive
 
+# Clones from before the fork -> upstream submodule URL switch must re-sync
+# the recorded remote once, or submodule update keeps fetching the old URL:
+# git submodule sync --recursive
+
 # 2. Create a Python 3.12 environment
 uv venv --python 3.12
 source .venv/bin/activate
@@ -70,9 +74,23 @@ newer upstream release:
 cd 3rdparty/sglang
 git fetch origin --tags && git checkout <new-tag>       # move the pristine pin
 cd ../.. && scripts/apply_sglang_patches.sh             # 3-way re-apply (resolve if needed)
-git -C 3rdparty/sglang format-patch <new-tag> -o patches/  # re-export the patch
-git update-index --cacheinfo 160000,$(git -C 3rdparty/sglang rev-parse <new-tag>^{commit}),3rdparty/sglang
+rm patches/*.patch                                      # drop the old export
+git -C 3rdparty/sglang format-patch -1 --stdout \
+  > patches/0001-smc-core-hooks-sglang-<new-version>.patch   # re-export the patch
+git update-index --cacheinfo 160000,$(git -C 3rdparty/sglang rev-parse "<new-tag>^{commit}"),3rdparty/sglang
 ```
+
+(`format-patch -o patches/` would resolve the path *inside the submodule* —
+`git -C` changes directory before resolving relative paths — so the export
+must go through `--stdout` or an absolute path.)
+
+> **The gitlink trap:** `.gitmodules` sets `ignore = all`, so the submodule
+> never shows in `git status` — but `git add -A` still stages its gitlink.
+> After the apply script runs, the submodule HEAD is a local patch commit
+> that exists on no remote; staging it makes every fresh clone unfetchable.
+> Only ever stage the pin via the `update-index` line above (pristine tag),
+> and check `git ls-tree HEAD 3rdparty/sglang` matches the upstream tag
+> before pushing.
 
 Then reinstall, run the unit suite (`pytest tests/`), and re-run the GSM8K
 accuracy gate before committing the new pin + patch.

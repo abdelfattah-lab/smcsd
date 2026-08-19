@@ -191,7 +191,8 @@ def main() -> None:
     if args.mem_fraction_static is not None:
         extra["mem_fraction_static"] = args.mem_fraction_static
     if args.cuda_graph_max_bs is not None:
-        extra["cuda_graph_max_bs"] = args.cuda_graph_max_bs
+        # v0.5.17 split the ServerArgs field into per-mode knobs.
+        extra["cuda_graph_max_bs_decode"] = args.cuda_graph_max_bs
     if args.trust_remote_code:
         extra["trust_remote_code"] = True
     if args.skip_server_warmup:

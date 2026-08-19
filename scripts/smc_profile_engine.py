@@ -165,7 +165,7 @@ def build_engine(args: argparse.Namespace):
             trust_remote_code=True,
             log_level="info",
             random_seed=1,
-            cuda_graph_max_bs=128,
+            cuda_graph_max_bs_decode=128,
             attention_backend="triton",
             smc_draft_temperature=0.8,
             smc_target_temperature=0.8,

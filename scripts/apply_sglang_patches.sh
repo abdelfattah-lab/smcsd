@@ -31,6 +31,10 @@ if [ "${1:-}" = "--reverse" ]; then
         echo "patches not applied; nothing to reverse."
         exit 0
     fi
+    if ! git -C "$SGL" diff --quiet || ! git -C "$SGL" diff --cached --quiet; then
+        echo "error: 3rdparty/sglang has local modifications; commit/stash them first." >&2
+        exit 1
+    fi
     base="$(git -C "$SGL" log --grep="$MARKER" --fixed-strings --format=%H | tail -1)"
     git -C "$SGL" reset --hard "$base~1"
     echo "reversed: submodule back at $(git -C "$SGL" log --oneline -1)"
