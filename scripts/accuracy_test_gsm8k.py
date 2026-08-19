@@ -187,7 +187,8 @@ def run_baseline_eval(args, prompts, labels):
     if args.mem_fraction_static is not None:
         engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
     if args.cuda_graph_max_bs is not None:
-        engine_kwargs["cuda_graph_max_bs"] = args.cuda_graph_max_bs
+        # v0.5.17 split the ServerArgs field into per-mode knobs.
+        engine_kwargs["cuda_graph_max_bs_decode"] = args.cuda_graph_max_bs
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
     if args.max_total_tokens is not None:

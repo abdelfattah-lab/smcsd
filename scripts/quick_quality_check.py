@@ -50,8 +50,7 @@ def run_smc(prompts, sampling_params, args):
         smc_draft_temperature=max(args.temperature, 0.01),
         smc_target_temperature=max(args.temperature, 0.01),
         mem_fraction_static=0.45,
-        disable_piecewise_cuda_graph=False,
-        cuda_graph_max_bs=16,
+        cuda_graph_max_bs_decode=16,
         attention_backend="triton",
     )
     results = engine.generate(prompts, sampling_params)
