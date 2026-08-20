@@ -953,7 +953,41 @@ An eventual headline should have this form:
 
 Do not choose X, Y, or Z until the frozen evaluation produces them.
 
-## 19. Experiment matrix (v1, 2026-08-20)
+## 19. Experiment matrix (v2, 2026-08-20 — supersedes v1 below)
+
+**Family decision (recorded):** Qwen3.5-generation (shared tokenizer, vocab
+248077). Default draft **Qwen3.5-2B** (won the draft-economics sweep:
+17/20 @ 563 tok/s vs the 397B target; 27B draft confirmed 2.3× slower with
+no accuracy gain — active-params trap). Alternate draft 4B. Target ladder
+**9B → Qwen3.8-27B → Qwen3.5-397B-A17B-FP8 (TP4)** — a capability ladder,
+not a FLOPs ladder (397B has 17B active). Thinking mode off everywhere.
+Comm flags for TP runs: disable_custom_all_reduce +
+enforce_disable_flashinfer_allreduce_fusion; CUDA_HOME=/data/home/yahya/cuda-13.0.
+
+**Baselines (Phase 1):** target AR; self-consistency majority@n (stock
+engines, n matched to N). Vanilla speculative decoding dropped — not a TTS
+method; the TTS controls are majority@n and terminal reranking. Paper-faithful
+set (GSI, LLM-as-a-Verifier, Rollout Roulette) unchanged in Phase 8.
+
+**Particle scaling to N=64 is a first-class requirement:** cuda_graph_max_bs
+(→ _decode) and SMC_DRAFT_GRAPH_MAX_BS must cover groups×N at every point,
+verified via SMC_GRAPH_STATS showing cycle_graph serving ~100% of cycles.
+Untuned graph caps silently demote large-N runs to fallback tiers and
+invalidate throughput numbers.
+
+- **E1.1 Reference grid:** {9B, 27B, 397B} × {2B, 4B} × 3 seeds ×
+  {GSM8K-200, MATH500-100}, N=8, γ=8.
+- **E1.2 Draft adequacy (gate):** ESS/ancestry diagnostics on {2B, 4B} ×
+  {9B, 397B} × N∈{8, 32, 64} × γ∈{4, 8}, MATH500-100 — the kill-question is
+  lineage collapse on hard tasks at scale.
+- **E1.3 N-sweep vs TTS controls:** N∈{1,2,4,8,16,32,64} at 9B+2B and
+  397B+2B on both benchmarks, γ=8, graph-tuned; against target-AR and
+  majority@n at matched candidate counts. First Pareto sketch.
+
+Exit: results in hand → decide experiment scaling, further baselines, and
+algorithm changes for particle/generation scaling.
+
+## 19b. Experiment matrix (v1, superseded)
 
 Model roster (tokenizer identity across the ladder verified 2026-08-20):
 drafts Qwen3-0.6B / 1.7B; targets Qwen3-4B / 8B / 14B / 32B (one B200
