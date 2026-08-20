@@ -13,12 +13,14 @@ pools are co-budgeted inside ``mem_fraction_static`` instead of the draft riding
 along on leftover headroom (see below).
 """
 
+import dataclasses
 import gc
 import logging
 
 import torch
 
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import get_available_gpu_memory
@@ -27,7 +29,41 @@ from smcsd.mem_cache.allocator import SMCRefCountedTokenAllocator
 logger = logging.getLogger(__name__)
 
 
+class SMCKVCacheConfigurator(KVCacheConfigurator):
+    """KVCacheConfigurator that honors a pre-seeded co-budget config.
+
+    Upstream ``configure()`` consults ``memory_pool_config`` only on the
+    draft-worker branch and re-resolves from scratch for the target.  SMC
+    budgets target and draft KV jointly inside ``mem_fraction_static``, so a
+    seeded config must win on both sides; ``_resolve_memory_pool_config`` is
+    the target branch's single entry point.
+    """
+
+    def _resolve_memory_pool_config(self, pre_model_load_memory):
+        if self.memory_pool_config is not None:
+            return self.memory_pool_config
+        return super()._resolve_memory_pool_config(pre_model_load_memory)
+
+
+def _as_smc_configurator(base: KVCacheConfigurator) -> "SMCKVCacheConfigurator":
+    """Rebuild an upstream configurator as the SMC subclass.
+
+    The upstream class is a slots dataclass, so neither ``__class__``
+    reassignment nor instance method patching is possible; reconstruct
+    field-for-field instead (drift-proof: fields are enumerated, not
+    mirrored by hand).
+    """
+    kwargs = {
+        f.name: getattr(base, f.name) for f in dataclasses.fields(base) if f.init
+    }
+    return SMCKVCacheConfigurator(**kwargs)
+
+
 class SMCModelRunner(ModelRunner):
+    def init_kv_cache_configurator(self):
+        super().init_kv_cache_configurator()
+        self.kv_cache_configurator = _as_smc_configurator(self.kv_cache_configurator)
+
     def alloc_memory_pool(self, memory_pool_config=None):
         """Mirror of ModelRunner.alloc_memory_pool with the allocator swap inlined.
 
@@ -45,6 +81,9 @@ class SMCModelRunner(ModelRunner):
             )
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
+            # Seed the configurator so the co-budget config governs the
+            # target's pool sizing too (upstream only honors it for drafts).
+            self.kv_cache_configurator.memory_pool_config = memory_pool_config
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
