@@ -264,6 +264,12 @@ class SMCScheduler(Scheduler):
             n_particles=n_particles,
             random_seed=server_args.random_seed,
         )
+        # SMC_SMC_STATS=1: per-cycle ESS / resample / clone telemetry and a
+        # per-request finalize summary.  Diagnostics only -- the recorder
+        # host-syncs every cycle, so never enable it for benchmarking.
+        self._smc_stats = (
+            {} if os.environ.get("SMC_SMC_STATS") == "1" else None
+        )
         self.coordinator = SMCCoordinator(
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
@@ -847,8 +853,13 @@ class SMCScheduler(Scheduler):
         # actually resample (unbiased-estimator product over resample steps).
         logZ_inc = self.slot_state.resample_logZ_increment()
 
-        # Resample all groups via the fused systematic kernel.
+        # Resample all groups via the fused systematic kernel.  The ESS
+        # snapshot must precede collect: the kernel zeroes resampled rows'
+        # interval weights in-launch, hiding exactly the dips of interest.
+        pre_ess = self._snapshot_ess() if self._smc_stats is not None else None
         plan = self.coordinator.collect_resample_jobs_batch(self.slot_state)
+        if self._smc_stats is not None:
+            self._record_smc_stats(plan, pre_ess)
         self.slot_state.group_log_Z_hat += torch.where(
             plan.resample_mask, logZ_inc, torch.zeros_like(logZ_inc)
         )
@@ -912,6 +923,44 @@ class SMCScheduler(Scheduler):
         self._drain_finished_groups(
             self.slot_state.finished_mask_host[snapshot.phase]
         )
+
+    def _snapshot_ess(self):
+        """ESS per in-use row, mirroring the fused collect kernel: softmax
+        over the row's interval weights, ESS = 1 / sum(w^2)."""
+        rows = self.slot_state.row_in_use.nonzero(as_tuple=True)[0]
+        if rows.numel() == 0:
+            return None
+        slots = self.slot_state.group_to_slots[rows]
+        w = torch.softmax(self.slot_state.interval_weights[slots], dim=1)
+        return rows, 1.0 / (w * w).sum(dim=1)
+
+    def _record_smc_stats(self, plan, pre_ess) -> None:
+        """Diagnostics (SMC_SMC_STATS=1): ESS/resample telemetry per cycle.
+
+        Host-syncing by design; gated off on the hot path.
+        """
+        st = self._smc_stats
+        if pre_ess is None:
+            return
+        rows, ess = pre_ess
+        st["cycles"] = st.get("cycles", 0) + 1
+        st["rows"] = st.get("rows", 0) + int(rows.numel())
+        st["ess_sum"] = st.get("ess_sum", 0.0) + float(ess.sum())
+        st["ess_min"] = min(st.get("ess_min", float("inf")), float(ess.min()))
+        st["resampled_rows"] = st.get("resampled_rows", 0) + int(
+            plan.resample_mask[rows].sum()
+        )
+        st["clone_jobs"] = st.get("clone_jobs", 0) + plan.n_jobs_sync()
+        if st["cycles"] % 50 == 0:
+            n = self.slot_state.n_particles
+            print(
+                f"[SMC_SMC_STATS] cycles={st['cycles']}"
+                f" mean_ess={st['ess_sum'] / max(st['rows'], 1):.2f}/{n}"
+                f" min_ess={st['ess_min']:.2f}"
+                f" resample_rate={st['resampled_rows'] / max(st['rows'], 1):.3f}"
+                f" clones_per_cycle={st['clone_jobs'] / max(st['cycles'], 1):.2f}",
+                flush=True,
+            )
 
     def _drain_finished_groups(self, finished_mask_host) -> None:
         remaining: List[SequenceGroup] = []

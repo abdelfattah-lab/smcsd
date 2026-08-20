@@ -110,6 +110,8 @@ class ScheduleBatchSMC:
         # global torch RNG so fixed-seed runs reproduce across restarts.
         self._finalize_rng = torch.Generator(device=device)
         self._finalize_rng.manual_seed((random_seed or 0) * 1_000_003 + 0xF1A7)
+        self._smc_stats_enabled = os.environ.get("SMC_SMC_STATS") == "1"
+
         self.gamma_plus_1 = gamma_plus_1
         self.vocab_size = vocab_size
         self.max_output_len = max_output_len
@@ -1097,6 +1099,15 @@ class ScheduleBatchSMC:
         parent_req.smc_log_Z_hat = log_Z_hat
         parent_req.smc_log_w_tilde = log_w_tilde
         parent_req.smc_particle_output_ids = particle_output_ids
+        if self._smc_stats_enabled:
+            uniq = len({tuple(p) for p in particle_output_ids})
+            print(
+                f"[SMC_SMC_STATS] finalize rid={parent_req.rid[:8]}"
+                f" pick={pick} unique={uniq}/{len(particle_output_ids)}"
+                f" lens={fin_lens} reasons={fin_codes} eos={matched_toks}"
+                f" logw={[round(x, 2) for x in log_w_tilde]}",
+                flush=True,
+            )
 
         self.free_group_slots(group_id)
         return parent_req
