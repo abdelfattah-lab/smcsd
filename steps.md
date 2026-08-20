@@ -1,6 +1,6 @@
 # TTS: Test-Time-Scaling Serving with Composite SMC Objectives
 
-Status: project roadmap  
+Status: project roadmap — revised 2026-08-20 (scorer designs A/B, offline decision gates, evidence-gated multi-target, engine prerequisites from the v0.5.17 review)  
 Branch: `tts`  
 Starting point: the existing one-draft, one-target SM-CSD implementation
 
@@ -21,6 +21,11 @@ Raw tokens per second is a diagnostic metric, not the main result. Different met
 
 This is primarily an MLSys project. The algorithmic contribution is a general composite SMC objective and a scheduling policy; the core contribution is making it efficient through KV-cache sharing, batched checkpoints, duplicate-prefix compaction, fused weight/resampling operations, fixed execution shapes, and cross-request pipelining.
 
+> **Scope in one sentence:** online compute reallocation for test-time scaling
+> via SMC, made cheap by KV-fork-based particle lineage and zero-copy semantic
+> checkpoints. Multi-likelihood aggregation is an ablation unless the Phase 2
+> offline evidence promotes it; cross-tokenizer aggregation is future work.
+
 ## 2. Scope and initial assumptions
 
 
@@ -29,8 +34,11 @@ This is primarily an MLSys project. The algorithmic contribution is a general co
 
 - Inference-only test-time scaling.
 - One draft model `q`.
-- One or more likelihood target models `p_m`.
-- Zero or more selectable semantic scorer models `v_j`.
+- One likelihood target model `p_1`; additional same-tokenizer targets are
+  evidence-gated by the Phase 2(c) complementarity study.
+- Zero or more semantic scorer models `v_j`, with two implementations:
+  KV-fork self-scoring (design A) and an external scorer engine (design B) —
+  see Section 5.
 - An independently configurable speculative block size and semantic-checkpoint interval.
 - Online particle reallocation using ESS and resampling.
 - Offline and online evaluation on reasoning tasks.
@@ -51,7 +59,7 @@ All likelihood models in the first version must use an identical token-ID mappin
 
 ## 3. What already exists
 
-The current SM-CSD path is already the first experimental condition:
+The current SMC-SD path is already the first experimental condition:
 
 - one draft model proposes tokens;
 - one target model verifies blocks;
@@ -69,8 +77,28 @@ Important integration points:
 - `smcsd/core/worker.py`: draft generation, target verification, and likelihood updates.
 - `smcsd/core/scheduler.py`: worker orchestration, ESS, and resampling.
 - `smcsd/core/req_state.py`: per-particle tokens, weights, histories, and ancestry.
-- `smcsd/core/fused_collect.py`: normalization, ESS, compaction, and systematic resampling.
-- `smcsd/core/fused_resample_kv.py`: KV and block-table updates after resampling.
+- `smcsd/core/kernels/fused_collect.py`: normalization, ESS, compaction, and systematic resampling.
+- `smcsd/core/kernels/fused_resample_kv.py`: KV and block-table updates after resampling.
+- `smcsd/mem_cache/allocator.py`: `SMCRefCountedTokenAllocator` and
+  `copy_block_table` — refcounted KV sharing and zero-copy block-table
+  forking; the machinery design A builds on.
+
+### Engine facts to plan around (v0.5.17 review, 2026-08-19/20)
+
+- The KV co-budget configurator is dead code at HEAD (review finding F5): the
+  target silently gets stock sizing and ignores the computed target+draft
+  split. Prerequisite fix for any multi-model memory plan (Phase 0).
+- Decode-dispatch observability existed and was removed: `SMC_GRAPH_STATS`
+  (added in commit b142421, dropped in 514eaf3). Resurrect it for Phase 1
+  instead of rebuilding.
+- Fixed-seed determinism holds in the sequential event loop (verified
+  seed-for-seed on B200); the overlap loop intentionally shifts RNG
+  consumption — golden tests must pin the loop mode.
+- SMC runs only through `SMCEngine` (offline) and `smcsd.http_server`
+  (server); `sgl.Engine(speculative_algorithm="SMC")` deliberately raises on
+  the vendored tree. The Phase 8 baseline harness must respect this.
+- The hybrid (Mamba/GDN) path is broken at HEAD (findings F4/F7): pick
+  non-hybrid model families in Phase 0 or land those fixes first.
 
 
 
@@ -145,6 +173,12 @@ The scorer prompt must clearly delimit:
 - an ordered score scale;
 - the required single scoring-token answer.
 
+Keep the template order problem → partial response → criterion → scale →
+answer format: the growing text then stays a cache/KV *prefix* (radix reuse
+in design B, literal KV reuse in design A) and only the short fixed tail
+re-prefills at each checkpoint. Do not move instructions ahead of the partial
+response without re-measuring both scorer cost and score quality (Phase 2b).
+
 Use expected score under the scoring-token probability distribution, following LLM-as-a-Verifier, rather than parsing only the argmax label. Start with one evaluation and either 5 or 20 ordered labels. Later ablate:
 
 - score granularity;
@@ -215,7 +249,31 @@ At each checkpoint:
 
 This staged update is useful because it avoids scoring doomed or duplicated particles.
 
-The initial scorer implementation may use a separate verifier prompt with its own prefix cache. A more aggressive suffix-form KV fork is valid only if the scorer input can literally reuse the generation prefix followed by a fixed scoring suffix.
+### Two scorer implementations
+
+**Design A — KV-fork self-scoring (default candidate).** The scorer is a
+model that already holds the context's KV (the likelihood target, or the
+draft). A checkpoint then costs: fork the particle's block table (zero-copy —
+the same refcount machinery as particle cloning), append a **fixed** scoring
+suffix as token IDs, run one short extend (the same operation shape as
+TARGET_VERIFY, which the engine executes every cycle), and read the
+score-token logits at the final position. No detokenization, no
+retokenization, no second engine; a fixed-length suffix means fixed shapes,
+which means the checkpoint can join the existing CUDA-graph families. Cost ≈
+suffix-length prefill × unique prefixes per checkpoint. Constraints: scorer
+choice is limited to in-engine models, and suffix-scoring an unfinished
+assistant turn is off-distribution relative to the clean re-prompted form —
+Phase 2(b) must validate A's score quality against B before A becomes the
+default. If it holds, zero-copy semantic checkpoints are a headline systems
+feature no external-verifier baseline can replicate cheaply.
+
+**Design B — external scorer engine (quality reference; arbitrary models).**
+A separate *stock* sglang engine with radix cache ON (the SMC engine forces
+radix off, so the scorer cannot live inside `SMCScheduler`), fed detokenized
+context over an explicit queue. Cost is the incremental prefill of the
+growing context (radix reuse) plus the host round trip (detokenize →
+template → retokenize) every checkpoint. This is the faithful reproduction of
+published verifier setups and the quality yardstick for A.
 
 ### Final answer selection
 
@@ -320,11 +378,32 @@ Cross-GPU traffic should be token IDs, scalar factor contributions, scores, and 
 
 ## 8. Implementation phases
 
+Ordering principle: three cheap offline studies (Phase 2) pick the build
+order before any major engine work, and the first online experiment
+(Phase 3) decides the paper's central claim before optimization begins.
 
+### Phase 0 — Freeze the experiment contract + engine prerequisites
 
-### Phase 0 — Freeze the experiment contract
+**Decisions recorded 2026-08-20:**
 
-- [ ] Choose the primary draft/target/scorer model family and GPU topology.
+- **Model family: Qwen3 dense.** Draft candidates: Qwen3-0.6B / Qwen3-1.7B.
+  Target ladder: Qwen3-4B → 8B → 14B → 32B, one B200 each (the 8×B200 node
+  makes target-size scaling a first-class study axis alongside `N` and
+  `gamma`). Scorer candidate #1 is the target itself (design A); external
+  candidates from the same family (design B). Hybrid Qwen3.5 deferred until
+  F4/F7 land. Qwen3 thinking/non-thinking mode must be fixed once in the
+  prompt contract and held constant across all methods.
+- **First paper claim (recorded):** at matched task accuracy with strong
+  TTS baselines on identical hardware, the system serves faster — higher
+  QPS / lower p95 latency at matched accuracy, equivalently more correct
+  answers per GPU-hour — with every allocated accelerator counted. Raw TPS
+  stays a diagnostic (Section 1).
+- **Scaling studies:** target size × `N` × `gamma` sweeps are part of the
+  main characterization (Phase 6), not an afterthought.
+
+- [x] Choose the primary draft/target/scorer model family and GPU topology
+      (Qwen3 dense, above; tokenizer identity across sizes still needs the
+      programmatic check below).
 - [ ] Validate exact tokenizer compatibility for likelihood models.
 - [ ] Define prompt templates and answer extraction once.
 - [ ] Define what accelerator time includes.
@@ -332,90 +411,145 @@ Cross-GPU traffic should be token IDs, scalar factor contributions, scores, and 
 - [ ] Record dependency versions, model revisions, seeds, and hardware.
 - [ ] Add a run manifest and machine-readable result schema.
 - [ ] Decide the first paper claim and go/no-go thresholds before optimizing.
+- [ ] Fix and validate the KV co-budget configurator (review finding F5) —
+      every multi-model memory plan below depends on it.
+- [ ] Resurrect the `SMC_GRAPH_STATS` dispatch counters (commit b142421) as
+      the seed of Phase 1 instrumentation.
+- [ ] Pin golden fixed-seed tests to the sequential event loop.
 
-Exit criterion: one written experiment contract can be applied unchanged to every method.
+Exit criterion: one written experiment contract applies unchanged to every
+method, and the engine prerequisites are merged.
 
-### Phase 1 — Reproduce and instrument current SM-CSD
+### Phase 1 — Reproduce, instrument, and test draft adequacy
 
 - [ ] Run one draft + one target + likelihood-only on a small reasoning set.
-- [ ] Confirm deterministic fixed-seed repeatability where expected.
+- [ ] Confirm deterministic fixed-seed repeatability where expected
+      (verified 2026-08-19 in the sequential loop).
 - [ ] Record exact-match accuracy and answer-parser failures.
-- [ ] Add end-to-end request timing: queue, prefill, draft, verify, resample, decode, postprocess.
+- [ ] Add end-to-end request timing: queue, prefill, draft, verify, resample,
+      decode, postprocess.
 - [ ] Record draft, target, and accepted/generated token counts.
-- [ ] Record ESS, resampling count, unique ancestors, KV usage, and peak memory.
-- [ ] Add QPS, p50/p95 latency, accelerator-seconds/query, and correct answers/GPU-hour.
+- [ ] Record ESS, resampling count, unique ancestors, KV usage, peak memory.
+- [ ] Add QPS, p50/p95 latency, accelerator-seconds/query, and correct
+      answers/GPU-hour.
 - [ ] Save a golden configuration and result for regression testing.
+- [ ] **Draft-adequacy diagnostic:** ESS decay rate and unique-ancestor
+      half-life on GSM8K vs a MATH500 subset, across `N` and `gamma`.
 
-Exit criterion: the current system has a reproducible quality/cost/latency baseline and no semantic code is involved.
+Exit criterion / gate: a reproducible quality/cost/latency baseline exists,
+and particle diversity survives the hard task. SMC-SD is importance sampling
+in sequence space with a small proposal; if `N_eff` collapses toward 1 on
+MATH500-class problems, fix the proposal story first (larger draft, draft
+temperature, smaller `gamma`) — no composite objective rescues a degenerate
+particle population.
 
-### Phase 2 — Test semantic signal offline
+### Phase 2 — Three offline studies (the decision gate)
+
+All three run on saved trajectories sampled from the current engine; no
+engine changes. Budget: days.
+
+**(a) Semantic predictiveness**
 
 - [ ] Sample diverse partial trajectories at several completion fractions.
 - [ ] Ask the chosen scorer for expected recoverability scores.
 - [ ] Measure AUROC/AUPRC for eventual correctness.
 - [ ] Measure calibration error and reliability curves.
 - [ ] Measure ranking accuracy within candidates for the same prompt.
-- [ ] Compare 5 versus 20 labels.
-- [ ] Sweep criterion wording and a small set of scorer models.
+- [ ] Compare 5 versus 20 labels; sweep criterion wording and a small set of
+      scorer models.
 - [ ] Estimate scorer latency, tokens, and batching efficiency.
 - [ ] Freeze a versioned first criterion and calibration mapping.
 
-Important limitation: scoring saved complete trajectories can establish that the score is predictive, but not that online reallocation improves outcomes. A faithful replay study needs a precomputed branching continuation tree, or it must regenerate new suffixes after each simulated resampling decision.
+**(b) Design A vs design B score quality.** Score the same prefixes via the
+suffix-form KV-fork prompt and the clean re-prompted form. If A tracks B
+(rank correlation, AUROC delta within noise), A becomes the online default;
+if not, B's host-loop and prefill costs define the checkpoint budget.
 
-Exit criterion: the semantic score predicts eventual correctness well enough to justify an online prototype and has a stable prompt/calibration.
+**(c) Two-target likelihood complementarity.** Score saved trajectories under
+a second same-tokenizer target; measure ranking complementarity and
+alpha-mixture accuracy versus `p_1` alone. Same-family models are expected to
+be highly correlated — this is the cheap test of whether LM mode deserves
+engine work at all.
 
-### Phase 3 — Build a slow, testable composite-objective reference
+Replay caveat (unchanged): offline predictiveness supports, but does not
+prove, online reallocation value — that is Phase 3's question.
 
-- [ ] Implement factor interfaces in `composite_target.py`.
-- [ ] Track likelihood and semantic components separately.
-- [ ] Implement score-difference checkpoint updates.
-- [ ] Implement semantic-only with `q` as the base distribution.
-- [ ] Implement the four objective modes L1, LM, S, and combined.
-- [ ] Add explicit final-selection modes.
-- [ ] Use ordinary PyTorch operations without custom-kernel optimization.
+Gate: the evidence sets the build order. S-family goes first if (a) holds
+(expected). Phase 5 (multi-target) is built only if (c) shows real
+complementarity; otherwise LM is demoted to the `M=1` identity test plus one
+ablation row.
 
-Exit criterion: exact toy tests and all degeneracy/invariance tests in Section 10 pass.
+### Phase 3 — First online experiment (specification in Section 17)
 
-### Phase 4 — Add one online semantic scorer
+The centerpiece question, answered before any optimization: **does
+intermediate semantic reallocation create value beyond spending the same
+verifier budget terminally?** One draft, one target, one scorer; the six
+conditions of Section 17 at matched allocated cost on GSM8K + a MATH500
+subset.
 
-- [ ] Add scorer configuration and prompt templates.
+Implementation needed — the minimal eager composite path only:
+
+- [ ] Factor interfaces in `composite_target.py`; likelihood and semantic
+      components tracked separately.
+- [ ] Score-difference checkpoint updates; semantic-only with `q` base.
+- [ ] Objective modes L1, S, L1+S; explicit final-selection policies.
+- [ ] The Phase-2-winning scorer design (A or B).
+- [ ] Ordinary PyTorch throughout; the Section 10 objective tests pass first.
+
+Exit criterion / gate: a matched-cost answer either way. Positive → Phases
+4–7. Negative → the pivot is explicit: "terminal reranking, served fast"
+(still a systems paper), or LM-led (only if Phase 2(c) was positive).
+
+### Phase 4 — Productionize the online scorer
+
+- [ ] Scorer configuration and prompt templates (Section 5 configurability).
 - [ ] Batch semantic checkpoints across particles and requests.
-- [ ] Compact identical prefixes before scoring.
+- [ ] Compact identical prefixes (ancestry-based) before scoring.
 - [ ] Extract expected score from scoring-token logits.
 - [ ] Cache the previous score and apply only score differences.
 - [ ] Propagate score state through resampling.
-- [ ] Support `H` values independent of `gamma`.
-- [ ] Add a terminal semantic pass for final selection and fair baselines.
+- [ ] Support `H` independent of `gamma`; report effective `H` (checkpoints
+      quantize to cycle boundaries).
+- [ ] Terminal semantic pass for final selection and fair baselines.
+- [ ] Design A: fixed-shape suffix extend on forked KV sharing the
+      TARGET_VERIFY execution path. Design B: external stock-sglang scorer
+      engine (radix cache on) with explicit queue, backpressure, and cost
+      accounting.
 - [ ] Validate semantic-only and L1+S end to end.
 
-Exit criterion: with one scorer, the online eager implementation changes ancestry correctly, improves or preserves quality on the development set, and produces complete cost traces.
+Exit criterion: the online scorer changes ancestry correctly, preserves or
+improves development-set quality, and produces complete cost traces.
 
-### Phase 5 — Add multiple likelihood targets
+### Phase 5 — Multiple likelihood targets (conditional on Phase 2(c))
 
 - [ ] Introduce `TargetGroup` and parallel target workers.
 - [ ] Validate tokenizer identity before engine startup.
-- [ ] Score selected tokens on each target.
-- [ ] Aggregate weighted log likelihoods.
-- [ ] Implement and test the designated-target bonus proposal.
-- [ ] Provide a no-bonus reference mode.
+- [ ] Score selected tokens on each target; aggregate weighted log
+      likelihoods.
+- [ ] Implement and test the designated-target bonus proposal by enumeration;
+      provide a no-bonus reference mode. Do not silently reuse a one-target
+      correction under a multi-target proposal.
 - [ ] Apply one shared ancestry map to every target's KV state.
 - [ ] Compare serial versus parallel target execution.
 - [ ] Validate LM with `M=1` against L1.
 
-Exit criterion: LM passes exact small-model tests and reports the cost of all likelihood models.
+Exit criterion: LM passes exact small-model tests and reports the cost of all
+likelihood models.
 
 ### Phase 6 — Combine and characterize objectives
 
-- [ ] Run L1, LM, S, L1+S, and LM+S with the same draft and budget.
-- [ ] Sweep `N`, `gamma`, `H`, ESS threshold, `alpha`, and `beta`.
+- [ ] Run the implemented modes with the same draft and budget.
+- [ ] Sweep target size (4B→32B), `N`, `gamma`, `H`, ESS threshold, `alpha`, and `beta`.
 - [ ] Measure factor correlation and complementarity.
-- [ ] Check whether multi-model likelihood adds quality beyond one target.
-- [ ] Check whether semantic scoring adds quality beyond terminal reranking.
+- [ ] Confirm the Phase 3 result at scale: online semantic versus terminal
+      reranking; multi-model likelihood versus one target (if built).
 - [ ] Select a small Pareto-optimal configuration family for optimization.
 
-Do not optimize every configuration. The system section should focus on the objective variants that show real quality/cost value.
+Do not optimize every configuration. The system section should focus on the
+objective variants that show real quality/cost value.
 
-Exit criterion: at least one online composite configuration beats a terminal-only control at matched accelerator cost.
+Exit criterion: at least one online composite configuration beats a
+terminal-only control at matched accelerator cost.
 
 ### Phase 7 — Optimize one bottleneck at a time
 
@@ -430,20 +564,29 @@ Exit criterion: at least one online composite configuration beats a terminal-onl
 - [ ] Add queueing, fairness, and memory admission control.
 - [ ] Reprofile after every optimization.
 
-For every optimization, preserve an off switch and record both the performance delta and objective-equivalence check.
+For every optimization, preserve an off switch and record both the
+performance delta and objective-equivalence check.
 
-Exit criterion: the cumulative optimized system produces a clear throughput/latency improvement over the eager composite implementation without changing accuracy outside confidence intervals.
+Exit criterion: the cumulative optimized system produces a clear
+throughput/latency improvement over the eager composite implementation
+without changing accuracy outside confidence intervals.
 
 ### Phase 8 — Full baseline implementation
 
-- [ ] Implement the baseline list in Section 9 through one harness.
+- [ ] Implement the baseline list in Section 9 through one harness (SMC
+      methods via `SMCEngine`/`smcsd.http_server`; stock methods via stock
+      engines on the same vendored tree).
 - [ ] Add paper-faithful settings where feasible.
-- [ ] Add shared-component variants using the same models, prompts, candidate budgets, and verifier.
+- [ ] Add shared-component variants using the same models, prompts, candidate
+      budgets, and verifier.
 - [ ] Validate every baseline on a tiny set manually.
-- [ ] Sweep each method's natural compute knob to obtain a curve, not one point.
-- [ ] Save per-request traces so quality and systems metrics can be recomputed.
+- [ ] Sweep each method's natural compute knob to obtain a curve, not one
+      point.
+- [ ] Save per-request traces so quality and systems metrics can be
+      recomputed.
 
-Exit criterion: every main baseline has a reproducible command/config and a verified cost trace.
+Exit criterion: every main baseline has a reproducible command/config and a
+verified cost trace.
 
 ### Phase 9 — Main evaluation
 
@@ -454,9 +597,11 @@ Exit criterion: every main baseline has a reproducible command/config and a veri
 - [ ] Run at several concurrency/SLO settings.
 - [ ] Account for every assigned accelerator, including pipeline bubbles.
 - [ ] Generate all figures and tables from saved result files.
-- [ ] Perform error analysis by task difficulty, output length, and scorer failure.
+- [ ] Perform error analysis by task difficulty, output length, and scorer
+      failure.
 
-Exit criterion: all main claims are supported by matched-budget curves and uncertainty estimates.
+Exit criterion: all main claims are supported by matched-budget curves and
+uncertainty estimates.
 
 ### Phase 10 — Artifact and paper
 
@@ -465,10 +610,13 @@ Exit criterion: all main claims are supported by matched-budget curves and uncer
 - [ ] Add a one-command small-scale correctness experiment.
 - [ ] Add a one-command systems benchmark.
 - [ ] Document hardware, software, prompts, and cost accounting.
-- [ ] Release raw aggregate results and plotting scripts where licensing permits.
-- [ ] Write limitations, including tokenizer compatibility and extra-model memory.
+- [ ] Release raw aggregate results and plotting scripts where licensing
+      permits.
+- [ ] Write limitations, including tokenizer compatibility and extra-model
+      memory.
 
-Exit criterion: another researcher can reproduce the small result and understand how the full result was obtained.
+Exit criterion: another researcher can reproduce the small result and
+understand how the full result was obtained.
 
 ## 9. Baselines
 
@@ -703,6 +851,7 @@ For methods whose papers assume different reward models or hardware mappings, re
 
 ### SMC ablations
 
+- Target model scale (4B → 32B) at fixed draft.
 - Particle count.
 - ESS threshold.
 - Systematic resampling versus alternatives if implemented.
@@ -741,6 +890,11 @@ Every headline figure should identify particle count, model placement, concurren
 
 ## 16. Go/no-go decisions
 
+Proceed past Phase 1 only if particle diversity survives the hard task
+(draft-adequacy diagnostic). If `N_eff` collapses toward 1 on MATH500-class
+problems, fix the proposal (draft size/temperature, `gamma`) before building
+any composite objective.
+
 Proceed with semantic online SMC only if:
 
 - prefix recoverability score predicts eventual correctness;
@@ -749,6 +903,7 @@ Proceed with semantic online SMC only if:
 
 Proceed with multiple likelihood targets only if:
 
+- the Phase 2(c) offline complementarity study was positive;
 - the models provide complementary rankings or accuracy;
 - the gain survives the full multi-GPU cost calculation;
 - the bonus-proposal correction passes exact tests.
@@ -757,7 +912,7 @@ Proceed with heavy kernel work only after profiling shows the relevant operation
 
 If the final system raises accuracy but cannot improve query-level serving efficiency after charging all GPUs, the thesis claim must be narrowed; raw TPS is not sufficient.
 
-## 17. Recommended first experiment
+## 17. First online experiment (Phase 3 specification)
 
 Use one draft, one target, and one semantic verifier on GSM8K plus a small MATH500 subset:
 
