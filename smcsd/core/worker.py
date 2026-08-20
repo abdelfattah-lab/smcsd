@@ -214,6 +214,11 @@ class SMCWorker(BaseSpecWorker):
             _hybrid_gdn_config(self.draft_runner.model_config) is not None
         )
         self._draft_is_hybrid = draft_is_hybrid
+        # The draft's own backend must exist first: the hybrid multi-step
+        # backend wraps draft_runner.attn_backend, which the draft worker's
+        # init_attention_backends constructs.
+        self._draft_worker.init_attention_backends()
+        self._repoint_draft_hybrid_linear_backend()
         if draft_is_hybrid:
             from smcsd.core.hybrid_multistep_backend import (
                 HybridLinearAttnMultiStepBackend,
@@ -233,8 +238,6 @@ class SMCWorker(BaseSpecWorker):
                 speculative_num_steps=self.gamma + 2,
             )
             self.draft_attn_backend = factory.create_decode_backend()
-
-        self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
         server_args = self.server_args
@@ -521,7 +524,7 @@ class SMCWorker(BaseSpecWorker):
             mamba_layer_ids=[
                 i
                 for i in draft_config.mamba2_cache_params.layers
-                if self.draft_runner.start_layer <= i < self.draft_runner.end_layer
+                if self.draft_runner.layer_info.start_layer <= i < self.draft_runner.layer_info.end_layer
             ],
             enable_mamba_extra_buffer=False,
             # Deferred-bonus runs a 2-token verify-style head on the draft, so
@@ -529,7 +532,7 @@ class SMCWorker(BaseSpecWorker):
             # target's verify buffer); plain full-cycle drafts need none.
             speculative_num_draft_tokens=(2 if self.smc_defer_bonus else None),
             enable_overlap_schedule=False,
-            start_layer=self.draft_runner.start_layer,
+            start_layer=self.draft_runner.layer_info.start_layer,
         )
         # Share token block-table storage; isolate only the recurrent state pool.
         draft_pool.req_to_token = target_pool.req_to_token
@@ -564,32 +567,20 @@ class SMCWorker(BaseSpecWorker):
             full_attention_layer_ids=[
                 i
                 for i in draft_config.full_attention_layer_ids
-                if self.draft_runner.start_layer <= i < self.draft_runner.end_layer
+                if self.draft_runner.layer_info.start_layer <= i < self.draft_runner.layer_info.end_layer
             ],
-            enable_kvcache_transpose=False,
             device=self.draft_runner.device,
             mamba_pool=draft_pool.mamba_pool,
             enable_memory_saver=self.server_args.enable_memory_saver,
             use_mla=self.draft_runner.use_mla_backend,
-            start_layer=self.draft_runner.start_layer,
+            start_layer=self.draft_runner.layer_info.start_layer,
             **extra_args,
         )
 
-        linear_backend = getattr(
-            self.draft_runner.attn_backend, "linear_attn_backend", None
-        )
-        if linear_backend is not None:
-            linear_backend.req_to_token_pool = draft_pool
-            linear_backend.conv_states_shape = draft_pool.mamba_pool.mamba_cache.conv[
-                0
-            ].shape
-            if hasattr(linear_backend, "verify_intermediate_state_indices"):
-                linear_backend.verify_intermediate_state_indices = torch.arange(
-                    draft_pool.size,
-                    dtype=torch.int32,
-                    device=self.draft_runner.device,
-                )
-
+        # The linear backend does not exist yet at this lifecycle phase
+        # (alloc_memory_pool precedes init_attention_backends); the
+        # re-pointing runs in _repoint_draft_hybrid_linear_backend once the
+        # draft backends are built.
         self._dense_draft_hybrid_req_to_token_pool = draft_pool
         # Backref so the SMC release helpers (_release_internal_req /
         # _release_smc_parent_req) can free the draft pool's mamba state
@@ -611,6 +602,32 @@ class SMCWorker(BaseSpecWorker):
         if _smc_debug:
             print(f"[SMC HYBRID] tp{self.tp_rank} {msg}", flush=True)
 
+    def _repoint_draft_hybrid_linear_backend(self) -> None:
+        """Point the draft's linear-attention backend at its isolated pool.
+
+        Runs from init_attention_backends: the backend is constructed in
+        that phase, after alloc_memory_pool installed the isolated pools on
+        the draft runner.
+        """
+        draft_pool = self._dense_draft_hybrid_req_to_token_pool
+        if draft_pool is None:
+            return
+        linear_backend = getattr(
+            self.draft_runner.attn_backend, "linear_attn_backend", None
+        )
+        if linear_backend is None:
+            return
+        linear_backend.req_to_token_pool = draft_pool
+        linear_backend.conv_states_shape = draft_pool.mamba_pool.mamba_cache.conv[
+            0
+        ].shape
+        if hasattr(linear_backend, "verify_intermediate_state_indices"):
+            linear_backend.verify_intermediate_state_indices = torch.arange(
+                draft_pool.size,
+                dtype=torch.int32,
+                device=self.draft_runner.device,
+            )
+
     def _commit_target_mamba_state_after_verify(
         self,
         verify_forward_batch: ForwardBatch,
@@ -630,7 +647,7 @@ class SMCWorker(BaseSpecWorker):
             return
 
         attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps.to(dtype=torch.int64),
+            last_correct_step_indices=accepted_steps.to(dtype=torch.int64),
             mamba_track_indices=verify_forward_batch.mamba_track_indices,
             mamba_steps_to_track=None,
             model=self._target_worker.model_runner.model,
@@ -658,7 +675,7 @@ class SMCWorker(BaseSpecWorker):
 
         accepted_steps = torch.ones(bs, dtype=torch.int64, device=self.device)
         attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps,
+            last_correct_step_indices=accepted_steps,
             mamba_track_indices=getattr(
                 head_forward_batch, "mamba_track_indices", None
             ),

@@ -1,4 +1,4 @@
-From 8dc03878fa14cf728cfb724dd571407447eba3e8 Mon Sep 17 00:00:00 2001
+From 621d0ef031890c0909966362c9a151df765a5831 Mon Sep 17 00:00:00 2001
 From: Magpie <ccbrian830@gmail.com>
 Date: Wed, 19 Aug 2026 01:51:38 +0000
 Subject: [PATCH] SMC speculative decoding: consolidated core hooks (v0.5.17)
@@ -67,6 +67,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  .../sglang/srt/arg_groups/speculative_hook.py |  80 +++++++
  python/sglang/srt/compilation/compile.py      |   9 +
  python/sglang/srt/configs/model_config.py     |  17 ++
+ .../layers/attention/attention_registry.py    |   4 +-
  .../attention/hybrid_linear_attn_backend.py   |  46 +++-
  .../srt/layers/attention/triton_backend.py    | 219 +++++++++++++-----
  python/sglang/srt/managers/scheduler.py       |  15 +-
@@ -78,7 +79,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  .../runner/decode_cuda_graph_runner.py        |   7 +-
  python/sglang/srt/server_args.py              |  71 +++++-
  python/sglang/srt/speculative/spec_info.py    |  26 +++
- 14 files changed, 454 insertions(+), 75 deletions(-)
+ 15 files changed, 457 insertions(+), 76 deletions(-)
 
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
 index 427acdd38..8c8adbd43 100644
@@ -222,6 +223,22 @@ index 15b84ed23..4d0e3d225 100644
          if is_draft_model and self.hf_config.architectures[0] in [
              "DeepseekV3ForCausalLM",
              "DeepseekV32ForCausalLM",
+diff --git a/python/sglang/srt/layers/attention/attention_registry.py b/python/sglang/srt/layers/attention/attention_registry.py
+index 9af985d73..4bf8cbe02 100644
+--- a/python/sglang/srt/layers/attention/attention_registry.py
++++ b/python/sglang/srt/layers/attention/attention_registry.py
+@@ -475,8 +475,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
+                     "If this is a custom hybrid model, use register_linear_attn_model() "
+                     "from sglang.srt.configs.linear_attn_model_registry."
+                 )
+-        if runner.is_draft_worker:
++        if runner.is_draft_worker and not runner.spec_algorithm.is_smc():
+             # FIXME: we assume that MTP/NEXTN always use full-attention.
++            # SMC dense drafts are complete hybrid models, not MTP heads;
++            # they keep their real full-attention layer set.
+             full_attn_layers = [0]
+         else:
+             full_attn_layers = cfg.full_attention_layer_ids
 diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 index f62abfe89..69788f224 100644
 --- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py

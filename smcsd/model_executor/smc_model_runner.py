@@ -153,8 +153,10 @@ class SMCModelRunner(ModelRunner):
             and self.server_args.max_mamba_cache_size is None
             and self.server_args.max_running_requests is not None
         ):
-            self.server_args.max_mamba_cache_size = (
-                self.server_args.max_running_requests
+            # ServerArgs is frozen after resolution; mutate via override().
+            self.server_args.override(
+                "smc_mamba_cache_default",
+                max_mamba_cache_size=self.server_args.max_running_requests,
             )
 
         available_bytes = kvc._profile_available_bytes(pre_model_load_memory)
@@ -255,11 +257,14 @@ class SMCModelRunner(ModelRunner):
         draft_mamba_bytes = 0
         if draft_mambaish is not None:
             # Draft pool slots == target req_to_token_pool size == max_num_reqs,
-            # which _resolve_max_num_reqs derives as max_running_requests //
-            # self.dp_size (the token-capacity cap only binds far above SMC's
+            # which resolve_max_num_reqs derives as max_running_requests //
+            # attn_dp_size (the token-capacity cap only binds far above SMC's
             # tiny groups*(N+1), and if it did it would shrink the real pool —
             # so this over-reserves, which is safe).
-            slots = self.server_args.max_running_requests // self.dp_size
+            slots = (
+                self.server_args.max_running_requests
+                // self.kv_cache_configurator.ps.attn_dp_size
+            )
             draft_mamba_bytes = (
                 draft_mambaish.mamba2_cache_params.mamba_cache_per_req * slots
             )

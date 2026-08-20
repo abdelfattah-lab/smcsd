@@ -1067,7 +1067,7 @@ class SMCDeferredCycleGraphRunner(SMCFullCycleGraphRunner):
         # index buffers that replay() refreshes.  Constant accepted_steps=1.
         if self._draft_head_commit:
             self.head_backend.update_mamba_state_after_mtp_verify(
-                accepted_steps=self._head_accepted_steps[:bs],
+                last_correct_step_indices=self._head_accepted_steps[:bs],
                 mamba_track_indices=getattr(head_fb, "mamba_track_indices", None),
                 mamba_steps_to_track=None,
                 model=self.model_runner.model,
