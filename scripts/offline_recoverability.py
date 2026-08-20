@@ -68,6 +68,8 @@ def main():
     ap.add_argument("--fractions", default="0.25,0.5,0.75")
     ap.add_argument("--max-trajectories", type=int, default=800)
     ap.add_argument("--mem-fraction-static", type=float, default=0.85)
+    ap.add_argument("--save-scores", default=None,
+                    help="write per-prefix scores JSONL here")
     ap.add_argument("--probe", action="store_true",
                     help="score 2 prompts, print meta structure, exit")
     args = ap.parse_args()
@@ -149,6 +151,7 @@ def main():
         z = sum(p.values())
         return sum(k * v for k, v in p.items()) / z
 
+    save_fh = open(args.save_scores, "w") if args.save_scores else None
     per = defaultdict(lambda: ([], []))  # (design, frac) -> (scores, labels)
     perq = defaultdict(lambda: defaultdict(list))  # (design, frac) -> qid -> [(s, corr)]
     skipped = 0
@@ -158,6 +161,12 @@ def main():
             skipped += 1
             continue
         r = rows[ri]
+        if save_fh:
+            save_fh.write(json.dumps({
+                "design": design, "frac": f, "qid": r["qid"],
+                "sample": r["sample"], "score": s, "correct": r["correct"],
+                "ntok": len(tok.encode(r["text"], add_special_tokens=False)),
+            }) + "\n")
         per[(design, f)][0].append(s)
         per[(design, f)][1].append(1 if r["correct"] else 0)
         perq[(design, f)][r["qid"]].append((s, r["correct"]))
