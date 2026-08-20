@@ -132,6 +132,13 @@ def main():
         outs = small.generate(
             [prompts[q] + texts[q][c] for q, c in active], sp)
         steps = [o["text"] for o in outs]
+        # A candidate is complete when generation ended on EOS rather than
+        # the step-delimiter stop string (answer-extraction alone is too
+        # lenient a termination signal on GSM8K-style tasks).
+        def _eos_done(o):
+            fr = o.get("meta_info", {}).get("finish_reason") or {}
+            return fr.get("type") == "stop" and fr.get("matched") != STEP_STOP
+        finished = [_eos_done(o) for o in outs]
         small_steps += len(steps)
         souts = reward.generate(
             [prompts[q] + texts[q][c] + s + SUFFIX_FORM
@@ -154,11 +161,12 @@ def main():
             for i, o, so in zip(fb_idx, fouts, fsouts):
                 steps[i] = o["text"]
                 rewards[i] = expected_score(so, score_ids) or rewards[i]
+                finished[i] = _eos_done(o)
                 fallbacks += 1
-        for (q, c), s, r in zip(active, steps, rewards):
+        for (q, c), s, r, fin in zip(active, steps, rewards, finished):
             texts[q][c] += s + (STEP_STOP if not s.endswith(STEP_STOP) else "")
             weights[q][c] += args.beta * (r - 1) / 4.0
-            if extract_answer(texts[q][c]) is not None or len(texts[q][c]) > 6000:
+            if fin or len(texts[q][c]) > 6000:
                 done[q][c] = True
     wall = time.perf_counter() - tic
 
