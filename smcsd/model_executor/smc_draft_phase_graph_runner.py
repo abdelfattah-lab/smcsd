@@ -241,8 +241,14 @@ class SMCDraftPhaseGraphRunner:
             int(os.environ.get("SMC_FUSED_SAMPLING", "1"))
         )
         with torch.device(model_runner.device):
-            self.sample_seed = torch.randint(
-                0, 2**31 - 1, (1,), dtype=torch.int64
+            # Derived from random_seed (not a global-RNG draw) so the
+            # in-graph Philox stream reproduces across engine restarts.
+            _base_seed = int(
+                getattr(model_runner.server_args, "random_seed", None) or 0
+            )
+            self.sample_seed = torch.tensor(
+                [(_base_seed * 1_000_003 + 0x9E37) % (2**31 - 1)],
+                dtype=torch.int64,
             )
             self._steps_arange = torch.arange(self.num_steps)
 

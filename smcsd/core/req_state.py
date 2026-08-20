@@ -102,9 +102,14 @@ class ScheduleBatchSMC:
         model_config: "ModelConfig",
         enable_overlap: bool = False,
         n_particles: int = 1,
+        random_seed: int | None = None,
     ):
         self.max_slots = max_num_reqs
         self.device = device
+        # Dedicated RNG for the finalize posterior pick: independent of the
+        # global torch RNG so fixed-seed runs reproduce across restarts.
+        self._finalize_rng = torch.Generator(device=device)
+        self._finalize_rng.manual_seed((random_seed or 0) * 1_000_003 + 0xF1A7)
         self.gamma_plus_1 = gamma_plus_1
         self.vocab_size = vocab_size
         self.max_output_len = max_output_len
@@ -1069,10 +1074,14 @@ class ScheduleBatchSMC:
         ]
 
         # Posterior sample over particles for the primary output. softmax
-        # handles the max-shift for numerical stability; multinomial respects
-        # the global torch RNG (seeded via ServerArgs.random_seed).
+        # handles the max-shift for numerical stability; the pick uses the
+        # slot state's dedicated generator (seeded from random_seed).
         probs = torch.softmax(self.log_weights[slot_idx_t], dim=0)
-        pick = int(torch.multinomial(probs, num_samples=1).item())
+        pick = int(
+            torch.multinomial(
+                probs.float(), num_samples=1, generator=self._finalize_rng
+            ).item()
+        )
         # Req.output_ids must stay an array("q"): the detokenizer
         # concatenates it with origin_input_ids_unpadded.
         parent_req.output_ids = array("q", particle_output_ids[pick])

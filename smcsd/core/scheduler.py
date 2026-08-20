@@ -262,6 +262,7 @@ class SMCScheduler(Scheduler):
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             n_particles=n_particles,
+            random_seed=server_args.random_seed,
         )
         self.coordinator = SMCCoordinator(
             device=self.device,

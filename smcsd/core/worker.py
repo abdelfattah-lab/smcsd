@@ -100,6 +100,13 @@ class SMCWorker(BaseSpecWorker):
         # ServerArgs instance (keeps the vendored class unmodified); defaults
         # to 1.0 (plain p) for launches that don't go through SMCEngine.
         self.smc_power_alpha = float(getattr(server_args, "smc_power_alpha", 1.0))
+        # Dedicated RNG for eager Gumbel draws (x0 prefill, eager draft/bonus
+        # sampling): derived from random_seed so fixed-seed runs reproduce
+        # across engine restarts regardless of how much global-RNG state the
+        # warmup/autotune path consumed.
+        _base_seed = int(getattr(server_args, "random_seed", None) or 0)
+        self._gumbel_rng = torch.Generator(device=self.device)
+        self._gumbel_rng.manual_seed(_base_seed * 1_000_003 + 0x5AC1)
         # SMC_GRAPH_STATS=1: count which decode path serves each cycle
         # (cycle graph vs fallback tiers); summary printed every 100 cycles.
         self._graph_stats = (
@@ -790,9 +797,12 @@ class SMCWorker(BaseSpecWorker):
             scaled = logits / self.smc_draft_temperature
             gumbel = -torch.log(
                 -torch.log(
-                    torch.rand_like(scaled).clamp_min_(
-                        torch.finfo(scaled.dtype).tiny
-                    )
+                    torch.rand(
+                        scaled.shape,
+                        dtype=scaled.dtype,
+                        device=scaled.device,
+                        generator=self._gumbel_rng,
+                    ).clamp_min_(torch.finfo(scaled.dtype).tiny)
                 )
             )
             idx = torch.argmax(scaled + gumbel, dim=-1)
@@ -822,9 +832,12 @@ class SMCWorker(BaseSpecWorker):
         scaled = self.smc_power_alpha * base
         gumbel = -torch.log(
             -torch.log(
-                torch.rand_like(scaled).clamp_min_(
-                    torch.finfo(scaled.dtype).tiny
-                )
+                torch.rand(
+                    scaled.shape,
+                    dtype=scaled.dtype,
+                    device=scaled.device,
+                    generator=self._gumbel_rng,
+                ).clamp_min_(torch.finfo(scaled.dtype).tiny)
             )
         )
         idx = torch.argmax(scaled + gumbel, dim=-1)
