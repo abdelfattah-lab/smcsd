@@ -953,7 +953,54 @@ An eventual headline should have this form:
 
 Do not choose X, Y, or Z until the frozen evaluation produces them.
 
-## 19. References
+## 19. Experiment matrix (v1, 2026-08-20)
+
+Model roster (tokenizer identity across the ladder verified 2026-08-20):
+drafts Qwen3-0.6B / 1.7B; targets Qwen3-4B / 8B / 14B / 32B (one B200
+each); scorer candidates: the target itself (design A), Qwen3-8B/32B as
+external judge (design B). All runs non-thinking unless a later ablation
+says otherwise.
+
+### Phase 1 (current engine + counters only)
+
+- **E1.1 Reference grid:** {4 targets} × {2 drafts} × 3 seeds, N=8, γ=8,
+  GSM8K 200q → accuracy / tok/s / cost reference and the first
+  target-scaling curve.
+- **E1.2 Draft adequacy (gate):** {0.6B, 1.7B} × {8B, 32B} × N∈{8,16,32}
+  × γ∈{4,8} on GSM8K and MATH500-100. Readouts: per-cycle ESS decay,
+  resample frequency, unique-ancestor half-life, accuracy. Key
+  interaction: larger target ⇒ larger q–p gap ⇒ faster ESS collapse.
+- **E1.3 N buys accuracy?** Likelihood-only N∈{1..32} at fixed γ vs
+  target-AR and target-BoN-N controls through stock sglang — earliest
+  signal that SMC reallocation is worth anything.
+- Build: per-cycle ESS/resample/ancestor counters (SMC_GRAPH_STATS
+  pattern), --dump-trajectories JSONL on the eval script, run-manifest
+  JSON. No algorithm changes.
+
+### Phase 2 (offline, zero engine code)
+
+- **E2.a predictiveness:** prefixes at 25/50/75% of saved trajectories,
+  scored by 8B-self and 32B-judge, 5 vs 20 labels → AUROC/calibration.
+- **E2.b design A vs B:** same prefixes, suffix-form prompt vs clean
+  re-prompt (offline, both are just prompts) → rank correlation decides
+  the online scorer design.
+- **E2.c complementarity:** rescore trajectories under 14B/32B; does the
+  α-mixture rank better than p₁ alone? Decides whether Phase 5 is built.
+
+### Phase 3 (first engine build, scoped by the gates)
+
+Six §17 conditions at matched allocated cost; N∈{8,16,32} ×
+H∈{32,64,128} × β∈{0, small, med}; GSM8K + MATH500-100; 3 seeds.
+Build: composite_target.py, score-difference checkpoints, L1/S/L1+S,
+final-selection policies, one scorer design (per E2.b).
+
+### Phases 5–7
+
+Phase 5 only if E2.c surprises; Phase 6 re-runs winning modes across
+target scale × N × γ × H (headline scaling figures); Phase 7 optimizes
+against the Phase 3 eager implementation.
+
+## 20. References
 
 - [LLM-as-a-Verifier: A General-Purpose Verification Framework](https://arxiv.org/abs/2607.05391) ([PDF](https://arxiv.org/pdf/2607.05391))
 - [Guided Speculative Inference for Efficient Test-Time Alignment of LLMs](https://arxiv.org/abs/2506.04118) ([PDF](https://arxiv.org/pdf/2506.04118))
