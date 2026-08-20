@@ -130,6 +130,10 @@ def run_smc_engine_eval(args, prompts, labels):
         engine_kwargs["max_total_tokens"] = args.max_total_tokens
     if getattr(args, "dtype", None):
         engine_kwargs["dtype"] = args.dtype
+    if getattr(args, "tp", 1) > 1:
+        engine_kwargs["tp_size"] = args.tp
+        engine_kwargs["disable_custom_all_reduce"] = True
+        engine_kwargs["enforce_disable_flashinfer_allreduce_fusion"] = True
     if getattr(args, "disable_cuda_graph", False):
         engine_kwargs["disable_cuda_graph"] = True
     if getattr(args, "tp_size", 1) and args.tp_size > 1:
@@ -174,6 +178,49 @@ def run_smc_engine_eval(args, prompts, labels):
     return preds, total_output_tokens, latency
 
 
+def run_majority_eval(args, prompts, labels):
+    """Fully batched stock-engine majority@n on the extracted numeric answer.
+
+    Returns majority-vote preds; total tokens count every sample generated
+    (the honest cost of the method).
+    """
+    import sglang as sgl
+    from collections import Counter
+
+    engine_kwargs = dict(
+        model_path=args.model,
+        trust_remote_code=True,
+        attention_backend=args.attention_backend,
+    )
+    if args.mem_fraction_static is not None:
+        engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
+    if args.seed is not None:
+        engine_kwargs["random_seed"] = args.seed
+    if getattr(args, "tp", 1) > 1:
+        engine_kwargs["tp_size"] = args.tp
+        engine_kwargs["disable_custom_all_reduce"] = True
+        engine_kwargs["enforce_disable_flashinfer_allreduce_fusion"] = True
+    engine = sgl.Engine(**engine_kwargs)
+    try:
+        n = args.n_samples
+        expanded = [p for p in prompts for _ in range(n)]
+        tic = time.perf_counter()
+        outs = engine.generate(
+            expanded,
+            {"max_new_tokens": args.max_new_tokens, "temperature": args.temperature},
+        )
+        latency = time.perf_counter() - tic
+    finally:
+        engine.shutdown()
+    total_tokens = sum(len(o["output_ids"]) for o in outs)
+    preds = []
+    for i in range(len(prompts)):
+        votes = [extract_answer(outs[i * n + j]["text"]) for j in range(n)]
+        votes = [v for v in votes if v is not None]
+        preds.append(Counter(votes).most_common(1)[0][0] if votes else None)
+    return preds, total_tokens, latency
+
+
 def run_baseline_eval(args, prompts, labels):
     """Baseline (vanilla generation, no speculative decoding) evaluation."""
     import sglang as sgl
@@ -183,6 +230,10 @@ def run_baseline_eval(args, prompts, labels):
         trust_remote_code=True,
         attention_backend=args.attention_backend,
     )
+    if getattr(args, "tp", 1) > 1:
+        engine_kwargs["tp_size"] = args.tp
+        engine_kwargs["disable_custom_all_reduce"] = True
+        engine_kwargs["enforce_disable_flashinfer_allreduce_fusion"] = True
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
     if args.mem_fraction_static is not None:
@@ -245,6 +296,7 @@ def main(args):
     mode_label = {
         "smc_engine": "SMCEngine (dedicated offline)",
         "baseline": "Baseline (vanilla)",
+        "majority": "Majority vote (batched vanilla)",
     }
     print(f"Mode: {mode_label[args.mode]} | Model: {args.model}")
     if args.mode == "smc_engine":
@@ -275,6 +327,8 @@ def main(args):
     # Run evaluation
     if args.mode == "smc_engine":
         preds, total_tokens, latency = run_smc_engine_eval(args, prompts, labels)
+    elif args.mode == "majority":
+        preds, total_tokens, latency = run_majority_eval(args, prompts, labels)
     else:
         preds, total_tokens, latency = run_baseline_eval(args, prompts, labels)
 
@@ -305,7 +359,7 @@ if __name__ == "__main__":
     # Core
     parser.add_argument(
         "--mode",
-        choices=["baseline", "smc_engine"],
+        choices=["baseline", "smc_engine", "majority"],
         default="smc_engine",
         help="baseline = vanilla, smc_engine = dedicated SMCEngine (default: smc_engine)",
     )
@@ -344,6 +398,7 @@ if __name__ == "__main__":
     bench.add_argument("--num-questions", type=int, default=80)
     bench.add_argument("--max-new-tokens", type=int, default=512)
     bench.add_argument("--batch-size", type=int, default=1)
+    bench.add_argument("--n-samples", type=int, default=8, help="majority mode votes")
     bench.add_argument(
         "--ignore-eos",
         action=argparse.BooleanOptionalAction,
@@ -367,6 +422,7 @@ if __name__ == "__main__":
     eng.add_argument("--mem-fraction-static", type=float, default=0.4)
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=16)
+    eng.add_argument("--tp", type=int, default=1)
     eng.add_argument(
         "--max-total-tokens",
         type=int,
