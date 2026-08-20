@@ -783,12 +783,18 @@ class SMCWorker(BaseSpecWorker):
             self.score_runner.model.lm_head,
             logits_metadata,
         ).next_token_logits
-        x0, _ = self._sample_target_power(x0_logits)
+        n_particles = int(getattr(self.server_args, "smc_n_particles", 1))
+        x0_draws = []
+        for _ in range(max(1, n_particles)):
+            xk, _ = self._sample_target_power(x0_logits)
+            x0_draws.append(xk)
+        x0 = x0_draws[0]
         score_result.next_token_ids = x0
 
         # x0 KV is NOT written during prefill — first decode writes it.
         score_result.next_draft_input = SMCDraftInput(
             verified_id=x0,
+            x0_per_particle=torch.stack(x0_draws, dim=1),
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
         score_result.accept_lens = torch.zeros(

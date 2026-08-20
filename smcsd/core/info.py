@@ -392,6 +392,13 @@ class SMCDraftInput(SpecInput):
     """
 
     verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token
+    # (bs, N) independent per-particle x0 draws from the target's power
+    # conditional at prefill; None outside the prefill result.  Sampling
+    # each particle's first token independently (rather than cloning the
+    # parent's single draw) removes the only cross-particle correlation
+    # left at resample_threshold=0.  Weight-neutral: drawn from the target,
+    # so the importance ratio for x0 is 1 for every particle.
+    x0_per_particle: Optional[torch.Tensor] = None
     # (bs,) per-row token at position S-1: the last *drafted* token
     # d_{gamma-1} from the previous step (deferred into the next step's
     # leading 2-token draft forward [prev_last_draft_id, verified_id]),

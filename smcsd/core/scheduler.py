@@ -666,6 +666,9 @@ class SMCScheduler(Scheduler):
             result.copy_done.synchronize()
         next_token_ids = result.next_token_ids.tolist()
         assert len(next_token_ids) == len(batch.reqs) == len(groups)
+        next_draft = getattr(result, "next_draft_input", None)
+        x0pp = getattr(next_draft, "x0_per_particle", None)
+        x0pp = x0pp.tolist() if x0pp is not None else None
 
         for i, (group, req, next_token_id) in enumerate(
             zip(groups, batch.reqs, next_token_ids)
@@ -678,6 +681,7 @@ class SMCScheduler(Scheduler):
             self._pending_admitted_slots -= group.n_particles
 
             req.output_ids.append(next_token_id)
+            group._x0_per_particle = x0pp[i] if x0pp is not None else None
             req.update_finish_state()
             if req.finished():
                 release_kv_cache(req, self.tree_cache)
@@ -703,6 +707,12 @@ class SMCScheduler(Scheduler):
             return f"SMC parent draft prefill failed: {exc}"
 
         group.materialize_particles()
+        # Give each particle its own x0 draw (clones carry the parent's).
+        x0s = getattr(group, "_x0_per_particle", None)
+        if x0s is not None:
+            for pidx, preq in group.particle_reqs.items():
+                if preq.output_ids:
+                    preq.output_ids[-1] = x0s[pidx]
         particle_reqs = list(group.particle_reqs.values())
         if self.req_to_token_pool.alloc(particle_reqs) is None:
             group.clear_particles()
