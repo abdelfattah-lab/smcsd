@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "experiment_id": "tb21-likelihood-dev-v1",
+  "purpose": "Development sweep for target-only AR versus likelihood-only SM-CSD. This set may be used for tuning and is not the held-out paper test set.",
+  "benchmark": {
+    "name": "terminal-bench-2.1",
+    "dataset_commit": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "tasks": [
+      {"id": "fix-git", "category": "software-engineering", "difficulty": "easy"},
+      {"id": "configure-git-webserver", "category": "system-administration", "difficulty": "hard"},
+      {"id": "sanitize-git-repo", "category": "security", "difficulty": "medium"},
+      {"id": "git-leak-recovery", "category": "software-engineering", "difficulty": "medium"},
+      {"id": "cancel-async-tasks", "category": "software-engineering", "difficulty": "hard"},
+      {"id": "fix-code-vulnerability", "category": "security", "difficulty": "hard"},
+      {"id": "nginx-request-logging", "category": "system-administration", "difficulty": "medium"},
+      {"id": "pypi-server", "category": "software-engineering", "difficulty": "medium"},
+      {"id": "regex-log", "category": "data-processing", "difficulty": "medium"},
+      {"id": "multi-source-data-merger", "category": "data-processing", "difficulty": "medium"},
+      {"id": "db-wal-recovery", "category": "file-operations", "difficulty": "medium"},
+      {"id": "query-optimize", "category": "data-science", "difficulty": "medium"}
+    ]
+  },
+  "models": {
+    "target": "Qwen/Qwen3.5-9B",
+    "draft": "Qwen/Qwen3.5-2B"
+  },
+  "agent": {
+    "adapter_commit": "ccb5e129d6cdbd8f761143e253adef48f9e6a477",
+    "pi_version": "0.84.2",
+    "thinking": "off",
+    "capture_requests": true,
+    "concurrency": 1,
+    "attempts_per_seed": 1
+  },
+  "server": {
+    "max_running_requests": 1,
+    "cuda_graphs": true,
+    "flashinfer_autotune": true,
+    "enable_metrics": true
+  },
+  "matrix": {
+    "methods": ["ar", "smcsd"],
+    "particles": [1, 4, 8, 16],
+    "gamma": [2, 4, 8],
+    "seeds": [0, 1, 2]
+  },
+  "primary_metrics": [
+    "terminal_bench_reward",
+    "agent_wall_time_s",
+    "tasks_per_agent_gpu_hour",
+    "correct_tasks_per_agent_gpu_hour",
+    "server_requests_per_s",
+    "server_time_per_query_s"
+  ],
+  "diagnostic_metrics": [
+    "server_ttft_s",
+    "server_inter_token_latency_s",
+    "server_prompt_tokens",
+    "server_generation_tokens",
+    "server_generation_tokens_per_s",
+    "provider_requests",
+    "agent_input_tokens",
+    "agent_output_tokens"
+  ]
+}

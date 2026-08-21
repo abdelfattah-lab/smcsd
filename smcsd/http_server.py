@@ -40,6 +40,7 @@ Then query the standard sglang endpoints, e.g. ``POST /generate`` or
 """
 
 import argparse
+import json
 import logging
 from typing import Optional
 
@@ -137,7 +138,18 @@ def launch_smc_http_server(server_args: ServerArgs, launch_callback=None) -> Non
     )
 
 
-def main() -> None:
+def _json_object(value: str) -> dict:
+    """Parse a JSON object for CLI options that feed chat-template kwargs."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return parsed
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Launch an HTTP server for SMC speculative decoding.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -164,6 +176,38 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument(
+        "--served-model-name",
+        default=None,
+        help="Model id advertised by /v1/models and accepted by OpenAI clients.",
+    )
+    parser.add_argument(
+        "--chat-template",
+        default=None,
+        help="Builtin chat-template name or path used by /v1/chat/completions.",
+    )
+    parser.add_argument(
+        "--hf-chat-template-name",
+        default=None,
+        help="Named Hugging Face chat template (for tokenizers with several).",
+    )
+    parser.add_argument(
+        "--tool-call-parser",
+        default=None,
+        help="SGLang tool-call parser name; 'auto' detects from the template.",
+    )
+    parser.add_argument(
+        "--reasoning-parser",
+        default=None,
+        help="SGLang reasoning parser name; 'auto' detects from the template.",
+    )
+    parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=_json_object,
+        default=None,
+        metavar="JSON",
+        help="Defaults applied to chat requests, e.g. '{\"enable_thinking\": false}'.",
+    )
+    parser.add_argument(
         "--mem-fraction-static",
         type=float,
         default=None,
@@ -174,12 +218,35 @@ def main() -> None:
         "--attention-backend", default="triton", choices=["triton", "fa3"]
     )
     parser.add_argument("--cuda-graph-max-bs", type=int, default=None)
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Seed used by SGLang workers; set it for reproducible experiment runs.",
+    )
+    parser.add_argument(
+        "--enable-metrics",
+        action="store_true",
+        help="Expose SGLang Prometheus serving metrics at /metrics.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--skip-server-warmup", action="store_true")
     parser.add_argument(
-        "--log-level", default="info", help="sglang server log level."
+        "--disable-cuda-graph",
+        action="store_true",
+        help="Use eager execution; useful as a correctness fallback for new models.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--disable-flashinfer-autotune",
+        action="store_true",
+        help="Skip FlashInfer startup autotuning.",
+    )
+    parser.add_argument("--log-level", default="info", help="sglang server log level.")
+    return parser
+
+
+def server_args_from_cli(args: argparse.Namespace) -> ServerArgs:
+    """Translate the dedicated SMC CLI into SGLang ``ServerArgs``."""
 
     extra = dict(
         host=args.host,
@@ -188,17 +255,35 @@ def main() -> None:
         attention_backend=args.attention_backend,
         log_level=args.log_level,
     )
+    for field in (
+        "served_model_name",
+        "chat_template",
+        "hf_chat_template_name",
+        "tool_call_parser",
+        "reasoning_parser",
+        "default_chat_template_kwargs",
+    ):
+        value = getattr(args, field)
+        if value is not None:
+            extra[field] = value
     if args.mem_fraction_static is not None:
         extra["mem_fraction_static"] = args.mem_fraction_static
     if args.cuda_graph_max_bs is not None:
         # v0.5.17 split the ServerArgs field into per-mode knobs.
         extra["cuda_graph_max_bs_decode"] = args.cuda_graph_max_bs
+    if args.random_seed is not None:
+        extra["random_seed"] = args.random_seed
+    if args.enable_metrics:
+        extra["enable_metrics"] = True
     if args.trust_remote_code:
         extra["trust_remote_code"] = True
     if args.skip_server_warmup:
         extra["skip_server_warmup"] = True
-
-    server_args = build_smc_server_args(
+    if args.disable_cuda_graph:
+        extra["disable_cuda_graph"] = True
+    if args.disable_flashinfer_autotune:
+        extra["disable_flashinfer_autotune"] = True
+    return build_smc_server_args(
         model_path=args.model_path,
         draft_model_path=args.draft_model_path,
         n_particles=args.particles,
@@ -210,6 +295,11 @@ def main() -> None:
         max_running_requests=args.max_running_requests,
         **extra,
     )
+
+
+def main() -> None:
+    args = build_cli_parser().parse_args()
+    server_args = server_args_from_cli(args)
     launch_smc_http_server(server_args)
 
 

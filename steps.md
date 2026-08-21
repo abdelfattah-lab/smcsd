@@ -1,6 +1,7 @@
 # TTS: Test-Time-Scaling Serving with Composite SMC Objectives
 
-Status: project roadmap — revised 2026-08-20 (scorer designs A/B, offline decision gates, evidence-gated multi-target, engine prerequisites from the v0.5.17 review)  
+Status: project roadmap — revised 2026-08-21 (CUDA-graph Qwen3.5 agent serving, matched target AR, frozen Terminal-Bench dev matrix, and joined agent/server metrics complete; semantic scoring not started)
+
 Branch: `tts`  
 Starting point: the existing one-draft, one-target SM-CSD implementation
 
@@ -88,17 +89,19 @@ Important integration points:
 - The KV co-budget configurator is dead code at HEAD (review finding F5): the
   target silently gets stock sizing and ignores the computed target+draft
   split. Prerequisite fix for any multi-model memory plan (Phase 0).
-- Decode-dispatch observability existed and was removed: `SMC_GRAPH_STATS`
-  (added in commit b142421, dropped in 514eaf3). Resurrect it for Phase 1
-  instead of rebuilding.
+- Decode-dispatch observability is available through `SMC_GRAPH_STATS`; the
+  Terminal-Bench launcher exposes it and a B200 tool-contract run reported
+  eight `cycle_graph` hits in eight cycles with no fallback.
 - Fixed-seed determinism holds in the sequential event loop (verified
   seed-for-seed on B200); the overlap loop intentionally shifts RNG
   consumption — golden tests must pin the loop mode.
 - SMC runs only through `SMCEngine` (offline) and `smcsd.http_server`
   (server); `sgl.Engine(speculative_algorithm="SMC")` deliberately raises on
   the vendored tree. The Phase 8 baseline harness must respect this.
-- The hybrid (Mamba/GDN) path is broken at HEAD (findings F4/F7): pick
-  non-hybrid model families in Phase 0 or land those fixes first.
+- The current branch contains the earlier hybrid-state fixes and now restores
+  the real full-attention layer map for dense AR draft workers. Live B200
+  Qwen3.5-2B/Qwen3.5-9B runs pass streamed tool calls and capture target,
+  draft, and deferred-cycle CUDA graphs; runtime logs confirm graph dispatch.
 
 
 
@@ -409,12 +412,14 @@ order before any major engine work, and the first online experiment
 - [ ] Define what accelerator time includes.
 - [ ] Choose development and held-out test splits.
 - [ ] Record dependency versions, model revisions, seeds, and hardware.
-- [ ] Add a run manifest and machine-readable result schema.
+- [x] Add a run manifest and machine-readable result schema
+      (`configs/terminal_bench/likelihood_dev_v1.json`; Harbor result plus
+      `experiment.json` and Prometheus snapshots).
 - [ ] Decide the first paper claim and go/no-go thresholds before optimizing.
 - [ ] Fix and validate the KV co-budget configurator (review finding F5) —
       every multi-model memory plan below depends on it.
-- [ ] Resurrect the `SMC_GRAPH_STATS` dispatch counters (commit b142421) as
-      the seed of Phase 1 instrumentation.
+- [x] Expose and validate the `SMC_GRAPH_STATS` dispatch counters, including a
+      configurable debug print interval for short contract tests.
 - [ ] Pin golden fixed-seed tests to the sequential event loop.
 
 Exit criterion: one written experiment contract applies unchanged to every
@@ -422,6 +427,20 @@ method, and the engine prerequisites are merged.
 
 ### Phase 1 — Reproduce, instrument, and test draft adequacy
 
+- [x] Add a turn-local Pi/Terminal-Bench 2.1 harness through the OpenAI chat
+      server, including automatic streamed tool-call and tool-history contract
+      validation (`docs/terminal_bench.md`).
+- [x] Run the first B200 `fix-git` correctness smoke at `N={1,4,8}` with
+      Qwen3.5-2B/Qwen3.5-9B: rewards `{0,0,1}`. This is a harness milestone,
+      not statistical evidence.
+- [x] Freeze a 12-task Terminal-Bench 2.1 development set, three seeds, and the
+      AR plus `N={1,4,8,16}` × `gamma={2,4,8}` likelihood-only matrix.
+- [ ] Add the self-consistency control to the same manifest and runner.
+- [x] Fix and validate Qwen3.5 draft CUDA-graph capture on B200, including
+      target/draft/cycle capture, eight-of-eight cycle-graph dispatch, and
+      streamed tool calls.
+- [x] Add a true target-only stock-SGLang AR launcher with matched agent API,
+      seed, metrics, and request limit; validate it end to end on B200.
 - [ ] Run one draft + one target + likelihood-only on a small reasoning set.
 - [ ] Confirm deterministic fixed-seed repeatability where expected
       (verified 2026-08-19 in the sequential loop).
@@ -430,8 +449,11 @@ method, and the engine prerequisites are merged.
       decode, postprocess.
 - [ ] Record draft, target, and accepted/generated token counts.
 - [ ] Record ESS, resampling count, unique ancestors, KV usage, peak memory.
-- [ ] Add QPS, p50/p95 latency, accelerator-seconds/query, and correct
-      answers/GPU-hour.
+- [x] Add per-job active-model QPS/time per query, mean TTFT/inter-token
+      latency, agent wall time, and correct tasks per agent GPU-hour by joining
+      SGLang Prometheus snapshots with Harbor/Pi results.
+- [ ] Add saturated QPS, p50/p95 latency, and accelerator-seconds/query through
+      controlled frozen-trace replay.
 - [ ] Save a golden configuration and result for regression testing.
 - [ ] **Draft-adequacy diagnostic:** ESS decay rate and unique-ancestor
       half-life on GSM8K vs a MATH500 subset, across `N` and `gamma`.
@@ -573,6 +595,8 @@ without changing accuracy outside confidence intervals.
 
 ### Phase 8 — Full baseline implementation
 
+- [x] Add and validate the target-only AR baseline on the same vendored stock
+      SGLang serving stack and Pi contract.
 - [ ] Implement the baseline list in Section 9 through one harness (SMC
       methods via `SMCEngine`/`smcsd.http_server`; stock methods via stock
       engines on the same vendored tree).
@@ -1044,4 +1068,3 @@ against the Phase 3 eager implementation.
 - [SMC-SD](https://arxiv.org/abs/2604.15672)
 - [Reward-Guided Speculative Decoding](https://arxiv.org/abs/2501.19324)
 - [ETS](https://arxiv.org/abs/2502.13575)
-

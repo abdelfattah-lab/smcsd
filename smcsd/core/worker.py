@@ -40,6 +40,42 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 logger = logging.getLogger(__name__)
 
 
+def _restore_dense_draft_hybrid_layer_map(model_runner) -> None:
+    """Undo SGLang's MTP-only hybrid draft layer-map assumption.
+
+    SGLang constructs hybrid attention backends with ``full_attn_layers=[0]``
+    whenever ``ModelRunner.is_draft_worker`` is true.  That is correct for its
+    one-layer MTP/NEXTN draft models, but SMC dense drafts deliberately keep a
+    complete autoregressive model.  Restore the full-attention layer IDs from
+    that model's config so linear layers (notably Qwen3.5 layer 0) are routed to
+    the linear backend.
+    """
+    backend = getattr(model_runner, "attn_backend", None)
+    if backend is None or not hasattr(backend, "full_attn_layers"):
+        return
+
+    model_config = model_runner.model_config
+    configured_layers = getattr(model_config, "full_attention_layer_ids", None)
+    if configured_layers is None:
+        hybrid_config = _hybrid_gdn_config(model_config)
+        configured_layers = getattr(
+            hybrid_config, "full_attention_layer_ids", None
+        )
+    if configured_layers is None:
+        return
+
+    layer_info = getattr(model_runner, "layer_info", None)
+    if layer_info is None:
+        backend.full_attn_layers = list(configured_layers)
+        return
+
+    backend.full_attn_layers = [
+        layer_id
+        for layer_id in configured_layers
+        if layer_info.start_layer <= layer_id < layer_info.end_layer
+    ]
+
+
 class SMCDenseDraftTpModelWorker(TpModelWorker):
     """Draft worker that keeps a standalone draft model as a normal LM.
 
@@ -66,6 +102,10 @@ class SMCDenseDraftTpModelWorker(TpModelWorker):
             model_revision=self.server_args.speculative_draft_model_revision,
             is_draft_model=False,
         )
+
+    def init_attention_backends(self):
+        super().init_attention_backends()
+        _restore_dense_draft_hybrid_layer_map(self.model_runner)
 
 
 class SMCWorker(BaseSpecWorker):
@@ -111,6 +151,9 @@ class SMCWorker(BaseSpecWorker):
         # (cycle graph vs fallback tiers); summary printed every 100 cycles.
         self._graph_stats = (
             {} if os.environ.get("SMC_GRAPH_STATS") == "1" else None
+        )
+        self._graph_stats_interval = max(
+            1, int(os.environ.get("SMC_GRAPH_STATS_INTERVAL", "100"))
         )
         # Debug-only: dump draft KV positions / cache-loc mapping for the first
         # few decode calls to confirm the prefill→step-0 position convention
@@ -1071,7 +1114,7 @@ class SMCWorker(BaseSpecWorker):
             return
         st[key] = st.get(key, 0) + 1
         st["_n"] = st.get("_n", 0) + 1
-        if st["_n"] % 100 == 0:
+        if st["_n"] % self._graph_stats_interval == 0:
             print(f"[SMC_GRAPH_STATS] {st}", flush=True)
 
     def _forward_decode(self, batch: ScheduleBatch):
