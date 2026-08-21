@@ -104,12 +104,19 @@ def aggregate_job(job_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     metadata = json.loads((job_dir / "experiment.json").read_text())
     trials = trial_rows(job_dir, metadata)
     delta = prom_delta(job_dir)
-    completed = [row for row in trials if not row["errored"]]
-    agent_seconds = sum(row["agent_wall_time_s"] or 0.0 for row in completed)
-    reward_sum = sum(float(row["reward"] or 0.0) for row in completed)
-    provider_requests = sum(row["provider_requests"] for row in completed)
-    input_tokens = sum(row["agent_input_tokens"] for row in completed)
-    output_tokens = sum(row["agent_output_tokens"] for row in completed)
+    expected_trials = len(metadata.get("tasks") or trials)
+    non_error_trials = [row for row in trials if not row["errored"]]
+    explicit_errors = len(trials) - len(non_error_trials)
+    missing_trials = max(expected_trials - len(trials), 0)
+
+    # Timeouts and non-zero agent exits are benchmark outcomes, not absent data.
+    # Count them as zero reward and include the resources they consumed. Dropping
+    # them makes both accuracy and correct-tasks/GPU-hour look artificially high.
+    agent_seconds = sum(row["agent_wall_time_s"] or 0.0 for row in trials)
+    reward_sum = sum(float(row["reward"] or 0.0) for row in trials)
+    provider_requests = sum(row["provider_requests"] for row in trials)
+    input_tokens = sum(row["agent_input_tokens"] for row in trials)
+    output_tokens = sum(row["agent_output_tokens"] for row in trials)
     request_count = delta.get("sglang:num_requests_total", 0.0)
     prompt_tokens = delta.get("sglang:prompt_tokens_total", 0.0)
     generation_tokens = delta.get("sglang:generation_tokens_total", 0.0)
@@ -127,12 +134,15 @@ def aggregate_job(job_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         "gamma": metadata["spec"].get("gamma"),
         "seed": metadata["spec"]["seed"],
         "n_trials": len(trials),
-        "n_completed": len(completed),
-        "n_errors": len(trials) - len(completed),
+        "n_expected_trials": expected_trials,
+        "n_completed": len(trials),
+        "n_non_error": len(non_error_trials),
+        "n_errors": explicit_errors + missing_trials,
+        "n_missing_trials": missing_trials,
         "reward_sum": reward_sum,
-        "pass_rate": ratio(reward_sum, len(completed)),
+        "pass_rate": ratio(reward_sum, expected_trials),
         "agent_wall_time_s": agent_seconds,
-        "tasks_per_agent_gpu_hour": ratio(len(completed) * 3600.0, agent_seconds),
+        "tasks_per_agent_gpu_hour": ratio(len(trials) * 3600.0, agent_seconds),
         "correct_tasks_per_agent_gpu_hour": ratio(reward_sum * 3600.0, agent_seconds),
         "provider_requests": provider_requests,
         "provider_requests_per_agent_s": ratio(provider_requests, agent_seconds),

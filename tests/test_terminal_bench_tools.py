@@ -78,3 +78,67 @@ def test_prometheus_parser_sums_labeled_series(tmp_path: Path) -> None:
     assert (
         summary.average_histogram(parsed, "sglang:e2e_request_latency_seconds") == 0.25
     )
+
+
+def test_summary_counts_errored_trials_as_failed_work(tmp_path: Path) -> None:
+    summary = load_script(
+        "summarize_pi_jobs_error_accounting_test",
+        "scripts/terminal_bench/summarize_pi_jobs.py",
+    )
+    metadata = {
+        "job_name": "screen-ar-seed0",
+        "run_tag": "screen-seed0",
+        "tasks": ["task-ok", "task-timeout"],
+        "spec": {"method": "ar", "seed": 0},
+        "measurement_started_at": "2026-01-01T00:00:00Z",
+        "measurement_finished_at": "2026-01-01T00:01:00Z",
+    }
+    (tmp_path / "experiment.json").write_text(json.dumps(metadata))
+    (tmp_path / "prometheus_before.prom").write_text("")
+    (tmp_path / "prometheus_after.prom").write_text("")
+
+    cases = [
+        ("task-ok", 1.0, None, 10, 100, 20),
+        (
+            "task-timeout",
+            None,
+            {"exception_type": "AgentTimeoutError"},
+            20,
+            200,
+            30,
+        ),
+    ]
+    for task, reward, exception, seconds, input_tokens, output_tokens in cases:
+        trial_dir = tmp_path / task
+        trial_dir.mkdir()
+        result = {
+            "task_name": task,
+            "trial_name": task,
+            "started_at": "2026-01-01T00:00:00Z",
+            "finished_at": "2026-01-01T00:01:00Z",
+            "agent_execution": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": f"2026-01-01T00:00:{seconds:02d}Z",
+            },
+            "agent_result": {
+                "n_input_tokens": input_tokens,
+                "n_output_tokens": output_tokens,
+            },
+            "verifier_result": {"rewards": {"reward": reward}},
+            "exception_info": exception,
+        }
+        (trial_dir / "result.json").write_text(json.dumps(result))
+
+    aggregate, trials = summary.aggregate_job(tmp_path)
+
+    assert len(trials) == 2
+    assert aggregate["n_expected_trials"] == 2
+    assert aggregate["n_completed"] == 2
+    assert aggregate["n_non_error"] == 1
+    assert aggregate["n_errors"] == 1
+    assert aggregate["reward_sum"] == 1.0
+    assert aggregate["pass_rate"] == 0.5
+    assert aggregate["agent_wall_time_s"] == 30.0
+    assert aggregate["correct_tasks_per_agent_gpu_hour"] == 120.0
+    assert aggregate["agent_input_tokens"] == 300
+    assert aggregate["agent_output_tokens"] == 50
