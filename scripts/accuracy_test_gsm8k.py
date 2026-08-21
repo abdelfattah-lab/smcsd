@@ -146,6 +146,7 @@ def run_smc_engine_eval(args, prompts, labels):
 
     with SMCEngine(**engine_kwargs) as engine:
         preds = []
+        _pmaj_votes = []
         total_output_tokens = 0
         tic = time.perf_counter()
         for start in range(0, len(prompts), args.batch_size):
@@ -162,6 +163,10 @@ def run_smc_engine_eval(args, prompts, labels):
                     print()
                 preds.append(extract_answer(output["text"]))
                 total_output_tokens += output["completion_tokens"]
+                ptexts = output.get("smc_particle_texts")
+                _pmaj_votes.append(
+                    [extract_answer(t) for t in ptexts] if ptexts else None
+                )
             elapsed = time.perf_counter() - tic
             correct = sum(
                 p == l for p, l in zip(preds, labels[: len(preds)])
@@ -175,6 +180,23 @@ def run_smc_engine_eval(args, prompts, labels):
             )
         latency = time.perf_counter() - tic
 
+    from collections import Counter as _Counter
+
+    pm = pk = valid = 0
+    for votes, gold in zip(_pmaj_votes, labels):
+        if votes is None:
+            continue
+        valid += 1
+        vs = [v for v in votes if v is not None]
+        if vs and _Counter(vs).most_common(1)[0][0] == gold:
+            pm += 1
+        if gold in vs:
+            pk += 1
+    if valid:
+        print(
+            f"\n  Particle-majority:  {pm}/{valid} ({100 * pm / valid:.1f}%)"
+            f"\n  Pass@particles:     {pk}/{valid} ({100 * pk / valid:.1f}%)"
+        )
     return preds, total_output_tokens, latency
 
 
