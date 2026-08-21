@@ -75,6 +75,10 @@ def resolved_resample_threshold(metadata: dict[str, Any]) -> float | None:
     return spec.get("resample_threshold", 0.5)
 
 
+def resolved_mem_fraction_static(metadata: dict[str, Any]) -> float:
+    return (metadata.get("server_config") or {}).get("mem_fraction_static", 0.4)
+
+
 def trial_rows(job_dir: Path, metadata: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for result_path in sorted(job_dir.glob("*/result.json")):
@@ -91,6 +95,7 @@ def trial_rows(job_dir: Path, metadata: dict[str, Any]) -> list[dict[str, Any]]:
                 "particles": metadata["spec"].get("particles"),
                 "gamma": metadata["spec"].get("gamma"),
                 "resample_threshold": resolved_resample_threshold(metadata),
+                "mem_fraction_static": resolved_mem_fraction_static(metadata),
                 "seed": metadata["spec"]["seed"],
                 "task": result.get("task_name"),
                 "trial_name": result.get("trial_name"),
@@ -141,6 +146,7 @@ def aggregate_job(job_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         "particles": metadata["spec"].get("particles"),
         "gamma": metadata["spec"].get("gamma"),
         "resample_threshold": resolved_resample_threshold(metadata),
+        "mem_fraction_static": resolved_mem_fraction_static(metadata),
         "seed": metadata["spec"]["seed"],
         "n_trials": len(trials),
         "n_expected_trials": expected_trials,

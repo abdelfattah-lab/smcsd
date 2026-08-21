@@ -76,6 +76,7 @@ def test_no_resample_manifest_expands_to_four_seed_zero_jobs() -> None:
         "smcsd-n32-g8-r0",
     ]
     assert all(spec.resample_threshold == 0.0 for spec in specs)
+    assert manifest["server"]["mem_fraction_static"] == 0.4
 
 
 def test_prometheus_parser_sums_labeled_series(tmp_path: Path) -> None:

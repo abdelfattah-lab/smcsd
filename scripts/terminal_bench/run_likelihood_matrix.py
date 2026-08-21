@@ -217,6 +217,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-configs", type=int)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        help="Override the manifest's static GPU-memory fraction",
+    )
     parser.add_argument("--server-timeout", type=float, default=600.0)
     parser.add_argument(
         "--substrate-root",
@@ -272,6 +277,11 @@ def run_one(
         )
     )
     server_env = os.environ.copy()
+    mem_fraction_static = (
+        args.mem_fraction_static
+        if args.mem_fraction_static is not None
+        else manifest["server"].get("mem_fraction_static", 0.4)
+    )
     server_env.update(
         {
             "GPU_DEVICE": args.gpu,
@@ -281,6 +291,7 @@ def run_one(
             "RANDOM_SEED": str(spec.seed),
             "ENABLE_METRICS": "true",
             "DISABLE_FLASHINFER_AUTOTUNE": "false",
+            "MEM_FRACTION_STATIC": str(mem_fraction_static),
         }
     )
     if spec.method == "smcsd":
@@ -309,6 +320,7 @@ def run_one(
         },
         "tasks": tasks,
         "models": manifest["models"],
+        "server_config": {"mem_fraction_static": mem_fraction_static},
         "revisions": revisions,
         "gpu_device": args.gpu,
         "server_log": str(log_path),
@@ -405,6 +417,15 @@ def main() -> int:
         raise RuntimeError("only experiment schema_version=1 is supported")
 
     specs = filter_specs(expand_specs(manifest), args)
+    mem_fraction_static = (
+        args.mem_fraction_static
+        if args.mem_fraction_static is not None
+        else manifest["server"].get("mem_fraction_static", 0.4)
+    )
+    if not 0.0 < mem_fraction_static < 1.0:
+        raise RuntimeError(
+            f"mem_fraction_static must be in (0, 1): {mem_fraction_static}"
+        )
     invalid_thresholds = [
         spec.resample_threshold
         for spec in specs
@@ -449,6 +470,7 @@ def main() -> int:
             "particles": spec.particles,
             "gamma": spec.gamma,
             "resample_threshold": spec.resample_threshold,
+            "mem_fraction_static": mem_fraction_static,
             "seed": spec.seed,
             "tasks": tasks,
         }

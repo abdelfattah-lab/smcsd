@@ -34,6 +34,7 @@
   },
   "server": {
     "max_running_requests": 1,
+    "mem_fraction_static": 0.4,
     "cuda_graphs": true,
     "flashinfer_autotune": true,
     "enable_metrics": true,

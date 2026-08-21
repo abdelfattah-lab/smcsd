@@ -172,6 +172,10 @@ and included in aggregate/trial CSVs. `SMC_SMC_STATS=1` enables ESS telemetry
 for separate diagnostic runs only; it synchronizes the GPU every cycle and
 must remain disabled for performance measurements.
 
+If a larger particle population exhausts the frozen 0.4 KV-cache budget, use
+`--mem-fraction-static` for a separately reported feasibility retry. The
+effective value is stored in `experiment.json` and both summary CSVs.
+
 ## B200 smoke result (2026-08-21)
 
 The first end-to-end smoke used one NVIDIA B200, Qwen3.5-2B as draft,
