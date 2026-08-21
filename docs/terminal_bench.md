@@ -155,6 +155,23 @@ inter-token latency, request rate, and model token counters. Its server QPS is
 active model requests divided by summed model-request latency. Saturated QPS
 and latency percentiles still require the frozen trace-replay benchmark.
 
+### No-resampling diversity ablation
+
+`configs/terminal_bench/no_resample_dev_v1.json` freezes the seed-0
+`N={16,32}` × `gamma={4,8}` ablation with ESS resampling disabled. Preview it
+with:
+
+```bash
+python scripts/terminal_bench/run_likelihood_matrix.py \
+  --manifest configs/terminal_bench/no_resample_dev_v1.json \
+  --run-tag no-resample-seed0
+```
+
+The effective resampling threshold is stored in every job's `experiment.json`
+and included in aggregate/trial CSVs. `SMC_SMC_STATS=1` enables ESS telemetry
+for separate diagnostic runs only; it synchronizes the GPU every cycle and
+must remain disabled for performance measurements.
+
 ## B200 smoke result (2026-08-21)
 
 The first end-to-end smoke used one NVIDIA B200, Qwen3.5-2B as draft,

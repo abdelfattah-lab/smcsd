@@ -34,18 +34,29 @@ class RunSpec:
     seed: int
     particles: int | None = None
     gamma: int | None = None
+    resample_threshold: float | None = None
 
     @property
     def setting(self) -> str:
         if self.method == "ar":
             return "ar"
-        return f"smcsd-n{self.particles}-g{self.gamma}"
+        setting = f"smcsd-n{self.particles}-g{self.gamma}"
+        if self.resample_threshold is not None and self.resample_threshold != 0.5:
+            threshold = f"{self.resample_threshold:g}".replace(".", "p")
+            setting += f"-r{threshold}"
+        return setting
 
 
 def _csv_ints(value: str | None) -> set[int] | None:
     if value is None:
         return None
     return {int(item.strip()) for item in value.split(",") if item.strip()}
+
+
+def _csv_floats(value: str | None) -> set[float] | None:
+    if value is None:
+        return None
+    return {float(item.strip()) for item in value.split(",") if item.strip()}
 
 
 def _csv_strings(value: str | None) -> set[str] | None:
@@ -56,6 +67,10 @@ def _csv_strings(value: str | None) -> set[str] | None:
 
 def expand_specs(manifest: dict[str, Any]) -> list[RunSpec]:
     matrix = manifest["matrix"]
+    thresholds = matrix.get(
+        "resample_thresholds",
+        [manifest.get("server", {}).get("resample_threshold", 0.5)],
+    )
     specs: list[RunSpec] = []
     for seed in matrix["seeds"]:
         if "ar" in matrix["methods"]:
@@ -63,14 +78,16 @@ def expand_specs(manifest: dict[str, Any]) -> list[RunSpec]:
         if "smcsd" in matrix["methods"]:
             for particles in matrix["particles"]:
                 for gamma in matrix["gamma"]:
-                    specs.append(
-                        RunSpec(
-                            method="smcsd",
-                            seed=seed,
-                            particles=particles,
-                            gamma=gamma,
+                    for resample_threshold in thresholds:
+                        specs.append(
+                            RunSpec(
+                                method="smcsd",
+                                seed=seed,
+                                particles=particles,
+                                gamma=gamma,
+                                resample_threshold=resample_threshold,
+                            )
                         )
-                    )
     return specs
 
 
@@ -78,6 +95,7 @@ def filter_specs(specs: Iterable[RunSpec], args: argparse.Namespace) -> list[Run
     methods = _csv_strings(args.methods)
     particles = _csv_ints(args.particles)
     gammas = _csv_ints(args.gamma)
+    resample_thresholds = _csv_floats(args.resample_thresholds)
     seeds = _csv_ints(args.seeds)
     selected = [
         spec
@@ -89,6 +107,10 @@ def filter_specs(specs: Iterable[RunSpec], args: argparse.Namespace) -> list[Run
             or (
                 (particles is None or spec.particles in particles)
                 and (gammas is None or spec.gamma in gammas)
+                and (
+                    resample_thresholds is None
+                    or spec.resample_threshold in resample_thresholds
+                )
             )
         )
     ]
@@ -182,6 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--methods", help="Comma-separated subset: ar,smcsd")
     parser.add_argument("--particles", help="Comma-separated SM-CSD N values")
     parser.add_argument("--gamma", help="Comma-separated SM-CSD gamma values")
+    parser.add_argument(
+        "--resample-thresholds",
+        help="Comma-separated SM-CSD ESS thresholds (0 disables resampling)",
+    )
     parser.add_argument("--seeds", help="Comma-separated seeds")
     parser.add_argument("--tasks", help="Comma-separated frozen task subset")
     parser.add_argument(
@@ -263,6 +289,7 @@ def run_one(
                 "DRAFT_MODEL": manifest["models"]["draft"],
                 "PARTICLES": str(spec.particles),
                 "GAMMA": str(spec.gamma),
+                "RESAMPLE_THRESHOLD": str(spec.resample_threshold),
                 "DISABLE_CUDA_GRAPH": "false",
             }
         )
@@ -277,6 +304,7 @@ def run_one(
             "method": spec.method,
             "particles": spec.particles,
             "gamma": spec.gamma,
+            "resample_threshold": spec.resample_threshold,
             "seed": spec.seed,
         },
         "tasks": tasks,
@@ -377,6 +405,16 @@ def main() -> int:
         raise RuntimeError("only experiment schema_version=1 is supported")
 
     specs = filter_specs(expand_specs(manifest), args)
+    invalid_thresholds = [
+        spec.resample_threshold
+        for spec in specs
+        if spec.resample_threshold is not None
+        and not 0.0 <= spec.resample_threshold <= 1.0
+    ]
+    if invalid_thresholds:
+        raise RuntimeError(
+            f"resample thresholds must be in [0, 1]: {invalid_thresholds}"
+        )
     frozen_tasks = [entry["id"] for entry in manifest["benchmark"]["tasks"]]
     requested_tasks = _csv_strings(args.tasks)
     tasks = [
@@ -410,6 +448,7 @@ def main() -> int:
             "method": spec.method,
             "particles": spec.particles,
             "gamma": spec.gamma,
+            "resample_threshold": spec.resample_threshold,
             "seed": spec.seed,
             "tasks": tasks,
         }

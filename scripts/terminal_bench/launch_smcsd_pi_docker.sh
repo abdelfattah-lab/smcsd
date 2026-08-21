@@ -11,6 +11,7 @@ GPU_DEVICE="${GPU_DEVICE:-0}"
 PORT="${PORT:-30000}"
 PARTICLES="${PARTICLES:-4}"
 GAMMA="${GAMMA:-4}"
+RESAMPLE_THRESHOLD="${RESAMPLE_THRESHOLD:-0.5}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.4}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-auto}"
@@ -23,6 +24,7 @@ RANDOM_SEED="${RANDOM_SEED:-0}"
 ENABLE_METRICS="${ENABLE_METRICS:-true}"
 SMC_GRAPH_STATS="${SMC_GRAPH_STATS:-0}"
 SMC_GRAPH_STATS_INTERVAL="${SMC_GRAPH_STATS_INTERVAL:-100}"
+SMC_SMC_STATS="${SMC_SMC_STATS:-0}"
 
 extra=()
 if [[ "${DISABLE_CUDA_GRAPH}" == "true" ]]; then
@@ -50,6 +52,7 @@ exec docker run --rm \
   -e FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-smcsd-pi \
   -e "SMC_GRAPH_STATS=${SMC_GRAPH_STATS}" \
   -e "SMC_GRAPH_STATS_INTERVAL=${SMC_GRAPH_STATS_INTERVAL}" \
+  -e "SMC_SMC_STATS=${SMC_SMC_STATS}" \
   "${SMCSD_IMAGE}" \
   python -m smcsd.http_server \
     --model "${TARGET_MODEL}" \
@@ -59,6 +62,7 @@ exec docker run --rm \
     --port "${PORT}" \
     --particles "${PARTICLES}" \
     --gamma "${GAMMA}" \
+    --resample-threshold "${RESAMPLE_THRESHOLD}" \
     --max-running-requests "${MAX_RUNNING_REQUESTS}" \
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \
     --random-seed "${RANDOM_SEED}" \

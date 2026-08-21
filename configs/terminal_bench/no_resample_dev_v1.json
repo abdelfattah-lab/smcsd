@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "experiment_id": "tb21-likelihood-dev-v1",
-  "purpose": "Development sweep for target-only AR versus likelihood-only SM-CSD. This set may be used for tuning and is not the held-out paper test set.",
+  "experiment_id": "tb21-no-resample-dev-v1",
+  "purpose": "Seed-0 diversity ablation with likelihood-only SM-CSD resampling disabled. This is a development set, not a held-out paper result.",
   "benchmark": {
     "name": "terminal-bench-2.1",
     "dataset_commit": "7131e4375048a0e408a8fb404b5f499d726b695b",
@@ -37,13 +37,14 @@
     "cuda_graphs": true,
     "flashinfer_autotune": true,
     "enable_metrics": true,
-    "resample_threshold": 0.5
+    "resample_threshold": 0.0
   },
   "matrix": {
-    "methods": ["ar", "smcsd"],
-    "particles": [1, 4, 8, 16],
-    "gamma": [2, 4, 8],
-    "seeds": [0, 1, 2]
+    "methods": ["smcsd"],
+    "particles": [16, 32],
+    "gamma": [4, 8],
+    "resample_thresholds": [0.0],
+    "seeds": [0]
   },
   "primary_metrics": [
     "terminal_bench_reward",

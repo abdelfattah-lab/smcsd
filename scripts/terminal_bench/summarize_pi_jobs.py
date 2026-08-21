@@ -68,6 +68,13 @@ def provider_request_count(trial_dir: Path) -> int:
     return count
 
 
+def resolved_resample_threshold(metadata: dict[str, Any]) -> float | None:
+    spec = metadata["spec"]
+    if spec["method"] != "smcsd":
+        return None
+    return spec.get("resample_threshold", 0.5)
+
+
 def trial_rows(job_dir: Path, metadata: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for result_path in sorted(job_dir.glob("*/result.json")):
@@ -83,6 +90,7 @@ def trial_rows(job_dir: Path, metadata: dict[str, Any]) -> list[dict[str, Any]]:
                 "method": metadata["spec"]["method"],
                 "particles": metadata["spec"].get("particles"),
                 "gamma": metadata["spec"].get("gamma"),
+                "resample_threshold": resolved_resample_threshold(metadata),
                 "seed": metadata["spec"]["seed"],
                 "task": result.get("task_name"),
                 "trial_name": result.get("trial_name"),
@@ -132,6 +140,7 @@ def aggregate_job(job_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         "method": metadata["spec"]["method"],
         "particles": metadata["spec"].get("particles"),
         "gamma": metadata["spec"].get("gamma"),
+        "resample_threshold": resolved_resample_threshold(metadata),
         "seed": metadata["spec"]["seed"],
         "n_trials": len(trials),
         "n_expected_trials": expected_trials,
@@ -199,6 +208,8 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         setting = row["method"]
         if setting == "smcsd":
             setting = f"N{row['particles']}/g{row['gamma']}"
+            if row["resample_threshold"] != 0.5:
+                setting += f"/r{row['resample_threshold']:g}"
         table.append(
             [
                 setting,

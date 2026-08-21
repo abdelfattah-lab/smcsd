@@ -58,6 +58,26 @@ def test_likelihood_matrix_filters_one_matched_pair() -> None:
     assert [spec.setting for spec in specs] == ["ar", "smcsd-n4-g4"]
 
 
+def test_no_resample_manifest_expands_to_four_seed_zero_jobs() -> None:
+    runner = load_script(
+        "run_no_resample_matrix_test",
+        "scripts/terminal_bench/run_likelihood_matrix.py",
+    )
+    manifest = json.loads(
+        (REPO_ROOT / "configs/terminal_bench/no_resample_dev_v1.json").read_text()
+    )
+
+    specs = runner.expand_specs(manifest)
+
+    assert [spec.setting for spec in specs] == [
+        "smcsd-n16-g4-r0",
+        "smcsd-n16-g8-r0",
+        "smcsd-n32-g4-r0",
+        "smcsd-n32-g8-r0",
+    ]
+    assert all(spec.resample_threshold == 0.0 for spec in specs)
+
+
 def test_prometheus_parser_sums_labeled_series(tmp_path: Path) -> None:
     summary = load_script(
         "summarize_pi_jobs_test",
