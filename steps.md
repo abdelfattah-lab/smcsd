@@ -2,8 +2,9 @@
 
 Status: project roadmap — revised 2026-08-24. The OlympiadBench semantic and
 likelihood gates remain negative, but the frozen Terminal-Bench semantic
-actionability gate passed. Deterministic terminal replay now passes real and
-synthetic fork tests; the host-side online trajectory controller is next.
+actionability gate passed. Deterministic replay and the live two-sibling
+controller now pass; semantic scoring/resampling and the first `N` sweep are
+next.
 
 Branch: `semantic-smc-test-time-scaling`
 Starting point: the existing one-draft, one-target SM-CSD implementation
@@ -1093,14 +1094,22 @@ backend binds transcript, checkpoint/model-prefix identity, lineage, and cost.
 It supports 253/288 frozen sessions (87.85%) and fails closed on the remaining
 35 with ambiguous failed writes/edits or unsupported tool names.
 
-The remaining promotion condition is the online trajectory controller. It
-must own one replayed environment, transcript, model continuation/KV lineage,
-and cost ledger per particle; route each generated tool call to the matching
-container; and resample all five together. Replaying environments alone is not
-yet online semantic SMC.
+**Online-controller outcome: PASS (2026-08-24).** From the real `fix-git`
+tool-12 checkpoint, two independently seeded Qwen3.5-9B siblings started with
+identical environment and serialized model-prefix state, then diverged in both
+prefix and filesystem. Resampling slot 0 over slot 1 copied filesystem,
+processes, 30-message prefix, and lineage exactly; both children then continued
+through another live model/tool transition. Final 32-message/15-event sidecars
+are replay-restorable, and a clean restore reproduced the sealed state. The
+controller globally accounts actual model, token, tool, and replay work without
+double-counting duplicated ancestry.
 
-After the controller passes an end-to-end sibling continuation test, sweep
-one dimension at a time rather than taking a Cartesian product:
+The correctness smoke still selects slot 0 deterministically and exports exact
+messages rather than a persistent KV handle. It is therefore a validated online
+particle substrate, not yet the semantic-SMC experiment. Connect Qwen3.8-27B
+scoring, ESS weighting/resampling, and full generator/verifier allocation-window
+accounting next. Then sweep one dimension at a time rather than taking a
+Cartesian product:
 
 1. use Qwen3.8-27B, a 256-token interval, one call, and ESS threshold 0.5;
    scale `N in {4,8,16,32,64}`;

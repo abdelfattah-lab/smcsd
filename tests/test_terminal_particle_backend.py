@@ -358,3 +358,26 @@ def test_frozen_tool_environment_normalizes_iso_and_epoch_milliseconds():
     assert iso["GIT_COMMITTER_DATE"] == iso["GIT_AUTHOR_DATE"]
     assert iso["SOURCE_DATE_EPOCH"] == "1787590326"
     assert iso["TZ"] == "UTC"
+
+
+def test_replay_skips_proven_failed_no_mutation_event():
+    backend = load_backend()
+    event = {
+        "call_id": "safe-failed-edit",
+        "name": "edit",
+        "arguments": {
+            "path": "/app/value",
+            "edits": [{"oldText": "missing", "newText": "value"}],
+        },
+        "expected_error": True,
+        "mutation_status": "none",
+    }
+
+    result = backend.replay_event(
+        FakeDocker(),
+        "particle",
+        event,
+        workdir="/app",
+    )
+
+    assert result["status"] == "skipped_failed_no_mutation"

@@ -454,9 +454,64 @@ failed `write`, and seven contain an unsupported/malformed tool name; three
 sessions have overlapping reasons. Failed write/edit atomicity has not yet
 been proven, so these events are deliberately not guessed through.
 
-This backend materializes terminal state; it does not yet fork a live model KV
-cache or drive multiple Pi continuations. The next implementation is a
-host-side trajectory controller that owns one container, transcript, model
-continuation, lineage, and ledger per particle. Once that controller passes an
-end-to-end two-sibling continuation test, run the frozen one-factor `N` sweep
-through 64 before varying checkpoint interval or verifier calls through 8.
+### Online two-sibling controller (2026-08-24)
+
+`scripts/terminal_bench/terminal_particle_controller.py` now owns the coupled
+online state. A shared OpenAI-compatible model server receives each particle's
+exact serialized message prefix; the controller routes every returned
+`bash`/`read`/`write`/`edit` call to that particle's Docker container,
+seals the environment and transcript together, and resamples a survivor by
+validated replay. The global ledger counts actual model calls/tokens, tool
+calls, and replay work once rather than summing duplicated ancestral costs.
+
+The real checkpoint test is:
+
+```bash
+python scripts/terminal_bench/terminal_particle_controller.py live-smoke \
+  --manifest ~/agentbench/semantic-actionability/\
+fix-git-prefix12-replay-manifest.json \
+  --capture /path/to/requests-1224.jsonl \
+  --after-tool-call-id call_c18c2fb811214ce7982ae505 \
+  --base-url http://127.0.0.1:30000 \
+  --pre-resample-turns 2 --post-resample-turns 1 \
+  --output ~/agentbench/semantic-actionability/\
+terminal-particle-controller-live-smoke.json
+
+python scripts/terminal_bench/terminal_particle_controller.py restore \
+  --checkpoint ~/agentbench/semantic-actionability/\
+terminal-particle-controller-live-smoke.particles/slot-0.json \
+  --name restored-particle --cleanup
+```
+
+With Qwen3.5-9B and the real reward-1 `fix-git` tool-12 checkpoint:
+
+- both initial siblings had exactly the same filesystem/process state and the
+  same serialized model-prefix hash;
+- two independently seeded continuation rounds produced two distinct model
+  prefixes and two distinct filesystems;
+- resampling slot 0 over slot 1 copied filesystem, surviving processes,
+  30-message prefix, and lineage exactly;
+- both resampled siblings then made another live model/tool transition;
+- the final sidecars each contain 15 replay events and 32 messages, with the
+  message hash bound into the replay manifest;
+- restoring one sidecar from the pinned image replayed all 15 events in 1.141
+  seconds and reproduced its sealed filesystem/process state.
+
+The final coupling run made six model calls and six tool calls in 5.259 seconds:
+39,622 prompt tokens, 290 completion tokens, 1.742 aggregate model-request
+seconds, 0.322 tool seconds, and 3.097 seconds for the three environment
+materializations. These are active correctness-test costs. Model load/graph
+capture and the server's full allocation window were shared with contract and
+debug runs, so this artifact is not a serving-cost comparison.
+
+Safe tool validation failures that provably occur before mutation are recorded
+as replayable no-ops; failures after mutation begins still fail closed. The
+controller stores exact OpenAI messages and benefits from server prefix caching,
+but it does not yet export a persistent KV-cache handle.
+
+This closes the two-sibling correctness milestone. Selection in the smoke test
+is deliberately fixed to slot 0; no semantic verifier is used to choose it.
+Next, connect Qwen3.8-27B checkpoint scoring and ESS resampling to the generic
+controller, add full generator/verifier allocation-window accounting, and run
+the frozen one-factor `N in {4,8,16,32,64}` sweep before varying checkpoint
+interval or independent verifier calls through 8.

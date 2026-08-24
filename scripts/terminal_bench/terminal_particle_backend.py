@@ -514,6 +514,12 @@ def replay_event(
         }
 
     if expected_error:
+        if event.get("mutation_status") == "none":
+            return {
+                "call_id": event["call_id"],
+                "name": name,
+                "status": "skipped_failed_no_mutation",
+            }
         raise ReplayError(
             f"failed {name} call has ambiguous partial-mutation semantics: "
             f"{event['call_id']}"
@@ -705,6 +711,10 @@ def fork_manifest(
             ),
             "read_only_calls_skipped": sum(
                 row["status"] == "skipped_read_only" for row in calls
+            ),
+            "failed_no_mutation_calls_skipped": sum(
+                row["status"] == "skipped_failed_no_mutation"
+                for row in calls
             ),
         },
         "calls": calls,
