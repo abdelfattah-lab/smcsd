@@ -305,3 +305,95 @@ def test_failed_edit_validation_is_a_replayable_noop():
     assert event["expected_error"] is True
     assert event["mutation_status"] == "none"
     assert docker.files["particle"]["/app/value"] == "original"
+
+    call["id"] = "failed-edit-schema"
+    call["function"]["arguments"] = json.dumps(
+        {
+            "path": "/app/value",
+            "edits": {"oldText": "original", "newText": "changed"},
+        }
+    )
+    result, event = controller.execute_live_tool(
+        docker,
+        "particle",
+        call,
+        workdir="/app",
+    )
+    assert result.is_error is True
+    assert event["mutation_status"] == "none"
+    assert docker.files["particle"]["/app/value"] == "original"
+
+    unknown_call = {
+        "id": "unknown-tool",
+        "function": {"name": "browser", "arguments": "{}"},
+    }
+    result, event = controller.execute_live_tool(
+        docker,
+        "particle",
+        unknown_call,
+        workdir="/app",
+    )
+    assert result.is_error is True
+    assert event["mutation_status"] == "none"
+
+
+def test_malformed_model_tool_json_becomes_replayable_error():
+    controller = load_controller()
+    docker = FakeDocker(controller)
+
+    def model_caller(payload, timeout):
+        return {
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "malformed-edit",
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "arguments": '{"path": "/app/value"',
+                    },
+                }
+            ],
+            "finish_reason": "tool_calls",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            "latency_s": 0.1,
+        }
+
+    runtime = controller.TerminalParticleController(
+        docker,
+        request_template=request_template(),
+        base_url="http://unused",
+        temperature=0.7,
+        top_p=0.95,
+        max_tokens=64,
+        timeout_s=1,
+        model_caller=model_caller,
+    )
+    current = runtime.spawn(
+        sample_manifest(controller),
+        request_template()["messages"],
+        slot=0,
+        name="particle",
+    )
+    before = current.state
+
+    transition = runtime.advance(current, seed=0)
+
+    event = current.manifest["tool_events"][-1]
+    assert transition["finished"] is False
+    assert event["call_id"] == "malformed-edit"
+    assert event["expected_error"] is True
+    assert event["mutation_status"] == "none"
+    assert event["validation_error"] == "invalid_json_arguments"
+    assert event["arguments"]["raw_arguments"] == '{"path": "/app/value"'
+    normalized = json.loads(
+        current.messages[-2]["tool_calls"][0]["function"]["arguments"]
+    )
+    assert normalized == {
+        "_smcsd_invalid_json": '{"path": "/app/value"',
+    }
+    assert current.messages[-1]["role"] == "tool"
+    assert "invalid JSON arguments" in current.messages[-1]["content"]
+    assert current.state == before
+    assert current.generated_tokens == 5
+    runtime.remove_particles([current])

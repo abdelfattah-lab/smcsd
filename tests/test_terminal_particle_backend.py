@@ -188,6 +188,43 @@ class FakeDocker:
         return ["root\tS\tservice\tservice --foreground"]
 
 
+class RecordingDocker:
+    def __init__(self, backend):
+        class Recorder(backend.DockerCLI):
+            def __init__(self):
+                self.commands = []
+                self.copied = None
+
+            def run(self, arguments, **kwargs):
+                self.commands.append(arguments)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def copy_to(self, source, container, destination):
+                self.copied = (
+                    source.read_text(encoding="utf-8"),
+                    container,
+                    destination,
+                )
+
+        self.instance = Recorder()
+
+
+def test_write_text_creates_missing_parent_before_copy():
+    backend = load_backend()
+    docker = RecordingDocker(backend).instance
+
+    docker.write_text("particle", "/app/missing/value", "payload")
+
+    assert docker.commands == [
+        ["exec", "particle", "mkdir", "-p", "/app/missing"]
+    ]
+    assert docker.copied == (
+        "payload",
+        "particle",
+        "/app/missing/value",
+    )
+
+
 def sample_manifest(backend):
     events = [
         {
@@ -369,6 +406,26 @@ def test_replay_skips_proven_failed_no_mutation_event():
             "path": "/app/value",
             "edits": [{"oldText": "missing", "newText": "value"}],
         },
+        "expected_error": True,
+        "mutation_status": "none",
+    }
+
+    result = backend.replay_event(
+        FakeDocker(),
+        "particle",
+        event,
+        workdir="/app",
+    )
+
+    assert result["status"] == "skipped_failed_no_mutation"
+
+
+def test_replay_skips_unknown_tool_when_controller_proved_no_mutation():
+    backend = load_backend()
+    event = {
+        "call_id": "malformed-unknown",
+        "name": "hallucinated_tool",
+        "arguments": {"raw_arguments": "{"},
         "expected_error": True,
         "mutation_status": "none",
     }

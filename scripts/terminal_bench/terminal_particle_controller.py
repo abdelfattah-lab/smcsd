@@ -72,6 +72,12 @@ class Particle:
     rounds: int = 0
     finished: bool = False
     resampled_from: str | None = None
+    generated_tokens: int = 0
+    semantic_score: float = 0.0
+    last_semantic_score: float = 0.0
+    semantic_log_weight: float = 0.0
+    last_semantic_checkpoint_tokens: int = 0
+    semantic_call_count: int = 0
     cost: dict[str, float | int] = field(
         default_factory=lambda: {
             "model_calls": 0,
@@ -246,7 +252,10 @@ def edit_text_tool(
     path: str,
     raw_edits: Any,
 ) -> None:
-    edits = backend.normalized_edits(raw_edits)
+    try:
+        edits = backend.normalized_edits(raw_edits)
+    except backend.ReplayError as error:
+        raise SafeToolError(str(error)) from error
     with tempfile.TemporaryDirectory(prefix="smcsd-live-edit-") as raw:
         local = Path(raw) / "value"
         try:
@@ -362,7 +371,7 @@ def execute_live_tool(
                 wall_time_s=time.perf_counter() - started,
             )
         else:
-            raise ControllerError(f"unsupported live tool: {name}")
+            raise SafeToolError(f"unsupported live tool: {name}")
     except SafeToolError as error:
         safe_no_mutation = True
         result = ToolExecution(
@@ -392,7 +401,7 @@ def execute_live_tool(
         "expected_error": result.is_error,
         "result_sha256": hashlib.sha256(result.content.encode()).hexdigest(),
     }
-    if safe_no_mutation and name in {"write", "edit"}:
+    if safe_no_mutation:
         event["mutation_status"] = "none"
     return result, event
 
@@ -557,6 +566,8 @@ class TerminalParticleController:
             self.timeout_s,
         )
         tool_calls = copy.deepcopy(result.get("tool_calls") or [])
+        invalid_tool_calls: dict[str, str] = {}
+        invalid_tool_raw_arguments: dict[str, Any] = {}
         for call in tool_calls:
             function = call.get("function")
             if function is None:
@@ -567,14 +578,30 @@ class TerminalParticleController:
                 call["function"] = function
                 call.pop("name", None)
                 call.pop("arguments", None)
-            try:
-                json.loads(function.get("arguments") or "{}")
-            except json.JSONDecodeError as error:
-                raise ControllerError(
-                    f"model returned invalid JSON arguments: {call}"
-                ) from error
             call.setdefault("id", f"call_{uuid.uuid4().hex}")
             call.setdefault("type", "function")
+            raw_arguments = function.get("arguments") or "{}"
+            try:
+                arguments = (
+                    json.loads(raw_arguments)
+                    if isinstance(raw_arguments, str)
+                    else raw_arguments
+                )
+                if not isinstance(arguments, dict):
+                    raise ValueError("tool arguments are not an object")
+            except (json.JSONDecodeError, ValueError):
+                invalid_tool_calls[str(call["id"])] = (
+                    "model returned invalid JSON arguments for "
+                    f"{function.get('name') or 'unknown'}: {raw_arguments!r}"
+                )
+                invalid_tool_raw_arguments[str(call["id"])] = raw_arguments
+                function["arguments"] = json.dumps(
+                    {
+                        "_smcsd_invalid_json": raw_arguments,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
 
         assistant = {
             "role": "assistant",
@@ -587,12 +614,39 @@ class TerminalParticleController:
         workdir = str(particle.manifest["base_environment"]["workdir"])
         tool_rows: list[dict[str, Any]] = []
         for call in tool_calls:
-            tool_result, event = execute_live_tool(
-                self.docker,
-                particle.container_name,
-                call,
-                workdir=workdir,
-            )
+            call_id = str(call["id"])
+            validation_error = invalid_tool_calls.get(call_id)
+            if validation_error is not None:
+                began = time.perf_counter()
+                function = call["function"]
+                raw_arguments = invalid_tool_raw_arguments[call_id]
+                tool_result = ToolExecution(
+                    content=validation_error,
+                    is_error=True,
+                    wall_time_s=time.perf_counter() - began,
+                )
+                event = {
+                    "call_id": call_id,
+                    "name": str(function.get("name") or ""),
+                    "arguments": {
+                        "raw_arguments": raw_arguments,
+                    },
+                    "assistant_timestamp_ms": epoch_milliseconds(),
+                    "result_timestamp_ms": epoch_milliseconds(),
+                    "expected_error": True,
+                    "result_sha256": hashlib.sha256(
+                        tool_result.content.encode()
+                    ).hexdigest(),
+                    "mutation_status": "none",
+                    "validation_error": "invalid_json_arguments",
+                }
+            else:
+                tool_result, event = execute_live_tool(
+                    self.docker,
+                    particle.container_name,
+                    call,
+                    workdir=workdir,
+                )
             particle.manifest["tool_events"].append(event)
             particle.messages.append(
                 {
@@ -636,6 +690,7 @@ class TerminalParticleController:
         particle.cost["prompt_tokens"] += prompt_tokens
         particle.cost["completion_tokens"] += completion_tokens
         particle.cost["model_wall_time_s"] += model_wall_time
+        particle.generated_tokens += completion_tokens
         self._record_cost(
             {
                 "model_calls": 1,
@@ -693,6 +748,16 @@ class TerminalParticleController:
             name=name,
             resampled_from=survivor.particle_id,
         )
+        child.rounds = survivor.rounds
+        child.finished = survivor.finished
+        child.generated_tokens = survivor.generated_tokens
+        child.semantic_score = survivor.semantic_score
+        child.last_semantic_score = survivor.last_semantic_score
+        child.semantic_log_weight = 0.0
+        child.last_semantic_checkpoint_tokens = (
+            survivor.last_semantic_checkpoint_tokens
+        )
+        child.semantic_call_count = survivor.semantic_call_count
         if child.model_prefix_sha256 != survivor.model_prefix_sha256:
             self.docker.remove(child.container_name)
             raise ControllerError("resampling copied the wrong model prefix")
@@ -718,6 +783,14 @@ def particle_summary(particle: Particle) -> dict[str, Any]:
         "state": copy.deepcopy(particle.state),
         "rounds": particle.rounds,
         "finished": particle.finished,
+        "generated_tokens": particle.generated_tokens,
+        "semantic_score": particle.semantic_score,
+        "last_semantic_score": particle.last_semantic_score,
+        "semantic_log_weight": particle.semantic_log_weight,
+        "last_semantic_checkpoint_tokens": (
+            particle.last_semantic_checkpoint_tokens
+        ),
+        "semantic_call_count": particle.semantic_call_count,
         "resampled_from": particle.resampled_from,
         "cost": copy.deepcopy(particle.cost),
         "replay_cost": copy.deepcopy(particle.replay_cost),

@@ -48,6 +48,13 @@ experiments on top of the standalone `smcsd/` implementation.
 - **`offline_likelihood_semantic_comparison.py`** — Frozen terminal L1+S beta
   sweep over a likelihood-SMC particle pool, with problem-paired bootstrap and
   explicit verifier GPU accounting.
+- **`terminal_bench/terminal_semantic_smc.py`** — Live semantic-only SMC over
+  coupled Terminal-Bench model/tool/environment particles. Supports score
+  differences, beta, ESS resampling, unique-prefix verifier deduplication,
+  `N` through 64, and one through eight independent rubric calls.
+- **`terminal_bench/analyze_terminal_semantic_smc.py`** — Aggregates live
+  sweeps into reward-isolated terminal ranking, selection, population, cost,
+  deduplication, and latency tables.
 - **`smc_profile_engine.py`** — Offline profiler harness for SMC. Use
   `--engine-kind smc_engine` to target the dedicated ``SMCEngine`` path;
   emits Chrome-compatible traces.
@@ -180,6 +187,8 @@ python scripts/terminal_bench/merge_semantic_score_shards.py --help
 python scripts/terminal_bench/analyze_semantic_actionability.py --help
 python scripts/terminal_bench/terminal_particle_backend.py --help
 python scripts/terminal_bench/terminal_particle_controller.py --help
+python scripts/terminal_bench/terminal_semantic_smc.py --help
+python scripts/terminal_bench/analyze_terminal_semantic_smc.py --help
 ```
 
 The completed OlympiadBench validity/progress screen uses Qwen3.8-27B and

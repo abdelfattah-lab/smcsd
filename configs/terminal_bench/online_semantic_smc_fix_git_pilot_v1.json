@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "experiment_id": "terminal-semantic-smc-fix-git-live-pilot-v1",
+  "scientific_scope": "Single-task engineering pilot with repeated stochastic runs. It validates the online mechanism and identifies candidate settings; it is not a benchmark-level accuracy estimate.",
+  "benchmark": {
+    "name": "terminal-bench-2.1",
+    "dataset_commit": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "task_id": "fix-git",
+    "task_image": "alexgshaw/fix-git:20260403",
+    "task_image_id": "sha256:389b9c8247610c2c5be080b1ac00429007c2c69bf57f7f26c79f0f75ba2d5c74",
+    "reward": "exact isolated hashes for /app/personal-site/_includes/about.md and /app/personal-site/_layouts/default.html"
+  },
+  "models": {
+    "generator": {
+      "model": "Qwen/Qwen3.5-9B",
+      "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "accelerators": 1
+    },
+    "semantic_verifier": {
+      "model": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "criterion": "recoverability_v1",
+      "accelerators": 1,
+      "reward_labels_visible": false
+    }
+  },
+  "controller": {
+    "objective": "semantic_only",
+    "weight_update": "beta * (current_semantic_score - previous_semantic_score)",
+    "resampling": "systematic when ESS < threshold_fraction * N",
+    "selection": "best terminal semantic score",
+    "unique_prefix_verifier_deduplication": true,
+    "checkpoint_alignment": "first completed assistant/tool turn at or after requested token interval",
+    "exact_partial_assistant_checkpoint": false,
+    "generator_max_tokens_per_completed_turn": 256,
+    "max_rounds": 24
+  },
+  "fixed_default": {
+    "particles": 8,
+    "checkpoint_interval_tokens": 256,
+    "verifier_calls_per_checkpoint": 1,
+    "semantic_beta": 12.0,
+    "ess_threshold_fraction": 0.5
+  },
+  "one_factor_sweeps": {
+    "particles": [4, 8, 16, 32, 64],
+    "checkpoint_interval_tokens": [256, 512, 2048, 8192],
+    "verifier_calls_per_checkpoint": [1, 2, 4, 8],
+    "semantic_beta": [4.0, 8.0, 12.0, 24.0, 48.0],
+    "ess_threshold_fraction": [0.25, 0.5, 0.75, 0.9]
+  },
+  "verifier_calls": {
+    "aggregation": "arithmetic mean of independent rubric variants",
+    "variant_count": 8,
+    "heterogeneous_model_count": 1,
+    "heterogeneous_models_deferred_to_multitask_gate": true
+  },
+  "repetitions": {
+    "particles": 1,
+    "checkpoint_interval_tokens": 3,
+    "verifier_calls_per_checkpoint": 3,
+    "semantic_beta": 3,
+    "ess_threshold_fraction": 3
+  },
+  "baseline_interpretation": {
+    "checkpoint_interval_8192": "terminal semantic Best-of-N control because this task finishes before an intermediate checkpoint",
+    "self_consistency": "requires a task-level aggregation definition and is deferred to the held-out multitask harness",
+    "gamma": "not present in this autoregressive controller; speculative gamma must be swept only after integration with the SM-CSD draft/target engine"
+  },
+  "cost_accounting": {
+    "runner_allocated_accelerator_seconds": "runner wall time times generator plus verifier accelerators",
+    "external_model_server_startup_excluded": true,
+    "generator_tool_replay_and_verifier_costs_separate": true
+  },
+  "artifacts": [
+    "terminal-semantic-smc-particle-sweep-v1.json",
+    "terminal-semantic-smc-interval-sweep-r3-v1.json",
+    "terminal-semantic-smc-verifier-call-sweep-v1.json",
+    "terminal-semantic-smc-beta-sweep-v1.json",
+    "terminal-semantic-smc-ess-sweep-v1.json",
+    "terminal-semantic-smc-live-pilot-analysis-v1.json",
+    "terminal-semantic-smc-live-pilot-analysis-v1.md"
+  ]
+}

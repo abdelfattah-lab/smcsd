@@ -1,10 +1,10 @@
 # TTS: Test-Time-Scaling Serving with Composite SMC Objectives
 
 Status: project roadmap — revised 2026-08-24. The OlympiadBench semantic and
-likelihood gates remain negative, but the frozen Terminal-Bench semantic
-actionability gate passed. Deterministic replay and the live two-sibling
-controller now pass; semantic scoring/resampling and the first `N` sweep are
-next.
+likelihood gates remain negative. The Terminal-Bench actionability gate,
+deterministic replay, live particle controller, semantic scoring/resampling,
+and frozen single-task scaling sweeps now pass mechanically. A held-out
+multi-task quality/cost comparison is next.
 
 Branch: `semantic-smc-test-time-scaling`
 Starting point: the existing one-draft, one-target SM-CSD implementation
@@ -1104,29 +1104,49 @@ are replay-restorable, and a clean restore reproduced the sealed state. The
 controller globally accounts actual model, token, tool, and replay work without
 double-counting duplicated ancestry.
 
-The correctness smoke still selects slot 0 deterministically and exports exact
-messages rather than a persistent KV handle. It is therefore a validated online
-particle substrate, not yet the semantic-SMC experiment. Connect Qwen3.8-27B
-scoring, ESS weighting/resampling, and full generator/verifier allocation-window
-accounting next. Then sweep one dimension at a time rather than taking a
-Cartesian product:
+**Live semantic-SMC outcome: mechanism PASS, quality INCONCLUSIVE
+(2026-08-24).** The reward-isolated Qwen3.8-27B scorer is now connected to
+Qwen3.5-9B particles with score-difference weights, `beta`, ESS-triggered
+systematic resampling, unique-prefix batching, one through eight independent
+rubric calls, terminal semantic selection, and two-accelerator allocation
+accounting. Generic `N` was exercised through 64. Safe malformed/no-mutation
+tool calls and missing write parents are replay-tested.
 
-1. use Qwen3.8-27B, a 256-token interval, one call, and ESS threshold 0.5;
-   scale `N in {4,8,16,32,64}`;
-2. hold the best `N` fixed and sweep every frozen interval plus post-tool;
-3. hold `N` and interval fixed; scale independent verifier calls through 8;
-4. compare Qwen3.8-27B with the calibrated two-model ensemble/cascade;
-5. sweep ESS thresholds `{0.25,0.5,0.75}` at the selected point;
-6. sweep speculative `gamma` only after policy quality is fixed, reporting
-   latency/throughput as a serving parameter rather than extra verifier signal;
-7. compare every promoted point with self-consistency, terminal Best-of-N,
-   LLM-as-a-Verifier, and ParticleScale-style allocation at matched total cost.
+Across 56 live `fix-git` runs, terminal semantic selection was 56/56 and its
+within-run ranking AUC was 1.0 whenever both reward classes existed. The
+three-repeat interval sweep retained 91.7% correct particles at `H=512` versus
+50.0% for terminal-only `H=8192`, which is preliminary evidence that middle
+semantic allocation can help. It is not a benchmark result: this is one easy
+task, `H=256` once collapsed to 1/8 correct particles, and concurrent serving
+is only best-effort deterministic.
 
-Only after this quality gate should serving optimization begin: reuse verifier
-prefix KV state, deduplicate cloned prefixes, batch and overlap scoring,
-conditionally request extra verifier calls, and test a small-to-large verifier
-cascade. The serving MVP succeeds only with a statistically supported
-quality/cost Pareto win after charging every accelerator.
+One verifier call is promoted over 2/4/8: every setting selected 3/3 correct,
+while eight calls increased mean wall time from 23.0 to 38.2 seconds and did
+not improve population survival. `N=8` is the pilot serving point; `N=64`
+worked but required 125.9 seconds. The one-factor `beta` and ESS results are
+non-monotonic, so their apparent winners must not be composed without a new
+held-out comparison. Exact results and caveats are frozen in
+`configs/terminal_bench/online_semantic_smc_fix_git_pilot_v1.json` and
+`docs/terminal_bench.md`.
+
+Next:
+
+1. run held-out medium/hard Terminal-Bench tasks at `N=8,H=512,calls=1`,
+   testing a small frozen set of `beta`/ESS choices;
+2. compare semantic SMC with unresampled sampling, terminal semantic Best-of-N,
+   LLM-as-a-Verifier-style reranking, and ParticleScale-style allocation at
+   matched generator and allocated-accelerator cost;
+3. add a second verifier endpoint only if task-level errors leave independent
+   headroom; use calibrated aggregation or a cascade, not repeated identical
+   calls;
+4. only after a statistically supported quality/cost win, add persistent KV
+   forks, overlap/batching, conditional verification, and SM-CSD draft/target
+   integration;
+5. sweep speculative `gamma` after that integration. The current AR runner has
+   no draft model, so its semantic `beta` sweep is not a `gamma` result.
+
+The serving MVP succeeds only with a task-level quality/cost Pareto win after
+charging every accelerator.
 
 ## 18. Definition of done
 

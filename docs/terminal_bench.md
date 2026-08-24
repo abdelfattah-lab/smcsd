@@ -511,7 +511,76 @@ but it does not yet export a persistent KV-cache handle.
 
 This closes the two-sibling correctness milestone. Selection in the smoke test
 is deliberately fixed to slot 0; no semantic verifier is used to choose it.
-Next, connect Qwen3.8-27B checkpoint scoring and ESS resampling to the generic
-controller, add full generator/verifier allocation-window accounting, and run
-the frozen one-factor `N in {4,8,16,32,64}` sweep before varying checkpoint
-interval or independent verifier calls through 8.
+
+### Live semantic-only SMC pilot (2026-08-24)
+
+`scripts/terminal_bench/terminal_semantic_smc.py` connects Qwen3.5-9B live
+particles to the frozen, reward-isolated Qwen3.8-27B recoverability scorer.
+Semantic score differences update log weights, `beta` controls their strength,
+ESS triggers systematic resampling, and the best terminal semantic score selects
+the returned particle. Identical cloned prefixes are scored once. Calls 2--8
+use independently worded evaluation lenses and are averaged; this pilot uses
+one verifier model, not a heterogeneous model ensemble.
+
+The controller starts at the initial captured provider request and supports
+generic `N`. Requested token interval `H` is aligned to the first completed
+assistant/tool turn at or after the target. It is not an exact partial-assistant
+checkpoint because the OpenAI-compatible generator exposes messages but no
+persistent mid-assistant KV continuation handle.
+
+The frozen single-task pilot and aggregation command are:
+
+```bash
+python scripts/terminal_bench/terminal_semantic_smc.py \
+  --manifest ~/agentbench/semantic-actionability/fix-git-prefix12-replay-manifest.json \
+  --capture /path/to/fix-git/agent/pi-capture/requests-1223.jsonl \
+  --generator-base-url http://127.0.0.1:30000 \
+  --verifier-base-url http://127.0.0.1:30001 \
+  --axis particles --values 4,8,16,32,64 \
+  --checkpoint-interval 256 --verifier-calls 1 \
+  --beta 12 --ess-threshold 0.5 --max-rounds 24 \
+  --output ~/agentbench/semantic-actionability/particle-sweep.json
+
+python scripts/terminal_bench/analyze_terminal_semantic_smc.py \
+  /path/to/particle-sweep.json /path/to/interval-sweep.json \
+  /path/to/verifier-call-sweep.json /path/to/beta-sweep.json \
+  /path/to/ess-sweep.json \
+  --output /path/to/analysis.json --markdown-output /path/to/analysis.md
+```
+
+The exact protocol is frozen in
+`configs/terminal_bench/online_semantic_smc_fix_git_pilot_v1.json`. Results:
+
+| sweep | value | repeats | selected | mean population success | mean wall s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| particles | 4 / 8 / 16 / 32 / 64 | 1 | 100% each | 75.0 / 75.0 / 93.8 / 90.6 / 92.2% | 17.5 / 14.1 / 40.9 / 56.6 / 125.9 |
+| interval | 256 / 512 / 2048 / 8192 | 3 | 100% each | 66.7 / 91.7 / 62.5 / 50.0% | 27.1 / 15.6 / 26.7 / 25.6 |
+| verifier calls | 1 / 2 / 4 / 8 | 3 | 100% each | 95.8 / 83.3 / 87.5 / 79.2% | 23.0 / 19.5 / 31.3 / 38.2 |
+| beta | 4 / 8 / 12 / 24 / 48 | 3 | 100% each | 79.2 / 79.2 / 100 / 91.7 / 100% | 24.3 / 22.5 / 24.2 / 20.2 / 26.3 |
+| ESS fraction | .25 / .5 / .75 / .9 | 3 | 100% each | 95.8 / 75.0 / 91.7 / 100% | 22.7 / 23.5 / 23.8 / 28.1 |
+
+Across all 56 runs, the terminal semantic selector chose a reward-1 state.
+Whenever a run contained both correct and incorrect final particles, its
+terminal semantic ranking AUC was 1.0. Thus this task clearly validates the
+semantic verifier as a terminal selector. The repeated interval comparison also
+shows preliminary middle-allocation value: `H=512` retains 91.7% correct
+particles versus 50.0% for the terminal-only `H=8192` control. It is not yet a
+benchmark claim: all points reuse one easy task, stochastic repetitions are not
+independent tasks, and `H=256` once collapsed to 1/8 correct particles.
+
+One verifier call is the promoted cost setting: 2/4/8 calls add no selected
+accuracy here and eight calls raise mean wall time from 23.0 to 38.2 seconds.
+`N=8` is the practical pilot size; `N=64` works correctly but takes 125.9
+seconds. A clean restore of the selected N=64 sidecar replayed nine tool calls
+in 0.847 seconds and reproduced its sealed model/environment state.
+
+The five sweeps charged 3,154.3 allocated accelerator-seconds across the two
+reserved GPUs while excluding external server startup. This is a correctness
+and policy pilot, not yet a fast serving result. The next gate is a held-out,
+multi-task Terminal-Bench comparison of `N=8,H=512,calls=1` against terminal
+semantic Best-of-N and unresampled sampling at matched generator cost. Only
+after that should the system add heterogeneous verifier endpoints, exact KV
+forks, batching/overlap, conditional extra calls, and SM-CSD draft/target
+integration. Speculative `gamma` is absent from this autoregressive controller
+and must be swept after that integration rather than relabeled as semantic
+`beta`.

@@ -255,6 +255,8 @@ class DockerCLI:
         self.run(["cp", str(source), f"{container}:{destination}"])
 
     def write_text(self, container: str, path: str, content: str) -> None:
+        parent = os.path.dirname(path) or "/"
+        self.run(["exec", container, "mkdir", "-p", parent])
         with tempfile.TemporaryDirectory(prefix="smcsd-replay-write-") as raw:
             local = Path(raw) / "value"
             local.write_text(content, encoding="utf-8")
@@ -476,6 +478,13 @@ def replay_event(
     name = str(event["name"])
     arguments = event["arguments"]
     expected_error = bool(event.get("expected_error"))
+
+    if expected_error and event.get("mutation_status") == "none":
+        return {
+            "call_id": event["call_id"],
+            "name": name,
+            "status": "skipped_failed_no_mutation",
+        }
 
     if name in READ_ONLY_TOOLS:
         return {
