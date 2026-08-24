@@ -389,9 +389,74 @@ for Qwen3-32B, including every process startup and resumed shard, and consumed
 probability mass on the requested score-label tokens versus 0.968 for
 Qwen3.8-27B, which is an additional reason to start with the latter.
 
-The next prerequisite is a cloneable terminal-particle backend coupling
-filesystem/process state, transcript, model-prefix/KV lineage, and cost state.
-Only after fork/resume equivalence tests pass should the online one-factor
-sweeps over particles through 64 and independent verifier calls through 8 run.
-Until then, resampling saved trajectories would be an offline allocation
-simulation rather than an online semantic-SMC result.
+The deterministic replay backend described below now satisfies the environment
+cloneability prerequisite for the supported Pi tool subset. The remaining
+prerequisite is a host-side online controller that advances and resamples the
+environment, transcript, and model continuation as one particle.
+
+### Deterministic terminal-particle backend (2026-08-24)
+
+`scripts/terminal_bench/terminal_particle_backend.py` implements the fallback
+selected for this host. Docker 29.6.2 is available, but daemon experimental
+mode and CRIU checkpoint/restore are unavailable. The backend therefore starts
+a content-addressed task image, replays completed Pi tool calls, and validates
+semantic filesystem state plus surviving-process fingerprints. Its manifest
+also binds the task, source transcript, checkpoint/model-prefix identity,
+lineage, replay calls, and exact replay cost.
+
+Useful entry points are:
+
+```bash
+python scripts/terminal_bench/terminal_particle_backend.py capabilities
+python scripts/terminal_bench/terminal_particle_backend.py smoke \
+  --image alexgshaw/fix-git:20260403 \
+  --output ~/agentbench/semantic-actionability/terminal-particle-backend-smoke.json
+
+python scripts/terminal_bench/terminal_particle_backend.py extract \
+  --session /path/to/pi-session.jsonl \
+  --image alexgshaw/fix-git:20260403 \
+  --source-container quiescent-source-container \
+  --task-id fix-git --workdir /app/personal-site \
+  --state-root /app/personal-site --max-tool-calls 12 \
+  --checkpoint-id trajectory-tool12 --output particle.json
+
+python scripts/terminal_bench/terminal_particle_backend.py fork \
+  --manifest particle.json --name semantic-particle-0 \
+  --ledger-output semantic-particle-0.ledger.json
+```
+
+`--source-container` seals the expected state from a live, quiescent source and
+causes every child to fail closed on filesystem or process divergence. When a
+historical source container no longer exists, deterministic sibling equality
+and the task verifier provide the independent checks.
+
+Validation on the pinned `fix-git` image produced:
+
+- synthetic replay: four mutating calls in 0.407 seconds, with identical
+  filesystem digest and identical task-process fingerprint, including a
+  surviving background process;
+- full real replay: all 18 calls from a reward-1 frozen trajectory in 1.320
+  seconds, reproducing Git HEAD `cecc2e5` and both exact benchmark verifier
+  hashes (`027310...` and `0f8793...`);
+- mid-trajectory fork: two independent replays of the first 12 calls produced
+  the same semantic filesystem digest
+  `24c15bb11ea776bdaf111bedb8825a4b516fb3fdc9ecc6d3a008e0190829baeb`
+  and the same surviving-process fingerprint.
+
+The filesystem digest hashes file bytes, executable bits, symlinks, and
+semantic Git state while normalizing volatile `.git/index` stat caches and Git
+reflog timestamps. Tool timestamps freeze Git author/committer time and
+`SOURCE_DATE_EPOCH`, so replayed commits retain the source identity.
+
+The frozen 288-trajectory pool audit finds 253 sessions (87.85%) immediately
+replayable. The other 35 fail closed: 29 include a failed `edit`, two include a
+failed `write`, and seven contain an unsupported/malformed tool name; three
+sessions have overlapping reasons. Failed write/edit atomicity has not yet
+been proven, so these events are deliberately not guessed through.
+
+This backend materializes terminal state; it does not yet fork a live model KV
+cache or drive multiple Pi continuations. The next implementation is a
+host-side trajectory controller that owns one container, transcript, model
+continuation, lineage, and ledger per particle. Once that controller passes an
+end-to-end two-sibling continuation test, run the frozen one-factor `N` sweep
+through 64 before varying checkpoint interval or verifier calls through 8.

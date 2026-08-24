@@ -178,6 +178,7 @@ python scripts/terminal_bench/export_semantic_checkpoints.py --help
 python scripts/terminal_bench/score_semantic_checkpoints.py --help
 python scripts/terminal_bench/merge_semantic_score_shards.py --help
 python scripts/terminal_bench/analyze_semantic_actionability.py --help
+python scripts/terminal_bench/terminal_particle_backend.py --help
 ```
 
 The completed OlympiadBench validity/progress screen uses Qwen3.8-27B and

@@ -2,9 +2,10 @@
 
 Status: project roadmap — revised 2026-08-24. The OlympiadBench semantic and
 likelihood gates remain negative, but the frozen Terminal-Bench semantic
-actionability gate passed. A cloneable online terminal-particle backend is next.
+actionability gate passed. Deterministic terminal replay now passes real and
+synthetic fork tests; the host-side online trajectory controller is next.
 
-Branch: `tts`  
+Branch: `semantic-smc-test-time-scaling`
 Starting point: the existing one-draft, one-target SM-CSD implementation
 
 ## 1. Project thesis
@@ -1043,10 +1044,10 @@ times are exact; shared-GPU allocation is exact at complete source-job scope
 and intentionally unavailable per trajectory under concurrent serving. The
 verifier cost ledger separately counts engine startup, graph capture,
 inference, and every resumed process. Existing Harbor traces do not contain
-clonable container
-snapshots, so true online trajectory-level SMC remains blocked on a snapshot
-or deterministic replay backend; the offline semantic-actionability screen is
-not blocked.
+clonable container snapshots. The deterministic replay fallback is now
+implemented and validated below; true online trajectory-level SMC still
+requires a controller that couples each replayed environment to its transcript
+and model continuation.
 
 After the smoke test, collect the development actionability pool with eight
 independent trajectories per task and three generation seeds. Start by scoring
@@ -1082,14 +1083,24 @@ Qwen3.8-27B the cost-conscious first online scorer. Full offline scoring cost
 token mass was only 0.287 versus 0.968 for Qwen3.8-27B, so its output-format
 confidence also needs correction before an eight-call study.
 
-Promotion is conditional on a cloneable online particle backend. Implement a
-filesystem/process snapshot or validated deterministic-replay layer first,
-with one terminal environment, transcript, model-prefix/KV lineage, and cost
-ledger per particle. A policy sweep before that backend would only be an
-offline selection simulation, not semantic SMC.
+**Replay-backend outcome: PASS (2026-08-24).** Docker CRIU is unavailable on
+this host, so the selected fallback replays completed Pi tools from a pinned
+image and verifies semantic filesystem plus surviving-process state. A
+synthetic fork reproduced file and background-process state; an 18-call
+reward-1 `fix-git` replay reproduced Git HEAD `cecc2e5` and both benchmark
+hashes; two independent tool-12 siblings had the same semantic digest. The
+backend binds transcript, checkpoint/model-prefix identity, lineage, and cost.
+It supports 253/288 frozen sessions (87.85%) and fails closed on the remaining
+35 with ambiguous failed writes/edits or unsupported tool names.
 
-After the backend passes fork/resume tests, sweep one dimension at a time
-rather than taking a Cartesian product:
+The remaining promotion condition is the online trajectory controller. It
+must own one replayed environment, transcript, model continuation/KV lineage,
+and cost ledger per particle; route each generated tool call to the matching
+container; and resample all five together. Replaying environments alone is not
+yet online semantic SMC.
+
+After the controller passes an end-to-end sibling continuation test, sweep
+one dimension at a time rather than taking a Cartesian product:
 
 1. use Qwen3.8-27B, a 256-token interval, one call, and ESS threshold 0.5;
    scale `N in {4,8,16,32,64}`;
