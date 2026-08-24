@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "dataset_id": "tb21-semantic-actionability-dev-v1",
+  "purpose": "Export the frozen 288-trajectory Terminal-Bench development pool for offline semantic checkpoint actionability analysis.",
+  "benchmark": {
+    "name": "terminal-bench-2.1",
+    "dataset_commit": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "tasks": [
+      {"id": "fix-git", "category": "software-engineering", "difficulty": "easy"},
+      {"id": "configure-git-webserver", "category": "system-administration", "difficulty": "hard"},
+      {"id": "sanitize-git-repo", "category": "security", "difficulty": "medium"},
+      {"id": "git-leak-recovery", "category": "software-engineering", "difficulty": "medium"},
+      {"id": "cancel-async-tasks", "category": "software-engineering", "difficulty": "hard"},
+      {"id": "fix-code-vulnerability", "category": "security", "difficulty": "hard"},
+      {"id": "nginx-request-logging", "category": "system-administration", "difficulty": "medium"},
+      {"id": "pypi-server", "category": "software-engineering", "difficulty": "medium"},
+      {"id": "regex-log", "category": "data-processing", "difficulty": "medium"},
+      {"id": "multi-source-data-merger", "category": "data-processing", "difficulty": "medium"},
+      {"id": "db-wal-recovery", "category": "file-operations", "difficulty": "medium"},
+      {"id": "query-optimize", "category": "data-science", "difficulty": "medium"}
+    ]
+  },
+  "source_jobs": [
+    {"job_name": "tb21-semantic-actionability-dev-v1__pool__ar__seed0"},
+    {"job_name": "tb21-semantic-actionability-dev-v1__pool__ar__seed1"},
+    {"job_name": "tb21-semantic-actionability-dev-v1__pool__ar__seed2"}
+  ],
+  "tokenizer": {
+    "model": "Qwen/Qwen3.5-9B",
+    "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "trust_remote_code": true,
+    "local_files_only": true
+  },
+  "semantic_verifiers": {
+    "criterion": "terminal_recoverability_v1",
+    "score_labels": "ABCDEFGHIJKLMNOPQRST",
+    "models": [
+      {
+        "id": "Qwen/Qwen3.8-27B",
+        "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+      },
+      {
+        "id": "Qwen/Qwen3-32B",
+        "revision": "9216db5781bf21249d130ec9da846c4624c16137"
+      }
+    ],
+    "combination": "leave-one-task-out convex score ensemble"
+  },
+  "offline_actionability_gate": {
+    "group_balanced_ranking_accuracy_min": 0.60,
+    "ranking_bootstrap_95_ci_lower_strictly_above": 0.50,
+    "top_half_correct_trajectory_survival_lift_min": 0.10,
+    "mixed_tasks_min": 4,
+    "pairwise_comparisons_min": 100,
+    "ensemble_must_improve_best_single": true
+  },
+  "checkpoint_policy": {
+    "base_interval_tokens": 256,
+    "derived_interval_tokens": [512, 2048, 8192],
+    "after_every_tool_result": true,
+    "token_position_basis": "cumulative_generator_completion_tokens"
+  },
+  "online_scaling_axes": {
+    "checkpoint_interval_tokens": [256, 512, 2048, 8192],
+    "particles": [4, 8, 16, 32, 64],
+    "verifier_calls_per_checkpoint": [1, 2, 4, 8],
+    "verifier_model_count": [1, 2],
+    "ess_resample_threshold": [0.25, 0.5, 0.75]
+  },
+  "labels": {
+    "success_threshold": 1.0,
+    "separate_file": true,
+    "semantic_verifier_may_read_labels": false
+  },
+  "cost_accounting": {
+    "accelerators_allocated": 1,
+    "separate_generator_tool_and_semantic_verifier_fields": true
+  },
+  "collection": {
+    "tasks": 12,
+    "generation_seeds": 3,
+    "trajectories_per_task_per_seed": 8,
+    "expected_trajectories": 288,
+    "held_out_test_set": false
+  }
+}

@@ -18,6 +18,7 @@ import os
 import re
 import time
 from collections import Counter
+from pathlib import Path
 from typing import List, Optional
 
 from datasets import load_dataset
@@ -62,27 +63,63 @@ def normalize_answer(ans: Optional[str]) -> Optional[str]:
     s = s.replace("^{\\circ}", "").replace("^\\circ", "")
     s = s.replace("\\%", "").rstrip("%")
     s = s.rstrip(".")
+    # MATH golds occasionally use ``x=5`` where a scalar ``5`` is equivalent.
+    scalar_equation = re.fullmatch(r"[A-Za-z]=(.+)", s)
+    if scalar_equation:
+        s = scalar_equation.group(1)
     # 0.50 -> 0.5, 3.0 -> 3
     if re.fullmatch(r"-?\d+\.\d*0+", s):
         s = s.rstrip("0").rstrip(".")
     return s or None
 
 
-def load_math500(tokenizer, num_questions: int, *, disable_thinking: bool):
+def load_math500_records(
+    tokenizer,
+    num_questions: int,
+    *,
+    disable_thinking: bool,
+    start_index: int = 0,
+):
     ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
-    prompts, labels = [], []
+    end_index = start_index + num_questions
+    if start_index < 0 or end_index > len(ds):
+        raise ValueError(
+            f"Requested MATH500 rows [{start_index}, {end_index}), but the "
+            f"dataset has {len(ds)} rows."
+        )
+    records = []
     kw = {"enable_thinking": False} if disable_thinking else {}
-    for row in ds.select(range(num_questions)):
+    for dataset_index, row in zip(
+        range(start_index, end_index),
+        ds.select(range(start_index, end_index)),
+    ):
         prompt = tokenizer.apply_chat_template(
             [{"role": "user", "content": INSTRUCTION + row["problem"]}],
             tokenize=False,
             add_generation_prompt=True,
             **kw,
         )
-        prompts.append(prompt)
-        labels.append(normalize_answer(row["answer"]))
-    assert all(l is not None for l in labels), "unparseable gold answer"
-    return prompts, labels
+        records.append(
+            {
+                "dataset": "HuggingFaceH4/MATH-500",
+                "dataset_config": "default",
+                "split": "test",
+                "dataset_index": dataset_index,
+                "problem_id": f"math500-test-{dataset_index}",
+                "problem": row["problem"],
+                "prompt": prompt,
+                "gold_answer": normalize_answer(row["answer"]),
+            }
+        )
+    assert all(r["gold_answer"] is not None for r in records), "unparseable gold answer"
+    return records
+
+
+def load_math500(tokenizer, num_questions: int, *, disable_thinking: bool):
+    records = load_math500_records(
+        tokenizer, num_questions, disable_thinking=disable_thinking
+    )
+    return [r["prompt"] for r in records], [r["gold_answer"] for r in records]
 
 
 def summarize(name, preds: List[Optional[str]], labels, total_tokens, wall):
@@ -164,7 +201,7 @@ def run_smc(args, prompts, labels):
     print(f"  Pass@particles:     {acc_pass}/{n} ({100 * acc_pass / n:.1f}%)")
 
 
-def run_stock(args, prompts, labels, n_samples: int):
+def run_stock(args, prompts, labels, n_samples: int, records=None):
     import sglang as sgl
 
     eng = sgl.Engine(
@@ -173,6 +210,7 @@ def run_stock(args, prompts, labels, n_samples: int):
         attention_backend=args.attention_backend,
         mem_fraction_static=args.mem_fraction_static,
         random_seed=args.seed,
+        base_gpu_id=getattr(args, "base_gpu_id", 0),
         tp_size=args.tp,
         disable_custom_all_reduce=args.tp > 1,
         enforce_disable_flashinfer_allreduce_fusion=args.tp > 1,
@@ -190,16 +228,36 @@ def run_stock(args, prompts, labels, n_samples: int):
     toks = sum(len(o["output_ids"]) for o in outs)
     if getattr(args, "dump_trajectories", None):
         import json
-        with open(args.dump_trajectories, "w") as fh:
+        if records is None:
+            raise ValueError("Rich trajectory dumps require dataset records.")
+        Path(args.dump_trajectories).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.dump_trajectories, "w", encoding="utf-8") as fh:
             for i in range(len(prompts)):
                 for j in range(n_samples):
                     o = outs[i * n_samples + j]
                     a = normalize_answer(extract_boxed(o["text"]))
+                    meta = o.get("meta_info", {})
                     fh.write(json.dumps({
-                        "qid": i, "sample": j, "text": o["text"],
-                        "answer": a, "gold": labels[i],
+                        "schema_version": 2,
+                        **records[i],
+                        # Legacy aliases kept for offline_policy_sim.py.
+                        "qid": records[i]["dataset_index"],
+                        "sample": j,
+                        "sample_id": j,
+                        "generator_model": args.model,
+                        "generator_seed": args.seed,
+                        "temperature": args.temperature,
+                        "max_new_tokens": args.max_new_tokens,
+                        "generator_output_ids": o["output_ids"],
+                        "full_text": o["text"],
+                        "text": o["text"],
+                        "completion_tokens": len(o["output_ids"]),
+                        "finish_reason": meta.get("finish_reason"),
+                        "extracted_answer": a,
+                        "answer": a,
+                        "gold": labels[i],
                         "correct": bool(a == labels[i]),
-                    }) + "\n")
+                    }, ensure_ascii=False) + "\n")
     preds = []
     for i in range(len(prompts)):
         votes = [
@@ -221,10 +279,12 @@ def main():
     p.add_argument("--gamma", "-g", type=int, default=8)
     p.add_argument("--n-samples", type=int, default=8, help="majority mode votes")
     p.add_argument("--num-questions", type=int, default=100)
+    p.add_argument("--start-index", type=int, default=0)
     p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tp", type=int, default=1)
+    p.add_argument("--base-gpu-id", type=int, default=0)
     p.add_argument("--attention-backend", default="triton")
     p.add_argument("--mem-fraction-static", type=float, default=0.75)
     p.add_argument("--max-running-requests", type=int, default=4)
@@ -237,15 +297,20 @@ def main():
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    prompts, labels = load_math500(
-        tok, args.num_questions, disable_thinking=args.disable_thinking
+    records = load_math500_records(
+        tok,
+        args.num_questions,
+        disable_thinking=args.disable_thinking,
+        start_index=args.start_index,
     )
+    prompts = [r["prompt"] for r in records]
+    labels = [r["gold_answer"] for r in records]
     if args.mode == "smc_engine":
         run_smc(args, prompts, labels)
     elif args.mode == "ar":
-        run_stock(args, prompts, labels, 1)
+        run_stock(args, prompts, labels, 1, records)
     else:
-        run_stock(args, prompts, labels, args.n_samples)
+        run_stock(args, prompts, labels, args.n_samples, records)
 
 
 if __name__ == "__main__":

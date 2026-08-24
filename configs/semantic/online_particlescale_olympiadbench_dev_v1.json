@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "experiment_id": "online-particlescale-olympiadbench-dev-v1",
+  "evaluation_status": "exploratory_development_not_disjoint_test",
+  "research_question": "Does intermediate semantic resampling or deterministic semantic forking beat completing and terminally ranking the same initial particle pool after all accelerator costs are charged?",
+  "dataset": {
+    "trajectories": "work_dirs/semantic_olympiadbench_pilot_v1/olympiadbench_50x8_16k_trajectories.jsonl",
+    "problems": 50,
+    "samples_per_problem": 8,
+    "selection_positions": [0, 49],
+    "selection_seed": 0,
+    "reuse_policy": "The common saved trajectories supply only the exact first 2048 generator tokens. Every post-allocation continuation is sampled online."
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "temperature": 0.7,
+    "initial_prefix_tokens": 2048,
+    "checkpoint_interval_tokens": 2048,
+    "total_output_budget_tokens": 16384,
+    "continuation_seed": 71,
+    "uses_likelihood": false
+  },
+  "semantic_verifier": {
+    "model": "Qwen/Qwen3.8-27B",
+    "rubrics": ["validity"],
+    "rubric_weights": {"validity": 1.0},
+    "labels": ["A", "B", "C", "D", "E"],
+    "values": [0.0, 0.25, 0.5, 0.75, 1.0],
+    "score_source": "exact requested next-token logprobs renormalized over A-E",
+    "sibling_candidates_visible": false
+  },
+  "methods": {
+    "semantic_smc": {
+      "resampler": "systematic",
+      "semantic_beta": 12.0,
+      "ess_threshold_fraction": 0.75,
+      "weight_update": "beta * (current_semantic_score - previous_semantic_score)",
+      "reason_for_temperature": "Smallest tested development temperature that triggered ESS resampling on at least 30% of problems at the first checkpoint under the frozen scores (16/50 at beta=12)."
+    },
+    "deterministic_semantic_fork": {
+      "keep_fraction": 0.5,
+      "fork_factor": 2,
+      "selection": "highest current pointwise semantic score with stable ties"
+    }
+  },
+  "terminal_baselines": [
+    "self_consistency_majority_at_8",
+    "terminal_pointwise_best_of_8_with_same_semantic_score",
+    "order_swapped_14_call_terminal_llm_as_a_verifier_knockout",
+    "oracle_pass_at_8_diagnostic"
+  ],
+  "cost_metrics": [
+    "generator_tokens",
+    "verifier_calls",
+    "verifier_prompt_tokens",
+    "active_component_gpu_seconds",
+    "static_reserved_gpu_seconds"
+  ],
+  "success_gate": {
+    "requirements": [
+      "semantic SMC point estimate exceeds self-consistency",
+      "semantic SMC point estimate exceeds both terminal semantic selectors",
+      "semantic SMC is not dominated in accuracy versus active accelerator seconds",
+      "semantic SMC exceeds deterministic semantic forking or preserves materially more final diversity"
+    ],
+    "must_pass_all": true
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "experiment_id": "pairwise-verifier-math500-v1",
+  "purpose": "Determine whether the semantic model can rank terminal candidates when direct comparison replaces pointwise A-T scoring.",
+  "trajectories": "semantic-verifier-math500-v1",
+  "dataset": {
+    "name": "HuggingFaceH4/MATH-500",
+    "split": "test",
+    "start_index": 0,
+    "num_problems": 100,
+    "diagnostic_only": true
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "candidates_per_problem": 8,
+    "max_new_tokens": 2048,
+    "temperature": 0.7,
+    "seed": 0
+  },
+  "verifier": {
+    "model": "Qwen/Qwen3.8-27B",
+    "comparison": "all_pairs",
+    "order_swapped": true,
+    "choice_labels": ["A", "B"],
+    "pair_probability": "mean_of_both_canonical_orders",
+    "candidate_rating": "mean_pairwise_win_probability",
+    "knockout_ablation": {
+      "bracket": "fixed_ascending_sample_id",
+      "canonical_pairs_per_problem": 7,
+      "order_swapped_calls_per_problem": 14,
+      "pair_probability": "mean_of_both_canonical_orders"
+    },
+    "bootstrap_samples": 500
+  },
+  "primary_metrics": [
+    "pairwise_selection_accuracy",
+    "knockout_selection_accuracy",
+    "correct_vs_incorrect_pair_accuracy",
+    "pairwise_minus_pointwise_terminal_bon",
+    "pairwise_minus_self_consistency"
+  ],
+  "cost_metrics": [
+    "order_swapped_verifier_calls",
+    "verifier_prompt_tokens",
+    "wall_time_s"
+  ]
+}

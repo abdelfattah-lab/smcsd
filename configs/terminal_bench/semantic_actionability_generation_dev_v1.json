@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "experiment_id": "tb21-semantic-actionability-dev-v1",
+  "purpose": "Generate the frozen Terminal-Bench development trajectory pool for semantic-only SMC actionability analysis. This is a tuning set, not the held-out paper test set.",
+  "benchmark": {
+    "name": "terminal-bench-2.1",
+    "dataset_commit": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "tasks": [
+      {"id": "fix-git", "category": "software-engineering", "difficulty": "easy"},
+      {"id": "configure-git-webserver", "category": "system-administration", "difficulty": "hard"},
+      {"id": "sanitize-git-repo", "category": "security", "difficulty": "medium"},
+      {"id": "git-leak-recovery", "category": "software-engineering", "difficulty": "medium"},
+      {"id": "cancel-async-tasks", "category": "software-engineering", "difficulty": "hard"},
+      {"id": "fix-code-vulnerability", "category": "security", "difficulty": "hard"},
+      {"id": "nginx-request-logging", "category": "system-administration", "difficulty": "medium"},
+      {"id": "pypi-server", "category": "software-engineering", "difficulty": "medium"},
+      {"id": "regex-log", "category": "data-processing", "difficulty": "medium"},
+      {"id": "multi-source-data-merger", "category": "data-processing", "difficulty": "medium"},
+      {"id": "db-wal-recovery", "category": "file-operations", "difficulty": "medium"},
+      {"id": "query-optimize", "category": "data-science", "difficulty": "medium"}
+    ]
+  },
+  "models": {
+    "target": "Qwen/Qwen3.5-9B",
+    "draft": "Qwen/Qwen3.5-2B"
+  },
+  "agent": {
+    "adapter_commit": "ccb5e129d6cdbd8f761143e253adef48f9e6a477",
+    "pi_version": "0.84.2",
+    "thinking": "off",
+    "capture_requests": true,
+    "concurrency": 4,
+    "attempts_per_seed": 8
+  },
+  "server": {
+    "max_running_requests": 8,
+    "mem_fraction_static": 0.4,
+    "cuda_graphs": true,
+    "flashinfer_autotune": true,
+    "enable_metrics": true,
+    "resample_threshold": 0.5
+  },
+  "matrix": {
+    "methods": ["ar"],
+    "particles": [],
+    "gamma": [],
+    "seeds": [0, 1, 2]
+  },
+  "primary_metrics": [
+    "terminal_bench_reward",
+    "agent_wall_time_s",
+    "tasks_per_agent_gpu_hour",
+    "correct_tasks_per_agent_gpu_hour"
+  ],
+  "diagnostic_metrics": [
+    "provider_requests",
+    "agent_input_tokens",
+    "agent_output_tokens",
+    "server_requests",
+    "server_prompt_tokens",
+    "server_generation_tokens",
+    "server_active_model_seconds"
+  ]
+}

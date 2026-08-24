@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "experiment_id": "pointwise-error-audit-math500-v1",
+  "purpose": "Transfer the verifier's pairwise error discrimination into an independently evaluable prefix score.",
+  "dataset": {
+    "name": "HuggingFaceH4/MATH-500",
+    "split": "test",
+    "start_index": 0,
+    "num_problems": 100,
+    "diagnostic_only": true
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "samples_per_problem": 8,
+    "max_new_tokens": 2048,
+    "temperature": 0.7,
+    "thinking": "off",
+    "seed": 0
+  },
+  "verifier": {
+    "model": "Qwen/Qwen3.8-27B",
+    "criterion": "pairwise-informed substantive-error audit",
+    "prompt_version": "error-audit-v1",
+    "pointwise": true,
+    "uses_generator_likelihood": false,
+    "score_labels": ["A", "B", "C", "D", "E"],
+    "score_values": [0.0, 0.25, 0.5, 0.75, 1.0],
+    "repetitions": 1
+  },
+  "prefixes": {
+    "fractions": [0.25, 0.5, 0.75, 1.0],
+    "positions_use_generator_tokenizer": true,
+    "minimum_tokens": 8
+  },
+  "bootstrap_samples": 500,
+  "primary_metrics": [
+    "auroc",
+    "within_problem_ranking_accuracy",
+    "top_half_correct_survival",
+    "top1_eventual_correct_rate",
+    "terminal_pointwise_bon_accuracy"
+  ]
+}

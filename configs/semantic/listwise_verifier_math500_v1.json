@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "experiment_id": "listwise-verifier-math500-v1",
+  "purpose": "Test whether one terminal verifier call can preserve the discrimination of order-swapped pairwise ranking.",
+  "trajectories": "semantic-verifier-math500-v1",
+  "dataset": {
+    "name": "HuggingFaceH4/MATH-500",
+    "split": "test",
+    "start_index": 0,
+    "num_problems": 100,
+    "diagnostic_only": true
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "candidates_per_problem": 8,
+    "max_new_tokens": 2048,
+    "temperature": 0.7,
+    "seed": 0
+  },
+  "verifier": {
+    "model": "Qwen/Qwen3.8-27B",
+    "calls_per_problem": 1,
+    "candidate_order": "deterministic_random_per_problem",
+    "candidate_order_seed": 0,
+    "choice_labels": ["A", "B", "C", "D", "E", "F", "G", "H"],
+    "ranking": "renormalized_exact_label_token_probabilities",
+    "bootstrap_samples": 500
+  },
+  "primary_metrics": [
+    "listwise_selection_accuracy",
+    "listwise_minus_self_consistency",
+    "listwise_minus_pointwise_terminal_bon",
+    "listwise_minus_pairwise_knockout",
+    "selected_label_counts"
+  ],
+  "cost_metrics": [
+    "verifier_calls",
+    "verifier_prompt_tokens",
+    "wall_time_s",
+    "mean_choice_token_mass"
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "experiment_id": "multiverifier-progress-olympiadbench-v1",
+  "purpose": "Measure whether separate mathematical-validity and budgeted-progress signals from two verifier models provide useful within-problem complementarity.",
+  "dataset": {
+    "trajectories": "work_dirs/semantic_olympiadbench_pilot_v1/olympiadbench_50x8_16k_trajectories.jsonl",
+    "name": "lscpku/OlympiadBench-official",
+    "config": "OE_TO_maths_en_COMP",
+    "split": "train",
+    "source_problems": 50,
+    "mixed_outcome_problems": 26,
+    "samples_per_problem": 8,
+    "evaluation_pairs": "all correct-versus-incorrect sibling pairs within mixed-outcome problems"
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "total_output_token_budget": 16384,
+    "fixed_prefix_token_positions": [
+      512,
+      1024,
+      2048
+    ],
+    "uses_likelihood": false
+  },
+  "verifier_models": [
+    "Qwen/Qwen3.8-27B",
+    "Qwen/Qwen3-32B"
+  ],
+  "semantic_rubrics": {
+    "validity": "Probability that the reasoning written so far is free of a substantive mathematical error and remains viable.",
+    "progress": "Probability that the same generator will reach a complete boxed answer within the remaining fixed token budget, independent of correctness."
+  },
+  "score_protocol": {
+    "labels": [
+      "A",
+      "B",
+      "C",
+      "D",
+      "E"
+    ],
+    "values": [
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "source": "exact requested next-token logprobs renormalized over A-E",
+    "uses_generator_likelihood": false
+  },
+  "ensemble": {
+    "method": "ridge_logistic_pairwise_ranker_on_score_logits",
+    "features": [
+      "qwen38_validity",
+      "qwen38_progress",
+      "qwen3_32b_validity",
+      "qwen3_32b_progress"
+    ],
+    "folds": 5,
+    "fold_seed": 41,
+    "ridge": 1.0,
+    "bootstrap_samples": 5000,
+    "bootstrap_unit": "problem",
+    "ablations": [
+      "each_single_feature",
+      "qwen38_validity_plus_progress",
+      "qwen3_32b_validity_plus_progress",
+      "both_validity_models",
+      "both_progress_models",
+      "all_four"
+    ]
+  },
+  "primary_gate": {
+    "checkpoint": "token_1024",
+    "ensemble": "all_four",
+    "problem_balanced_accuracy_at_least": 0.6,
+    "problem_cluster_bootstrap_95_percent_lower_bound_above": 0.5,
+    "point_estimate_must_exceed_every_single_feature": true,
+    "must_pass_all": true
+  },
+  "secondary_checkpoints": [
+    "token_512",
+    "token_2048"
+  ],
+  "evaluation_status": "exploratory_problem_level_cross_validation_not_disjoint_validation"
+}

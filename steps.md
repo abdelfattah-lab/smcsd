@@ -1,6 +1,8 @@
 # TTS: Test-Time-Scaling Serving with Composite SMC Objectives
 
-Status: project roadmap — revised 2026-08-21 (CUDA-graph Qwen3.5 agent serving, matched target AR, frozen Terminal-Bench dev matrix, and joined agent/server metrics complete; semantic scoring not started)
+Status: project roadmap — revised 2026-08-24. The OlympiadBench semantic and
+likelihood gates remain negative, but the frozen Terminal-Bench semantic
+actionability gate passed. A cloneable online terminal-particle backend is next.
 
 Branch: `tts`  
 Starting point: the existing one-draft, one-target SM-CSD implementation
@@ -22,10 +24,41 @@ Raw tokens per second is a diagnostic metric, not the main result. Different met
 
 This is primarily an MLSys project. The algorithmic contribution is a general composite SMC objective and a scheduling policy; the core contribution is making it efficient through KV-cache sharing, batched checkpoints, duplicate-prefix compaction, fused weight/resampling operations, fixed execution shapes, and cross-request pipelining.
 
-> **Scope in one sentence:** online compute reallocation for test-time scaling
-> via SMC, made cheap by KV-fork-based particle lineage and zero-copy semantic
-> checkpoints. Multi-likelihood aggregation is an ablation unless the Phase 2
-> offline evidence promotes it; cross-tokenizer aggregation is future work.
+> **Scope in one sentence:** fast online compute reallocation for test-time
+> scaling via SMC, made cheap by KV-fork-based particle lineage and optimized
+> likelihood verification. Semantic checkpoints remain negative on
+> OlympiadBench but cleared the frozen Terminal-Bench actionability gate and
+> are promoted there. Multi-likelihood aggregation remains evidence-gated, and
+> cross-tokenizer aggregation is future work.
+
+**Evidence update, 2026-08-24.** On 50 long-form OlympiadBench problems,
+Qwen3.8-27B and Qwen3-32B validity/progress scores and their out-of-fold
+ensembles failed to rank correct versus incorrect sibling prefixes reliably at
+the primary 1,024-token checkpoint. The four-score ensemble reached 52.52%
+[41.91%, 63.93%] problem-balanced accuracy and an actual cross-validated
+allocation policy lost 2.40 accuracy points to a verifier-free agreement
+control at matched compute. A subsequent true online run reached 46% at 46.77
+active GPU-seconds/problem, versus 48% at 12.32 GPU-seconds/problem for
+self-consistency. Do not build the external semantic hot path from this
+evidence. The optimized Qwen3.5-9B/2B likelihood run also failed: particle
+majority reached 26% at 13.38 active GPU-seconds/problem and its pool oracle
+was only 26%, versus self-consistency's 48% at 12.32. A terminal L1+S sweep
+over `beta={0,1,2,4,8,12,16}` changed no answer and raised cost to 18.53.
+The immediate blocker is proposal/ancestry collapse, not final selection; see
+`docs/semantic_tts.md`.
+
+**Terminal-Bench evidence update, 2026-08-24.** The sealed development pool
+contains 288 Qwen3.5-9B trajectories across 12 tasks (134 successful, 154
+failed) and 22,258 exact, reward-isolated checkpoints. Qwen3.8-27B plus
+Qwen3-32B at 256-token checkpoints reached 61.33% group-balanced sibling
+ranking accuracy [57.18%, 66.42%] and a 12.12-point top-half
+correct-trajectory survival lift. All six predeclared promotion gates passed
+over 537 mixed checkpoint groups, 11 mixed tasks, and 16,226 pairwise
+comparisons. The ensemble improves Qwen3.8-27B by only 0.09 points and verifier
+errors correlate at 0.940, so the quality result promotes semantic online SMC
+but does not justify paying for both models on every checkpoint. The immediate
+engineering prerequisite is restorable terminal state; the stored language
+model prefixes are resumable, but the source Harbor containers are not.
 
 ## 2. Scope and initial assumptions
 
@@ -472,15 +505,20 @@ engine changes. Budget: days.
 
 **(a) Semantic predictiveness**
 
-- [ ] Sample diverse partial trajectories at several completion fractions.
-- [ ] Ask the chosen scorer for expected recoverability scores.
-- [ ] Measure AUROC/AUPRC for eventual correctness.
-- [ ] Measure calibration error and reliability curves.
-- [ ] Measure ranking accuracy within candidates for the same prompt.
-- [ ] Compare 5 versus 20 labels; sweep criterion wording and a small set of
+- [x] Sample diverse partial trajectories at fractional and equal-token checkpoints.
+- [x] Ask the chosen scorer for recoverability, error-audit, validity, and progress scores.
+- [x] Measure AUROC/AUPRC for eventual correctness.
+- [x] Measure calibration error and reliability curves.
+- [x] Measure ranking accuracy within candidates for the same prompt.
+- [x] Compare 5 versus 20 labels; sweep criterion wording and a small set of
       scorer models.
-- [ ] Estimate scorer latency, tokens, and batching efficiency.
-- [ ] Freeze a versioned first criterion and calibration mapping.
+- [x] Estimate scorer latency, tokens, and batching efficiency.
+- [x] Freeze versioned criteria, checkpoints, splits, and gates.
+
+Outcome: global predictiveness is real, but same-problem actionability is not.
+Pointwise, relative, dual-rubric, and multi-model variants all failed the
+frozen online-allocation gate. Terminal LLM-as-a-Verifier remains a baseline,
+not the online policy.
 
 **(b) Design A vs design B score quality.** Score the same prefixes via the
 suffix-form KV-fork prompt and the clean re-prompted form. If A tracks B
@@ -501,13 +539,28 @@ Gate: the evidence sets the build order. S-family goes first if (a) holds
 complementarity; otherwise LM is demoted to the `M=1` identity test plus one
 ablation row.
 
-### Phase 3 — First online experiment (specification in Section 17)
+### Phase 3 — First online semantic experiment (complete, negative)
 
-The centerpiece question, answered before any optimization: **does
-intermediate semantic reallocation create value beyond spending the same
-verifier budget terminally?** One draft, one target, one scorer; the six
-conditions of Section 17 at matched allocated cost on GSM8K + a MATH500
-subset.
+The offline gate was negative, then the centerpiece question was tested
+directly with a standalone true-branching runner before modifying the optimized
+engine. **Intermediate large-model semantic scoring did not create value over
+self-consistency or a verifier-free agreement policy at matched cost.** The
+harder OlympiadBench study supersedes the originally proposed GSM8K/MATH smoke
+because GSM8K was saturated and fractional prefixes leaked final length.
+
+At `N=8`, 2,048-token checkpoints, `beta=12`, and ESS threshold `0.75N`,
+semantic SMC scores 46% and costs 46.77 active GPU-seconds/problem. The common
+self-consistency pool scores 48% at 12.32 GPU-seconds/problem. Deterministic
+top-half/fork-two scores 40% at 35.27 GPU-seconds/problem; terminal pointwise
+Best-of-8 scores 40%, and the order-swapped terminal knockout scores 14%.
+Semantic SMC preserves diversity and reaches 58% oracle accuracy, but its
+semantic terminal selector fails to convert that headroom. The frozen gate is
+failed; see `configs/semantic/online_particlescale_olympiadbench_dev_v1.json`.
+
+No-go outcome: do not implement the external Qwen3.8-27B/Qwen3-32B semantic
+hot path. The tasks below are retained as the interface specification for a
+future in-engine or distilled scorer, but are inactive until that scorer
+passes the same offline gate.
 
 Implementation needed — the minimal eager composite path only:
 
@@ -518,9 +571,10 @@ Implementation needed — the minimal eager composite path only:
 - [ ] The Phase-2-winning scorer design (A or B).
 - [ ] Ordinary PyTorch throughout; the Section 10 objective tests pass first.
 
-Exit criterion / gate: a matched-cost answer either way. Positive → Phases
-4–7. Negative → the pivot is explicit: "terminal reranking, served fast"
-(still a systems paper), or LM-led (only if Phase 2(c) was positive).
+Exit criterion / gate: complete, negative, including a direct online run. The
+project pivots to optimized likelihood-SMC serving with cheap in-loop
+allocation signals; terminal verifier selection is a charged negative
+baseline. Multi-target work remains conditional on Phase 2(c).
 
 ### Phase 4 — Productionize the online scorer
 
@@ -925,6 +979,14 @@ Proceed with semantic online SMC only if:
 - score calibration is stable enough to choose `beta`;
 - online checkpoints outperform terminal-only reranking at matched total cost.
 
+Current decision (2026-08-24): **no-go for the tested large external semantic
+verifiers.** Prefix scores do not rank siblings stably, the multi-verifier
+ensemble fails the frozen gate, and the cross-validated hybrid loses to the
+agreement control. True branched semantic SMC is also dominated by
+self-consistency, 46% at 46.77 versus 48% at 12.32 active GPU-seconds/problem.
+A materially cheaper self-scorer or distilled scorer must start again at this
+gate; it does not inherit approval from global AUROC.
+
 Proceed with multiple likelihood targets only if:
 
 - the Phase 2(c) offline complementarity study was positive;
@@ -936,36 +998,127 @@ Proceed with heavy kernel work only after profiling shows the relevant operation
 
 If the final system raises accuracy but cannot improve query-level serving efficiency after charging all GPUs, the thesis claim must be narrowed; raw TPS is not sufficient.
 
-## 17. First online experiment (Phase 3 specification)
+## 17. Next experiment: semantic-only actionability screen
 
-Use one draft, one target, and one semantic verifier on GSM8K plus a small MATH500 subset:
+The user-selected research direction is semantic-only SMC: identify tasks and
+prefix locations where a semantic verifier can improve allocation without
+using likelihood as an SMC weight. The existing negative OlympiadBench result
+remains an important control, not a reason to assume that long interactive
+tasks have the same prefix-signal behavior.
 
-- `N in {8, 16, 32}`;
-- current default `gamma` plus one smaller and one larger value;
-- `H in {32, 64, 128}`;
-- `beta in {0, small, medium}`;
-- fixed recoverability criterion;
-- terminal semantic reranking for every method.
+Freeze the eventual online scaling axes now:
 
-Run:
+1. generated-token checkpoint interval in `{256, 512, 2048, 8192}`;
+2. particles `N in {4, 8, 16, 32, 64}`;
+3. semantic-verifier calls per checkpoint in `{1, 2, 4, 8}`;
+4. one verifier model versus two heterogeneous verifier models;
+5. ESS resampling threshold in `{0.25, 0.5, 0.75}`.
 
-1. target AR;
-2. target BoN;
-3. current SM-CSD/L1;
-4. semantic-only SMC;
-5. L1+S;
-6. L1 with terminal-only semantic reranking.
+Do not run this full Cartesian product. First build a frozen Terminal-Bench
+actionability dataset. Export the exact agent-visible state every 256 generated
+tokens and immediately after every tool call, together with stable task and
+trajectory IDs, token position, a separately stored final task reward, and
+separate generator, tool, and verifier cost fields. The 512/2048/8192-token
+views must be obtained by subsampling these same trajectories. The semantic
+verifier must not see the final reward, hidden tests, privileged grader state,
+or future tool output.
 
-This experiment answers the first important scientific question: does intermediate semantic reallocation create value beyond spending the same verifier budget at the end? Only after that result should multiple likelihood targets and deeper systems optimization become the main focus.
+The first implementation milestone is a two-task, two-trajectory smoke test
+that establishes:
+
+1. exact and reproducible checkpoint alignment;
+2. serializable and engine-resumable model prefix state, with terminal
+   environment cloneability reported explicitly;
+3. no future or grader leakage into verifier inputs;
+4. stable task, trajectory, checkpoint, verifier-model, and call IDs;
+5. exact token, total wall-time, and allocated-accelerator-time accounting,
+   with unavailable generator/tool wall-time splits marked rather than
+   estimated.
+
+Smoke outcome, 2026-08-24: complete for the offline artifact. Four trajectories
+over `fix-git` and `query-optimize` produced 123 checkpoints: 39 exact
+256-token checkpoints and 84 post-tool checkpoints. Token alignment, stable
+IDs, reward isolation, and serialized model prefixes pass. Agent/trial wall
+times are exact; shared-GPU allocation is exact at complete source-job scope
+and intentionally unavailable per trajectory under concurrent serving. The
+verifier cost ledger separately counts engine startup, graph capture,
+inference, and every resumed process. Existing Harbor traces do not contain
+clonable container
+snapshots, so true online trajectory-level SMC remains blocked on a snapshot
+or deterministic replay backend; the offline semantic-actionability screen is
+not blocked.
+
+After the smoke test, collect the development actionability pool with eight
+independent trajectories per task and three generation seeds. Start by scoring
+each checkpoint once with each of two heterogeneous semantic verifier models.
+Measure sibling correct-versus-incorrect ranking accuracy, bootstrap confidence
+intervals, top-half survival lift, score-versus-final-reward curves by prefix
+position, cross-verifier error correlation, and cost.
+
+Eight verifier calls mean eight reproducible but independently varied
+evaluations, for example different sampling seeds, prompt variants, or scoring
+criteria. Eight identical greedy calls with the same model and prompt do not
+provide verifier-call scaling. Store every call's score and metadata before
+aggregation so marginal gain and correlation can be measured.
+
+Advance to online semantic SMC only if the offline screen shows all of:
+
+- sibling correct-versus-incorrect ranking accuracy of at least 60%;
+- a bootstrap lower confidence bound above 50%;
+- at least a 10 percentage-point lift in correct-trajectory survival in the
+  verifier's top half;
+- useful signal before the terminal checkpoint;
+- a heterogeneous ensemble that improves on the best single verifier.
+
+**Gate outcome: PASS (2026-08-24).** The leakage-safe, leave-one-task-out
+two-model ensemble at 256-token checkpoints reached 61.33% ranking accuracy
+[57.18%, 66.42%], versus 61.23% for Qwen3.8-27B alone at that view,
+and lifted top-half correct-trajectory survival by 12.12 points. Qwen3.8-27B
+alone was strongest at post-tool events (62.98%), but event frequency is
+irregular. The ensemble's 0.09-point gain and 0.940 error correlation make
+Qwen3.8-27B the cost-conscious first online scorer. Full offline scoring cost
+9,590 allocated GPU-seconds for Qwen3.8-27B and 16,393 for Qwen3-32B, with
+370.1 million prompt tokens across both models. Qwen3-32B's mean selected-label
+token mass was only 0.287 versus 0.968 for Qwen3.8-27B, so its output-format
+confidence also needs correction before an eight-call study.
+
+Promotion is conditional on a cloneable online particle backend. Implement a
+filesystem/process snapshot or validated deterministic-replay layer first,
+with one terminal environment, transcript, model-prefix/KV lineage, and cost
+ledger per particle. A policy sweep before that backend would only be an
+offline selection simulation, not semantic SMC.
+
+After the backend passes fork/resume tests, sweep one dimension at a time
+rather than taking a Cartesian product:
+
+1. use Qwen3.8-27B, a 256-token interval, one call, and ESS threshold 0.5;
+   scale `N in {4,8,16,32,64}`;
+2. hold the best `N` fixed and sweep every frozen interval plus post-tool;
+3. hold `N` and interval fixed; scale independent verifier calls through 8;
+4. compare Qwen3.8-27B with the calibrated two-model ensemble/cascade;
+5. sweep ESS thresholds `{0.25,0.5,0.75}` at the selected point;
+6. sweep speculative `gamma` only after policy quality is fixed, reporting
+   latency/throughput as a serving parameter rather than extra verifier signal;
+7. compare every promoted point with self-consistency, terminal Best-of-N,
+   LLM-as-a-Verifier, and ParticleScale-style allocation at matched total cost.
+
+Only after this quality gate should serving optimization begin: reuse verifier
+prefix KV state, deduplicate cloned prefixes, batch and overlap scoring,
+conditionally request extra verifier calls, and test a small-to-large verifier
+cascade. The serving MVP succeeds only with a statistically supported
+quality/cost Pareto win after charging every accelerator.
 
 ## 18. Definition of done
 
 The project is complete when:
 
-- all four objective families are implemented and correctness-tested;
+- the likelihood-SMC serving path and every promoted cheap allocation signal
+  are implemented and correctness-tested;
 - current SM-CSD remains an exact compatibility mode;
-- semantic scorer model(s), criteria, and intervals are configurable;
-- at least the required LLM-as-a-Verifier and GSI baselines run through the same harness;
+- the rejected semantic objectives remain reproducible offline rather than
+  being silently omitted from the comparison;
+- self-consistency, terminal Best-of-N/LLM-as-a-Verifier,
+  ParticleScale-style allocation, and target AR run through the same harness;
 - all accelerator costs are counted;
 - results include quality/cost Pareto curves and serving-load experiments;
 - the optimized system beats strong baselines at matched accuracy on at least two substantive workloads;

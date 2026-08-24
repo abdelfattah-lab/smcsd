@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "experiment_id": "semantic-verifier-math500-holdout-v1",
+  "purpose": "Disjoint validation of frozen semantic-only verifier interfaces and allocation policies.",
+  "dataset": {
+    "name": "HuggingFaceH4/MATH-500",
+    "split": "test",
+    "start_index": 100,
+    "num_problems": 100,
+    "development_indices": [0, 99],
+    "holdout_indices": [100, 199]
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "samples_per_problem": 8,
+    "max_new_tokens": 2048,
+    "temperature": 0.7,
+    "thinking": "off",
+    "seed": 0,
+    "uses_likelihood": false
+  },
+  "pointwise_verifier": {
+    "model": "Qwen/Qwen3.8-27B",
+    "prompt_version": "error-audit-v1",
+    "frozen_from": "configs/semantic/pointwise_error_audit_math500_v1.json",
+    "score_labels": ["A", "B", "C", "D", "E"],
+    "score_values": [0.0, 0.25, 0.5, 0.75, 1.0],
+    "prefix_fractions": [0.25, 0.5, 0.75, 1.0],
+    "uses_generator_likelihood": false
+  },
+  "terminal_verifier": {
+    "method": "stagewise_fixed_bracket_order_swapped_knockout",
+    "model": "Qwen/Qwen3.8-27B",
+    "matches_per_problem": 7,
+    "orders_per_match": 2,
+    "calls_per_problem": 14,
+    "frozen_from": "configs/semantic/pairwise_verifier_math500_v1.json"
+  },
+  "allocation": {
+    "calibration_indices": [0, 99],
+    "judge_adaptive_threshold": 0.9137391484994779,
+    "judge_adaptive_initial_samples": 2,
+    "judge_adaptive_expanded_samples": 8,
+    "agreement_adaptive_initial_samples": 2,
+    "agreement_adaptive_expanded_samples": 8,
+    "randomized_order_trials": 500
+  },
+  "primary_metrics": [
+    "semantic_auroc",
+    "within_problem_ranking_accuracy",
+    "selection_accuracy",
+    "generator_tokens_per_problem",
+    "verifier_prompt_tokens_per_problem",
+    "steady_state_gpu_seconds"
+  ]
+}

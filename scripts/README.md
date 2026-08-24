@@ -15,6 +15,39 @@ experiments on top of the standalone `smcsd/` implementation.
   directly comparable.
 - **`quick_quality_check.py`** — Quick output quality sanity check
   (vanilla vs SMC) on a handful of hardcoded prompts.
+- **`accuracy_test_olympiadbench.py`** — Long-form semantic-TTS eligibility
+  pilot on the official text-only English OlympiadBench subset. Saves exact
+  output token IDs for fixed-horizon prefix scoring.
+- **`continue_olympiadbench_trajectories.py`** — Continues only length-capped
+  pilot trajectories from their exact saved token IDs.
+- **`offline_pointwise_error_audit.py`** — Scores semantic recoverability at
+  fractional or fixed generator-token checkpoints without generator
+  likelihoods.
+- **`offline_semantic_hybrid_sim.py`** — Cross-validated offline simulation of
+  the agreement-conditioned semantic expansion policy.
+- **`offline_prefix_pairwise_verifier.py`** — Order-swapped relative verifier
+  on correct/incorrect sibling prefixes at identical generator-token horizons.
+  This is a diagnostic screen, not a deployable label-independent selector.
+- **`offline_dual_semantic_audit.py`** — Fixed-token validity and
+  progress-to-completion scoring with exact ordered-label logprobs. Supports
+  multiple verifier models without exposing generator likelihoods.
+- **`offline_semantic_ensemble.py`** — Problem-level out-of-fold pairwise
+  fusion of multiple semantic models and rubrics, with clustered confidence
+  intervals and a frozen gate verdict.
+- **`online_semantic_particlescale.py`** — True branched semantic-only SMC or
+  deterministic top-half/fork-two continuation from common exact-token
+  prefixes. Records ancestry, ESS, diversity, model tokens, and accelerator
+  cost without generator likelihoods.
+- **`offline_semantic_method_comparison.py`** — Aligned problem bootstrap and
+  quality/cost dominance report across self-consistency, terminal semantic
+  selectors, semantic SMC, and deterministic semantic forking.
+- **`online_likelihood_smc_olympiadbench.py`** — Optimized likelihood-only
+  `SMCEngine` run on the frozen long-form slice. Preserves every final particle
+  and reports posterior, majority, likelihood-weighted majority, maximum
+  weight, oracle, returned tokens, and accelerator seconds.
+- **`offline_likelihood_semantic_comparison.py`** — Frozen terminal L1+S beta
+  sweep over a likelihood-SMC particle pool, with problem-paired bootstrap and
+  explicit verifier GPU accounting.
 - **`smc_profile_engine.py`** — Offline profiler harness for SMC. Use
   `--engine-kind smc_engine` to target the dedicated ``SMCEngine`` path;
   emits Chrome-compatible traces.
@@ -110,6 +143,62 @@ python scripts/accuracy_test_gsm8k_http.py --mode baseline --num-questions 200
 See `tps_benchmark_scripts/` for shell-based sweeps across batch sizes
 and (gamma, n) configurations. Sweep scripts emit timestamped CSVs with
 columns `method,gamma,n,tps,b`.
+
+## Long-form semantic verifier pilot
+
+The official symbolic-equivalence judge requires the SymPy-compatible ANTLR
+runtime:
+
+```bash
+source .venv/bin/activate
+uv pip install antlr4-python3-runtime==4.11.1
+```
+
+The frozen protocol and all model/split settings are recorded in
+`configs/semantic/semantic_verifier_olympiadbench_pilot_v1.json`. The main
+stages are generation, exact-token continuation for capped paths, pointwise
+scoring at fixed 512/1,024/2,048-token horizons, relabeling those unchanged
+prefix scores with the longer outcomes, and cross-validated hybrid simulation.
+Use each script's `--help` for hardware-specific SGLang flags and output paths:
+
+```bash
+python scripts/accuracy_test_olympiadbench.py --help
+python scripts/continue_olympiadbench_trajectories.py --help
+python scripts/offline_pointwise_error_audit.py --help
+python scripts/relabel_semantic_scores.py --help
+python scripts/offline_semantic_hybrid_sim.py --help
+python scripts/offline_prefix_pairwise_verifier.py --help
+python scripts/offline_dual_semantic_audit.py --help
+python scripts/offline_semantic_ensemble.py --help
+python scripts/online_semantic_particlescale.py --help
+python scripts/offline_semantic_method_comparison.py --help
+python scripts/online_likelihood_smc_olympiadbench.py --help
+python scripts/offline_likelihood_semantic_comparison.py --help
+python scripts/terminal_bench/export_semantic_checkpoints.py --help
+python scripts/terminal_bench/score_semantic_checkpoints.py --help
+python scripts/terminal_bench/merge_semantic_score_shards.py --help
+python scripts/terminal_bench/analyze_semantic_actionability.py --help
+```
+
+The completed OlympiadBench validity/progress screen uses Qwen3.8-27B and
+Qwen3-32B. Its four-score ensemble failed the frozen 1,024-token actionability
+gate (52.52% problem-balanced correct/incorrect sibling ranking, 95% CI
+41.91--63.93%) and the Qwen3-32B progress allocation policy lost to the
+verifier-free agreement control at matched compute. See
+`docs/semantic_tts.md` for the full results and serving-cost decision.
+
+The subsequent true online 50-problem experiment starts every method from the
+same eight 2,048-token prefixes and samples every branched continuation online.
+Semantic SMC reaches 46% accuracy at 46.77 active GPU-seconds/problem, versus
+48% at 12.32 GPU-seconds/problem for self-consistency; deterministic semantic
+forking reaches 40% at 35.27 GPU-seconds/problem. The frozen online gate fails.
+
+The optimized likelihood follow-up also fails on this draft/target pair.
+Qwen3.5-9B/2B likelihood SMC reaches 26% particle-majority accuracy at 13.38
+active GPU-seconds/problem and has only 26% pool oracle. Adding one terminal
+Qwen3.8-27B semantic factor at every frozen beta changes no answer and raises
+cost to 18.53 GPU-seconds/problem. Self-consistency@8 remains best at 48% and
+12.32 GPU-seconds/problem; proposal adequacy and ancestry survival are next.
 
 ## Quick Quality Check
 

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "experiment_id": "pairwise-distill-math500-v1",
+  "purpose": "Test whether terminal order-swapped pair preferences can calibrate a pointwise semantic prefix student.",
+  "student_features": [
+    "recoverability_score_logit",
+    "error_audit_score_logit"
+  ],
+  "teacher": "within-problem preferences induced by terminal order-swapped all-pairs ratings",
+  "fit": {
+    "method": "ridge-regularized logistic pairwise ranker",
+    "ridge": 1.0,
+    "folds": 5,
+    "fold_unit": "problem",
+    "seed": 0
+  },
+  "evaluation": {
+    "predictions": "out_of_fold_only",
+    "status": "exploratory_cross_validation_not_frozen_test",
+    "uses_generator_likelihood": false
+  },
+  "bootstrap_samples": 500
+}

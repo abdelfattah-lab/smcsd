@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "experiment_id": "likelihood-semantic-hybrid-olympiadbench-dev-v1",
+  "evaluation_status": "exploratory_development_not_disjoint_test",
+  "dataset": {
+    "name": "lscpku/OlympiadBench-official",
+    "config": "OE_TO_maths_en_COMP",
+    "selection_seed": 0,
+    "selection_positions": [0, 49],
+    "problems": 50
+  },
+  "likelihood_smc": {
+    "target": "Qwen/Qwen3.5-9B",
+    "draft": "Qwen/Qwen3.5-2B",
+    "particles": 8,
+    "gamma": 8,
+    "target_temperature": 0.7,
+    "draft_temperature": 0.7,
+    "power_alpha": 1.0,
+    "ess_threshold_fraction": 0.5,
+    "max_new_tokens": 16384,
+    "seed": 0
+  },
+  "serving": {
+    "resident_gpus": 1,
+    "max_running_smc_groups": 4,
+    "cuda_graph_max_particle_batch": 32,
+    "attention_backend": "triton",
+    "model_initialization_excluded_from_active_gpu_seconds": true
+  },
+  "semantic_terminal_factor": {
+    "scorer": "Qwen/Qwen3.8-27B",
+    "rubric": "validity",
+    "score_source": "exact requested next-token logprobs renormalized over A-E",
+    "semantic_betas": [0.0, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0],
+    "combined_log_weight": "smc_final_log_weight + beta * semantic_score"
+  },
+  "selection_rules": [
+    "posterior_sample",
+    "particle_majority",
+    "likelihood_weighted_answer_majority",
+    "maximum_likelihood_weight",
+    "maximum_terminal_semantic_score",
+    "maximum_combined_particle_weight",
+    "combined_weighted_answer_majority"
+  ],
+  "interpretation": {
+    "terminal_combination": "A valid L1+S objective with one semantic checkpoint at termination; it is distinct from periodic intermediate semantic resampling.",
+    "beta_selection": "Development sweep only. Any selected beta must be frozen before a disjoint test.",
+    "primary_decision": "Compare quality and all accelerator seconds against self-consistency and likelihood-only SMC."
+  }
+}

@@ -19,9 +19,11 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import time
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -69,14 +71,29 @@ def format_instruction(question: str) -> str:
     )
 
 
-def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False):
-    """Load GSM8K and build chat-template prompts + gold labels."""
+def load_gsm8k_records(
+    tokenizer,
+    num_questions: int,
+    *,
+    disable_thinking: bool = False,
+    split: str = "test",
+    start_index: int = 0,
+):
+    """Load GSM8K into self-contained records for reproducible studies."""
     print("Loading GSM8K dataset...")
-    dataset = load_dataset("openai/gsm8k", "main", split="test")
+    dataset = load_dataset("openai/gsm8k", "main", split=split)
+    end_index = start_index + num_questions
+    if start_index < 0 or end_index > len(dataset):
+        raise ValueError(
+            f"Requested GSM8K rows [{start_index}, {end_index}), but split "
+            f"{split!r} has {len(dataset)} rows."
+        )
 
-    prompts = []
-    labels = []
-    for sample in dataset.select(range(num_questions)):
+    records = []
+    for dataset_index, sample in zip(
+        range(start_index, end_index),
+        dataset.select(range(start_index, end_index)),
+    ):
         instruction = format_instruction(sample["question"])
         chat_template_kwargs = {}
         if disable_thinking:
@@ -87,10 +104,44 @@ def load_gsm8k(tokenizer, num_questions: int, *, disable_thinking: bool = False)
             add_generation_prompt=True,
             **chat_template_kwargs,
         )
-        prompts.append(prompt)
-        labels.append(extract_answer(sample["answer"]))
-    assert all(l is not None for l in labels), "Some gold labels could not be parsed"
-    return prompts, labels
+        records.append(
+            {
+                "dataset": "openai/gsm8k",
+                "dataset_config": "main",
+                "split": split,
+                "dataset_index": dataset_index,
+                "problem_id": f"gsm8k-{split}-{dataset_index}",
+                "problem": sample["question"],
+                "prompt": prompt,
+                "gold_answer": extract_answer(sample["answer"]),
+            }
+        )
+    assert all(r["gold_answer"] is not None for r in records), (
+        "Some gold labels could not be parsed"
+    )
+    return records
+
+
+def load_gsm8k(
+    tokenizer,
+    num_questions: int,
+    *,
+    disable_thinking: bool = False,
+    split: str = "test",
+    start_index: int = 0,
+):
+    """Compatibility wrapper returning prompts + labels."""
+    records = load_gsm8k_records(
+        tokenizer,
+        num_questions,
+        disable_thinking=disable_thinking,
+        split=split,
+        start_index=start_index,
+    )
+    return (
+        [r["prompt"] for r in records],
+        [r["gold_answer"] for r in records],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +251,7 @@ def run_smc_engine_eval(args, prompts, labels):
     return preds, total_output_tokens, latency
 
 
-def run_majority_eval(args, prompts, labels):
+def run_majority_eval(args, prompts, labels, records=None):
     """Fully batched stock-engine majority@n on the extracted numeric answer.
 
     Returns majority-vote preds; total tokens count every sample generated
@@ -213,11 +264,14 @@ def run_majority_eval(args, prompts, labels):
         model_path=args.model,
         trust_remote_code=True,
         attention_backend=args.attention_backend,
+        base_gpu_id=getattr(args, "base_gpu_id", 0),
     )
     if args.mem_fraction_static is not None:
         engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
     if args.seed is not None:
         engine_kwargs["random_seed"] = args.seed
+    if getattr(args, "max_running_requests", None) is not None:
+        engine_kwargs["max_running_requests"] = args.max_running_requests
     if getattr(args, "tp", 1) > 1:
         engine_kwargs["tp_size"] = args.tp
         engine_kwargs["disable_custom_all_reduce"] = True
@@ -235,6 +289,44 @@ def run_majority_eval(args, prompts, labels):
     finally:
         engine.shutdown()
     total_tokens = sum(len(o["output_ids"]) for o in outs)
+    dump_path = getattr(args, "dump_trajectories", None)
+    if dump_path:
+        if records is None:
+            raise ValueError("Rich trajectory dumps require dataset records.")
+        Path(dump_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(dump_path, "w", encoding="utf-8") as fh:
+            for i, record in enumerate(records):
+                for j in range(n):
+                    output = outs[i * n + j]
+                    answer = extract_answer(output["text"])
+                    meta = output.get("meta_info", {})
+                    fh.write(
+                        json.dumps(
+                            {
+                                "schema_version": 2,
+                                **record,
+                                # Legacy aliases kept for offline_policy_sim.py.
+                                "qid": record["dataset_index"],
+                                "sample": j,
+                                "sample_id": j,
+                                "generator_model": args.model,
+                                "generator_seed": args.seed,
+                                "temperature": args.temperature,
+                                "max_new_tokens": args.max_new_tokens,
+                                "generator_output_ids": output["output_ids"],
+                                "full_text": output["text"],
+                                "text": output["text"],
+                                "completion_tokens": len(output["output_ids"]),
+                                "finish_reason": meta.get("finish_reason"),
+                                "extracted_answer": answer,
+                                "answer": answer,
+                                "gold": record["gold_answer"],
+                                "correct": bool(answer == record["gold_answer"]),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
     preds = []
     for i in range(len(prompts)):
         votes = [extract_answer(outs[i * n + j]["text"]) for j in range(n)]
@@ -340,17 +432,23 @@ def main(args):
 
     # Load tokenizer and data (shared across all modes)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    prompts, labels = load_gsm8k(
+    records = load_gsm8k_records(
         tokenizer,
         args.num_questions,
         disable_thinking=args.disable_thinking,
+        split=args.split,
+        start_index=args.start_index,
     )
+    prompts = [r["prompt"] for r in records]
+    labels = [r["gold_answer"] for r in records]
 
     # Run evaluation
     if args.mode == "smc_engine":
         preds, total_tokens, latency = run_smc_engine_eval(args, prompts, labels)
     elif args.mode == "majority":
-        preds, total_tokens, latency = run_majority_eval(args, prompts, labels)
+        preds, total_tokens, latency = run_majority_eval(
+            args, prompts, labels, records
+        )
     else:
         preds, total_tokens, latency = run_baseline_eval(args, prompts, labels)
 
@@ -418,9 +516,21 @@ if __name__ == "__main__":
     # Benchmark
     bench = parser.add_argument_group("benchmark")
     bench.add_argument("--num-questions", type=int, default=80)
+    bench.add_argument(
+        "--split",
+        choices=["train", "test"],
+        default="test",
+        help="GSM8K split (use train for semantic-verifier development).",
+    )
+    bench.add_argument("--start-index", type=int, default=0)
     bench.add_argument("--max-new-tokens", type=int, default=512)
     bench.add_argument("--batch-size", type=int, default=1)
     bench.add_argument("--n-samples", type=int, default=8, help="majority mode votes")
+    bench.add_argument(
+        "--dump-trajectories",
+        default=None,
+        help="Majority mode: write one self-contained JSONL row per sample.",
+    )
     bench.add_argument(
         "--ignore-eos",
         action=argparse.BooleanOptionalAction,
@@ -445,6 +555,7 @@ if __name__ == "__main__":
     eng.add_argument("--cuda-graph-max-bs", type=int, default=128)
     eng.add_argument("--max-running-requests", type=int, default=16)
     eng.add_argument("--tp", type=int, default=1)
+    eng.add_argument("--base-gpu-id", type=int, default=0)
     eng.add_argument(
         "--max-total-tokens",
         type=int,

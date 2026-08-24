@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "dataset_id": "tb21-semantic-actionability-smoke-v1",
+  "purpose": "Validate exact semantic checkpoint export on two Terminal-Bench tasks and two completed trajectories per task. This is an artifact smoke test, not a quality result.",
+  "benchmark": {
+    "name": "terminal-bench-2.1",
+    "dataset_commit": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "tasks": [
+      {
+        "id": "fix-git",
+        "category": "software-engineering",
+        "difficulty": "easy"
+      },
+      {
+        "id": "query-optimize",
+        "category": "data-science",
+        "difficulty": "medium"
+      }
+    ]
+  },
+  "source_jobs": [
+    {
+      "job_name": "tb21-likelihood-dev-v1__screen-seed0__ar__seed0",
+      "role": "smoke-trajectory-a"
+    },
+    {
+      "job_name": "tb21-likelihood-dev-v1__screen-seed0__smcsd-n8-g8__seed0",
+      "role": "smoke-trajectory-b"
+    }
+  ],
+  "tokenizer": {
+    "model": "Qwen/Qwen3.5-9B",
+    "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "trust_remote_code": true,
+    "local_files_only": true
+  },
+  "checkpoint_policy": {
+    "base_interval_tokens": 256,
+    "derived_interval_tokens": [
+      512,
+      2048,
+      8192
+    ],
+    "after_every_tool_result": true,
+    "token_position_basis": "cumulative_generator_completion_tokens"
+  },
+  "online_scaling_axes": {
+    "checkpoint_interval_tokens": [
+      256,
+      512,
+      2048,
+      8192
+    ],
+    "particles": [
+      4,
+      8,
+      16,
+      32,
+      64
+    ],
+    "verifier_calls_per_checkpoint": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "verifier_model_count": [
+      1,
+      2
+    ],
+    "ess_resample_threshold": [
+      0.25,
+      0.5,
+      0.75
+    ]
+  },
+  "labels": {
+    "success_threshold": 1.0,
+    "separate_file": true,
+    "semantic_verifier_may_read_labels": false
+  },
+  "cost_accounting": {
+    "accelerators_allocated": 1,
+    "separate_generator_tool_and_semantic_verifier_fields": true
+  },
+  "smoke": {
+    "expected_tasks": 2,
+    "expected_trajectories_per_task": 2,
+    "expected_trajectories": 4,
+    "scientific_claim_allowed": false
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "experiment_id": "prefix-pairwise-olympiadbench-screen-v1",
+  "purpose": "Test whether direct semantic comparison can distinguish correct from incorrect sibling reasoning paths at equal online token horizons.",
+  "dataset": {
+    "trajectories": "work_dirs/semantic_olympiadbench_pilot_v1/olympiadbench_50x8_16k_trajectories.jsonl",
+    "name": "lscpku/OlympiadBench-official",
+    "config": "OE_TO_maths_en_COMP",
+    "split": "train",
+    "source_problems": 50,
+    "mixed_outcome_problems": 26,
+    "samples_per_problem": 8,
+    "pair_selection": "all correct-versus-incorrect sibling pairs on mixed-outcome problems",
+    "correct_incorrect_pairs_per_checkpoint": 287,
+    "diagnostic_not_deployable": true
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "thinking": "enabled",
+    "fixed_token_positions": [
+      512,
+      1024,
+      2048
+    ],
+    "prefix_source": "exact saved generator output token IDs",
+    "uses_likelihood": false
+  },
+  "verifier": {
+    "model": "Qwen/Qwen3.8-27B",
+    "prompt_version": "equal-horizon-relative-error-v1",
+    "orders_per_pair": 2,
+    "order_aggregation": "mean canonical win probability after A/B swap",
+    "choice_labels": [
+      "A",
+      "B"
+    ],
+    "score_source": "exact requested next-token logprobs renormalized over A/B",
+    "uses_generator_likelihood": false
+  },
+  "analysis": {
+    "primary_metric": "problem_balanced_correct_vs_incorrect_pair_accuracy",
+    "secondary_metric": "micro_correct_vs_incorrect_pair_accuracy",
+    "bootstrap_samples": 5000,
+    "bootstrap_unit": "problem",
+    "seed": 0,
+    "pointwise_comparison": "error-audit-v1 scores on the identical fixed prefixes"
+  },
+  "integration_gate": {
+    "problem_balanced_accuracy_at_least": 0.6,
+    "cluster_bootstrap_95_percent_lower_bound_above": 0.5,
+    "must_pass_both": true
+  }
+}

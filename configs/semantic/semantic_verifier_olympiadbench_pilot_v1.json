@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "experiment_id": "semantic-verifier-olympiadbench-pilot-v1",
+  "purpose": "Long-form semantic-only test-time-scaling gate before online ParticleScale integration.",
+  "dataset": {
+    "name": "lscpku/OlympiadBench-official",
+    "config": "OE_TO_maths_en_COMP",
+    "split": "train",
+    "selection_seed": 0,
+    "selection_positions": [
+      0,
+      49
+    ],
+    "num_problems": 50
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "samples_per_problem": 8,
+    "temperature": 0.7,
+    "thinking": "enabled",
+    "first_stage_max_new_tokens": 8192,
+    "first_stage_seed": 0,
+    "continuation_max_new_tokens": 8192,
+    "continuation_seed": 1,
+    "total_max_new_tokens": 16384,
+    "continuation_scope": "only trajectories capped at the first-stage limit",
+    "continuation_input": "exact saved generator token IDs",
+    "uses_likelihood": false
+  },
+  "pointwise_verifier": {
+    "model": "Qwen/Qwen3.8-27B",
+    "prompt_version": "error-audit-v1",
+    "score_labels": [
+      "A",
+      "B",
+      "C",
+      "D",
+      "E"
+    ],
+    "score_values": [
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "fixed_generator_token_positions": [
+      512,
+      1024,
+      2048
+    ],
+    "uses_generator_likelihood": false
+  },
+  "allocation": {
+    "method": "agreement_conditioned_semantic_hybrid_cross_validation",
+    "initial_samples": 2,
+    "expanded_samples": 8,
+    "folds": 5,
+    "fold_seed": 29,
+    "candidate_order_trials": 500,
+    "candidate_order_seed": 17,
+    "bootstrap_samples": 5000,
+    "confidence_aggregations": [
+      "mean",
+      "max",
+      "min"
+    ],
+    "budget_ratios_vs_agreement_control": [
+      0.9,
+      1.0
+    ]
+  },
+  "eligibility_gate": {
+    "median_completion_tokens_at_least": 2000,
+    "sample_accuracy_between": [
+      0.1,
+      0.7
+    ],
+    "mixed_problem_rate_at_least": 0.3,
+    "oracle_minus_self_consistency_at_least": 0.05,
+    "oracle_minus_pass_at_2_at_least": 0.1
+  },
+  "primary_metrics": [
+    "sample_accuracy",
+    "self_consistency_accuracy",
+    "oracle_pass_at_n",
+    "mixed_problem_rate",
+    "semantic_auroc",
+    "within_problem_ranking_accuracy",
+    "selection_accuracy",
+    "generator_tokens_per_problem",
+    "verifier_prompt_tokens_per_problem",
+    "steady_state_gpu_seconds"
+  ]
+}
