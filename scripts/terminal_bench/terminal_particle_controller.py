@@ -528,6 +528,9 @@ class TerminalParticleController:
             "filesystem_sha256": self.docker.filesystem_digest(
                 particle.container_name,
                 environment["state_roots"],
+                bool(
+                    environment.get("ignore_runtime_caches", False)
+                ),
             ),
             "process_fingerprint": self.docker.process_fingerprint(
                 particle.container_name
@@ -700,7 +703,11 @@ class TerminalParticleController:
             }
         )
         particle.rounds += 1
-        particle.finished = not tool_calls
+        finish_reason = str(result.get("finish_reason") or "")
+        continued_after_length = (
+            not tool_calls and finish_reason in {"length", "max_tokens"}
+        )
+        particle.finished = not tool_calls and not continued_after_length
         self.seal(particle)
         return {
             "particle_id": particle.particle_id,
@@ -708,7 +715,8 @@ class TerminalParticleController:
             "seed": seed,
             "request_prefix_sha256": request_prefix,
             "response_prefix_sha256": particle.model_prefix_sha256,
-            "finish_reason": result.get("finish_reason"),
+            "finish_reason": finish_reason,
+            "continued_after_length": continued_after_length,
             "finished": particle.finished,
             "content_sha256": hashlib.sha256(
                 (result.get("content") or "").encode()

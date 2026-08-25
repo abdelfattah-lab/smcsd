@@ -55,6 +55,11 @@ experiments on top of the standalone `smcsd/` implementation.
 - **`terminal_bench/analyze_terminal_semantic_smc.py`** — Aggregates live
   sweeps into reward-isolated terminal ranking, selection, population, cost,
   deduplication, and latency tables.
+- **`terminal_bench/terminal_semantic_benchmark.py`** — Runs the frozen
+  multi-task Terminal-Bench matrix with official per-task graders. It compares
+  terminal semantic Best-of-N, ESS semantic SMC, and deterministic semantic
+  top-half forking while keeping tests and rewards unavailable until terminal
+  selection is sealed.
 - **`smc_profile_engine.py`** — Offline profiler harness for SMC. Use
   `--engine-kind smc_engine` to target the dedicated ``SMCEngine`` path;
   emits Chrome-compatible traces.
@@ -191,6 +196,7 @@ python scripts/terminal_bench/terminal_semantic_smc.py --help
 python scripts/terminal_bench/analyze_terminal_semantic_smc.py --help
 ```
 
+python scripts/terminal_bench/terminal_semantic_benchmark.py --help
 The completed OlympiadBench validity/progress screen uses Qwen3.8-27B and
 Qwen3-32B. Its four-score ensemble failed the frozen 1,024-token actionability
 gate (52.52% problem-balanced correct/incorrect sibling ranking, 95% CI

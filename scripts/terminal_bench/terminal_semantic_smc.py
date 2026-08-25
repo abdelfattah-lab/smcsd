@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -523,6 +523,26 @@ def population_weights(
     return probabilities, effective_sample_size(probabilities)
 
 
+def top_half_indices(
+    particles: Sequence[live.Particle],
+) -> list[int]:
+    if len(particles) < 2:
+        raise ValueError("top-half allocation requires at least two particles")
+    survivor_count = (len(particles) + 1) // 2
+    ranked = sorted(
+        range(len(particles)),
+        key=lambda index: (
+            -particles[index].semantic_score,
+            particles[index].slot,
+        ),
+    )
+    survivors = ranked[:survivor_count]
+    return [
+        survivors[slot % survivor_count]
+        for slot in range(len(particles))
+    ]
+
+
 def _copy_particle_progress(
     child: live.Particle,
     ancestor: live.Particle,
@@ -705,7 +725,12 @@ def run_configuration(
     name_prefix: str,
     checkpoint_dir: Path,
     keep_containers: bool,
+    method: str = "semantic_smc",
+    grader: Callable[..., tuple[list[dict[str, Any]], float]] = grade_fix_git,
+    grader_name: str = "terminal-bench-fix-git-file-hashes-v1",
 ) -> dict[str, Any]:
+    if method not in {"semantic_smc", "terminal_bon", "particle_scale"}:
+        raise ValueError(f"unsupported semantic allocation method: {method}")
     controller = live.TerminalParticleController(
         docker,
         request_template=checkpoint,
@@ -738,28 +763,29 @@ def run_configuration(
         if len(initial_states) != 1 or len(initial_prefixes) != 1:
             raise live.ControllerError("initial semantic SMC population is not coupled")
 
-        baseline = verifier.score(
-            particles,
-            calls_per_checkpoint=verifier_calls,
-            experiment_id=experiment_id,
-            checkpoint_index=checkpoint_index,
-        )
-        baseline_rows = apply_semantic_scores(
-            particles,
-            baseline,
-            initialize=True,
-        )
-        checkpoint_events.append(
-            {
-                "kind": "common_baseline",
-                "target_generated_tokens": 0,
-                "scoring": baseline,
-                "particles": baseline_rows,
-                "ess": float(num_particles),
-                "resampled": False,
-            }
-        )
-        checkpoint_index += 1
+        if method != "terminal_bon":
+            baseline = verifier.score(
+                particles,
+                calls_per_checkpoint=verifier_calls,
+                experiment_id=experiment_id,
+                checkpoint_index=checkpoint_index,
+            )
+            baseline_rows = apply_semantic_scores(
+                particles,
+                baseline,
+                initialize=True,
+            )
+            checkpoint_events.append(
+                {
+                    "kind": "common_baseline",
+                    "target_generated_tokens": 0,
+                    "scoring": baseline,
+                    "particles": baseline_rows,
+                    "ess": float(num_particles),
+                    "resampled": False,
+                }
+            )
+            checkpoint_index += 1
 
         for round_index in range(max_rounds):
             active = [particle for particle in particles if not particle.finished]
@@ -782,6 +808,8 @@ def run_configuration(
                     ],
                 }
             )
+            if method == "terminal_bon":
+                continue
             ready = all(
                 particle.finished
                 or particle.generated_tokens >= next_checkpoint_tokens
@@ -802,23 +830,37 @@ def run_configuration(
                 initialize=False,
             )
             probabilities, ess = population_weights(particles, beta)
-            should_resample = ess < ess_threshold * num_particles
+            if method == "particle_scale":
+                should_resample = True
+                ancestors = top_half_indices(particles)
+                resampling_policy = "deterministic_top_half_fork"
+            else:
+                should_resample = ess < ess_threshold * num_particles
+                ancestors = (
+                    systematic_indices(probabilities, rng)
+                    if should_resample
+                    else []
+                )
+                resampling_policy = "ess_systematic"
             event: dict[str, Any] = {
                 "kind": "token_interval",
                 "target_generated_tokens": next_checkpoint_tokens,
                 "actual_generated_tokens": [
                     particle.generated_tokens for particle in particles
                 ],
-                "checkpoint_alignment": "completed_assistant_turn_at_or_after_target",
+                "checkpoint_alignment": (
+                    "serialized_assistant_segment_or_completed_tool_turn_"
+                    "at_or_after_target"
+                ),
                 "scoring": scoring,
                 "particles": score_rows,
                 "probabilities": probabilities,
                 "ess": ess,
                 "ess_threshold": ess_threshold * num_particles,
                 "resampled": should_resample,
+                "resampling_policy": resampling_policy,
             }
             if should_resample:
-                ancestors = systematic_indices(probabilities, rng)
                 event["ancestor_slots"] = ancestors
                 event["unique_ancestors"] = len(set(ancestors))
                 particles = resample_population(
@@ -851,7 +893,7 @@ def run_configuration(
         terminal_rows = apply_semantic_scores(
             particles,
             terminal,
-            initialize=False,
+            initialize=method == "terminal_bon",
         )
         probabilities, terminal_ess = population_weights(particles, beta)
         checkpoint_events.append(
@@ -866,26 +908,28 @@ def run_configuration(
             }
         )
 
-        grades, grader_wall = grade_fix_git(docker, particles)
-        grades_by_id = {row["particle_id"]: row for row in grades}
         selected = max(
             particles,
             key=lambda particle: (particle.semantic_score, -particle.slot),
         )
-        selected_grade = grades_by_id[selected.particle_id]
         checkpoint_path = checkpoint_dir / f"{experiment_id}-selected.json"
         backend.atomic_write_json(
             checkpoint_path,
             live.particle_checkpoint(selected),
         )
+        grades, grader_wall = grader(docker, particles)
+        grades_by_id = {row["particle_id"]: row for row in grades}
+        selected_grade = grades_by_id[selected.particle_id]
         verifier_after = verifier.snapshot_cost()
         wall_time = time.perf_counter() - config_started
         success_count = sum(row["reward"] >= 1.0 for row in grades)
+        slot_zero = min(particles, key=lambda particle: particle.slot)
         return {
             "schema_version": SCHEMA_VERSION,
             "experiment_id": experiment_id,
             "status": "pass",
             "configuration": {
+                "method": method,
                 "num_particles": num_particles,
                 "checkpoint_interval_tokens": checkpoint_interval,
                 "verifier_calls_per_checkpoint": verifier_calls,
@@ -901,11 +945,15 @@ def run_configuration(
                 "requested_interval_tokens": checkpoint_interval,
                 "exact_partial_assistant_checkpoint": False,
                 "implemented_alignment": (
-                    "first completed assistant/tool turn at or after the target"
+                    "first serialized assistant response segment or completed "
+                    "tool turn at or after the target"
                 ),
                 "reason": (
                     "the OpenAI chat controller has serialized messages but no "
-                    "persistent mid-assistant KV continuation handle"
+                    "persistent mid-assistant KV continuation handle; a response "
+                    "that reaches max_tokens is appended as an assistant segment "
+                    "and resumed in a new call, so this is an explicit "
+                    "distributional approximation"
                 ),
             },
             "initial_coupling": {
@@ -919,7 +967,7 @@ def run_configuration(
             ),
             "final_particles": [live.particle_summary(p) for p in particles],
             "grader": {
-                "name": "terminal-bench-fix-git-file-hashes-v1",
+                "name": grader_name,
                 "reward_isolated_from_semantic_verifier": True,
                 "wall_time_s": grader_wall,
                 "particles": grades,
@@ -934,6 +982,26 @@ def run_configuration(
                 "semantic_score": selected.semantic_score,
                 "reward": selected_grade["reward"],
                 "selected_checkpoint": str(checkpoint_path.resolve()),
+            },
+            "selection_baselines": {
+                "ar1_slot0": {
+                    "slot": slot_zero.slot,
+                    "particle_id": slot_zero.particle_id,
+                    "reward": grades_by_id[slot_zero.particle_id]["reward"],
+                },
+                "terminal_semantic": {
+                    "slot": selected.slot,
+                    "particle_id": selected.particle_id,
+                    "reward": selected_grade["reward"],
+                },
+                "pass_at_n": float(success_count > 0),
+                "oracle_max_reward": max(
+                    float(row["reward"]) for row in grades
+                ),
+                "random_particle_expected_reward": statistics.fmean(
+                    float(row["reward"]) for row in grades
+                ),
+                "self_consistency": None,
             },
             "generator_tool_replay_cost": copy.deepcopy(controller.cost),
             "semantic_verifier_cost": numeric_delta(

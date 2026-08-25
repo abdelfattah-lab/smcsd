@@ -69,7 +69,12 @@ class FakeDocker:
     def exec_bash(self, container, command, *, workdir, environment=None):
         return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
 
-    def filesystem_digest(self, container, roots):
+    def filesystem_digest(
+        self,
+        container,
+        roots,
+        ignore_runtime_caches=False,
+    ):
         return self.controller.backend.canonical_json_sha256(
             self.files[container]
         )
@@ -396,4 +401,65 @@ def test_malformed_model_tool_json_becomes_replayable_error():
     assert "invalid JSON arguments" in current.messages[-1]["content"]
     assert current.state == before
     assert current.generated_tokens == 5
+    runtime.remove_particles([current])
+
+
+def test_length_capped_response_continues_until_a_real_stop():
+    controller = load_controller()
+    docker = FakeDocker(controller)
+    payloads = []
+    responses = iter(
+        [
+            {
+                "content": "partial reasoning",
+                "tool_calls": [],
+                "finish_reason": "length",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 64},
+                "latency_s": 0.1,
+            },
+            {
+                "content": "done",
+                "tool_calls": [],
+                "finish_reason": "stop",
+                "usage": {"prompt_tokens": 12, "completion_tokens": 1},
+                "latency_s": 0.1,
+            },
+        ]
+    )
+
+    def model_caller(payload, timeout):
+        payloads.append(payload)
+        return next(responses)
+
+    runtime = controller.TerminalParticleController(
+        docker,
+        request_template=request_template(),
+        base_url="http://unused",
+        temperature=0.7,
+        top_p=0.95,
+        max_tokens=64,
+        timeout_s=1,
+        model_caller=model_caller,
+    )
+    current = runtime.spawn(
+        sample_manifest(controller),
+        request_template()["messages"],
+        slot=0,
+        name="particle-length",
+    )
+
+    first = runtime.advance(current, seed=1)
+    assert first["finish_reason"] == "length"
+    assert first["continued_after_length"] is True
+    assert first["finished"] is False
+    assert current.messages[-1] == {
+        "role": "assistant",
+        "content": "partial reasoning",
+    }
+
+    second = runtime.advance(current, seed=2)
+    assert payloads[1]["messages"][-1] == current.messages[-2]
+    assert second["continued_after_length"] is False
+    assert second["finished"] is True
+    assert current.generated_tokens == 65
     runtime.remove_particles([current])

@@ -584,3 +584,120 @@ forks, batching/overlap, conditional extra calls, and SM-CSD draft/target
 integration. Speculative `gamma` is absent from this autoregressive controller
 and must be swept after that integration rather than relabeled as semantic
 `beta`.
+### Multi-task semantic-allocation harness (2026-08-25)
+
+`scripts/terminal_bench/terminal_semantic_benchmark.py` generalizes the live
+controller from the `fix-git` file-hash pilot to official per-task
+Terminal-Bench graders. The frozen protocol is
+`configs/terminal_bench/semantic_allocation_holdout_v1.json`. It contains eight
+medium/hard application tasks: `query-optimize`, `db-wal-recovery`,
+`multi-source-data-merger`, `regex-log`, `sanitize-git-repo`,
+`git-leak-recovery`, `cancel-async-tasks`, and
+`fix-code-vulnerability`. The service/system tasks
+`configure-git-webserver`, `nginx-request-logging`, and `pypi-server` remain
+excluded until replay captures state outside the task workdir. `fix-git`
+remains the development task.
+
+This is an online-policy holdout, not a final blind benchmark: the eight tasks
+were not used to tune the live online policy, but they contributed to the
+earlier offline semantic-actionability audit. Every method starts from the same
+pinned image and exact initial Pi provider request. Official tests are copied
+into a particle only after terminal semantic scoring and selection are sealed.
+The selected replay sidecar is also written before grading. Generator and
+semantic verifier therefore cannot observe tests, rewards, or grader output.
+
+The implemented matched methods are:
+
+- `terminal_bon`: independent particles, one terminal semantic score per
+  particle, and no intermediate allocation. The same unresampled pool reports
+  AR@1 (slot 0), random-particle expected reward, pass@N, and terminal
+  LLM-as-a-Verifier selection.
+- `semantic_smc_ess25` and `semantic_smc_ess50`: semantic score differences,
+  beta 12, and systematic resampling below 0.25N or 0.50N ESS.
+- `particle_scale`: a semantic Particle-Scale-style policy that retains the
+  top semantic half and forks evenly back to N at every checkpoint.
+
+Classic answer-vote self-consistency is not reported for these tasks. The
+outputs are heterogeneous environment mutations, so exact text or command
+voting would not be a valid aggregation rule. Self-consistency remains a
+baseline for math/code benchmarks with canonical final answers.
+
+Two live-smoke bugs were fixed before freezing the runner. Minimal images
+without `python3` now use a canonical tar digest. New benchmark manifests
+ignore only non-semantic `__pycache__`, `.pyc/.pyo`, and `.pytest_cache`
+artifacts during replay validation; legacy manifests keep the prior hash
+behavior. A real Python-image check showed an unchanged semantic hash after
+bytecode generation while the legacy digest changed. Also,
+`finish_reason=length` no longer falsely completes a particle. The capped
+assistant segment is serialized and supplied to the next call. This enables
+short checkpoint intervals, but it is explicitly a distributional
+approximation rather than an exact persistent-KV continuation.
+
+The final systems smoke used two tasks, three methods, N=4, H=512, one verifier
+call, and one repeat:
+
+```bash
+python scripts/terminal_bench/terminal_semantic_benchmark.py \
+  --plan configs/terminal_bench/semantic_allocation_holdout_v1.json \
+  --generator-base-url http://127.0.0.1:30000 \
+  --verifier-base-url http://127.0.0.1:30001 \
+  --task-id regex-log,cancel-async-tasks \
+  --method-id terminal_bon,semantic_smc_ess25,particle_scale \
+  --repetitions 1 --num-particles 4 \
+  --output ~/agentbench/semantic-actionability/\
+terminal-semantic-allocation-holdout-smoke-v1.json
+```
+
+| method | selected reward | final population success | pass@4 | mean generator calls | mean physical verifier calls | mean wall s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| terminal semantic BoN | 0/2 | 0.0% | 0/2 | 68.0 | 4.0 | 33.4 |
+| semantic SMC, ESS .25 | 0/2 | 12.5% | 1/2 | 87.5 | 19.0 | 34.9 |
+| semantic Particle-Scale | 0/2 | 0.0% | 0/2 | 70.0 | 21.5 | 77.5 |
+
+All six cells executed and graded successfully, including nine Particle-Scale
+resampling events. The run charged 604.2 allocated accelerator-seconds across
+the generator and verifier GPUs, excluding server startup. Most populations
+reached the fixed 24-response-segment budget rather than a natural stop, so
+these are budgeted agent results and are not directly comparable to the
+Terminal-Bench leaderboard.
+
+This smoke does not show useful middle allocation. It does expose selection
+headroom and verifier error: semantic SMC produced the only reward-1
+`regex-log` particle, but the successful particle scored 0.4488 and a failed
+particle scored 0.4526, so terminal semantic selection missed it by 0.0038.
+At N=4, the ESS .25 threshold is exactly the theoretical minimum ESS and cannot
+trigger under the strict inequality; the N=8 confirmatory setting can resample.
+The smoke is therefore a systems/reward-isolation check, not an accuracy
+comparison.
+
+The actual experiment proceeds in gates:
+
+1. Run the frozen `terminal_bon` method at N=8 on all eight tasks for repeat
+   zero. This yields AR@1, random-particle reward, pass@8, and terminal
+   LLM-as-a-Verifier accuracy, while checking that every task has replay-safe
+   trajectories and enough success headroom.
+2. If the baseline pool has useful headroom, complete the primary matrix:
+   eight tasks, four methods, and three matched repeats at N=8, H=512,
+   calls=1, beta=12. This is 96 method-task runs and 768 nominal trajectories.
+   Report paired task-repeat differences, task-cluster bootstrap confidence
+   intervals, exact generator/verifier tokens and calls, replay work, wall
+   time, and allocated accelerator-seconds.
+3. Only if an intermediate policy beats terminal BoN, sweep one axis at a
+   time: N={4,8,16,32,64}, H={256,512,2048,8192}, verifier calls={1,2,4,8},
+   and beta={4,8,12,24,48}. Use the mixed tasks from the primary matrix and
+   retain matched seeds.
+4. Then add the heterogeneous Qwen3.8-27B plus Qwen3-32B verifier ensemble and
+   compare fixed averaging with conditional second-verifier calls. The earlier
+   0.940 verifier error correlation means this extra model must justify its
+   cost rather than being enabled by default.
+5. Serving optimization follows an accuracy win: persistent KV forks, batched
+   multi-particle generation, overlapped verifier work, prefix-score caching,
+   and uncertainty-triggered verifier calls. Speculative gamma is swept only
+   after reconnecting this controller to the SM-CSD draft/target engine.
+
+The project succeeds as a fast serving system only if a semantic middle policy
+moves the official accuracy/cost frontier relative to terminal BoN. The easy
+pilot showed mechanism correctness; this smoke shows that terminal semantic
+ranking is not reliably perfect on harder tasks. The baseline-coverage gate is
+therefore the next result to collect, before spending the full 96-run budget or
+optimizing the serving path.

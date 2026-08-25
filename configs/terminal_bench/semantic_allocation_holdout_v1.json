@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "experiment_id": "terminal-semantic-allocation-holdout-v1",
+  "scientific_scope": "Frozen multi-task evaluation of online allocation policies after the fix-git live pilot. These tasks were not used to tune the live online policy, but they contributed to the earlier offline semantic-actionability audit, so this is an online-policy holdout rather than a final blind benchmark.",
+  "benchmark": {
+    "name": "terminal-bench-2.1",
+    "dataset_commit": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "selection": "Eight medium/hard application and file tasks whose relevant mutable state is contained under the image workdir and can be reconstructed by deterministic Pi tool replay.",
+    "excluded_until_full_state_checkpointing": [
+      "configure-git-webserver",
+      "nginx-request-logging",
+      "pypi-server"
+    ],
+    "development_task_excluded": "fix-git"
+  },
+  "models": {
+    "generator": {
+      "model": "Qwen/Qwen3.5-9B",
+      "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "role": "tool-using policy"
+    },
+    "semantic_verifier": {
+      "model": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "criterion": "terminal_recoverability_v1",
+      "reward_labels_visible": false
+    }
+  },
+  "tasks": [
+    {
+      "id": "query-optimize",
+      "path": "~/agentbench/terminal-bench-2-1/tasks/query-optimize",
+      "capture_glob": "~/agentbench/jobs/tb21-semantic-actionability-dev-v1__pool__ar__seed0/query-optimize__*/agent/pi-capture/requests-*.jsonl",
+      "state_roots": ["/app"],
+      "particle_network": "bridge",
+      "difficulty": "medium",
+      "category": "data-science",
+      "grader_timeout_s": 1800
+    },
+    {
+      "id": "db-wal-recovery",
+      "path": "~/agentbench/terminal-bench-2-1/tasks/db-wal-recovery",
+      "capture_glob": "~/agentbench/jobs/tb21-semantic-actionability-dev-v1__pool__ar__seed0/db-wal-recovery__*/agent/pi-capture/requests-*.jsonl",
+      "state_roots": ["/app"],
+      "particle_network": "bridge",
+      "difficulty": "medium",
+      "category": "file-operations",
+      "grader_timeout_s": 900
+    },
+    {
+      "id": "multi-source-data-merger",
+      "path": "~/agentbench/terminal-bench-2-1/tasks/multi-source-data-merger",
+      "capture_glob": "~/agentbench/jobs/tb21-semantic-actionability-dev-v1__pool__ar__seed0/multi-source-data-merger__*/agent/pi-capture/requests-*.jsonl",
+      "state_roots": ["/app"],
+      "particle_network": "bridge",
+      "difficulty": "medium",
+      "category": "data-processing",
+      "grader_timeout_s": 900
+    },
+    {
+      "id": "regex-log",
+      "path": "~/agentbench/terminal-bench-2-1/tasks/regex-log",
+      "capture_glob": "~/agentbench/jobs/tb21-semantic-actionability-dev-v1__pool__ar__seed0/regex-log__*/agent/pi-capture/requests-*.jsonl",
+      "state_roots": ["/app"],
+      "particle_network": "bridge",
+      "difficulty": "medium",
+      "category": "data-processing",
+      "grader_timeout_s": 900
+    },
+    {
+      "id": "sanitize-git-repo",
+      "path": "~/agentbench/terminal-bench-2-1/tasks/sanitize-git-repo",
+      "capture_glob": "~/agentbench/jobs/tb21-semantic-actionability-dev-v1__pool__ar__seed0/sanitize-git-repo__*/agent/pi-capture/requests-*.jsonl",
+      "state_roots": ["/app/dclm"],
+      "particle_network": "bridge",
+      "difficulty": "medium",
+      "category": "security",
+      "grader_timeout_s": 900
+    },
+    {
+      "id": "git-leak-recovery",
+      "path": "~/agentbench/terminal-bench-2-1/tasks/git-leak-recovery",
+      "capture_glob": "~/agentbench/jobs/tb21-semantic-actionability-dev-v1__pool__ar__seed0/git-leak-recovery__*/agent/pi-capture/requests-*.jsonl",
+      "state_roots": ["/app"],
+      "particle_network": "bridge",
+      "difficulty": "medium",
+      "category": "software-engineering",
+      "grader_timeout_s": 900
+    },
+    {
+      "id": "cancel-async-tasks",
+      "path": "~/agentbench/terminal-bench-2-1/tasks/cancel-async-tasks",
+      "capture_glob": "~/agentbench/jobs/tb21-semantic-actionability-dev-v1__pool__ar__seed0/cancel-async-tasks__*/agent/pi-capture/requests-*.jsonl",
+      "state_roots": ["/app"],
+      "particle_network": "bridge",
+      "difficulty": "hard",
+      "category": "software-engineering",
+      "grader_timeout_s": 900
+    },
+    {
+      "id": "fix-code-vulnerability",
+      "path": "~/agentbench/terminal-bench-2-1/tasks/fix-code-vulnerability",
+      "capture_glob": "~/agentbench/jobs/tb21-semantic-actionability-dev-v1__pool__ar__seed0/fix-code-vulnerability__*/agent/pi-capture/requests-*.jsonl",
+      "state_roots": ["/app"],
+      "particle_network": "bridge",
+      "difficulty": "hard",
+      "category": "security",
+      "grader_timeout_s": 900
+    }
+  ],
+  "methods": [
+    {
+      "id": "terminal_bon",
+      "policy": "terminal_bon",
+      "description": "Independent N-particle generation with one terminal semantic LLM-as-verifier call and no intermediate allocation."
+    },
+    {
+      "id": "semantic_smc_ess25",
+      "policy": "semantic_smc",
+      "description": "Semantic score-difference weighting with systematic resampling below 0.25N ESS.",
+      "overrides": {"ess_threshold_fraction": 0.25}
+    },
+    {
+      "id": "semantic_smc_ess50",
+      "policy": "semantic_smc",
+      "description": "Semantic score-difference weighting with systematic resampling below 0.50N ESS.",
+      "overrides": {"ess_threshold_fraction": 0.50}
+    },
+    {
+      "id": "particle_scale",
+      "policy": "particle_scale",
+      "description": "Semantic Particle-Scale-style allocation: retain the top semantic half and deterministically fork back to N at every checkpoint."
+    }
+  ],
+  "defaults": {
+    "num_particles": 8,
+    "checkpoint_interval_tokens": 512,
+    "verifier_calls_per_checkpoint": 1,
+    "semantic_beta": 12.0,
+    "ess_threshold_fraction": 0.25,
+    "max_rounds": 24
+  },
+  "repetitions": 3,
+  "seed_base": 23000,
+  "generator": {
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "max_tokens_per_turn": 256
+  },
+  "semantic": {
+    "transcript_max_chars": 24000,
+    "tool_output_max_chars": 4000
+  },
+  "verifier_engine": {
+    "batch_size": 32,
+    "mem_fraction_static": 0.75,
+    "max_running_requests": 64,
+    "max_mamba_cache_size": 64
+  },
+  "timeouts": {
+    "model_request_s": 300,
+    "official_grader_s": 900
+  },
+  "allocation": {
+    "generator_accelerators": 1,
+    "verifier_accelerators": 1
+  },
+  "materialize_workers": 8,
+  "grader_workers": 4,
+  "continue_on_error": true,
+  "primary_allocation": {
+    "tasks": 8,
+    "methods": 4,
+    "repetitions": 3,
+    "method_task_runs": 96,
+    "nominal_trajectories": 768
+  },
+  "reported_terminal_baselines": {
+    "ar_at_1": "slot 0 from the unresampled terminal_bon pool",
+    "random_particle": "mean official reward over the unresampled terminal_bon pool",
+    "pass_at_n": "oracle availability upper bound over the unresampled terminal_bon pool",
+    "terminal_bon_llm_as_verifier": "highest terminal semantic score in the unresampled pool",
+    "self_consistency": "not defined for heterogeneous environment mutations; exact-text voting would not be a valid agent baseline"
+  },
+  "execution_stages": {
+    "baseline_coverage": {
+      "tasks": 8,
+      "method": "terminal_bon",
+      "repetitions": 1,
+      "purpose": "Measure AR@1, random-particle reward, pass@8, terminal verifier selection, replay safety, and success headroom before allocating the full matrix."
+    },
+    "complete_primary": {
+      "condition": "Continue only when the baseline pool has useful success/mixed-outcome headroom and replay succeeds.",
+      "reuse_baseline_repeat_zero": true,
+      "target_method_task_runs": 96
+    }
+  },
+  "post_gate_scaling_axes": {
+    "particles": [4, 8, 16, 32, 64],
+    "checkpoint_interval_tokens": [256, 512, 2048, 8192],
+    "verifier_calls_per_checkpoint": [1, 2, 4, 8],
+    "semantic_beta": [4.0, 8.0, 12.0, 24.0, 48.0],
+    "heterogeneous_verifier_models": [
+      "Qwen/Qwen3.8-27B",
+      "Qwen/Qwen3-32B"
+    ]
+  },
+  "decision_gate": {
+    "primary_metric": "mean official selected reward across task-repeat blocks",
+    "middle_allocation_success": "semantic_smc or particle_scale must beat terminal_bon at matched nominal generator particles",
+    "efficiency": "report exact generator calls/tokens, physical and logical verifier calls/tokens, replay work, wall time, and allocated accelerator-seconds",
+    "uncertainty": "paired task-repeat bootstrap confidence intervals are required before a benchmark claim",
+    "scaling_sweeps_begin_only_after_primary_gate": true
+  }
+}

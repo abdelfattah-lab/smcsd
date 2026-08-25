@@ -287,14 +287,82 @@ class DockerCLI:
             local.write_text(content, encoding="utf-8")
             self.copy_to(local, container, path)
 
+    def _filesystem_digest_with_tar(
+        self,
+        container: str,
+        roots: Sequence[str],
+        ignore_runtime_caches: bool = False,
+    ) -> str:
+        script = r"""
+set -euo pipefail
+ignore_runtime_caches="$1"
+shift
+exclude_args=()
+if [[ "$ignore_runtime_caches" == "1" ]]; then
+    exclude_args+=(--exclude='*/__pycache__' --exclude='*/__pycache__/*')
+    exclude_args+=(--exclude='*/.pytest_cache' --exclude='*/.pytest_cache/*')
+    exclude_args+=(--exclude='*.pyc' --exclude='*.pyo')
+fi
+{
+    for root in "$@"; do
+        printf 'ROOT\000%s\000' "$root"
+        if [[ ! -e "$root" && ! -L "$root" ]]; then
+            printf 'MISSING\000'
+            continue
+        fi
+        git_dir="$(find "$root" -type d -name .git -print -quit 2>/dev/null || true)"
+        if [[ -n "$git_dir" ]]; then
+            echo "python3 is required to normalize Git semantic state: $git_dir" >&2
+            exit 86
+        fi
+        relative="${root#/}"
+        if [[ -z "$relative" ]]; then
+            relative="."
+        fi
+        tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            --format=gnu --exclude='*/.git/index' --exclude='*/.git/logs' \
+            "${exclude_args[@]}" \
+            -cf - -C / "$relative"
+    done
+} | sha256sum
+"""
+        process = self.run(
+            [
+                "exec",
+                container,
+                "/bin/bash",
+                "-c",
+                script,
+                "smcsd-filesystem-digest",
+                "1" if ignore_runtime_caches else "0",
+                *sorted(roots),
+            ],
+            check=False,
+        )
+        value = process.stdout.strip().split(" ", 1)[0]
+        if process.returncode != 0 or not re.fullmatch(r"[0-9a-f]{64}", value):
+            detail = process.stderr.strip() or process.stdout.strip()
+            raise ReplayError(f"portable filesystem digest failed: {detail}")
+        return value
+
     def filesystem_digest(
         self,
         container: str,
         roots: Sequence[str],
+        ignore_runtime_caches: bool = False,
     ) -> str:
+        python = self.run(
+            ["exec", container, "/bin/bash", "-lc", "command -v python3"],
+            check=False,
+        )
+        if python.returncode != 0:
+            return self._filesystem_digest_with_tar(
+                container, roots, ignore_runtime_caches
+            )
         script = r"""
 import hashlib, json, os, stat, subprocess, sys
 roots = json.loads(sys.argv[1])
+ignore_runtime_caches = sys.argv[2] == "1"
 digest = hashlib.sha256()
 git_repositories = set()
 def add(value):
@@ -308,6 +376,15 @@ def volatile_git_path(relative):
         return False
     tail = parts[parts.index(".git") + 1:]
     return tail == ["index"] or (tail and tail[0] == "logs")
+def volatile_path(relative):
+    if volatile_git_path(relative):
+        return True
+    parts = relative.split(os.sep)
+    return ignore_runtime_caches and (
+        "__pycache__" in parts
+        or ".pytest_cache" in parts
+        or relative.endswith((".pyc", ".pyo"))
+    )
 for root in sorted(roots):
     root = os.path.abspath(root)
     add("ROOT")
@@ -323,12 +400,12 @@ for root in sorted(roots):
         directories[:] = [
             name
             for name in directories
-            if not volatile_git_path(os.path.relpath(os.path.join(current, name), root))
+            if not volatile_path(os.path.relpath(os.path.join(current, name), root))
         ]
         files = [
             name
             for name in files
-            if not volatile_git_path(os.path.relpath(os.path.join(current, name), root))
+            if not volatile_path(os.path.relpath(os.path.join(current, name), root))
         ]
         entries = [(name, "D") for name in directories]
         entries.extend((name, "F") for name in files)
@@ -382,6 +459,7 @@ print(digest.hexdigest())
                 "-c",
                 script,
                 json.dumps(list(roots)),
+                "1" if ignore_runtime_caches else "0",
             ]
         )
         value = process.stdout.strip()
@@ -681,7 +759,11 @@ def fork_manifest(
             )
         time.sleep(0.1)
         roots = list(environment["state_roots"])
-        filesystem = docker.filesystem_digest(name, roots)
+        filesystem = docker.filesystem_digest(
+            name,
+            roots,
+            bool(environment.get("ignore_runtime_caches", False)),
+        )
         processes = docker.process_fingerprint(name)
         expected = manifest.get("expected_state") or {}
         if expected.get("filesystem_sha256") not in (None, filesystem):

@@ -181,7 +181,12 @@ class FakeDocker:
     def edit_text(self, container, path, edits):
         self.edits.append((container, path, edits))
 
-    def filesystem_digest(self, container, roots):
+    def filesystem_digest(
+        self,
+        container,
+        roots,
+        ignore_runtime_caches=False,
+    ):
         return "b" * 64
 
     def process_fingerprint(self, container):

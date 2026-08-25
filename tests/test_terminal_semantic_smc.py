@@ -277,3 +277,18 @@ def test_collect_materialized_drains_and_cleans_successes_after_failure():
 
     assert all(future.called for future in futures)
     assert controller.removed == [first, later]
+
+
+def test_particle_scale_top_half_is_deterministic_and_balanced():
+    module = load_semantic_smc()
+    particles = [
+        particle(module, "p0", [{"role": "user", "content": "task"}]),
+        particle(module, "p1", [{"role": "user", "content": "task"}]),
+        particle(module, "p2", [{"role": "user", "content": "task"}]),
+        particle(module, "p3", [{"role": "user", "content": "task"}]),
+    ]
+    for item, score in zip(particles, [0.1, 0.9, 0.8, 0.2]):
+        item.semantic_score = score
+
+    assert module.top_half_indices(particles) == [1, 2, 1, 2]
+    particles[2].semantic_score = 0.9
