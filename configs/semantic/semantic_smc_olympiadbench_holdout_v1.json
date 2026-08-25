@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "experiment_id": "semantic-smc-olympiadbench-holdout-v1",
+  "evaluation_status": "frozen_disjoint_holdout",
+  "research_question": "Does semantic verification during generation improve exact-answer accuracy over independent sampling with terminal-only semantic selection at the same N=8 generator budget?",
+  "dataset": {
+    "name": "lscpku/OlympiadBench-official",
+    "config": "OE_TO_maths_en_COMP",
+    "split": "train",
+    "selection_seed": 0,
+    "selection_positions": [50, 149],
+    "problems": 100,
+    "excluded_development_positions": [0, 49]
+  },
+  "generator": {
+    "model": "Qwen/Qwen3.5-9B",
+    "samples_or_particles_per_problem": 8,
+    "temperature": 0.7,
+    "max_new_tokens": 16384,
+    "independent_pool_seed": 0,
+    "smc_continuation_seed": 71,
+    "thinking": "enabled"
+  },
+  "methods": {
+    "ar_at_1": "sample 0 from the independent N=8 pool",
+    "self_consistency_at_8": "canonical-answer majority over the independent pool",
+    "terminal_semantic_bon_at_8": "highest Qwen3.8-27B terminal validity score",
+    "terminal_multimodel_ensemble_at_8": "highest unweighted mean terminal validity score from Qwen3.8-27B and Qwen3-32B",
+    "semantic_smc_at_8": {
+      "scorer": "Qwen/Qwen3.8-27B",
+      "rubric": "validity",
+      "initial_prefix_tokens": 2048,
+      "checkpoint_interval_tokens": 2048,
+      "verification_rounds": 8,
+      "semantic_beta": 12.0,
+      "ess_threshold_fraction": 0.75,
+      "resampler": "systematic",
+      "terminal_selection": "highest final semantic validity score"
+    }
+  },
+  "semantic_score": {
+    "labels": ["A", "B", "C", "D", "E"],
+    "values": [0.0, 0.25, 0.5, 0.75, 1.0],
+    "source": "exact requested next-token logprobs renormalized over A-E",
+    "uses_generator_likelihood": false
+  },
+  "primary_metric": "exact_answer_accuracy",
+  "diagnostics": [
+    "independent_oracle_pass_at_8",
+    "smc_oracle_pass_at_8",
+    "generator_tokens",
+    "verifier_calls",
+    "verifier_prompt_tokens",
+    "active_component_gpu_seconds",
+    "wall_time_seconds",
+    "smc_resampling_events",
+    "paired_method_wins_and_losses"
+  ],
+  "inference": {
+    "bootstrap_samples": 10000,
+    "bootstrap_unit": "problem",
+    "bootstrap_seed": 20260825,
+    "interval": "percentile_95_percent"
+  },
+  "future_excluded_baseline": "The exact LLM-as-a-Verifier PPT baseline is intentionally deferred until after this five-method run."
+}

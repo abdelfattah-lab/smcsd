@@ -589,3 +589,41 @@ are in `work_dirs/semantic_verifier_v1/`, MATH holdout artifacts are in
 `work_dirs/semantic_verifier_holdout_v1/`, and long-form artifacts are in
 `work_dirs/semantic_olympiadbench_pilot_v1/`. Generated artifacts are
 intentionally git-ignored.
+
+## Frozen 100-problem semantic-SMC holdout
+
+The earlier stop decision above records the outcome of the first 50-problem
+development cycle. The subsequent primary evaluation was explicitly reopened
+to answer one narrower question on a larger disjoint set: does using the same
+frozen semantic score *during* generation beat applying it only at the end?
+The protocol was frozen before reading any new answers in
+`configs/semantic/semantic_smc_olympiadbench_holdout_v1.json`.
+
+The evaluation unit is 100 OlympiadBench open-ended English competition-math
+problems at frozen permutation positions 50--149. Positions 0--49, including
+all earlier diagnostics and method development, are excluded. Every method
+uses Qwen3.5-9B, thinking enabled, temperature 0.7, a 16,384-token cap, and
+`N=8` except the one-sample AR reference. The independent pool is shared by:
+
+- AR@1 (fixed sample zero),
+- canonical-answer self-consistency@8,
+- terminal semantic Best-of-8 using Qwen3.8-27B validity,
+- terminal two-model Best-of-8 using the unweighted mean of Qwen3.8-27B and
+  Qwen3-32B validity.
+
+Semantic SMC is a separate online branched run initialized from the exact
+2,048-token roots of that pool. It uses Qwen3.8-27B validity, incremental
+semantic weights with beta 12, systematic resampling below ESS `0.75N`, and
+2,048-token checkpoints through 16,384 tokens (eight verifier rounds,
+including terminal scoring). This primary run does not include the exact
+LLM-as-a-Verifier PPT baseline; that is the next experiment after these
+methods are measured.
+
+`scripts/analyze_olympiadbench_semantic_smc_holdout.py` rejects the run unless
+all 100 frozen positions, all eight sample IDs, both distinct verifier score
+sets, and all semantic-SMC problem rows align exactly. It reports exact-answer
+accuracy, problem-bootstrap confidence intervals, paired wins/losses,
+independent and SMC oracle pass@8, verifier/generator tokens, calls, wall time,
+and active accelerator-seconds. Raw trajectories and scores remain under
+`work_dirs/semantic_olympiadbench_holdout_v1/`; the compact final summary is
+tracked under `results/olympiadbench/`.
