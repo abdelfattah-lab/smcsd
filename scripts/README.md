@@ -60,6 +60,10 @@ experiments on top of the standalone `smcsd/` implementation.
   terminal semantic Best-of-N, ESS semantic SMC, and deterministic semantic
   top-half forking while keeping tests and rewards unavailable until terminal
   selection is sealed.
+- **`terminal_bench/analyze_semantic_allocation.py`** — Merges primary and
+  recovery artifacts by task-method-repeat key, validates the matched matrix,
+  and reports task-cluster bootstrap intervals, exact costs, source hashes,
+  and the precommitted scaling-gate verdict.
 - **`smc_profile_engine.py`** — Offline profiler harness for SMC. Use
   `--engine-kind smc_engine` to target the dedicated ``SMCEngine`` path;
   emits Chrome-compatible traces.

@@ -171,6 +171,8 @@ class DockerCLI:
             [self.binary, *arguments],
             input=input_text,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -303,17 +305,46 @@ if [[ "$ignore_runtime_caches" == "1" ]]; then
     exclude_args+=(--exclude='*/.pytest_cache' --exclude='*/.pytest_cache/*')
     exclude_args+=(--exclude='*.pyc' --exclude='*.pyo')
 fi
+emit_git_command() {
+    repository="$1"
+    label="$2"
+    shift 2
+    temporary="$(mktemp -d /tmp/smcsd-git-digest.XXXXXX)"
+    if git -C "$repository" "$@" >"$temporary/stdout" 2>"$temporary/stderr"; then
+        status=0
+    else
+        status=$?
+    fi
+    printf 'COMMAND\000%s\000STATUS\000%s\000STDOUT\000' "$label" "$status"
+    cat "$temporary/stdout"
+    printf '\000STDERR\000'
+    cat "$temporary/stderr"
+    printf '\000'
+    rm -- "$temporary/stdout" "$temporary/stderr"
+    rmdir -- "$temporary"
+}
+emit_git_semantic_state() {
+    repository="$1"
+    printf 'GIT_SEMANTIC\000%s\000' "$repository"
+    emit_git_command "$repository" 'ls-files --stage -z' \
+        ls-files --stage -z
+    emit_git_command "$repository" \
+        'status --porcelain=v1 -z --untracked-files=all' \
+        status --porcelain=v1 -z --untracked-files=all
+    emit_git_command "$repository" \
+        'for-each-ref --format=%(refname)%00%(objectname)' \
+        for-each-ref '--format=%(refname)%00%(objectname)'
+    emit_git_command "$repository" 'rev-parse --verify HEAD' \
+        rev-parse --verify HEAD
+    emit_git_command "$repository" 'rev-parse --abbrev-ref HEAD' \
+        rev-parse --abbrev-ref HEAD
+}
 {
     for root in "$@"; do
         printf 'ROOT\000%s\000' "$root"
         if [[ ! -e "$root" && ! -L "$root" ]]; then
             printf 'MISSING\000'
             continue
-        fi
-        git_dir="$(find "$root" -type d -name .git -print -quit 2>/dev/null || true)"
-        if [[ -n "$git_dir" ]]; then
-            echo "python3 is required to normalize Git semantic state: $git_dir" >&2
-            exit 86
         fi
         relative="${root#/}"
         if [[ -z "$relative" ]]; then
@@ -323,6 +354,9 @@ fi
             --format=gnu --exclude='*/.git/index' --exclude='*/.git/logs' \
             "${exclude_args[@]}" \
             -cf - -C / "$relative"
+        while IFS= read -r -d '' git_dir; do
+            emit_git_semantic_state "${git_dir%/.git}"
+        done < <(find "$root" -type d -name .git -print0 2>/dev/null | sort -z)
     done
 } | sha256sum
 """

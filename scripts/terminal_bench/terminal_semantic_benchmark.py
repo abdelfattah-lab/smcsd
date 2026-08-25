@@ -358,6 +358,19 @@ def csv_filter(value: str | None) -> set[str] | None:
     return result or None
 
 
+def selected_repetition_ids(value: str | None, total: int) -> list[int]:
+    pieces = csv_filter(value)
+    if pieces is None:
+        return list(range(total))
+    try:
+        result = sorted({int(piece) for piece in pieces})
+    except ValueError as error:
+        raise ValueError("repeat IDs must be integers") from error
+    if result[0] < 0 or result[-1] >= total:
+        raise ValueError(f"repeat IDs must be between 0 and {total - 1}")
+    return result
+
+
 def write_report(
     path: Path,
     *,
@@ -372,6 +385,7 @@ def write_report(
     selected_tasks: Sequence[str],
     selected_methods: Sequence[str],
     repetitions: int,
+    selected_repetitions: Sequence[int],
 ) -> dict[str, Any]:
     wall_time = time.perf_counter() - started
     allocation = plan["allocation"]
@@ -386,6 +400,7 @@ def write_report(
         "selected_tasks": list(selected_tasks),
         "selected_methods": list(selected_methods),
         "repetitions": repetitions,
+        "selected_repetitions": list(selected_repetitions),
         "models": plan["models"],
         "verifier": {
             "startup_wall_time_s": verifier_startup_s,
@@ -418,6 +433,7 @@ def main() -> int:
     parser.add_argument("--task-id")
     parser.add_argument("--method-id")
     parser.add_argument("--repetitions", type=int)
+    parser.add_argument("--repeat-id")
     parser.add_argument("--num-particles", type=int)
     parser.add_argument("--max-rounds", type=int)
     parser.add_argument("--output", type=Path, required=True)
@@ -446,6 +462,7 @@ def main() -> int:
     repetitions = int(args.repetitions or plan["repetitions"])
     if repetitions < 1:
         raise ValueError("repetitions must be positive")
+    selected_repetitions = selected_repetition_ids(args.repeat_id, repetitions)
 
     started = time.perf_counter()
     verifier: smc.OnlineSemanticVerifier | None = None
@@ -501,7 +518,7 @@ def main() -> int:
                     settings["num_particles"] = args.num_particles
                 if args.max_rounds is not None:
                     settings["max_rounds"] = args.max_rounds
-                for repetition in range(repetitions):
+                for repetition in selected_repetitions:
                     seed_base = (
                         int(plan["seed_base"])
                         + task_index * 1_000_000
@@ -569,6 +586,8 @@ def main() -> int:
                             grader_name=grader_metadata["name"],
                         )
                         result["configuration"]["method_id"] = method_row["id"]
+                        result["repetition"] = repetition
+                        result["seed_base"] = seed_base
                         result["task"] = {
                             key: (
                                 str(value)
@@ -595,6 +614,8 @@ def main() -> int:
                         result = {
                             "schema_version": SCHEMA_VERSION,
                             "experiment_id": experiment_id,
+                            "repetition": repetition,
+                            "seed_base": seed_base,
                             "status": "error",
                             "error": f"{type(error).__name__}: {error}",
                             "task": {
@@ -625,6 +646,7 @@ def main() -> int:
                         selected_tasks=selected_tasks,
                         selected_methods=selected_methods,
                         repetitions=repetitions,
+                        selected_repetitions=selected_repetitions,
                     )
                     print(
                         json.dumps(
@@ -668,6 +690,7 @@ def main() -> int:
             selected_tasks=selected_tasks,
             selected_methods=selected_methods,
             repetitions=repetitions,
+            selected_repetitions=selected_repetitions,
         )
     print(
         json.dumps(

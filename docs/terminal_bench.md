@@ -695,9 +695,73 @@ The actual experiment proceeds in gates:
    and uncertainty-triggered verifier calls. Speculative gamma is swept only
    after reconnecting this controller to the SM-CSD draft/target engine.
 
-The project succeeds as a fast serving system only if a semantic middle policy
-moves the official accuracy/cost frontier relative to terminal BoN. The easy
-pilot showed mechanism correctness; this smoke shows that terminal semantic
-ranking is not reliably perfect on harder tasks. The baseline-coverage gate is
-therefore the next result to collect, before spending the full 96-run budget or
-optimizing the serving path.
+### Primary semantic-allocation result (2026-08-25)
+
+The frozen primary matrix is complete: eight tasks, four methods, three
+repetitions, N=8, H=512, one verifier call per scored checkpoint, and beta 12.
+This produced 96 valid task-method-repeat cells and 768 official particle
+gradings. Three infrastructure-error cells were rerun with the same frozen
+configuration and replace only their failed counterparts. The compact result
+contains the raw-artifact SHA-256 hashes and exact replacement audit.
+
+| method | selected reward | paired difference vs terminal (task-cluster 95% CI) | final pass blocks | particle success | mean generator calls | mean physical verifier calls | mean resamples |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| terminal semantic BoN | 5/24 (20.8%) | reference | 5/24 | 25/192 (13.0%) | 179.8 | 8.0 | 0.00 |
+| semantic SMC, ESS .25 | 5/24 (20.8%) | 0.0 pp [−12.5, +12.5] | 6/24 | 25/192 (13.0%) | 179.3 | 32.5 | 0.38 |
+| semantic SMC, ESS .50 | 5/24 (20.8%) | 0.0 pp [−12.5, +12.5] | 5/24 | 36/192 (18.8%) | 174.7 | 33.8 | 1.17 |
+| semantic Particle-Scale | 3/24 (12.5%) | −8.3 pp [−20.8, 0.0] | 3/24 | 24/192 (12.5%) | 170.9 | 30.7 | 2.92 |
+
+ESS .25 and ESS .50 each had two paired wins and two paired losses against
+terminal BoN, with 20 ties. Particle-Scale had no wins and two losses. ESS .50
+did increase final-particle success by 44% relative to terminal BoN (36 versus
+25), showing that middle semantic allocation can amplify promising lineages.
+That gain was concentrated in five task-repeat blocks and did not increase the
+number of selected correct solutions. ESS .25 exposed the remaining selector
+problem directly: six final populations contained a success, but terminal
+semantic scoring selected only five.
+
+The task mix is less informative than intended. git-leak-recovery accounts
+for 23 of terminal BoN's 25 successful particles, while four tasks had zero
+successful particles under every method. The useful paired changes occurred on
+cancel-async-tasks, fix-code-vulnerability, and regex-log: semantic SMC
+won two blocks but lost two different blocks. The wide paired intervals and
+effective four-task floor/ceiling problem rule out a positive accuracy claim.
+
+The runs consumed 35,505.5 allocated accelerator-seconds (9.86
+accelerator-hours), including all three failed attempts and recovery reruns,
+but excluding model-server startup. Mean physical verifier calls were 4.07x
+terminal for ESS .25, 4.23x for ESS .50, and 3.84x for Particle-Scale.
+End-to-end wall time is not a serving-speed result because official graders ran
+while both model accelerators remained reserved and grader time varied by
+task. Particle-Scale additionally spent 7,315 seconds replaying environments
+across valid cells, making the current container-fork implementation
+unsuitable as a low-latency serving path.
+
+The precommitted gate therefore fails: no intermediate policy strictly beat
+terminal BoN on mean official selected reward. The N, checkpoint-interval,
+verifier-call, beta, and heterogeneous-verifier production sweeps should not
+start from this policy unchanged.
+
+The next experiment should be a cheaper diagnostic on the saved states before
+more generation:
+
+1. Label terminal and intermediate checkpoints by whether their descendant
+   final state passed, then measure score separation and successful-lineage
+   survival at every checkpoint. This determines whether the issue is the
+   semantic signal or the resampling rule.
+2. Rescore the saved final states with repeated verifier calls and the frozen
+   second verifier. Compare single-model averaging, heterogeneous averaging,
+   and an uncertainty-triggered second call. This directly targets the one
+   observed ESS .25 selection miss without rerunning the generator.
+3. Build a separate development suite of longer tasks whose terminal BoN
+   pass rate is neither zero nor saturated. Tune the verifier/allocation rule
+   there, then use a new blind task set for the next accuracy claim.
+4. Resume N={4,8,16,32,64}, H={256,512,2048,8192}, calls={1,2,4,8}, and beta
+   sweeps only after a revised middle policy wins the targeted matched test.
+   Persistent KV forks and batched generation are serving optimizations after
+   that accuracy gate, not evidence for it.
+
+The reproducible analyzer is
+`scripts/terminal_bench/analyze_semantic_allocation.py`; its compact output
+is
+`results/terminal_bench/semantic_allocation_holdout_v1_summary.json`.

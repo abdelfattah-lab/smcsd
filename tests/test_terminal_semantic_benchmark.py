@@ -137,6 +137,15 @@ def test_official_tests_are_materialized_only_inside_grader(tmp_path):
     assert metadata["reward_isolated"] is True
 
 
+def test_selected_repetition_ids_preserve_frozen_indices():
+    module = load_benchmark()
+
+    assert module.selected_repetition_ids(None, 3) == [0, 1, 2]
+    assert module.selected_repetition_ids(
+        "2,1,2", 3
+    ) == [1, 2]
+
+
 def test_frozen_plan_has_expected_primary_matrix():
     plan = json.loads(
         (

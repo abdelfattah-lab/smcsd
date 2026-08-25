@@ -26,6 +26,15 @@ def load_backend():
     return module
 
 
+def test_docker_cli_replaces_non_utf8_subprocess_output():
+    backend = load_backend()
+    result = backend.DockerCLI(binary="/bin/sh").run(
+        ["-c", "printf '\\310'"]
+    )
+
+    assert result.stdout == "\ufffd"
+
+
 def write_session(path: Path) -> None:
     rows = [
         {
@@ -228,6 +237,39 @@ def test_write_text_creates_missing_parent_before_copy():
         "particle",
         "/app/missing/value",
     )
+
+
+def test_minimal_image_digest_normalizes_git_state_without_python():
+    backend = load_backend()
+
+    class MinimalDocker(backend.DockerCLI):
+        def __init__(self):
+            self.commands = []
+
+        def run(self, arguments, **kwargs):
+            self.commands.append(arguments)
+            if arguments[-1] == "command -v python3":
+                return SimpleNamespace(
+                    returncode=1, stdout="", stderr=""
+                )
+            return SimpleNamespace(
+                returncode=0, stdout="a" * 64 + "  -\n", stderr=""
+            )
+
+    docker = MinimalDocker()
+    digest = docker.filesystem_digest(
+        "particle",
+        ["/app"],
+        ignore_runtime_caches=True,
+    )
+
+    assert digest == "a" * 64
+    assert len(docker.commands) == 2
+    script = docker.commands[1][4]
+    assert "emit_git_semantic_state" in script
+    assert "ls-files --stage -z" in script
+    assert "status --porcelain=v1 -z --untracked-files=all" in script
+    assert "python3 is required" not in script
 
 
 def sample_manifest(backend):
